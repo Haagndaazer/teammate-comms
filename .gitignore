@@ -1,0 +1,10 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+.pytest_cache/
+
+# NOTE: do NOT ignore uv.lock or .mcp.json — both are shipped artifacts.
+# uv.lock pins reproducible installs; .mcp.json (if present) is part of the plugin.
