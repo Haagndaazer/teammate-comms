@@ -1,0 +1,15 @@
+{
+  "name": "coltondyck",
+  "owner": { "name": "ColtonDyck" },
+  "plugins": [
+    {
+      "name": "teammate-comms",
+      "description": "Agent-to-agent messaging + channel idle-wake.",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Haagndaazer/teammate-comms.git",
+        "sha": "REPLACE_AT_RELEASE"
+      }
+    }
+  ]
+}

@@ -6,5 +6,9 @@ dist/
 *.egg-info/
 .pytest_cache/
 
-# NOTE: do NOT ignore uv.lock or .mcp.json — both are shipped artifacts.
-# uv.lock pins reproducible installs; .mcp.json (if present) is part of the plugin.
+# Local dev tooling — NOT part of this plugin (teammate-comms ships mcpServers
+# inline in plugin.json). The .mcp.json present here is a vibe-cognition dev
+# config for working in this repo; do not commit it.
+.mcp.json
+
+# Keep uv.lock tracked (reproducible installs) — do not add it here.

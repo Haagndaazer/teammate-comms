@@ -1,0 +1,16 @@
+{
+  "description": "teammate-comms — pre-build the venv and surface launch identity",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

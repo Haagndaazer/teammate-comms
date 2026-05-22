@@ -1,0 +1,21 @@
+{
+  "name": "teammate-comms",
+  "version": "0.1.0",
+  "description": "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances.",
+  "author": { "name": "ColtonDyck" },
+  "license": "MIT",
+  "repository": "https://github.com/Haagndaazer/teammate-comms",
+  "keywords": ["mcp", "channel", "agent", "messaging"],
+  "mcpServers": {
+    "teammate-comms": {
+      "command": "uv",
+      "args": ["run", "--no-sync", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "teammate_comms.server"],
+      "env": {
+        "TEAMMATE_AGENT": "${TEAMMATE_AGENT}",
+        "TEAMMATE_TEAM": "${TEAMMATE_TEAM}",
+        "TEAMMATE_COMMS_DIR": "${TEAMMATE_COMMS_DIR}"
+      }
+    }
+  },
+  "channels": [{ "server": "teammate-comms" }]
+}
