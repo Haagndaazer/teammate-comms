@@ -1,0 +1,4 @@
+# Normalize all text to LF in the working tree. Critical for hooks/session-start.sh:
+# bash fails on CRLF line endings, and this repo may be checked out on Windows
+# (where core.autocrlf=true would otherwise convert it).
+* text=auto eol=lf
