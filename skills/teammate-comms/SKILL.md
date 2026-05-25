@@ -51,7 +51,7 @@ Identity is per-instance, set in the shell **before** launching `claude`:
 
 ```powershell
 $env:TEAMMATE_AGENT = 'Grant'      # and $env:TEAMMATE_TEAM = '<team>' if using teams
-claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
+claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@colton-comms
 ```
 
 Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled

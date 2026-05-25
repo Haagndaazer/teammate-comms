@@ -44,7 +44,7 @@ marketplace registration entirely:
 
 ```powershell
 $env:TEAMMATE_AGENT = 'Grant'        # per-instance identity, set BEFORE launching
-claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
+claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@colton-comms
 ```
 
 Set `$env:TEAMMATE_TEAM` too if you want team-namespaced inboxes. Custom channels
@@ -66,17 +66,25 @@ session, **restart Claude Code once** — every session after is instant.
   Code provides to the spawned server). Messages live at
   `<root>/TeammateComms/[<team>/]inboxes/`. `teammate_whoami` reports which won.
 
-## ⚠️ Marketplace note (read before publishing)
+## Marketplace
 
-The `coltondyck` marketplace on this machine is already registered to the
-**vibe-cognition** repo, and marketplaces are keyed by name. **Do not run
-`/plugin marketplace add` against this repository** — it would re-point `coltondyck`
-away from vibe-cognition and break that working install.
+This repo ships its own marketplace named **`colton-comms`** (distinct from the
+`coltondyck` marketplace, which is registered to the **vibe-cognition** repo).
+Because the names differ, there is no collision — you can register this repo as its
+own marketplace without disturbing vibe-cognition:
 
-This repo ships a `coltondyck` `marketplace.json` for brand/intent only; it is not
-the served marketplace. The durable fix for a working *published* install is to add
-a `teammate-comms` plugin entry to **vibe-cognition's** `marketplace.json` (one
-marketplace repo hosting both plugins). Until then, use `--plugin-dir` for local use.
+```
+/plugin marketplace add Haagndaazer/teammate-comms
+/plugin install teammate-comms@colton-comms
+```
+
+Or, for local development, skip registration entirely and load straight from the
+directory with `--plugin-dir` (see the launch command above).
+
+> If you later prefer a single shared marketplace for both plugins, add a
+> `teammate-comms` plugin entry to vibe-cognition's `coltondyck` `marketplace.json`
+> (one marketplace can list many plugins, each pointing at its own repo) instead of
+> shipping a second marketplace here.
 
 ## Development
 

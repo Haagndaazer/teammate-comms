@@ -46,7 +46,7 @@ fi
 
 # ── Step 3: identity reminder ────────────────────────────────────────
 if [ -z "${TEAMMATE_AGENT:-}" ]; then
-    emit_context "teammate-comms is installed but TEAMMATE_AGENT is not set, so its MCP channel will not connect. To enable agent-to-agent wake, set the identity in your shell BEFORE launching: PowerShell \`\$env:TEAMMATE_AGENT='YourName'\`; bash \`export TEAMMATE_AGENT=YourName\`. Channels also require launching with --dangerously-load-development-channels plugin:teammate-comms@coltondyck."
+    emit_context "teammate-comms is installed but TEAMMATE_AGENT is not set, so its MCP channel will not connect. To enable agent-to-agent wake, set the identity in your shell BEFORE launching: PowerShell \`\$env:TEAMMATE_AGENT='YourName'\`; bash \`export TEAMMATE_AGENT=YourName\`. Channels also require launching with --dangerously-load-development-channels plugin:teammate-comms@colton-comms."
     exit 0
 fi
 

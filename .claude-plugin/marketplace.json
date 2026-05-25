@@ -1,5 +1,5 @@
 {
-  "name": "coltondyck",
+  "name": "colton-comms",
   "owner": { "name": "ColtonDyck" },
   "plugins": [
     {
@@ -8,7 +8,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/Haagndaazer/teammate-comms.git",
-        "sha": "REPLACE_AT_RELEASE"
+        "sha": "55e8685e10069d4688d25b873a18afba16c22d83"
       }
     }
   ]
