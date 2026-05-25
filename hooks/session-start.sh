@@ -44,11 +44,8 @@ if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
     echo "$HASH" > "$STAMP"
 fi
 
-# ── Step 3: identity reminder ────────────────────────────────────────
-if [ -z "${TEAMMATE_AGENT:-}" ]; then
-    emit_context "teammate-comms is installed but TEAMMATE_AGENT is not set, so its MCP channel will not connect. To enable agent-to-agent wake, set the identity in your shell BEFORE launching: PowerShell \`\$env:TEAMMATE_AGENT='YourName'\`; bash \`export TEAMMATE_AGENT=YourName\`. Channels also require launching with --dangerously-load-development-channels plugin:teammate-comms@colton-comms."
-    exit 0
-fi
-
+# Identity is established at runtime via the teammate_register tool, so an unset
+# TEAMMATE_AGENT is the normal case — nothing to warn about. (Setting it is still
+# supported: the server auto-registers from it if present.)
 echo '{}'
 exit 0
