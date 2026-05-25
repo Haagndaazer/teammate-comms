@@ -1,27 +1,27 @@
 """teammate-comms MCP server: a pure-stdlib JSON-RPC stdio server that is both a
 tool server (the ``teammate_*`` tools) and a Claude Code channel (idle wake).
 
-One process per full instance. The main thread reads stdin and answers
-``initialize`` / ``tools/list`` / ``tools/call`` / ``ping``; a background thread
-(``channel.run_watcher``) heartbeats the registry and pushes
-``notifications/claude/channel`` when this agent's inbox grows. Both write stdout
-under a single lock, so messages never interleave at the byte level.
+The server starts **identity-less**. An agent calls ``teammate_register`` once at
+session start (the setup.py equivalent) to establish its name; that registers the
+inbox, writes the registry record, and arms the channel watcher. Identity is NOT
+baked into the MCP launch config. (As a convenience, if ``$TEAMMATE_AGENT`` is
+already in the environment the server auto-registers with it at startup.)
 
-Identity comes from ``$TEAMMATE_AGENT`` / ``$TEAMMATE_TEAM`` (the per-instance
-differentiator). The comms root comes from ``$TEAMMATE_COMMS_DIR`` or
-``$CLAUDE_PROJECT_DIR`` (see comms.resolve_comms_root). The stdio transport is
+The main thread reads stdin and answers initialize / tools/list / tools/call /
+ping; a background thread (channel.run_watcher) heartbeats the registry and pushes
+notifications/claude/channel once registered. Both write stdout under one lock, so
+messages never interleave at the byte level. The stdio transport is
 newline-delimited JSON-RPC 2.0 in BOM-free UTF-8.
 """
 
-import argparse
 import json
 import os
 import socket
 import sys
 import threading
 
-from . import __version__
-from . import channel, tools
+from . import __version__, channel
+from . import tools as tools_mod
 from .comms import (
     CommsError,
     _looks_unset,
@@ -30,6 +30,7 @@ from .comms import (
     is_channel_alive,
     now_timestamp,
     read_agent_record,
+    read_json_readonly,
     resolve_comms_root,
     validate_agent_name,
     write_agent_record,
@@ -38,16 +39,40 @@ from .comms import (
 SERVER_NAME = "teammate-comms"
 
 INSTRUCTIONS = (
-    "This is teammate-comms. The teammate_* tools send and read agent-to-agent "
-    "messages. A channel event (notifications/claude/channel) means a teammate "
-    "sent you message(s) while you were idle — call teammate_inbox to read, then "
-    "teammate_ack. You are a full instance: the channel wakes you, so no polling "
-    "loop is needed. Reply with teammate_send."
+    "This is teammate-comms. Call teammate_register(agent=\"<your-name>\") once at "
+    "session start to establish your identity and start your channel, then "
+    "teammate_inbox to drain any queued messages. A channel event "
+    "(notifications/claude/channel) means a teammate messaged you while idle — "
+    "read with teammate_inbox, then teammate_ack. Reply with teammate_send. You are "
+    "a full instance: the channel wakes you, so no polling loop is needed."
 )
 
 _stdout_lock = threading.Lock()
 _initialized = threading.Event()
+_registered = threading.Event()
 _stop = threading.Event()
+
+
+class Identity:
+    """Thread-safe holder for this instance's resolved identity + comms root."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.agent = None
+        self.team = None
+        self.root = None
+        self.unread_file = None
+
+    def set(self, agent, team, root, unread_file):
+        with self._lock:
+            self.agent, self.team, self.root, self.unread_file = agent, team, root, unread_file
+
+    def snapshot(self):
+        with self._lock:
+            return (self.agent, self.team, self.root, self.unread_file)
+
+
+_identity = Identity()
 
 
 def log(msg):
@@ -71,14 +96,61 @@ def respond_error(msg_id, code, message):
     send_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
 
 
-def handle(msg, agent, team):
+def register_identity(agent, team, comms_dir):
+    """Establish identity + start watching. Raises CommsError on bad input.
+
+    Used by the teammate_register tool and by the optional env auto-register.
+    Returns a human-readable status string.
+    """
+    validate_agent_name(agent)
+    root, source = resolve_comms_root(comms_dir)
+    hostname = socket.gethostname()
+
+    inboxes_dir = get_inboxes_dir(root, team)
+    ensure_inbox(inboxes_dir, agent)
+    unread_file = inboxes_dir / f"{agent}_unread.json"
+
+    # If re-registering to a different agent, mark the old one offline.
+    old_agent, old_team, old_root, _ = _identity.snapshot()
+    if old_agent and old_agent != agent and old_root is not None:
+        write_agent_record(old_root, old_team, old_agent, timeout=2,
+                           channel=False, lastHeartbeat=now_timestamp())
+
+    # Collision guard: warn (stderr) if another live channel server on this host
+    # already owns this agent name (the classic same-name misconfiguration).
+    existing = read_agent_record(root, team, agent)
+    if existing and existing.get("pid") != os.getpid() and is_channel_alive(existing):
+        log(f"WARNING: another live channel server (pid={existing.get('pid')}, "
+            f"host={existing.get('host')}) already owns agent {agent!r}. Two "
+            f"instances bound to the same agent will both nudge and fight over the "
+            f"registry — check the name you registered.")
+
+    write_agent_record(
+        root, team, agent, timeout=5,
+        type="full", channel=True, pid=os.getpid(), host=hostname,
+        startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
+    )
+
+    _identity.set(agent, team, root, unread_file)
+    _registered.set()
+
+    unread = read_json_readonly(unread_file) or []
+    log(f"registered: agent={agent!r} team={team!r} comms_root={root} (from {source})")
+    team_str = f", team {team!r}" if team else ""
+    return (
+        f"Registered as {agent!r}{team_str}. Comms root: {root} (from {source}). "
+        f"Channel armed. You have {len(unread)} unread message(s) — call "
+        f"teammate_inbox to read them."
+    )
+
+
+def handle(msg, ctx):
     method = msg.get("method")
     msg_id = msg.get("id")  # echoed verbatim (preserves int/str type)
 
     if method == "initialize":
         params = msg.get("params") or {}
         respond(msg_id, {
-            # Echo the client's requested version verbatim (research-preview safe).
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": {
                 "experimental": {"claude/channel": {}},
@@ -88,94 +160,46 @@ def handle(msg, agent, team):
             "instructions": INSTRUCTIONS,
         })
     elif method == "notifications/initialized":
-        _initialized.set()  # gate opens: watcher may now emit (no response)
+        _initialized.set()  # gate one of two: watcher also needs registration
     elif method == "ping":
         respond(msg_id, {})
     elif method == "tools/list":
-        respond(msg_id, {"tools": tools.TOOL_DEFINITIONS})
+        respond(msg_id, {"tools": tools_mod.TOOL_DEFINITIONS})
     elif method == "tools/call":
         params = msg.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        text, is_error = tools.dispatch(name, arguments, agent, team)
-        respond(msg_id, {
-            "content": [{"type": "text", "text": text}],
-            "isError": is_error,
-        })
+        text, is_error = tools_mod.dispatch(name, arguments, ctx)
+        respond(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
     elif msg_id is not None:
-        # Unknown request: report method-not-found but stay alive.
         respond_error(msg_id, -32601, f"Method not found: {method}")
-    # Unknown notifications (no id), incl. notifications/cancelled: ignore.
+    # Unknown notifications (no id): ignore.
 
 
-def resolve_identity(args):
-    raw_agent = args.agent if args.agent else os.environ.get("TEAMMATE_AGENT")
-    agent = "" if _looks_unset(raw_agent) else raw_agent.strip()
-    raw_team = args.team if args.team else os.environ.get("TEAMMATE_TEAM")
-    team = None if _looks_unset(raw_team) else raw_team.strip()
-
-    source = (
-        "arg" if args.agent
-        else ("env TEAMMATE_AGENT" if not _looks_unset(os.environ.get("TEAMMATE_AGENT"))
-              else "none")
-    )
-    log(f"resolved identity: agent={agent!r} team={team!r} (from {source})")
-    if not agent:
-        log("ERROR: no agent identity. Set --agent or the TEAMMATE_AGENT env var "
-            "before launching claude. Exiting.")
-        sys.exit(1)
+def _maybe_auto_register():
+    """Auto-register from $TEAMMATE_AGENT if it's set (best-effort convenience)."""
+    env_agent = os.environ.get("TEAMMATE_AGENT")
+    if _looks_unset(env_agent):
+        return
+    env_team = os.environ.get("TEAMMATE_TEAM")
+    team = None if _looks_unset(env_team) else env_team.strip()
     try:
-        validate_agent_name(agent)
+        register_identity(env_agent.strip(), team, None)
     except CommsError as e:
-        log(f"ERROR: {e} Exiting.")
-        sys.exit(1)
-    return agent, team
+        log(f"auto-register from $TEAMMATE_AGENT skipped: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="teammate-comms MCP server")
-    parser.add_argument("--agent", default=None, help="Agent name (else $TEAMMATE_AGENT)")
-    parser.add_argument("--team", default=None, help="Team name (else $TEAMMATE_TEAM)")
-    args = parser.parse_args()
-
-    agent, team = resolve_identity(args)
-    hostname = socket.gethostname()
-
-    # Resolve the comms root up front — without it the channel cannot work.
-    try:
-        root, root_source = resolve_comms_root()
-        log(f"comms root: {root} (from {root_source})")
-        inboxes_dir = get_inboxes_dir(team)
-        ensure_inbox(inboxes_dir, agent)
-    except CommsError as e:
-        log(f"ERROR: {e} Exiting.")
-        sys.exit(1)
-    unread_file = inboxes_dir / f"{agent}_unread.json"
-
-    # Collision guard: loudly warn (stderr) if another live channel server on
-    # this host already owns this agent name — the classic TEAMMATE_AGENT
-    # misconfiguration where two instances bind the same inbox.
-    existing = read_agent_record(team, agent)
-    if existing and existing.get("pid") != os.getpid() and is_channel_alive(existing):
-        log(f"WARNING: another live channel server (pid={existing.get('pid')}, "
-            f"host={existing.get('host')}) already owns agent {agent!r}. Two "
-            f"instances bound to the same agent will both nudge and fight over "
-            f"the registry — check TEAMMATE_AGENT.")
-
-    if not write_agent_record(
-        team, agent, timeout=5,
-        type="full", channel=True, pid=os.getpid(), host=hostname,
-        startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
-    ):
-        log("WARNING: could not write startup registry record (lock contention); "
-            "send liveness reporting may be stale until the next heartbeat.")
+    ctx = {"identity": _identity, "register": register_identity}
 
     watcher = threading.Thread(
         target=channel.run_watcher,
-        args=(send_message, agent, team, unread_file, hostname, _initialized, _stop),
+        args=(send_message, _identity, _initialized, _registered, _stop),
         daemon=True,
     )
     watcher.start()
+
+    _maybe_auto_register()
 
     try:
         for raw in iter(sys.stdin.buffer.readline, b""):
@@ -186,10 +210,13 @@ def main():
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            handle(msg, agent, team)
+            handle(msg, ctx)
     finally:
         _stop.set()
-        write_agent_record(team, agent, timeout=2, channel=False, lastHeartbeat=now_timestamp())
+        agent, team, root, _ = _identity.snapshot()
+        if agent and root is not None:
+            write_agent_record(root, team, agent, timeout=2,
+                               channel=False, lastHeartbeat=now_timestamp())
 
 
 if __name__ == "__main__":

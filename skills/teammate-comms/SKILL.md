@@ -12,11 +12,17 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 
 | Tool | Args | Behavior |
 |------|------|----------|
-| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your own identity; sending to yourself is rejected. |
+| `teammate_register` | `agent`, `team?`, `comms_dir?` | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. The other messaging tools error until you do this. |
+| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. |
 | `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. |
 | `teammate_list` | — | List registered teammates with type + liveness. |
-| `teammate_whoami` | — | Your resolved identity, team, and comms dir (diagnostics). |
+| `teammate_whoami` | — | Your registration state, identity, team, and comms dir (diagnostics). |
+
+**Startup protocol:** as soon as the session begins, call
+`teammate_register(agent: "<your-name>")` (the human/lead tells you your name), then
+`teammate_inbox` to drain anything that queued while you were down. After that the
+channel wakes you for new arrivals — no polling loop.
 
 > Tool names may appear in the model surface with an MCP prefix
 > (`mcp__plugin_teammate-comms_teammate-comms__teammate_inbox`). Refer to them by
@@ -45,20 +51,28 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 - Diagnostics (resolved identity, comms root, warnings) go to stderr →
   `~/.claude/debug/<session-id>.txt`. Check `/mcp` for connection status.
 
-## Launching a full instance (identity + channel)
+## Launching a full instance (channel)
 
-Identity is per-instance, set in the shell **before** launching `claude`:
+No identity env var is required — launch with the channel flag, then register from
+inside the session:
 
 ```powershell
-$env:TEAMMATE_AGENT = 'Grant'      # and $env:TEAMMATE_TEAM = '<team>' if using teams
 claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@colton-comms
 ```
+
+Then, at session start, call `teammate_register(agent: "Grant")` (add `team:` if
+using team-namespaced inboxes). The channel arms on registration.
 
 Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled
 (individual Pro/Max: on by default). Custom channels require
 `--dangerously-load-development-channels` (they are not on Anthropic's allowlist;
 the flag only bypasses that allowlist — org `channelsEnabled` policy still applies).
 
-If `/mcp` shows the server not-connected, `TEAMMATE_AGENT` is almost certainly
-unset/empty — set it in the shell and relaunch. Storage location: messages live in
-`<project>/TeammateComms/[<team>/]inboxes/` (or under `$TEAMMATE_COMMS_DIR` if set).
+Storage lives at `<comms-root>/TeammateComms/[<team>/]inboxes/`. The comms root is
+the `comms_dir` passed to `teammate_register`, else `$TEAMMATE_COMMS_DIR`, else the
+project directory Claude Code provides. Two instances must share the same root to
+message each other. `teammate_whoami` reports the resolved root.
+
+> Power-user shortcut: if `$TEAMMATE_AGENT` (and optionally `$TEAMMATE_TEAM`) is set
+> in the environment, the server auto-registers with it at startup — no explicit
+> `teammate_register` call needed.

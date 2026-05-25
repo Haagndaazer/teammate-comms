@@ -1,18 +1,20 @@
 """Channel wake mechanics: heartbeat + inbox watcher + idle push.
 
-Ported from the proven prototype. Once the session is initialized this polls the
-agent's own ``_unread.json`` and emits a ``notifications/claude/channel`` event
-whenever the unread count rises above a baseline seeded at init — so a peer's
-``teammate_send`` writing this inbox *is* the nudge.
+The single watcher thread starts with the server but stays dormant until two
+gates open: ``notifications/initialized`` (the client is ready) AND registration
+(``teammate_register`` has set this instance's identity). Once both are open it
+polls the agent's own ``_unread.json`` and emits a ``notifications/claude/channel``
+event whenever the unread count rises above a baseline seeded at registration —
+so a peer's ``teammate_send`` writing this inbox *is* the nudge.
 
 Reliability contract: the inbox JSON is the source of truth. The baseline reset
-on ack is a coarse heuristic (it reacts to the array length between polls), NOT a
-correctness guarantee — a missed nudge is always recovered when the agent next
-reads its inbox. Pushes are best-effort; a dropped event (session closed) loses
-nothing.
+on ack is a coarse heuristic, not a correctness guarantee — a missed nudge is
+recovered on the next inbox read. Dropped pushes (session closed) lose nothing.
 """
 
 import os
+import socket
+import time
 
 from .comms import now_timestamp, read_json_readonly, write_agent_record
 
@@ -36,44 +38,53 @@ def emit_channel_event(send_message, agent, count):
     })
 
 
-def run_watcher(send_message, agent, team, unread_file, hostname,
-                initialized_evt, stop_evt):
-    """Heartbeat + inbox poll loop. Emits events only after ``initialized``.
+def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
+    """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
 
-    Args mirror the prototype: ``send_message`` is the thread-safe stdout writer
-    owned by the server; ``initialized_evt``/``stop_evt`` are the server's gate
-    and shutdown signals.
+    ``identity`` is the server's shared Identity object (thread-safe snapshot).
+    Re-seeds the baseline whenever the registered agent changes.
     """
+    hostname = socket.gethostname()
     last_hb = 0.0
-    baseline = None  # seeded to the unread count when the gate first opens
+    baseline = None
+    last_agent = None
+
     while not stop_evt.is_set():
-        now = _monotonic()
+        if not (initialized_evt.is_set() and registered_evt.is_set()):
+            stop_evt.wait(POLL_SECONDS)
+            continue
+
+        agent, team, root, unread_file = identity.snapshot()
+        if agent is None or root is None:
+            stop_evt.wait(POLL_SECONDS)
+            continue
+
+        # Identity (re)set: reset the baseline so it re-seeds for this inbox.
+        if agent != last_agent:
+            baseline = None
+            last_agent = agent
+
+        now = time.monotonic()
         if now - last_hb >= HEARTBEAT_SECONDS:
             write_agent_record(
-                team, agent, timeout=2,
+                root, team, agent, timeout=2,
                 channel=True, pid=os.getpid(), host=hostname,
                 lastHeartbeat=now_timestamp(),
             )
             last_hb = now
 
-        if initialized_evt.is_set():
-            messages = read_json_readonly(unread_file)
-            if messages is not None:  # None = unreadable mid-write; skip cycle
-                count = len(messages)
-                if baseline is None:
-                    # Seed at first post-init read: messages already present at
-                    # session start are drained by the agent's startup inbox
-                    # read — the channel must not also nudge for them.
-                    baseline = count
-                elif count > baseline:
-                    emit_channel_event(send_message, agent, count)
-                    baseline = count
-                elif count < baseline:
-                    baseline = count
+        messages = read_json_readonly(unread_file)
+        if messages is not None:  # None = unreadable mid-write; skip cycle
+            count = len(messages)
+            if baseline is None:
+                # Seed at first read after registration: messages already present
+                # are drained by the agent's startup teammate_inbox — the channel
+                # must not also nudge for them.
+                baseline = count
+            elif count > baseline:
+                emit_channel_event(send_message, agent, count)
+                baseline = count
+            elif count < baseline:
+                baseline = count
 
         stop_evt.wait(POLL_SECONDS)
-
-
-def _monotonic():
-    import time
-    return time.monotonic()

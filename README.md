@@ -18,11 +18,16 @@ tools and pushes `notifications/claude/channel` events.
 
 | Tool | Args | Behavior |
 |------|------|----------|
+| `teammate_register` | `agent`, `team?`, `comms_dir?` | Call once at session start to establish identity, register your inbox, and arm the channel. |
 | `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. |
 | `teammate_inbox` | `count_only?` | Read your unread messages (or count). |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. |
 | `teammate_list` | — | List registered teammates with type + liveness. |
-| `teammate_whoami` | — | Resolved identity, team, comms dir (diagnostics). |
+| `teammate_whoami` | — | Registration state, identity, team, comms dir (diagnostics). |
+
+Identity is established at runtime by `teammate_register` (the setup step) — it is
+**not** baked into the MCP launch config. The other messaging tools return an error
+until you register.
 
 ## Two wake regimes
 
@@ -43,13 +48,13 @@ other bash-hooked plugins).
 marketplace registration entirely:
 
 ```powershell
-$env:TEAMMATE_AGENT = 'Grant'        # per-instance identity, set BEFORE launching
 claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@colton-comms
 ```
 
-Set `$env:TEAMMATE_TEAM` too if you want team-namespaced inboxes. Custom channels
-require `--dangerously-load-development-channels` — the flag only bypasses the
-plugin allowlist; your org's `channelsEnabled` policy still applies.
+No env var is required. At session start, call `teammate_register(agent: "Grant")`
+(add `team:` for namespaced inboxes) to establish identity and arm the channel.
+Custom channels require `--dangerously-load-development-channels` — the flag only
+bypasses the plugin allowlist; your org's `channelsEnabled` policy still applies.
 
 **First install:** a SessionStart hook builds the (zero-dep) venv so the server
 launches with `uv run --no-sync`. If the server isn't connected on the very first
@@ -57,14 +62,16 @@ session, **restart Claude Code once** — every session after is instant.
 
 ## Identity & storage
 
-- **Identity** (`TEAMMATE_AGENT`) is per-instance and read from the shell
-  environment. If it is unset, the MCP channel will not connect — `/mcp` shows the
-  server not-connected, and the resolved identity is logged to
-  `~/.claude/debug/<session-id>.txt`.
-- **Storage root** is resolved as `$TEAMMATE_COMMS_DIR` (explicit override, enables
-  cross-project/global comms) → else `$CLAUDE_PROJECT_DIR` (the project root Claude
-  Code provides to the spawned server). Messages live at
-  `<root>/TeammateComms/[<team>/]inboxes/`. `teammate_whoami` reports which won.
+- **Identity** is set at runtime via `teammate_register(agent: …)` — once per
+  session, like the old `setup.py` step. The channel arms on registration. As a
+  shortcut, if `$TEAMMATE_AGENT` (and optionally `$TEAMMATE_TEAM`) is set in the
+  environment, the server auto-registers with it at startup. Diagnostics (resolved
+  identity, comms root, collisions) are logged to `~/.claude/debug/<session-id>.txt`.
+- **Storage root** is resolved as the `comms_dir` passed to `teammate_register` →
+  else `$TEAMMATE_COMMS_DIR` (cross-project/global) → else `$CLAUDE_PROJECT_DIR`
+  (the project root Claude Code provides). Messages live at
+  `<root>/TeammateComms/[<team>/]inboxes/`; two instances must share a root.
+  `teammate_whoami` reports which won.
 
 ## Marketplace
 

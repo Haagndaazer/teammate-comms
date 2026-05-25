@@ -5,9 +5,10 @@ changes for the plugin/MCP-server context:
 
 1. **Comms-root resolution** replaces the prototype's ``git rev-parse``. A
    plugin-spawned server's cwd is the plugin cache directory (itself a git
-   repo), so git-based resolution would scatter inboxes into the cache. We
-   resolve an explicit root instead (see ``resolve_comms_root``).
-2. **``validate_agent_name`` raises** ``ValueError`` instead of calling
+   repo), so git-based resolution would scatter inboxes there. The root is
+   resolved once at registration (see ``resolve_comms_root``) and then passed
+   explicitly to the path/registry helpers.
+2. **``validate_agent_name`` raises** ``CommsError`` instead of calling
    ``sys.exit``. The server is long-lived; a bad tool argument must surface as
    a tool error, never tear down the whole process.
 """
@@ -33,8 +34,8 @@ TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S.%f"
 class CommsError(Exception):
     """Raised for recoverable comms failures (invalid input, missing root).
 
-    Tool handlers convert this into an ``isError`` result; startup code catches
-    it to log and exit cleanly. It must never escape as an unhandled crash.
+    Tool handlers convert this into an ``isError`` result. It must never escape
+    as an unhandled crash.
     """
 
 
@@ -46,8 +47,8 @@ def now_timestamp():
 def validate_agent_name(name):
     """Validate an agent name; raise CommsError on anything unsafe.
 
-    Unlike the prototype this does NOT call sys.exit — the server is long-lived
-    and a bad ``to``/``id`` argument from a tool call must not kill it.
+    Does NOT call sys.exit — a bad ``to``/``agent`` argument from a tool call
+    must not kill the long-lived server.
     """
     if not isinstance(name, str) or not AGENT_NAME_PATTERN.match(name) or ".." in name:
         raise CommsError(
@@ -57,30 +58,28 @@ def validate_agent_name(name):
 
 
 def _looks_unset(value):
-    """True if an env value is missing, blank, or an unexpanded ``${...}`` token.
-
-    Claude Code's manifest ``${VAR}`` expansion may leave a literal token if the
-    referenced shell var is unset; treat that as "not provided" rather than a
-    real value.
-    """
+    """True if an env value is missing, blank, or an unexpanded ``${...}`` token."""
     if not value:
         return True
     v = value.strip()
     return not v or ("${" in v and "}" in v)
 
 
-def resolve_comms_root():
+def resolve_comms_root(explicit=None):
     """Resolve the directory under which ``TeammateComms/`` lives.
 
-    Resolution order (first hit wins):
-      1. ``$TEAMMATE_COMMS_DIR`` — explicit override (cross-project / global).
-      2. ``$CLAUDE_PROJECT_DIR`` — the authoritative project root that Claude
-         Code injects into a spawned server's environment.
-    Never falls back to cwd/git (a plugin server's cwd is the plugin cache).
-    Raises CommsError if neither is usable.
+    Order (first hit wins):
+      1. ``explicit`` — a comms_dir passed to teammate_register.
+      2. ``$TEAMMATE_COMMS_DIR`` — explicit env override (cross-project/global).
+      3. ``$CLAUDE_PROJECT_DIR`` — the project root Claude Code injects into a
+         spawned server's environment.
+    Never falls back to cwd/git. Raises CommsError if none is usable.
 
-    Returns ``(root: Path, source: str)`` so callers can report which won.
+    Returns ``(root: Path, source: str)``.
     """
+    if explicit and not _looks_unset(explicit):
+        return Path(explicit.strip()), "comms_dir arg"
+
     override = os.environ.get("TEAMMATE_COMMS_DIR")
     if not _looks_unset(override):
         return Path(override.strip()), "TEAMMATE_COMMS_DIR"
@@ -90,24 +89,23 @@ def resolve_comms_root():
         return Path(project.strip()), "CLAUDE_PROJECT_DIR"
 
     raise CommsError(
-        "No comms root. Set TEAMMATE_COMMS_DIR, or run inside a project where "
-        "Claude Code provides CLAUDE_PROJECT_DIR."
+        "No comms root. Pass comms_dir to teammate_register, set "
+        "TEAMMATE_COMMS_DIR, or run inside a project where Claude Code provides "
+        "CLAUDE_PROJECT_DIR."
     )
 
 
-def get_inboxes_dir(team=None):
+def get_inboxes_dir(root, team=None):
     """``<root>/TeammateComms/[<team>/]inboxes`` (team namespacing optional)."""
-    root, _ = resolve_comms_root()
-    base = root / "TeammateComms"
+    base = Path(root) / "TeammateComms"
     if team:
         base = base / team
     return base / "inboxes"
 
 
-def get_agents_dir(team=None):
+def get_agents_dir(root, team=None):
     """``<root>/TeammateComms/[<team>/]agents`` registry directory."""
-    root, _ = resolve_comms_root()
-    base = root / "TeammateComms"
+    base = Path(root) / "TeammateComms"
     if team:
         base = base / team
     return base / "agents"
@@ -139,9 +137,9 @@ def read_json_safe(filepath):
 def read_json_readonly(filepath):
     """Read a JSON file WITHOUT writing on failure.
 
-    Returns the parsed value, or None if the file is missing or currently
-    unreadable (e.g. a concurrent partial write). Never mutates the file — safe
-    for a high-frequency poller that holds no write lock. Callers skip on None.
+    Returns the parsed value, or None if missing or currently unreadable (e.g. a
+    concurrent partial write). Never mutates the file — safe for a poller that
+    holds no write lock. Callers skip on None.
     """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -151,11 +149,7 @@ def read_json_readonly(filepath):
 
 
 def write_json_atomic(filepath, data):
-    """Write JSON via a temp file + os.replace (atomic on the same volume).
-
-    A concurrent reader sees either the old contents or the new — never a
-    half-written truncation.
-    """
+    """Write JSON via a temp file + os.replace (atomic on the same volume)."""
     filepath = Path(filepath)
     tmp = filepath.with_name(filepath.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -197,11 +191,7 @@ def file_lock(lock_path, timeout=10):
 
 @contextmanager
 def file_lock_optional(lock_path, timeout=2):
-    """Best-effort lock that never raises. Yields True if acquired, else False.
-
-    Safe to call from a background thread (heartbeat loop): a failed acquire
-    simply skips the write and catches up next cycle.
-    """
+    """Best-effort lock that never raises. Yields True if acquired, else False."""
     lock_dir = Path(str(lock_path) + ".lock")
     start = time.time()
     acquired = False
@@ -226,18 +216,17 @@ def file_lock_optional(lock_path, timeout=2):
                 pass
 
 
-def write_agent_record(team, name, timeout=5, **fields):
+def write_agent_record(root, team, name, timeout=5, **fields):
     """Field-level merge of ``fields`` into ``agents/<name>.json`` under a lock.
 
-    Only provided keys are overwritten; existing keys are preserved, so
-    ``setup``-owned fields (``type``) and channel-owned fields
-    (``pid``/``channel``/``lastHeartbeat``) coexist. Returns True if written.
+    Only provided keys are overwritten; existing keys are preserved, so the
+    register-owned ``type`` and the channel-owned ``pid``/``channel``/
+    ``lastHeartbeat`` coexist. Returns True if written.
 
-    Hardening over the prototype: if the record file *exists* but currently
-    reads as None (a concurrent mid-write), skip this write instead of
-    clobbering it with an empty dict — that would transiently drop ``type``.
+    Hardening: if the record file *exists* but currently reads as None (a
+    concurrent mid-write), skip this write instead of clobbering ``type``.
     """
-    agents_dir = get_agents_dir(team)
+    agents_dir = get_agents_dir(root, team)
     agents_dir.mkdir(parents=True, exist_ok=True)
     record_path = agents_dir / f"{name}.json"
     with file_lock_optional(record_path, timeout=timeout) as acquired:
@@ -245,7 +234,6 @@ def write_agent_record(team, name, timeout=5, **fields):
             return False
         record = read_json_readonly(record_path)
         if record is None and record_path.exists():
-            # Exists but unreadable right now — don't clobber; retry next cycle.
             return False
         if not isinstance(record, dict):
             record = {}
@@ -255,9 +243,9 @@ def write_agent_record(team, name, timeout=5, **fields):
         return True
 
 
-def read_agent_record(team, name):
+def read_agent_record(root, team, name):
     """Read ``agents/<name>.json``, or None if absent/unreadable."""
-    record = read_json_readonly(get_agents_dir(team) / f"{name}.json")
+    record = read_json_readonly(get_agents_dir(root, team) / f"{name}.json")
     return record if isinstance(record, dict) else None
 
 
@@ -291,11 +279,9 @@ def is_channel_alive(record, staleness=30, pid_check=True):
     """Decide whether an agent's channel server is currently running.
 
     Same host with ``pid_check=True``: authoritative pid liveness (no staleness
-    window). Otherwise (or if the pid check is undetermined / cross-host): fall
-    back to heartbeat freshness within ``staleness`` seconds.
-
-    ``teammate_list`` passes ``pid_check=False`` so listing N agents does not
-    spawn N ``tasklist`` subprocesses.
+    window). Otherwise (or if undetermined / cross-host): heartbeat freshness
+    within ``staleness`` seconds. ``teammate_list`` passes ``pid_check=False`` so
+    listing N agents does not spawn N ``tasklist`` subprocesses.
     """
     if not record or not record.get("channel"):
         return False
