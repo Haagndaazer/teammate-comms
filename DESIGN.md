@@ -270,8 +270,10 @@ plain keys on the agent registry record (the field-level merge in `write_agent_r
 makes this additive and backward-compatible; the heartbeat preserves them). They let
 teammates see what a peer is doing (`status`) and what part of the project a peer owns
 (`authority`) at a glance, without interrupting them. `teammate_update` keeps them
-fresh; `teammate_list` always surfaces `status`/`authority`; `teammate_profile` reads
-the full set.
+fresh; `teammate_list` always surfaces `status`/`authority` (and `role`/`personality`
+when set); `teammate_profile` reads the full set. An agent's own profile is echoed in
+the `teammate_register` return and the channel wake event leads with
+`You are <name>: <personality>`, so it stays reminded of who it is across waking.
 
 ---
 

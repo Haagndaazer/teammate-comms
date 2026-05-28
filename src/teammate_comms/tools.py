@@ -43,8 +43,18 @@ _PROFILE_DESCRIPTIONS = {
 
 
 def _profile_schema_properties():
-    """inputSchema 'properties' for the four optional profile fields."""
-    return {name: {"type": "string", "description": _PROFILE_DESCRIPTIONS[name]} for name in PROFILE_FIELDS}
+    """inputSchema 'properties' for the four optional profile fields.
+
+    The per-field char cap is appended from PROFILE_FIELDS so the advertised limit
+    always matches what validate_profile_field actually enforces.
+    """
+    return {
+        name: {
+            "type": "string",
+            "description": f"{_PROFILE_DESCRIPTIONS[name]} Max {PROFILE_FIELDS[name]} chars, single line.",
+        }
+        for name in PROFILE_FIELDS
+    }
 
 
 def _collect_profile_args(args):
@@ -311,6 +321,9 @@ def _handle_list(args, ctx):
         role = record.get("role")
         if role:
             rows.append(f"      role:      {role}")
+        personality = record.get("personality")
+        if personality:
+            rows.append(f"      personality: {personality}")
     return "Registered teammates:\n" + "\n".join(rows) if rows else "No registered teammates yet."
 
 

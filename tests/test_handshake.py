@@ -11,9 +11,11 @@ primary path). Asserts both halves of the unified server:
       to registered and echoes the profile
 
   Profile fields:
-    - teammate_update changes status; teammate_list always shows status/authority;
-      teammate_profile returns the full profile (incl. personality); a profile field
+    - teammate_register echoes the profile back (personality reminder at start)
+    - teammate_update changes status; teammate_list always shows status/authority and
+      includes personality; teammate_profile returns the full profile; a profile field
       SURVIVES a heartbeat cycle
+    - the channel wake event leads with the personality reminder
 
   Channel half:
     - initialize echoes the id and advertises BOTH experimental['claude/channel']
@@ -228,6 +230,9 @@ def main():
     # registration succeeded + whoami flips
     if is_error(5) or "Registered as" not in text(5):
         failures.append(f"teammate_register failed: {text(5)}")
+    # register return echoes the profile back (personality reminder at session start)
+    if PERSONALITY not in text(5) or ROLE not in text(5):
+        failures.append(f"teammate_register did not echo profile: {text(5)}")
     if '"registered": true' not in text(6).lower() or AGENT not in text(6):
         failures.append(f"whoami after register wrong: {text(6)}")
     # whoami echoes the profile set at registration
@@ -255,6 +260,9 @@ def main():
         failures.append("no notifications/claude/channel emitted for new message")
     elif notifications[0]["params"]["meta"].get("agent") != AGENT:
         failures.append(f"channel notification meta wrong: {notifications[0]['params']['meta']}")
+    # wake event leads with the personality reminder
+    elif PERSONALITY not in notifications[0]["params"].get("content", ""):
+        failures.append(f"channel notification missing personality reminder: {notifications[0]['params'].get('content')}")
 
     # inbox shows message, ack clears, ping ok
     if "hello via channel" not in text(13):
@@ -272,6 +280,8 @@ def main():
         failures.append(f"teammate_list missing status/authority labels: {text(17)}")
     if STATUS_NEW not in text(17) or AUTHORITY not in text(17):
         failures.append(f"teammate_list missing updated status/authority values: {text(17)}")
+    if PERSONALITY not in text(17):
+        failures.append(f"teammate_list missing personality: {text(17)}")
     # teammate_profile (self) returns the full profile incl. personality
     for needle in (PERSONALITY, ROLE, STATUS_NEW, AUTHORITY):
         if needle not in text(18):

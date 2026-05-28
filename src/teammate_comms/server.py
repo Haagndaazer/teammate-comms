@@ -23,6 +23,7 @@ import threading
 from . import __version__, channel
 from . import tools as tools_mod
 from .comms import (
+    PROFILE_FIELDS,
     CommsError,
     _looks_unset,
     ensure_inbox,
@@ -146,9 +147,22 @@ def register_identity(agent, team, comms_dir, profile=None):
     unread = read_json_readonly(unread_file) or []
     log(f"registered: agent={agent!r} team={team!r} comms_root={root} (from {source})")
     team_str = f", team {team!r}" if team else ""
+
+    # Echo the effective profile back so the agent is reminded who it is (incl. its
+    # personality) — read the record so persisted fields from a prior registration
+    # show too, not just what this call passed.
+    effective = read_agent_record(root, team, agent) or {}
+    set_fields = [(k, effective[k]) for k in PROFILE_FIELDS if effective.get(k)]
+    if set_fields:
+        profile_str = "Your profile — " + "; ".join(f"{k}: {v!r}" for k, v in set_fields) + ". "
+    else:
+        profile_str = (
+            "No profile set — set one with teammate_update "
+            "(role/personality/status/authority) so teammates know what you're doing. "
+        )
     return (
         f"Registered as {agent!r}{team_str}. Comms root: {root} (from {source}). "
-        f"Channel armed. You have {len(unread)} unread message(s) — call "
+        f"Channel armed. {profile_str}You have {len(unread)} unread message(s) — call "
         f"teammate_inbox to read them."
     )
 

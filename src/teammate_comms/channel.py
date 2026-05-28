@@ -16,16 +16,21 @@ import os
 import socket
 import time
 
-from .comms import now_timestamp, read_json_readonly, write_agent_record
+from .comms import now_timestamp, read_agent_record, read_json_readonly, write_agent_record
 
 HEARTBEAT_SECONDS = 5
 POLL_SECONDS = 0.5
 
 
-def emit_channel_event(send_message, agent, count):
-    """Push one ``notifications/claude/channel`` event for ``count`` unread."""
+def emit_channel_event(send_message, agent, count, personality=None):
+    """Push one ``notifications/claude/channel`` event for ``count`` unread.
+
+    If ``personality`` is set, it leads the content so a woken idle instance is
+    reminded who it is before it acts.
+    """
+    intro = f"You are {agent}: {personality.rstrip('. ')}. " if personality else ""
     content = (
-        f"You have {count} new teammate message(s). Use your teammate-comms "
+        f"{intro}You have {count} new teammate message(s). Use your teammate-comms "
         f"tools to read them: call `teammate_inbox` to view, then `teammate_ack` "
         f"(id \"all\") once handled. Reply with `teammate_send`. You are a full "
         f"instance — this channel wakes you; no polling loop needed."
@@ -82,7 +87,10 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 # must not also nudge for them.
                 baseline = count
             elif count > baseline:
-                emit_channel_event(send_message, agent, count)
+                # Read the record only when actually nudging (rare) to fetch the
+                # personality reminder — avoids a per-poll read.
+                record = read_agent_record(root, team, agent) or {}
+                emit_channel_event(send_message, agent, count, record.get("personality"))
                 baseline = count
             elif count < baseline:
                 baseline = count

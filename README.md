@@ -22,7 +22,7 @@ tools and pushes `notifications/claude/channel` events.
 | `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. |
 | `teammate_inbox` | `count_only?` | Read your unread messages (or count). |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. |
-| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `status` and `authority`** (plus `role` when set). |
+| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `status` and `authority`** (plus `role`/`personality` when set). |
 | `teammate_whoami` | — | Registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
@@ -45,8 +45,13 @@ interrupting you:
 
 Set any of these at `teammate_register` and update them anytime with
 `teammate_update`. `teammate_list` always surfaces `status` + `authority` for every
-teammate; `teammate_profile` returns the full set (including `personality`). All
-fields are optional and single-line.
+teammate (and shows `role`/`personality` when set); `teammate_profile` returns the
+full set. All fields are optional and single-line.
+
+Your own profile is surfaced back to you so you stay in character: the
+`teammate_register` return echoes it, and the channel wake event leads with
+`You are <name>: <personality>` so a woken idle instance is reminded who it is. You
+can always re-read it with `teammate_whoami` or `teammate_profile`.
 
 ## Two wake regimes
 
