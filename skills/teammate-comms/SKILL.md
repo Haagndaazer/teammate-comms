@@ -12,17 +12,27 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 
 | Tool | Args | Behavior |
 |------|------|----------|
-| `teammate_register` | `agent`, `team?`, `comms_dir?` | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. The other messaging tools error until you do this. |
+| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile. The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. |
 | `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. |
-| `teammate_list` | — | List registered teammates with type + liveness. |
-| `teammate_whoami` | — | Your registration state, identity, team, and comms dir (diagnostics). |
+| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `status` and `authority`** (plus `role` when set). |
+| `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
+| `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
+| `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 
 **Startup protocol:** as soon as the session begins, call
-`teammate_register(agent: "<your-name>")` (the human/lead tells you your name), then
+`teammate_register(agent: "<your-name>")` (the human/lead tells you your name) —
+optionally with a profile (`role`, `personality`, `status`, `authority`) — then
 `teammate_inbox` to drain anything that queued while you were down. After that the
 channel wakes you for new arrivals — no polling loop.
+
+**Profiles — at-a-glance coordination.** Set a profile so peers can see what you're
+doing and what you own without interrupting you. Keep `status` current with
+`teammate_update` as you move between tasks, and set `authority` to the parts of the
+project you own. Before modifying an area, check `teammate_list` (always shows
+`status` + `authority`) or `teammate_profile(agent)` to see if a teammate owns it or
+is mid-task there.
 
 > Tool names may appear in the model surface with an MCP prefix
 > (`mcp__plugin_teammate-comms_teammate-comms__teammate_inbox`). Refer to them by

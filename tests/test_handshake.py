@@ -5,9 +5,15 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 6 tools (register + 5), each with a valid object inputSchema
+    - tools/list returns 8 tools (register + 7), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
-    - teammate_register establishes identity; teammate_whoami flips to registered
+    - teammate_register (with a profile) establishes identity; teammate_whoami flips
+      to registered and echoes the profile
+
+  Profile fields:
+    - teammate_update changes status; teammate_list always shows status/authority;
+      teammate_profile returns the full profile (incl. personality); a profile field
+      SURVIVES a heartbeat cycle
 
   Channel half:
     - initialize echoes the id and advertises BOTH experimental['claude/channel']
@@ -38,6 +44,11 @@ SRC = REPO / "src"
 AGENT = "test-chan"
 PEER = "test-peer"
 TEAM = "chtest"
+ROLE = "test runner"
+PERSONALITY = "methodical and dry"
+STATUS_INIT = "booting up"
+STATUS_NEW = "running checks"
+AUTHORITY = "tests/**"
 
 stdout_lines = []
 stderr_lines = []
@@ -105,12 +116,15 @@ def main():
                 "params": {"name": "teammate_whoami", "arguments": {}}})       # registered:false
     time.sleep(0.3)
 
-    # Register, then verify identity + channel arming
+    # Register (WITH a profile), then verify identity + channel arming
     send(proc, {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                "params": {"name": "teammate_register", "arguments": {"agent": AGENT, "team": TEAM}}})
+                "params": {"name": "teammate_register",
+                           "arguments": {"agent": AGENT, "team": TEAM, "role": ROLE,
+                                         "personality": PERSONALITY, "status": STATUS_INIT,
+                                         "authority": AUTHORITY}}})
     time.sleep(1.0)  # let the watcher seed its baseline (count 0)
     send(proc, {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
-                "params": {"name": "teammate_whoami", "arguments": {}}})       # registered:true
+                "params": {"name": "teammate_whoami", "arguments": {}}})       # registered:true + profile
 
     # Tool round-trips + error paths
     send(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
@@ -138,11 +152,25 @@ def main():
     send(proc, {"jsonrpc": "2.0", "id": 15, "method": "ping"})
     time.sleep(0.6)
 
-    # Heartbeat cycle (5s) -> confirm type:"full" survives the merge.
+    # Profile: update status, then read it back via list + profile.
+    send(proc, {"jsonrpc": "2.0", "id": 16, "method": "tools/call",
+                "params": {"name": "teammate_update", "arguments": {"status": STATUS_NEW}}})
+    send(proc, {"jsonrpc": "2.0", "id": 17, "method": "tools/call",
+                "params": {"name": "teammate_list", "arguments": {}}})
+    send(proc, {"jsonrpc": "2.0", "id": 18, "method": "tools/call",
+                "params": {"name": "teammate_profile", "arguments": {}}})           # self full profile
+    send(proc, {"jsonrpc": "2.0", "id": 19, "method": "tools/call",
+                "params": {"name": "teammate_profile", "arguments": {"agent": PEER}}})  # no record -> isError
+    time.sleep(0.6)
+
+    # Heartbeat cycle (5s) -> confirm type:"full" AND a profile field survive the merge.
     time.sleep(5.5)
     type_after_heartbeat = None
+    status_after_heartbeat = None
     if record.exists():
-        type_after_heartbeat = json.loads(record.read_text(encoding="utf-8")).get("type")
+        rec_hb = json.loads(record.read_text(encoding="utf-8"))
+        type_after_heartbeat = rec_hb.get("type")
+        status_after_heartbeat = rec_hb.get("status")
 
     proc.stdin.close()
     try:
@@ -178,10 +206,11 @@ def main():
         if init.get("result", {}).get("protocolVersion") != "2025-06-18":
             failures.append("initialize did not echo protocolVersion")
 
-    # tools/list: 6 tools, each with an object inputSchema
+    # tools/list: 8 tools, each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
-                      "teammate_ack", "teammate_list", "teammate_whoami"}
+                      "teammate_ack", "teammate_list", "teammate_whoami",
+                      "teammate_update", "teammate_profile"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:
@@ -201,6 +230,9 @@ def main():
         failures.append(f"teammate_register failed: {text(5)}")
     if '"registered": true' not in text(6).lower() or AGENT not in text(6):
         failures.append(f"whoami after register wrong: {text(6)}")
+    # whoami echoes the profile set at registration
+    if STATUS_INIT not in text(6) or ROLE not in text(6):
+        failures.append(f"whoami missing profile fields: {text(6)}")
 
     # send to peer wrote peer's inbox
     if is_error(7):
@@ -232,7 +264,23 @@ def main():
     if by_id.get(15, {}).get("result") != {}:
         failures.append(f"ping result not empty: {by_id.get(15)}")
 
-    # registry: written + type survives heartbeat merge
+    # profile: update succeeded; list + profile reflect it
+    if is_error(16) or "Profile updated" not in text(16):
+        failures.append(f"teammate_update failed: {text(16)}")
+    # teammate_list always surfaces status + authority, and shows the updated status
+    if "status:" not in text(17) or "authority:" not in text(17):
+        failures.append(f"teammate_list missing status/authority labels: {text(17)}")
+    if STATUS_NEW not in text(17) or AUTHORITY not in text(17):
+        failures.append(f"teammate_list missing updated status/authority values: {text(17)}")
+    # teammate_profile (self) returns the full profile incl. personality
+    for needle in (PERSONALITY, ROLE, STATUS_NEW, AUTHORITY):
+        if needle not in text(18):
+            failures.append(f"teammate_profile missing {needle!r}: {text(18)}")
+    # teammate_profile for an agent with no registry record -> isError
+    if not is_error(19):
+        failures.append(f"teammate_profile for unregistered peer not isError: {by_id.get(19)}")
+
+    # registry: written + type/profile survive heartbeat merge
     if not record.exists():
         failures.append(f"registry record not written at {record}")
     else:
@@ -241,6 +289,8 @@ def main():
             failures.append(f"registry record incomplete: {rec}")
     if type_after_heartbeat != "full":
         failures.append(f"type:'full' did not survive heartbeat (got {type_after_heartbeat!r})")
+    if status_after_heartbeat != STATUS_NEW:
+        failures.append(f"profile status did not survive heartbeat (got {status_after_heartbeat!r})")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

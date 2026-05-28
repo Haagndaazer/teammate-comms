@@ -18,16 +18,35 @@ tools and pushes `notifications/claude/channel` events.
 
 | Tool | Args | Behavior |
 |------|------|----------|
-| `teammate_register` | `agent`, `team?`, `comms_dir?` | Call once at session start to establish identity, register your inbox, and arm the channel. |
+| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`role`, `personality`, `status`, `authority`) | Call once at session start to establish identity, register your inbox, and arm the channel. Optionally set your profile. |
 | `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. |
 | `teammate_inbox` | `count_only?` | Read your unread messages (or count). |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. |
-| `teammate_list` | — | List registered teammates with type + liveness. |
-| `teammate_whoami` | — | Registration state, identity, team, comms dir (diagnostics). |
+| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `status` and `authority`** (plus `role` when set). |
+| `teammate_whoami` | — | Registration state, identity, team, comms dir, and your own profile (diagnostics). |
+| `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
+| `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
 until you register.
+
+## Profiles
+
+Each teammate can attach an optional profile to its registry record so peers can see
+**what you're doing** and **what you own** at a glance — without messaging and
+interrupting you:
+
+- `role` — your job on the team (e.g. `backend / API`)
+- `personality` — a short blurb (mostly for fun)
+- `status` — what you're doing right now; **keep it fresh** with `teammate_update`
+- `authority` — areas of the project you own (e.g. `src/auth/**, billing`), so
+  teammates know before modifying them
+
+Set any of these at `teammate_register` and update them anytime with
+`teammate_update`. `teammate_list` always surfaces `status` + `authority` for every
+teammate; `teammate_profile` returns the full set (including `personality`). All
+fields are optional and single-line.
 
 ## Two wake regimes
 

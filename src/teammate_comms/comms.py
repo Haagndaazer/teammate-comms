@@ -30,6 +30,17 @@ AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 # checks. Naive local time — writer and reader are always co-located.
 TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S.%f"
 
+# Optional free-text profile fields an agent can attach to its registry record,
+# mapped to a max length. All single-line: a teammate scans these in teammate_list
+# (status/authority) or reads the full set via teammate_profile. Embedded newlines
+# are collapsed so a value can never break the one-block-per-teammate list layout.
+PROFILE_FIELDS = {
+    "role": 200,
+    "personality": 280,
+    "status": 200,
+    "authority": 500,
+}
+
 
 class CommsError(Exception):
     """Raised for recoverable comms failures (invalid input, missing root).
@@ -55,6 +66,27 @@ def validate_agent_name(name):
             f"Invalid agent name {name!r}. Use alphanumerics, hyphens, "
             f"underscores, and dots only (no path separators)."
         )
+
+
+def validate_profile_field(name, value):
+    """Normalize one optional profile field; raise CommsError on bad input.
+
+    Coerces to a trimmed, single-line string (internal whitespace/newlines
+    collapsed to single spaces so a value can never break the teammate_list block
+    layout) and length-caps per ``PROFILE_FIELDS``. A value that trims to empty
+    returns ``""`` — the caller stores that, which reads as "cleared".
+    """
+    if name not in PROFILE_FIELDS:
+        raise CommsError(
+            f"Unknown profile field {name!r}. Valid fields: {sorted(PROFILE_FIELDS)}."
+        )
+    if not isinstance(value, str):
+        raise CommsError(f"Profile field {name!r} must be a string, got {type(value).__name__}.")
+    collapsed = " ".join(value.split())
+    max_len = PROFILE_FIELDS[name]
+    if len(collapsed) > max_len:
+        raise CommsError(f"Profile field {name!r} exceeds {max_len} characters.")
+    return collapsed
 
 
 def _looks_unset(value):

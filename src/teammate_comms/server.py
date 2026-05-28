@@ -33,6 +33,7 @@ from .comms import (
     read_json_readonly,
     resolve_comms_root,
     validate_agent_name,
+    validate_profile_field,
     write_agent_record,
 )
 
@@ -41,10 +42,14 @@ SERVER_NAME = "teammate-comms"
 INSTRUCTIONS = (
     "This is teammate-comms. Call teammate_register(agent=\"<your-name>\") once at "
     "session start to establish your identity and start your channel, then "
-    "teammate_inbox to drain any queued messages. A channel event "
-    "(notifications/claude/channel) means a teammate messaged you while idle — "
-    "read with teammate_inbox, then teammate_ack. Reply with teammate_send. You are "
-    "a full instance: the channel wakes you, so no polling loop is needed."
+    "teammate_inbox to drain any queued messages. Optionally set a profile at "
+    "register (role, personality, status, authority) and keep your status current "
+    "with teammate_update so teammates can see what you're doing and which areas "
+    "you own — via teammate_list / teammate_profile — without interrupting you. A "
+    "channel event (notifications/claude/channel) means a teammate messaged you "
+    "while idle — read with teammate_inbox, then teammate_ack. Reply with "
+    "teammate_send. You are a full instance: the channel wakes you, so no polling "
+    "loop is needed."
 )
 
 _stdout_lock = threading.Lock()
@@ -96,13 +101,16 @@ def respond_error(msg_id, code, message):
     send_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
 
 
-def register_identity(agent, team, comms_dir):
+def register_identity(agent, team, comms_dir, profile=None):
     """Establish identity + start watching. Raises CommsError on bad input.
 
     Used by the teammate_register tool and by the optional env auto-register.
-    Returns a human-readable status string.
+    ``profile`` is an optional dict of free-text profile fields (role/personality/
+    status/authority) validated and written onto the registry record. Returns a
+    human-readable status string.
     """
     validate_agent_name(agent)
+    profile_fields = {k: validate_profile_field(k, v) for k, v in (profile or {}).items()}
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
 
@@ -129,6 +137,7 @@ def register_identity(agent, team, comms_dir):
         root, team, agent, timeout=5,
         type="full", channel=True, pid=os.getpid(), host=hostname,
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
+        **profile_fields,
     )
 
     _identity.set(agent, team, root, unread_file)

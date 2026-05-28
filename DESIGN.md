@@ -257,10 +257,21 @@ server's own resolved identity). Validate `to` with `validate_agent_name`.
 | `teammate_send` | `to: str`, `message: str`, `priority?: "normal"\|"urgent"` | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). |
 | `teammate_inbox` | `count_only?: bool` | Read this agent's unread messages (or just the count). |
 | `teammate_ack` | `id: str` | Move a message (`id` or `"all"`) from unread → read. |
-| `teammate_list` | — | List registered agents with type + liveness. |
-| `teammate_whoami` | — | Report resolved identity, team, and comms dir (diagnostics). |
+| `teammate_list` | — | List registered agents with type + liveness; always shows each agent's `status` + `authority`. |
+| `teammate_whoami` | — | Report resolved identity, team, comms dir, and own profile (diagnostics). |
+| `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update own profile fields (self-only field-merge write). |
+| `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
+
+**Profile fields (added 0.2.0).** `teammate_register` also accepts optional
+free-text profile fields — `role`, `personality`, `status`, `authority` — stored as
+plain keys on the agent registry record (the field-level merge in `write_agent_record`
+makes this additive and backward-compatible; the heartbeat preserves them). They let
+teammates see what a peer is doing (`status`) and what part of the project a peer owns
+(`authority`) at a glance, without interrupting them. `teammate_update` keeps them
+fresh; `teammate_list` always surfaces `status`/`authority`; `teammate_profile` reads
+the full set.
 
 ---
 
