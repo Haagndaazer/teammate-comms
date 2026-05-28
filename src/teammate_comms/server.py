@@ -19,6 +19,7 @@ import os
 import socket
 import sys
 import threading
+from pathlib import Path
 
 from . import __version__, channel
 from . import tools as tools_mod
@@ -44,9 +45,12 @@ INSTRUCTIONS = (
     "This is teammate-comms. Call teammate_register(agent=\"<your-name>\") once at "
     "session start to establish your identity and start your channel, then "
     "teammate_inbox to drain any queued messages. Optionally set a profile at "
-    "register (role, personality, status, authority) and keep your status current "
-    "with teammate_update so teammates can see what you're doing and which areas "
-    "you own — via teammate_list / teammate_profile — without interrupting you. A "
+    "register (role, personality, status, authority; your project is auto-filled) "
+    "and keep your status current with teammate_update so teammates can see what "
+    "you're doing, which project you're in, and which areas you own, via "
+    "teammate_list / teammate_profile, without interrupting you. Comms are global by "
+    "default (all projects share one space), so you can message agents in other "
+    "projects too. A "
     "channel event (notifications/claude/channel) means a teammate messaged you "
     "while idle — read with teammate_inbox, then teammate_ack. Reply with "
     "teammate_send. You are a full instance: the channel wakes you, so no polling "
@@ -111,7 +115,15 @@ def register_identity(agent, team, comms_dir, profile=None):
     human-readable status string.
     """
     validate_agent_name(agent)
-    profile_fields = {k: validate_profile_field(k, v) for k, v in (profile or {}).items()}
+    profile = dict(profile or {})
+    # Auto-fill `project` from the current project dir (Claude Code injects
+    # CLAUDE_PROJECT_DIR) unless the agent set it explicitly. With a global-by-
+    # default comms root, this is how teammate_list shows who is working where.
+    if "project" not in profile:
+        proj_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+        if not _looks_unset(proj_dir):
+            profile["project"] = Path(proj_dir.strip()).name
+    profile_fields = {k: validate_profile_field(k, v) for k, v in profile.items()}
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
 

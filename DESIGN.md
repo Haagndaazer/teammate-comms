@@ -240,10 +240,19 @@ and a single pinned timestamp format.
 cache directory** (which is itself a git repo), so the prototype's
 `git rev-parse --git-common-dir`-from-cwd would scatter inboxes into the plugin
 cache. Resolve in this order and stop at the first hit:
-1. `$TEAMMATE_COMMS_DIR` (explicit override — enables cross-project/global comms).
-2. `$CLAUDE_PROJECT_DIR` (Claude Code sets this in a spawned server's environment;
-   authoritative project root). Comms live at `<root>/TeammateComms/[<team>/]…`.
-3. Otherwise: log to stderr and exit (do **not** fall back to cwd/git).
+1. `comms_dir` arg passed to `teammate_register`.
+2. `$TEAMMATE_COMMS_DIR` (explicit override — use for per-project isolation).
+3. `$CLAUDE_CONFIG_DIR` (the user's Claude config dir, if relocated).
+4. `~/.claude` (the default). Comms live at `<root>/TeammateComms/[<team>/]…`.
+
+**Global by default (0.3.0).** The default root is the user config dir (`~/.claude`),
+NOT the project dir — so every agent on the machine shares one comms space and agents
+in different projects can message each other out of the box. `$CLAUDE_PROJECT_DIR` is
+no longer the default root (that isolated agents per repo); it now only auto-fills the
+`project` profile field at registration. Tradeoff: a flat global namespace means agent
+inbox names must be unique across all projects (two repos each registering `lead`
+collide on one inbox — the server's same-name collision warning still applies); team
+namespacing carves out subsets.
 
 ---
 
@@ -264,14 +273,17 @@ server's own resolved identity). Validate `to` with `validate_agent_name`.
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
 
-**Profile fields (added 0.2.0).** `teammate_register` also accepts optional
-free-text profile fields — `role`, `personality`, `status`, `authority` — stored as
-plain keys on the agent registry record (the field-level merge in `write_agent_record`
+**Profile fields (added 0.2.0; `project` added 0.3.0).** `teammate_register` also
+accepts optional free-text profile fields — `project`, `role`, `personality`,
+`status`, `authority` — stored as plain keys on the agent registry record (the field-level merge in `write_agent_record`
 makes this additive and backward-compatible; the heartbeat preserves them). They let
 teammates see what a peer is doing (`status`) and what part of the project a peer owns
 (`authority`) at a glance, without interrupting them. `teammate_update` keeps them
-fresh; `teammate_list` always surfaces `status`/`authority` (and `role`/`personality`
-when set); `teammate_profile` reads the full set. An agent's own profile is echoed in
+fresh; `teammate_list` always surfaces `project`/`status`/`authority` (and
+`role`/`personality` when set); `teammate_profile` reads the full set. `project` is
+auto-filled from `basename($CLAUDE_PROJECT_DIR)` at registration (overridable), so
+peers see who is working where now that comms are global. An agent's own profile is
+echoed in
 the `teammate_register` return and the channel wake event leads with
 `You are <name>: <personality>`, so it stays reminded of who it is across waking.
 

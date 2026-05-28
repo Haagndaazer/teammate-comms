@@ -12,9 +12,11 @@ primary path). Asserts both halves of the unified server:
 
   Profile fields:
     - teammate_register echoes the profile back (personality reminder at start)
-    - teammate_update changes status; teammate_list always shows status/authority and
-      includes personality; teammate_profile returns the full profile; a profile field
-      SURVIVES a heartbeat cycle
+    - `project` is auto-filled from CLAUDE_PROJECT_DIR's basename and shows in
+      whoami / teammate_list / teammate_profile
+    - teammate_update changes status; teammate_list always shows project/status/
+      authority and includes personality; teammate_profile returns the full profile;
+      a profile field SURVIVES a heartbeat cycle
     - the channel wake event leads with the personality reminder
 
   Channel half:
@@ -51,6 +53,7 @@ PERSONALITY = "methodical and dry"
 STATUS_INIT = "booting up"
 STATUS_NEW = "running checks"
 AUTHORITY = "tests/**"
+PROJECT = "MyTestProject"  # basename auto-filled from CLAUDE_PROJECT_DIR
 
 stdout_lines = []
 stderr_lines = []
@@ -93,7 +96,10 @@ def main():
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("TEAMMATE_AGENT", None)   # force explicit registration (no auto-register)
     env.pop("TEAMMATE_TEAM", None)
-    env.pop("CLAUDE_PROJECT_DIR", None)
+    # Comms root comes from TEAMMATE_COMMS_DIR above; CLAUDE_PROJECT_DIR now only
+    # feeds the auto-filled `project` profile field (no longer the comms root).
+    env["CLAUDE_PROJECT_DIR"] = f"C:/some/path/{PROJECT}"
+    env.pop("CLAUDE_CONFIG_DIR", None)
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "teammate_comms.server"],
@@ -238,6 +244,9 @@ def main():
     # whoami echoes the profile set at registration
     if STATUS_INIT not in text(6) or ROLE not in text(6):
         failures.append(f"whoami missing profile fields: {text(6)}")
+    # project was auto-filled from CLAUDE_PROJECT_DIR's basename (not passed explicitly)
+    if PROJECT not in text(6):
+        failures.append(f"whoami missing auto-filled project {PROJECT!r}: {text(6)}")
 
     # send to peer wrote peer's inbox
     if is_error(7):
@@ -275,15 +284,17 @@ def main():
     # profile: update succeeded; list + profile reflect it
     if is_error(16) or "Profile updated" not in text(16):
         failures.append(f"teammate_update failed: {text(16)}")
-    # teammate_list always surfaces status + authority, and shows the updated status
-    if "status:" not in text(17) or "authority:" not in text(17):
-        failures.append(f"teammate_list missing status/authority labels: {text(17)}")
+    # teammate_list always surfaces project + status + authority, and the updated status
+    if "project:" not in text(17) or "status:" not in text(17) or "authority:" not in text(17):
+        failures.append(f"teammate_list missing project/status/authority labels: {text(17)}")
+    if PROJECT not in text(17):
+        failures.append(f"teammate_list missing project value {PROJECT!r}: {text(17)}")
     if STATUS_NEW not in text(17) or AUTHORITY not in text(17):
         failures.append(f"teammate_list missing updated status/authority values: {text(17)}")
     if PERSONALITY not in text(17):
         failures.append(f"teammate_list missing personality: {text(17)}")
     # teammate_profile (self) returns the full profile incl. personality
-    for needle in (PERSONALITY, ROLE, STATUS_NEW, AUTHORITY):
+    for needle in (PROJECT, PERSONALITY, ROLE, STATUS_NEW, AUTHORITY):
         if needle not in text(18):
             failures.append(f"teammate_profile missing {needle!r}: {text(18)}")
     # teammate_profile for an agent with no registry record -> isError

@@ -35,6 +35,10 @@ _PRIORITIES = ("normal", "urgent")
 
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
+    "project": (
+        "The project/repo you're working in. Auto-filled from the current project "
+        "directory at registration — set this only to override the auto-filled value."
+    ),
     "role": "Your job/role on the team (e.g. 'backend / API').",
     "personality": (
         "Give the agent a bit of human soul: a persona to genuinely inhabit, not a property list. "
@@ -329,7 +333,9 @@ def _handle_list(args, ctx):
         kind = record.get("type", "unknown")
         me = " (you)" if path.stem == _agent else ""
         rows.append(f"  - {path.stem}{me}: type={kind}, channel={'live' if live else 'offline'}")
-        # status + authority always surface — they are the at-a-glance fields.
+        # project + status + authority always surface — the at-a-glance fields
+        # (project matters most now that comms are global across projects).
+        rows.append(f"      project:   {record.get('project') or '(not set)'}")
         rows.append(f"      status:    {record.get('status') or '(not set)'}")
         rows.append(f"      authority: {record.get('authority') or '(not set)'}")
         role = record.get("role")

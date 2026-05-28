@@ -35,6 +35,7 @@ TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S.%f"
 # (status/authority) or reads the full set via teammate_profile. Embedded newlines
 # are collapsed so a value can never break the one-block-per-teammate list layout.
 PROFILE_FIELDS = {
+    "project": 100,
     "role": 200,
     "personality": 280,
     "status": 200,
@@ -102,10 +103,16 @@ def resolve_comms_root(explicit=None):
 
     Order (first hit wins):
       1. ``explicit`` — a comms_dir passed to teammate_register.
-      2. ``$TEAMMATE_COMMS_DIR`` — explicit env override (cross-project/global).
-      3. ``$CLAUDE_PROJECT_DIR`` — the project root Claude Code injects into a
-         spawned server's environment.
-    Never falls back to cwd/git. Raises CommsError if none is usable.
+      2. ``$TEAMMATE_COMMS_DIR`` — explicit env override (per-project isolation).
+      3. ``$CLAUDE_CONFIG_DIR`` — the user's Claude config dir, if relocated.
+      4. ``~/.claude`` — the default. This is **global by default**: every agent on
+         the machine shares one comms space, so agents in different projects can
+         message each other out of the box. For per-project isolation, set
+         ``$TEAMMATE_COMMS_DIR`` (or pass ``comms_dir``) to the project dir.
+
+    Note: ``$CLAUDE_PROJECT_DIR`` is no longer the default root (that isolated
+    agents per repo) — it is now used only to auto-fill the ``project`` profile
+    field at registration. Always resolves (never raises).
 
     Returns ``(root: Path, source: str)``.
     """
@@ -116,15 +123,11 @@ def resolve_comms_root(explicit=None):
     if not _looks_unset(override):
         return Path(override.strip()), "TEAMMATE_COMMS_DIR"
 
-    project = os.environ.get("CLAUDE_PROJECT_DIR")
-    if not _looks_unset(project):
-        return Path(project.strip()), "CLAUDE_PROJECT_DIR"
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not _looks_unset(config):
+        return Path(config.strip()), "CLAUDE_CONFIG_DIR"
 
-    raise CommsError(
-        "No comms root. Pass comms_dir to teammate_register, set "
-        "TEAMMATE_COMMS_DIR, or run inside a project where Claude Code provides "
-        "CLAUDE_PROJECT_DIR."
-    )
+    return Path.home() / ".claude", "~/.claude default"
 
 
 def get_inboxes_dir(root, team=None):

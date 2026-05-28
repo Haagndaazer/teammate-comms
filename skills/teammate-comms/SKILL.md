@@ -12,11 +12,11 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 
 | Tool | Args | Behavior |
 |------|------|----------|
-| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile. The other messaging tools error until you do this. |
+| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. |
 | `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. |
-| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `status` and `authority`** (plus `role`/`personality` when set). |
+| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `project`, `status`, and `authority`** (plus `role`/`personality` when set). |
 | `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
@@ -31,8 +31,9 @@ channel wakes you for new arrivals — no polling loop.
 doing and what you own without interrupting you. Keep `status` current with
 `teammate_update` as you move between tasks, and set `authority` to the parts of the
 project you own. Before modifying an area, check `teammate_list` (always shows
-`status` + `authority`) or `teammate_profile(agent)` to see if a teammate owns it or
-is mid-task there. Your own profile is echoed back in the `teammate_register` return,
+`project` + `status` + `authority`) or `teammate_profile(agent)` to see if a teammate
+owns it or is mid-task there. Because comms are global across projects, `project`
+(auto-filled from your project dir) tells peers which repo each teammate is in. Your own profile is echoed back in the `teammate_register` return,
 and the channel wake event leads with `You are <name>: <personality>` so a woken idle
 instance is reminded who it is.
 
@@ -88,9 +89,12 @@ Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled
 the flag only bypasses that allowlist — org `channelsEnabled` policy still applies).
 
 Storage lives at `<comms-root>/TeammateComms/[<team>/]inboxes/`. The comms root is
-the `comms_dir` passed to `teammate_register`, else `$TEAMMATE_COMMS_DIR`, else the
-project directory Claude Code provides. Two instances must share the same root to
-message each other. `teammate_whoami` reports the resolved root.
+**global by default** — `comms_dir` passed to `teammate_register`, else
+`$TEAMMATE_COMMS_DIR`, else `$CLAUDE_CONFIG_DIR`, else `~/.claude` — so agents across
+different projects share one space and can message each other. For per-project
+isolation, set `$TEAMMATE_COMMS_DIR` (or pass `comms_dir`) to the project dir. Two
+instances must share the same root to message each other; `teammate_whoami` reports
+the resolved root.
 
 > Power-user shortcut: if `$TEAMMATE_AGENT` (and optionally `$TEAMMATE_TEAM`) is set
 > in the environment, the server auto-registers with it at startup — no explicit
