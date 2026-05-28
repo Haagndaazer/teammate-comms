@@ -36,6 +36,13 @@ is mid-task there. Your own profile is echoed back in the `teammate_register` re
 and the channel wake event leads with `You are <name>: <personality>` so a woken idle
 instance is reminded who it is.
 
+`personality` is a *persona to inhabit* (write a person — concrete detail, a
+temperament, voice cues — never the job/owned-areas/current-task; those are
+role/authority/status); see the `teammate_register` tool description for the full
+guide. Profile fields are **durable**: re-registering later only re-establishes your
+identity and channel — your `role`/`personality`/`authority` persist, so you don't
+re-supply them (refresh the dynamic `status` with `teammate_update`).
+
 > Tool names may appear in the model surface with an MCP prefix
 > (`mcp__plugin_teammate-comms_teammate-comms__teammate_inbox`). Refer to them by
 > the short names above; they resolve to the same tools.

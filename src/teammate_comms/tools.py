@@ -36,7 +36,19 @@ _PRIORITIES = ("normal", "urgent")
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
     "role": "Your job/role on the team (e.g. 'backend / API').",
-    "personality": "A short personality blurb (mostly for fun).",
+    "personality": (
+        "Give the agent a bit of human soul: a persona to genuinely inhabit, not a property list. "
+        "Write a PERSON — concrete, lived-in sensory detail over adjectives ('swims in water that "
+        "bites the breath out of her, then grins' beats 'adventurous'); a through-line of temperament "
+        "or values that ties the details together; voice cues for how they talk (deadpan, warm, gruff). "
+        "Pure flavor: it colors tone and conversation, never what the agent decides, owns, or how "
+        "rigorously it works. Mention NONE of its job, owned areas, or current task — those are the "
+        "role/authority/status fields; if you can tell what the agent does from this, rewrite it. "
+        "Durable identity: set once, change rarely (unlike status, which you refresh). The bar to hit: "
+        "'Island girl, North Atlantic. Swims in water that bites the breath out of her, then grins about "
+        "it. Always has tea going cold somewhere. Reads the shipping forecast like a lullaby. Quiet, dry, "
+        "fierce about small kindnesses.'"
+    ),
     "status": "What you're doing right now — keep this fresh so teammates can see it at a glance.",
     "authority": "Areas of the project you own (e.g. 'src/auth/**, billing'), so teammates know before modifying them.",
 }
@@ -70,7 +82,9 @@ TOOL_DEFINITIONS = [
             "wakes you when teammates message you. Run teammate_inbox afterward to "
             "drain anything that arrived while you were down. Optionally set your "
             "profile (role, personality, status, authority) — update it later with "
-            "teammate_update."
+            "teammate_update. Re-registering later only re-establishes your identity "
+            "and channel: your existing profile is preserved, so you do NOT need to "
+            "re-supply role/personality/authority — pass a field only to change it."
         ),
         "inputSchema": {
             "type": "object",

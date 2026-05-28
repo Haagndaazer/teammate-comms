@@ -53,6 +53,13 @@ Your own profile is surfaced back to you so you stay in character: the
 `You are <name>: <personality>` so a woken idle instance is reminded who it is. You
 can always re-read it with `teammate_whoami` or `teammate_profile`.
 
+`personality` is a persona to inhabit, not a property list — write a *person*
+(concrete detail, a temperament, voice cues), never the agent's job/owned-areas/task.
+The `teammate_register` tool description carries the full writing guide. Profile
+fields are durable: **re-registering only re-establishes identity + channel and
+preserves your existing `role`/`personality`/`authority`** — pass a field only to
+change it (refresh the dynamic `status` with `teammate_update`).
+
 ## Two wake regimes
 
 - **Full instance** → woken by the **channel** here.
