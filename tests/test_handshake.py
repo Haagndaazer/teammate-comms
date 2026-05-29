@@ -150,7 +150,7 @@ def main():
                            "arguments": {"agent": AGENT, "team": TEAM, "role": ROLE,
                                          "personality": PERSONALITY, "status": STATUS_INIT,
                                          "authority": AUTHORITY}}})
-    time.sleep(1.0)  # let the watcher seed its baseline (count 0)
+    time.sleep(1.0)  # let the watcher seed known_ids (empty inbox at register)
     send(proc, {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
                 "params": {"name": "teammate_whoami", "arguments": {}}})       # registered:true + profile
 
@@ -331,8 +331,13 @@ def main():
     # wake event leads with the personality reminder
     elif PERSONALITY not in notifications[0]["params"].get("content", ""):
         failures.append(f"channel notification missing personality reminder: {notifications[0]['params'].get('content')}")
-
-    # inbox shows message, ack clears, ping ok
+    # v0.4.2: nudge count is the UNSEEN count and is never padded by read-but-unacked
+    # messages. Every message in this run is read/acked before the next arrives, so the
+    # unseen count at each nudge is exactly 1 — a notification with count>1 would mean a
+    # read-but-unacked message padded it (the old baseline=len(unread) behavior).
+    padded = [n for n in notifications if n["params"]["meta"].get("count") != "1"]
+    if padded:
+        failures.append(f"channel nudge count padded (expected all '1'): {[n['params']['meta'] for n in padded]}")
     if "hello via channel" not in text(13):
         failures.append(f"teammate_inbox missing message: {text(13)}")
     if is_error(14) or "Acknowledged" not in text(14):

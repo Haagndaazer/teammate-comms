@@ -210,8 +210,15 @@ gates open: `notifications/initialized` AND registration. Once armed it:
 - Polls `<self>_unread.json` every ~0.5s via a **non-destructive read** (never
   rewrites the file on a partial/corrupt read — that would destroy a message
   mid-delivery).
-- Seeds `baseline` to the current unread count at init; emits only when the count
-  rises above `baseline`; resets `baseline` downward on ack.
+- **Nudge gating (v0.4.2):** nudges only for messages the agent hasn't been shown —
+  an unread id that is neither in `Identity.last_seen` (ids returned by the last full
+  `teammate_inbox`) nor in a watcher-local `known_ids` set (seeded to the inbox
+  contents at registration so pre-existing messages don't nudge, then accumulating
+  what's already been nudged). The emitted `count` is the number of *unseen* unread
+  messages, so a read-but-unacked message never pads it. Reading (not acking) silences
+  a nudge. Missed-nudge-safe: a genuinely new message has a fresh id in neither set, so
+  it always nudges. (Replaced the earlier integer `baseline` count, which re-nudged on
+  every count rise and counted read-but-unacked messages — the v0.4.1-test noise.)
 - Emits `notifications/claude/channel` with `meta = {count, agent}` and content that
   references the MCP tools. If the agent has a `personality` set, the content **leads
   with `You are <name>: <personality>`** so a woken idle instance is reminded who it
