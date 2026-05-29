@@ -31,19 +31,31 @@ HEARTBEAT_SECONDS = 5
 POLL_SECONDS = 0.5
 
 
-def emit_channel_event(send_message, agent, count, personality=None):
+def emit_channel_event(send_message, agent, count, personality=None, groups=None):
     """Push one ``notifications/claude/channel`` event for ``count`` unread.
 
     If ``personality`` is set, it leads the content so a woken idle instance is
-    reminded who it is before it acts.
+    reminded who it is before it acts. If ``groups`` (a set of ``#``-prefixed group
+    names whose messages triggered this wake) is non-empty, the content names the
+    group reply target so the agent replies to the group, not 1:1 to the sender.
     """
     intro = f"You are {agent}: {personality.rstrip('. ')}. " if personality else ""
+    if groups:
+        # The `group` field already carries the leading '#', so render it verbatim.
+        targets = " or ".join(f"to:'{g}'" for g in sorted(groups))
+        group_line = (
+            f" Some are group messages — reply to the group with `teammate_send` "
+            f"{targets} (replying to the sender instead starts a 1:1 and fractures the "
+            f"thread)."
+        )
+    else:
+        group_line = ""
     content = (
         f"{intro}You have {count} new teammate message(s). Use your teammate-comms "
         f"tools to read them: call `teammate_inbox` to view, then `teammate_ack` "
-        f"(id \"all\") once handled. Reply with `teammate_send`. (Group threads: the "
-        f"full history is in `teammate_group` action=history.) You are a full "
-        f"instance — this channel wakes you; no polling loop needed."
+        f"(id \"all\") once handled. Reply with `teammate_send`.{group_line} (Group "
+        f"threads: the full history is in `teammate_group` action=history.) You are a "
+        f"full instance — this channel wakes you; no polling loop needed."
     )
     meta = {"count": str(count), "agent": agent}
     send_message({
@@ -105,7 +117,13 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 if fresh:
                     record = read_agent_record(root, team, agent) or {}
                     unseen_count = len(unread_ids - last_seen)
-                    emit_channel_event(send_message, agent, unseen_count, record.get("personality"))
+                    # Distinct groups among the messages that triggered THIS wake, so
+                    # the nudge can name the group reply target. (.get guards id-less /
+                    # 1:1 records, which have no 'group' key.)
+                    fresh_groups = {m.get("group") for m in messages
+                                    if m.get("id") in fresh and m.get("group")}
+                    emit_channel_event(send_message, agent, unseen_count,
+                                       record.get("personality"), groups=fresh_groups)
                     known_ids |= unread_ids
                 known_ids &= unread_ids  # prune acked/removed ids; keeps the set bounded
 

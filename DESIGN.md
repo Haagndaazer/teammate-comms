@@ -223,6 +223,11 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   references the MCP tools. If the agent has a `personality` set, the content **leads
   with `You are <name>: <personality>`** so a woken idle instance is reminded who it
   is (personality is read from the registry only at nudge time, not every poll).
+- **Group reply target (v0.4.3):** when the messages that triggered the wake include
+  group messages, the content **names the group reply target** —
+  *"reply to the group with `teammate_send to:'#<group>'`"* (distinct fresh groups,
+  `sorted`) — so a woken agent replies to the group, not 1:1 to the sender (which
+  would silently fracture the thread). 1:1-only wakes keep the generic text.
 - Heartbeats the agent's registry record every ~5s.
 
 Dropped pushes (session closed) never lose a message — the inbox JSON is the source of

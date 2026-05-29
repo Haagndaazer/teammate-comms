@@ -338,6 +338,15 @@ def main():
     padded = [n for n in notifications if n["params"]["meta"].get("count") != "1"]
     if padded:
         failures.append(f"channel nudge count padded (expected all '1'): {[n['params']['meta'] for n in padded]}")
+    # v0.4.3: a group-message wake names the group reply target; a 1:1 wake does not.
+    group_nudges = [n for n in notifications if GROUP_SIGIL in n["params"].get("content", "")]
+    if not group_nudges:
+        failures.append("no channel nudge named the group reply target")
+    elif f"to:'{GROUP_SIGIL}'" not in group_nudges[0]["params"]["content"]:
+        failures.append(f"group nudge missing reply target to:'{GROUP_SIGIL}': {group_nudges[0]['params']['content']}")
+    # notifications[0] is the 1:1 "hello via channel" wake — must NOT name a group target
+    if notifications and "to:'#" in notifications[0]["params"].get("content", ""):
+        failures.append(f"1:1 nudge wrongly named a group target: {notifications[0]['params']['content']}")
     if "hello via channel" not in text(13):
         failures.append(f"teammate_inbox missing message: {text(13)}")
     if is_error(14) or "Acknowledged" not in text(14):
