@@ -230,6 +230,18 @@ def main():
                            "arguments": {"action": "history", "group": GROUP_SIGIL, "sender": PEER}}})  # none
     time.sleep(0.5)
 
+    # v0.4.4 mixed-batch: a DM-triggered wake must still name a PENDING unseen group
+    # thread. Drain to a clean slate, then inject an (unread) group msg + a later DM in
+    # SEPARATE polls. The DM wake fires at count=2 (group+DM both unseen) and must name
+    # the group target — under v0.4.3 it would not (DM alone in `fresh`).
+    send(proc, {"jsonrpc": "2.0", "id": 30, "method": "tools/call",
+                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})   # clear leftover (seen)
+    time.sleep(0.6)
+    append_external_message(root, AGENT, PEER, "mixed-group", group=GROUP_SIGIL)  # unread group msg
+    time.sleep(1.3)   # nudged in its own poll -> known_ids, still unseen
+    append_external_message(root, AGENT, PEER, "mixed-dm")                         # 1:1 DM
+    time.sleep(1.3)   # DM wake: fresh={dm}, unseen={group,dm} -> count 2, names group
+
     # Heartbeat cycle (5s) -> confirm type:"full" AND a profile field survive the merge.
     time.sleep(5.5)
     type_after_heartbeat = None
@@ -335,9 +347,14 @@ def main():
     # messages. Every message in this run is read/acked before the next arrives, so the
     # unseen count at each nudge is exactly 1 — a notification with count>1 would mean a
     # read-but-unacked message padded it (the old baseline=len(unread) behavior).
-    padded = [n for n in notifications if n["params"]["meta"].get("count") != "1"]
-    if padded:
-        failures.append(f"channel nudge count padded (expected all '1'): {[n['params']['meta'] for n in padded]}")
+    # Counts are unseen-only (never padded). Every nudge in this flow is count "1"
+    # EXCEPT the v0.4.4 mixed-batch DM wake — a legit count "2" (group + DM both unseen)
+    # that must name the group reply target (proves the mixed-batch fix).
+    non_one = [n for n in notifications if n["params"]["meta"].get("count") != "1"]
+    if len(non_one) != 1 or non_one[0]["params"]["meta"].get("count") != "2":
+        failures.append(f"unexpected nudge counts (want all '1' except one '2'): {[n['params']['meta'].get('count') for n in notifications]}")
+    elif f"to:'{GROUP_SIGIL}'" not in non_one[0]["params"].get("content", ""):
+        failures.append(f"mixed-batch DM nudge (count 2) did not name group target: {non_one[0]['params']['content']}")
     # v0.4.3: a group-message wake names the group reply target; a 1:1 wake does not.
     group_nudges = [n for n in notifications if GROUP_SIGIL in n["params"].get("content", "")]
     if not group_nudges:

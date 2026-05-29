@@ -116,14 +116,16 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 fresh = unread_ids - known_ids - last_seen
                 if fresh:
                     record = read_agent_record(root, team, agent) or {}
-                    unseen_count = len(unread_ids - last_seen)
-                    # Distinct groups among the messages that triggered THIS wake, so
-                    # the nudge can name the group reply target. (.get guards id-less /
-                    # 1:1 records, which have no 'group' key.)
-                    fresh_groups = {m.get("group") for m in messages
-                                    if m.get("id") in fresh and m.get("group")}
+                    unseen_ids = unread_ids - last_seen
+                    unseen_count = len(unseen_ids)
+                    # Name the group reply target for ANY unseen (unread, not-yet-read)
+                    # group message — not just the one that triggered this wake — so a
+                    # DM-triggered wake still surfaces a pending group thread (mixed-batch
+                    # fix). (.get guards id-less / 1:1 records, which have no 'group' key.)
+                    group_targets = {m.get("group") for m in messages
+                                     if m.get("id") in unseen_ids and m.get("group")}
                     emit_channel_event(send_message, agent, unseen_count,
-                                       record.get("personality"), groups=fresh_groups)
+                                       record.get("personality"), groups=group_targets)
                     known_ids |= unread_ids
                 known_ids &= unread_ids  # prune acked/removed ids; keeps the set bounded
 
