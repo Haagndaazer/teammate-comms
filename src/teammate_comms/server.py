@@ -72,14 +72,31 @@ class Identity:
         self.team = None
         self.root = None
         self.unread_file = None
+        # Ids returned by the most recent full teammate_inbox read this session, so
+        # ack("all") only clears what the agent has actually SEEN (arrivals after the
+        # last read are preserved). None = never read this session (ack-all then clears
+        # everything, preserving startup-drain). Cleared to None on identity change.
+        self._last_seen = None
 
     def set(self, agent, team, root, unread_file):
         with self._lock:
+            if agent != self.agent:
+                self._last_seen = None  # new identity → drop the previous one's seen-ids
             self.agent, self.team, self.root, self.unread_file = agent, team, root, unread_file
 
     def snapshot(self):
         with self._lock:
             return (self.agent, self.team, self.root, self.unread_file)
+
+    def set_last_seen(self, ids):
+        """Record the set of message ids shown by the latest full inbox read."""
+        with self._lock:
+            self._last_seen = set(ids)
+
+    def get_last_seen(self):
+        """Return a copy of the last-seen id set, or None if never read this session."""
+        with self._lock:
+            return None if self._last_seen is None else set(self._last_seen)
 
 
 _identity = Identity()

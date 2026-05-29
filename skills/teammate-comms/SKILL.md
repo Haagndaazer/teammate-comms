@@ -15,7 +15,7 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** (e.g. `#design`) — fans out to every member. |
 | `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). Group messages are tagged `[group: #X]`. |
-| `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. |
+| `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. `"all"` clears only what you've **seen** as of your last `teammate_inbox` read — arrivals since then are kept. |
 | `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. |
 | `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |

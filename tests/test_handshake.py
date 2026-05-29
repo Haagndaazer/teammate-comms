@@ -12,8 +12,11 @@ primary path). Asserts both halves of the unified server:
 
   Group chat:
     - teammate_group create; teammate_send to="#grp" fans out to members' inboxes
-      (group-tagged) but NOT the sender; the shared transcript records it;
-      teammate_group history returns it; unknown action + duplicate create are isError
+      (group-tagged 👥) but NOT the sender; the shared transcript records it;
+      teammate_group history returns it (and filters by sender); unknown action +
+      duplicate create are isError
+    - ack("all") only clears messages SEEN as of the last teammate_inbox read; an
+      arrival that lands after the read is preserved (v0.4.1)
 
   Profile fields:
     - teammate_register echoes the profile back (personality reminder at start)
@@ -208,8 +211,24 @@ def main():
     append_external_message(root, AGENT, PEER, "from the group", group=GROUP_SIGIL)
     time.sleep(0.6)
     send(proc, {"jsonrpc": "2.0", "id": 25, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})
+                "params": {"name": "teammate_inbox", "arguments": {}}})   # last_seen = {this msg}
     time.sleep(0.4)
+
+    # A1: ack("all") must PRESERVE a message that arrives AFTER the last read.
+    append_external_message(root, AGENT, PEER, "arrived-after-read")
+    time.sleep(0.3)
+    send(proc, {"jsonrpc": "2.0", "id": 26, "method": "tools/call",
+                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})   # acks SEEN only
+    send(proc, {"jsonrpc": "2.0", "id": 27, "method": "tools/call",
+                "params": {"name": "teammate_inbox", "arguments": {}}})            # still shows the new one
+    # A2: history sender filter (only AGENT posted "group hello" to the transcript).
+    send(proc, {"jsonrpc": "2.0", "id": 28, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "history", "group": GROUP_SIGIL, "sender": AGENT}}})
+    send(proc, {"jsonrpc": "2.0", "id": 29, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "history", "group": GROUP_SIGIL, "sender": PEER}}})  # none
+    time.sleep(0.5)
 
     # Heartbeat cycle (5s) -> confirm type:"full" AND a profile field survive the merge.
     time.sleep(5.5)
@@ -367,9 +386,24 @@ def main():
     # unknown action -> isError
     if not is_error(24):
         failures.append(f"unknown group action not isError: {by_id.get(24)}")
-    # inbox shows the [group: #grp] tag for a group-tagged message
+    # inbox shows the [👥 group: #grp] tag for a group-tagged message
     if "group:" not in text(25) or GROUP_SIGIL not in text(25) or "from the group" not in text(25):
         failures.append(f"teammate_inbox missing group tag: {text(25)}")
+    if "👥" not in text(25):
+        failures.append(f"teammate_inbox group tag missing glyph: {text(25)}")
+
+    # A1: ack("all") preserved the post-read arrival; the seen group msg was acked
+    if is_error(26) or "Acknowledged" not in text(26) or "Kept 1" not in text(26):
+        failures.append(f"ack-all did not preserve post-read arrival: {text(26)}")
+    if "arrived-after-read" not in text(27):
+        failures.append(f"post-read arrival was wrongly acked (not in inbox): {text(27)}")
+    if "from the group" in text(27):
+        failures.append(f"seen message was not acked by ack-all: {text(27)}")
+    # A2: history sender filter
+    if is_error(28) or "group hello" not in text(28):
+        failures.append(f"history sender={AGENT} missing AGENT's message: {text(28)}")
+    if "group hello" in text(29):
+        failures.append(f"history sender={PEER} wrongly included AGENT's message: {text(29)}")
 
     # registry: written + type/profile survive heartbeat merge
     if not record.exists():

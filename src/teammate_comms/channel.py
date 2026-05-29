@@ -32,7 +32,8 @@ def emit_channel_event(send_message, agent, count, personality=None):
     content = (
         f"{intro}You have {count} new teammate message(s). Use your teammate-comms "
         f"tools to read them: call `teammate_inbox` to view, then `teammate_ack` "
-        f"(id \"all\") once handled. Reply with `teammate_send`. You are a full "
+        f"(id \"all\") once handled. Reply with `teammate_send`. (Group threads: the "
+        f"full history is in `teammate_group` action=history.) You are a full "
         f"instance — this channel wakes you; no polling loop needed."
     )
     meta = {"count": str(count), "agent": agent}

@@ -21,7 +21,7 @@ tools and pushes `notifications/claude/channel` events.
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once at session start to establish identity, register your inbox, and arm the channel. Optionally set your profile (`project` is auto-filled). |
 | `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (e.g. `#design`) to post to a group chat (fans out to all members). |
 | `teammate_inbox` | `count_only?` | Read your unread messages (or count). Group messages are tagged `[group: #X]`. |
-| `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. |
+| `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. `"all"` clears only what you've **seen** (messages that arrived since your last `teammate_inbox` read are kept). |
 | `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. |
 | `teammate_whoami` | — | Registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
@@ -75,10 +75,11 @@ teammate_send(to: "#design", message: "what should the API shape be?")
 ```
 
 `teammate_send(to="#design")` **fans the message out** into every member's inbox
-(group-tagged `[group: #design]`), so the existing channel wakes them — no new wake
-mechanism. The full ordered conversation is kept in a **shared transcript**; read it
-with `teammate_group(action: "history", group: "#design")` (handy for catching up or
-for members who joined late).
+(group-tagged `[👥 group: #design]`), so the existing channel wakes them — no new wake
+mechanism. The full ordered conversation is kept in a **shared transcript** — the
+canonical record (it survives inbox acks); read it with `teammate_group(action:
+"history", group: "#design")`, optionally filtered by `sender` (handy for catching up,
+for late joiners, or for reconstructing who said what).
 
 - **Membership is open** — anyone can `join`, `leave`, or `add` others; posting to a
   group auto-joins you. `delete` is creator-only.

@@ -202,9 +202,11 @@ TOOL_DEFINITIONS = [
             "Manage group chats for brainstorming with multiple teammates. A group is "
             "addressed like a teammate but with a '#' prefix: post to it with "
             "teammate_send(to=\"#<group>\"), which fans out to every member and wakes "
-            "them. Membership is open (anyone can join/add). Actions: create, delete "
+            "them. The full ordered thread is kept in a shared transcript — use "
+            "action='history' as the canonical record (it survives inbox acks). "
+            "Membership is open (anyone can join/add). Actions: create, delete "
             "(creator-only), join, leave, add (members), members (list), history (read "
-            "the shared transcript)."
+            "the shared transcript; optionally filter by 'sender')."
         ),
         "inputSchema": {
             "type": "object",
@@ -221,6 +223,7 @@ TOOL_DEFINITIONS = [
                     "description": "Member names — for 'create' (initial members) and 'add'.",
                 },
                 "limit": {"type": "integer", "description": "For 'history': max messages to return (default 50)."},
+                "sender": {"type": "string", "description": "For 'history': only show messages from this teammate."},
             },
             "required": ["action", "group"],
         },
@@ -326,6 +329,11 @@ def _handle_inbox(args, ctx):
 
     if args.get("count_only"):
         return str(len(messages))
+
+    # Record the ids shown so a later ack("all") only clears what was actually SEEN
+    # (arrivals after this read are preserved). Count-only reads (above) don't count.
+    ctx["identity"].set_last_seen(m.get("id") for m in messages)
+
     if not messages:
         return "No unread messages."
 
@@ -333,7 +341,7 @@ def _handle_inbox(args, ctx):
     for msg in messages:
         tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
         grp = msg.get("group")
-        gtag = f" [group: {grp}]" if grp else ""
+        gtag = f" [👥 group: {grp}]" if grp else ""
         out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{tag} ---")
         out.append(str(msg.get("message", "")))
     return "\n".join(out)
@@ -358,10 +366,24 @@ def _handle_ack(args, ctx):
             return "No unread messages to acknowledge."
 
         if msg_id == "all":
-            count = len(unread)
-            read.extend(unread)
-            unread = []
-            result = f"Acknowledged all {count} message(s)."
+            last_seen = ctx["identity"].get_last_seen()
+            if last_seen is None:
+                # Never read this session → clear everything (startup-drain behavior).
+                acked, unread = unread, []
+                result = f"Acknowledged all {len(acked)} message(s)."
+            else:
+                # Only ack messages the agent has actually SEEN; preserve arrivals that
+                # landed after the last teammate_inbox read.
+                acked = [m for m in unread if m.get("id") in last_seen]
+                unread = [m for m in unread if m.get("id") not in last_seen]
+                if not acked:
+                    return ("No seen messages to acknowledge — new arrivals since your "
+                            "last read are kept. Call teammate_inbox to read them first.")
+                result = f"Acknowledged {len(acked)} seen message(s)."
+                if unread:
+                    result += (f" Kept {len(unread)} that arrived since your last read — "
+                               f"call teammate_inbox to see them.")
+            read.extend(acked)
         else:
             to_ack = next((m for m in unread if m.get("id") == msg_id), None)
             if to_ack is None:
@@ -649,10 +671,18 @@ def _handle_group(args, ctx):
     if not isinstance(limit, int) or limit <= 0:
         limit = 50
     messages = read_group_messages(root, team, group)
+    # Filter by sender FIRST, then take the last `limit` (so limit counts post-filter).
+    sender = args.get("sender")
+    by = ""
+    if sender is not None:
+        validate_agent_name(sender)
+        messages = [m for m in messages if m.get("from") == sender]
+        by = f" from {sender}"
     if not messages:
-        return f"{sigil} has no messages yet."
+        return f"{sigil} has no messages{by} yet."
+    total = len(messages)
     recent = messages[-limit:]
-    out = [f"=== {sigil} transcript ({len(recent)} of {len(messages)} message(s)) ==="]
+    out = [f"=== {sigil} transcript{by} ({len(recent)} of {total} message(s)) ==="]
     for msg in recent:
         urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""
         out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{urgent} ---")
