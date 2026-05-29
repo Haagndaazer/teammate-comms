@@ -257,20 +257,34 @@ namespacing carves out subsets.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **8 tools:**
+long-lived server. **9 tools:**
 
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, profile? (`project`/`role`/`personality`/`status`/`authority`) | Establish identity, register the inbox, arm the channel. Optionally set a profile (`project` is auto-filled). Re-registering only re-establishes identity + channel and **preserves** the existing profile. |
-| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. |
-| `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). |
+| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. **A `#`-prefixed `to` posts to a group** (fan-out). |
+| `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). Group messages are tagged `[group: #X]`. |
 | `teammate_ack` | `id` (or `"all"`) | Move a message from unread → read. |
-| `teammate_list` | — | List registered agents with type + liveness; **always shows each agent's `project`, `status`, and `authority`** (and `role`/`personality` when set). |
+| `teammate_list` | — | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. |
 | `teammate_whoami` | — | Resolved identity, team, comms dir, and own profile (diagnostics). |
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats (see below). |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
+
+**Group chat (added 0.4.0).** Named group chats addressed with a `#` sigil
+(`teammate_send(to="#design")`) — a separate namespace from agents, so names can't
+collide. A group is a per-group subdir under `groups/`: `meta.json` (`name`, `members`,
+`creator`, `createdAt`) + an append-only `messages.json` transcript (the canonical
+ordered history; read via `teammate_group action=history`). Posting **fans the message
+out** into each member's `_unread.json` (group-tagged), so the **existing channel wake
+delivers it with no `channel.py` change** — the transcript is written first
+(authoritative), then fan-out is best-effort (a locked member inbox is non-fatal; they
+catch up via `history`). Membership is **open** (`join`/`leave`/`add`; posting
+auto-joins the sender); `delete` is creator-only. Fan-out liveness uses
+`pid_check=False` (no per-member `tasklist`); all transcript/meta reads use
+`read_json_readonly` (never `read_json_safe`, which would reset a mid-write file to []).
 
 **Profile fields (0.2.0; `project` added 0.3.0).** Stored as plain keys on the agent
 registry record via `write_agent_record`'s field-level merge — additive,

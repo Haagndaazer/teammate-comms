@@ -16,6 +16,7 @@ changes for the plugin/MCP-server context:
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -90,6 +91,25 @@ def validate_profile_field(name, value):
     return collapsed
 
 
+def validate_group_name(name):
+    """Validate a group name (with or without a leading ``#``); return the clean name.
+
+    Groups are addressed with a ``#`` sigil (``teammate_send(to="#design")``) so they
+    occupy a separate namespace from agents and can never collide. The stored name and
+    on-disk paths use the clean (sigil-stripped) form. Raises CommsError on anything
+    unsafe — same character set as an agent name.
+    """
+    if not isinstance(name, str):
+        raise CommsError(f"Invalid group name {name!r}.")
+    clean = name[1:] if name.startswith("#") else name
+    if not AGENT_NAME_PATTERN.match(clean) or ".." in clean:
+        raise CommsError(
+            f"Invalid group name {name!r}. Use alphanumerics, hyphens, underscores, "
+            f"and dots only (an optional leading '#' is allowed)."
+        )
+    return clean
+
+
 def _looks_unset(value):
     """True if an env value is missing, blank, or an unexpanded ``${...}`` token."""
     if not value:
@@ -144,6 +164,61 @@ def get_agents_dir(root, team=None):
     if team:
         base = base / team
     return base / "agents"
+
+
+def get_groups_dir(root, team=None):
+    """``<root>/TeammateComms/[<team>/]groups`` — one subdir per group."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "groups"
+
+
+def get_group_dir(root, team, group):
+    """``<groups>/<group>/`` (group is the clean, sigil-stripped name)."""
+    return get_groups_dir(root, team) / group
+
+
+def read_group_meta(root, team, group):
+    """Read ``groups/<group>/meta.json`` (non-destructive), or None if absent/unreadable."""
+    meta = read_json_readonly(get_group_dir(root, team, group) / "meta.json")
+    return meta if isinstance(meta, dict) else None
+
+
+def write_group_meta(root, team, group, meta):
+    """Atomically write a group's ``meta.json`` (caller holds any needed lock)."""
+    group_dir = get_group_dir(root, team, group)
+    group_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(group_dir / "meta.json", meta)
+
+
+def read_group_messages(root, team, group):
+    """Read a group's transcript (``messages.json``) non-destructively; [] if absent.
+
+    Uses ``read_json_readonly`` (NOT read_json_safe) so a concurrent partial write is
+    never mistaken for corruption and the shared transcript is never reset to []. A
+    None (unreadable mid-write) is surfaced as [] to the caller for display.
+    """
+    msgs = read_json_readonly(get_group_dir(root, team, group) / "messages.json")
+    return msgs if isinstance(msgs, list) else []
+
+
+def append_group_message(root, team, group, record, timeout=10):
+    """Append one record to a group's transcript under a lock (atomic write)."""
+    group_dir = get_group_dir(root, team, group)
+    group_dir.mkdir(parents=True, exist_ok=True)
+    messages_file = group_dir / "messages.json"
+    with file_lock(messages_file, timeout=timeout):
+        messages = read_group_messages(root, team, group)
+        messages.append(record)
+        write_json_atomic(messages_file, messages)
+
+
+def delete_group(root, team, group):
+    """Remove a group's directory (meta + transcript). Best-effort."""
+    group_dir = get_group_dir(root, team, group)
+    if group_dir.exists():
+        shutil.rmtree(group_dir, ignore_errors=True)
 
 
 def ensure_inbox(inboxes_dir, agent):

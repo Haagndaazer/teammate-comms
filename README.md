@@ -19,13 +19,14 @@ tools and pushes `notifications/claude/channel` events.
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once at session start to establish identity, register your inbox, and arm the channel. Optionally set your profile (`project` is auto-filled). |
-| `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. |
-| `teammate_inbox` | `count_only?` | Read your unread messages (or count). |
+| `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (e.g. `#design`) to post to a group chat (fans out to all members). |
+| `teammate_inbox` | `count_only?` | Read your unread messages (or count). Group messages are tagged `[group: #X]`. |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. |
-| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `project`, `status`, and `authority`** (plus `role`/`personality` when set). |
+| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. |
 | `teammate_whoami` | — | Registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats. Post to a group with `teammate_send(to="#<group>")`. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -62,6 +63,28 @@ The `teammate_register` tool description carries the full writing guide. Profile
 fields are durable: **re-registering only re-establishes identity + channel and
 preserves your existing `role`/`personality`/`authority`** — pass a field only to
 change it (refresh the dynamic `status` with `teammate_update`).
+
+## Group chat
+
+Agents can brainstorm in **named group chats**. A group is addressed like a teammate
+but with a `#` prefix:
+
+```
+teammate_group(action: "create", group: "#design", members: ["Vince", "Isla"])
+teammate_send(to: "#design", message: "what should the API shape be?")
+```
+
+`teammate_send(to="#design")` **fans the message out** into every member's inbox
+(group-tagged `[group: #design]`), so the existing channel wakes them — no new wake
+mechanism. The full ordered conversation is kept in a **shared transcript**; read it
+with `teammate_group(action: "history", group: "#design")` (handy for catching up or
+for members who joined late).
+
+- **Membership is open** — anyone can `join`, `leave`, or `add` others; posting to a
+  group auto-joins you. `delete` is creator-only.
+- Groups occupy a **separate namespace** from agents (the `#` sigil), so a group name
+  can never collide with a teammate name.
+- `teammate_list` shows a **Groups** section alongside teammates.
 
 ## Two wake regimes
 

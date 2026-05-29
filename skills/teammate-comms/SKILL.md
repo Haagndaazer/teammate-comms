@@ -13,13 +13,14 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
-| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. |
-| `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). |
+| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** (e.g. `#design`) — fans out to every member. |
+| `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). Group messages are tagged `[group: #X]`. |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. |
-| `teammate_list` | — | List registered teammates with type + liveness; **always shows each teammate's `project`, `status`, and `authority`** (plus `role`/`personality` when set). |
+| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. |
 | `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats. Post with `teammate_send(to="#<group>")`; read the shared transcript with `history`. Open membership; `delete` is creator-only. |
 
 **Startup protocol:** as soon as the session begins, call
 `teammate_register(agent: "<your-name>")` (the human/lead tells you your name) —
@@ -43,6 +44,17 @@ role/authority/status); see the `teammate_register` tool description for the ful
 guide. Profile fields are **durable**: re-registering later only re-establishes your
 identity and channel — your `role`/`personality`/`authority` persist, so you don't
 re-supply them (refresh the dynamic `status` with `teammate_update`).
+
+**Group chat — brainstorm with several teammates.** Create a named group and post to it
+by addressing a `#`-prefixed name with the normal send tool:
+`teammate_group(action: "create", group: "#design", members: [...])`, then
+`teammate_send(to: "#design", message: ...)`. The message fans out to every member's
+inbox (tagged `[group: #design]`) and wakes them via the usual channel; the full
+ordered conversation is kept in a shared transcript readable with
+`teammate_group(action: "history", group: "#design")` — useful for catching up.
+Membership is open (`join`/`leave`/`add`, and posting auto-joins you); `delete` is
+creator-only. Groups are a separate `#` namespace, so a group name never collides with
+a teammate name.
 
 > Tool names may appear in the model surface with an MCP prefix
 > (`mcp__plugin_teammate-comms_teammate-comms__teammate_inbox`). Refer to them by

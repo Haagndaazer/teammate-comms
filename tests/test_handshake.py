@@ -5,10 +5,15 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 8 tools (register + 7), each with a valid object inputSchema
+    - tools/list returns 9 tools (register + 8), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
     - teammate_register (with a profile) establishes identity; teammate_whoami flips
       to registered and echoes the profile
+
+  Group chat:
+    - teammate_group create; teammate_send to="#grp" fans out to members' inboxes
+      (group-tagged) but NOT the sender; the shared transcript records it;
+      teammate_group history returns it; unknown action + duplicate create are isError
 
   Profile fields:
     - teammate_register echoes the profile back (personality reminder at start)
@@ -54,6 +59,8 @@ STATUS_INIT = "booting up"
 STATUS_NEW = "running checks"
 AUTHORITY = "tests/**"
 PROJECT = "MyTestProject"  # basename auto-filled from CLAUDE_PROJECT_DIR
+GROUP = "brainstorm"
+GROUP_SIGIL = "#brainstorm"
 
 stdout_lines = []
 stderr_lines = []
@@ -75,13 +82,23 @@ def inboxes_dir(root):
     return Path(root) / "TeammateComms" / TEAM / "inboxes"
 
 
-def append_external_message(root, to, frm, message):
-    """Simulate a peer's send by appending to <to>'s unread inbox directly."""
+def groups_dir(root):
+    return Path(root) / "TeammateComms" / TEAM / "groups"
+
+
+def append_external_message(root, to, frm, message, group=None):
+    """Simulate a peer's send by appending to <to>'s unread inbox directly.
+
+    Pass ``group`` to simulate a peer posting to a group (a group-tagged record).
+    """
     d = inboxes_dir(root)
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{to}_unread.json"
     msgs = json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
-    msgs.append({"id": f"ext-{time.time()}", "from": frm, "priority": "normal", "message": message})
+    rec = {"id": f"ext-{time.time()}", "from": frm, "priority": "normal", "message": message}
+    if group:
+        rec["group"] = group
+    msgs.append(rec)
     tmp = f.with_name(f.name + ".tmp")
     tmp.write_text(json.dumps(msgs), encoding="utf-8")
     os.replace(tmp, f)
@@ -171,6 +188,29 @@ def main():
                 "params": {"name": "teammate_profile", "arguments": {"agent": PEER}}})  # no record -> isError
     time.sleep(0.6)
 
+    # Group chat: create, duplicate-create (isError), send (fan-out), history, bad action.
+    send(proc, {"jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "create", "group": GROUP_SIGIL, "members": [PEER]}}})
+    send(proc, {"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "create", "group": GROUP_SIGIL}}})   # dup -> isError
+    send(proc, {"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                "params": {"name": "teammate_send",
+                           "arguments": {"to": GROUP_SIGIL, "message": "group hello"}}})
+    send(proc, {"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+                "params": {"name": "teammate_group", "arguments": {"action": "history", "group": GROUP_SIGIL}}})
+    send(proc, {"jsonrpc": "2.0", "id": 24, "method": "tools/call",
+                "params": {"name": "teammate_group", "arguments": {"action": "bogus", "group": GROUP_SIGIL}}})  # isError
+    time.sleep(0.6)
+
+    # A peer posts to the group -> group-tagged record in AGENT's inbox; inbox shows the tag.
+    append_external_message(root, AGENT, PEER, "from the group", group=GROUP_SIGIL)
+    time.sleep(0.6)
+    send(proc, {"jsonrpc": "2.0", "id": 25, "method": "tools/call",
+                "params": {"name": "teammate_inbox", "arguments": {}}})
+    time.sleep(0.4)
+
     # Heartbeat cycle (5s) -> confirm type:"full" AND a profile field survive the merge.
     time.sleep(5.5)
     type_after_heartbeat = None
@@ -214,11 +254,11 @@ def main():
         if init.get("result", {}).get("protocolVersion") != "2025-06-18":
             failures.append("initialize did not echo protocolVersion")
 
-    # tools/list: 8 tools, each with an object inputSchema
+    # tools/list: 9 tools, each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_ack", "teammate_list", "teammate_whoami",
-                      "teammate_update", "teammate_profile"}
+                      "teammate_update", "teammate_profile", "teammate_group"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:
@@ -300,6 +340,36 @@ def main():
     # teammate_profile for an agent with no registry record -> isError
     if not is_error(19):
         failures.append(f"teammate_profile for unregistered peer not isError: {by_id.get(19)}")
+
+    # group chat: create / duplicate / send fan-out / transcript / history / bad action
+    if is_error(20) or "Created group" not in text(20):
+        failures.append(f"teammate_group create failed: {text(20)}")
+    if not is_error(21):
+        failures.append(f"duplicate group create not isError: {by_id.get(21)}")
+    if is_error(22) or "Posted to" not in text(22):
+        failures.append(f"teammate_send to group failed: {text(22)}")
+    # fan-out reached PEER's inbox (group-tagged) but NOT the sender's own inbox
+    peer_unread = inboxes_dir(root) / f"{PEER}_unread.json"
+    peer_txt = peer_unread.read_text(encoding="utf-8") if peer_unread.exists() else ""
+    if "group hello" not in peer_txt or GROUP_SIGIL not in peer_txt:
+        failures.append("group send did not fan out to peer inbox (tagged)")
+    agent_unread = inboxes_dir(root) / f"{AGENT}_unread.json"
+    agent_txt = agent_unread.read_text(encoding="utf-8") if agent_unread.exists() else ""
+    if "group hello" in agent_txt:
+        failures.append("group send echoed to the sender's own inbox (should skip sender)")
+    # transcript recorded the message
+    transcript = groups_dir(root) / GROUP / "messages.json"
+    if not transcript.exists() or "group hello" not in transcript.read_text(encoding="utf-8"):
+        failures.append(f"group transcript missing message at {transcript}")
+    # history returns it
+    if is_error(23) or "group hello" not in text(23):
+        failures.append(f"teammate_group history missing message: {text(23)}")
+    # unknown action -> isError
+    if not is_error(24):
+        failures.append(f"unknown group action not isError: {by_id.get(24)}")
+    # inbox shows the [group: #grp] tag for a group-tagged message
+    if "group:" not in text(25) or GROUP_SIGIL not in text(25) or "from the group" not in text(25):
+        failures.append(f"teammate_inbox missing group tag: {text(25)}")
 
     # registry: written + type/profile survive heartbeat merge
     if not record.exists():

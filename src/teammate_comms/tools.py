@@ -17,21 +17,30 @@ import json
 from .comms import (
     PROFILE_FIELDS,
     CommsError,
+    append_group_message,
+    delete_group,
     ensure_inbox,
     file_lock,
     get_agents_dir,
+    get_group_dir,
+    get_groups_dir,
     get_inboxes_dir,
     is_channel_alive,
     now_timestamp,
     read_agent_record,
+    read_group_messages,
+    read_group_meta,
     read_json_safe,
     validate_agent_name,
+    validate_group_name,
     validate_profile_field,
     write_agent_record,
+    write_group_meta,
     write_json_atomic,
 )
 
 _PRIORITIES = ("normal", "urgent")
+_GROUP_ACTIONS = ("create", "delete", "join", "leave", "add", "members", "history")
 
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
@@ -107,14 +116,16 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_send",
         "description": (
-            "Send a message to another teammate's inbox. If the recipient is a live "
-            "full instance, their channel nudges them automatically; otherwise the "
-            "message is queued and seen on their next start."
+            "Send a message to another teammate's inbox, OR to a group chat by passing "
+            "a '#'-prefixed group name as 'to' (e.g. '#design') — a group message fans "
+            "out to every member. If the recipient is a live full instance, their "
+            "channel nudges them automatically; otherwise the message is queued and "
+            "seen on their next start. (Manage groups with teammate_group.)"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "Recipient agent name."},
+                "to": {"type": "string", "description": "Recipient agent name, or a '#'-prefixed group name (e.g. '#design')."},
                 "message": {"type": "string", "description": "Message body."},
                 "priority": {
                     "type": "string",
@@ -185,6 +196,35 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "name": "teammate_group",
+        "description": (
+            "Manage group chats for brainstorming with multiple teammates. A group is "
+            "addressed like a teammate but with a '#' prefix: post to it with "
+            "teammate_send(to=\"#<group>\"), which fans out to every member and wakes "
+            "them. Membership is open (anyone can join/add). Actions: create, delete "
+            "(creator-only), join, leave, add (members), members (list), history (read "
+            "the shared transcript)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": list(_GROUP_ACTIONS),
+                    "description": "create | delete | join | leave | add | members | history",
+                },
+                "group": {"type": "string", "description": "Group name (a leading '#' is optional)."},
+                "members": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Member names — for 'create' (initial members) and 'add'.",
+                },
+                "limit": {"type": "integer", "description": "For 'history': max messages to return (default 50)."},
+            },
+            "required": ["action", "group"],
+        },
+    },
 ]
 
 
@@ -214,9 +254,32 @@ def _handle_register(args, ctx):
     return ctx["register"](agent, team.strip() if team else None, comms_dir, profile)
 
 
+def _validate_message(args):
+    """Return the trimmed message body, or raise CommsError."""
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise CommsError("'message' is required and must be a non-empty string.")
+    return message.strip()
+
+
+def _validate_priority(args):
+    priority = args.get("priority", "normal")
+    if priority not in _PRIORITIES:
+        raise CommsError(f"'priority' must be one of {list(_PRIORITIES)}.")
+    return priority
+
+
 def _handle_send(args, ctx):
     agent, team, root = _require_registered(ctx)
     to = args.get("to")
+    if not isinstance(to, str) or not to.strip():
+        raise CommsError("'to' is required (a teammate name, or a '#'-prefixed group name).")
+    to = to.strip()
+
+    # Group path: a '#'-prefixed recipient fans out to the group's members.
+    if to.startswith("#"):
+        return _send_to_group(agent, team, root, to, args)
+
     validate_agent_name(to)
     if to == agent:
         raise CommsError(
@@ -224,14 +287,8 @@ def _handle_send(args, ctx):
             "use teammate_inbox to read your own messages."
         )
 
-    message = args.get("message")
-    if not isinstance(message, str) or not message.strip():
-        raise CommsError("'message' is required and must be a non-empty string.")
-    content = message.strip()
-
-    priority = args.get("priority", "normal")
-    if priority not in _PRIORITIES:
-        raise CommsError(f"'priority' must be one of {list(_PRIORITIES)}.")
+    content = _validate_message(args)
+    priority = _validate_priority(args)
 
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, to)
@@ -275,7 +332,9 @@ def _handle_inbox(args, ctx):
     out = [f"=== {len(messages)} unread message(s) for {agent} ==="]
     for msg in messages:
         tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{tag} ---")
+        grp = msg.get("group")
+        gtag = f" [group: {grp}]" if grp else ""
+        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{tag} ---")
         out.append(str(msg.get("message", "")))
     return "\n".join(out)
 
@@ -344,7 +403,22 @@ def _handle_list(args, ctx):
         personality = record.get("personality")
         if personality:
             rows.append(f"      personality: {personality}")
-    return "Registered teammates:\n" + "\n".join(rows) if rows else "No registered teammates yet."
+    teammates = "Registered teammates:\n" + "\n".join(rows) if rows else "No registered teammates yet."
+
+    # Groups section — groups are addressed like teammates (with a '#' prefix).
+    group_rows = []
+    groups_dir = get_groups_dir(root, team)
+    if groups_dir.exists():
+        for gp in sorted(p for p in groups_dir.iterdir() if p.is_dir()):
+            meta = read_group_meta(root, team, gp.name)
+            if not isinstance(meta, dict):
+                continue
+            members = meta.get("members", [])
+            mark = " (member)" if _agent in members else ""
+            group_rows.append(f"  - #{gp.name}{mark}: {len(members)} member(s) — {', '.join(members) or '(none)'}")
+    if group_rows:
+        return teammates + "\n\nGroups:\n" + "\n".join(group_rows)
+    return teammates
 
 
 def _handle_whoami(args, ctx):
@@ -408,6 +482,184 @@ def _handle_profile(args, ctx):
     return _format_profile(record, target, is_self=(target == agent))
 
 
+# ── Group chat ────────────────────────────────────────────────────────────────
+
+def _group_meta_file(root, team, group):
+    return get_group_dir(root, team, group) / "meta.json"
+
+
+def _send_to_group(agent, team, root, to_sigil, args):
+    """Fan a message out to every member of a group + record it in the transcript."""
+    group = validate_group_name(to_sigil)  # strips '#', validates
+    sigil = f"#{group}"
+    meta = read_group_meta(root, team, group)
+    if meta is None:
+        raise CommsError(
+            f"No group {sigil!r}. Create it with "
+            f"teammate_group(action=\"create\", group=\"{sigil}\")."
+        )
+    content = _validate_message(args)
+    priority = _validate_priority(args)
+
+    # Open membership: posting auto-joins the sender (re-read under lock to add).
+    members = list(meta.get("members", []))
+    if agent not in members:
+        with file_lock(_group_meta_file(root, team, group)):
+            meta = read_group_meta(root, team, group) or meta
+            members = list(meta.get("members", []))
+            if agent not in members:
+                members.append(agent)
+                meta["members"] = members
+                write_group_meta(root, team, group, meta)
+
+    record = {"id": now_timestamp(), "from": agent, "group": sigil,
+              "priority": priority, "message": content}
+
+    # Transcript is the canonical, ordered source of truth — write it first.
+    append_group_message(root, team, group, record)
+
+    # Best-effort fan-out into each other member's inbox. A locked/failed inbox is
+    # NON-FATAL: the transcript is authoritative and the member catches up via history.
+    inboxes_dir = get_inboxes_dir(root, team)
+    delivered, live, deferred = [], 0, []
+    for member in members:
+        if member == agent:
+            continue
+        try:
+            ensure_inbox(inboxes_dir, member)
+            unread_file = inboxes_dir / f"{member}_unread.json"
+            with file_lock(unread_file):
+                msgs = read_json_safe(unread_file)
+                msgs.append(record)
+                write_json_atomic(unread_file, msgs)
+            delivered.append(member)
+            rec = read_agent_record(root, team, member)
+            if rec and is_channel_alive(rec, pid_check=False):  # heartbeat-only (no N tasklist)
+                live += 1
+        except CommsError:
+            deferred.append(member)
+
+    lines = [f"Posted to {sigil} (id: {record['id']})."]
+    if delivered:
+        lines.append(
+            f"Delivered to {len(delivered)} member(s) ({live} live, "
+            f"{len(delivered) - live} queued): {', '.join(delivered)}."
+        )
+    else:
+        lines.append("No other members yet — recorded in the transcript only.")
+    if deferred:
+        lines.append(f"Deferred (inbox busy; will catch up via history): {', '.join(deferred)}.")
+    return "\n".join(lines)
+
+
+def _edit_group_members(root, team, group, sigil, mutate):
+    """Lock meta.json, apply mutate(meta)->meta, write. Raises if the group is gone."""
+    with file_lock(_group_meta_file(root, team, group)):
+        meta = read_group_meta(root, team, group)
+        if meta is None:
+            raise CommsError(f"No group {sigil!r}.")
+        meta = mutate(meta)
+        write_group_meta(root, team, group, meta)
+        return meta
+
+
+def _handle_group(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    action = args.get("action")
+    if action not in _GROUP_ACTIONS:  # MCP clients don't enforce the schema enum
+        raise CommsError(f"'action' must be one of {list(_GROUP_ACTIONS)}.")
+    group = validate_group_name(args.get("group"))  # raises on missing/bad
+    sigil = f"#{group}"
+
+    if action == "create":
+        members = [agent]
+        for m in args.get("members") or []:
+            validate_agent_name(m)
+            if m not in members:
+                members.append(m)
+        get_group_dir(root, team, group).mkdir(parents=True, exist_ok=True)  # so the .lock dir can be made
+        with file_lock(_group_meta_file(root, team, group)):
+            if read_group_meta(root, team, group) is not None:
+                raise CommsError(f"Group {sigil!r} already exists.")
+            write_group_meta(root, team, group, {
+                "name": group, "members": members,
+                "creator": agent, "createdAt": now_timestamp(),
+            })
+        return (f"Created group {sigil} with member(s): {', '.join(members)}. "
+                f"Post with teammate_send(to=\"{sigil}\").")
+
+    if action == "delete":
+        meta = read_group_meta(root, team, group)
+        if meta is None:
+            raise CommsError(f"No group {sigil!r}.")
+        creator = meta.get("creator")
+        members = meta.get("members", [])
+        # Creator-only, OR any member if the creator is no longer a member (orphan).
+        if not (agent == creator or (creator not in members and agent in members)):
+            raise CommsError(f"Only the creator ({creator}) can delete {sigil}.")
+        delete_group(root, team, group)
+        return f"Deleted group {sigil}."
+
+    if action == "join":
+        def mutate(meta):
+            members = meta.get("members", [])
+            if agent not in members:
+                members.append(agent)
+            meta["members"] = members
+            return meta
+        meta = _edit_group_members(root, team, group, sigil, mutate)
+        return f"Joined {sigil}. Members: {', '.join(meta['members'])}."
+
+    if action == "leave":
+        def mutate(meta):
+            meta["members"] = [m for m in meta.get("members", []) if m != agent]
+            return meta
+        meta = _edit_group_members(root, team, group, sigil, mutate)
+        return f"Left {sigil}. Members: {', '.join(meta['members']) or '(none)'}."
+
+    if action == "add":
+        to_add = args.get("members") or []
+        if not to_add:
+            raise CommsError("Provide 'members' (a list of names) to add.")
+        for m in to_add:
+            validate_agent_name(m)
+
+        def mutate(meta):
+            members = meta.get("members", [])
+            for m in to_add:
+                if m not in members:
+                    members.append(m)
+            meta["members"] = members
+            return meta
+        meta = _edit_group_members(root, team, group, sigil, mutate)
+        return f"Added to {sigil}. Members: {', '.join(meta['members'])}."
+
+    if action == "members":
+        meta = read_group_meta(root, team, group)
+        if meta is None:
+            raise CommsError(f"No group {sigil!r}.")
+        mem = meta.get("members", [])
+        return (f"{sigil} — creator: {meta.get('creator')}, "
+                f"members ({len(mem)}): {', '.join(mem) or '(none)'}.")
+
+    # action == "history"
+    if read_group_meta(root, team, group) is None:
+        raise CommsError(f"No group {sigil!r}.")
+    limit = args.get("limit")
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 50
+    messages = read_group_messages(root, team, group)
+    if not messages:
+        return f"{sigil} has no messages yet."
+    recent = messages[-limit:]
+    out = [f"=== {sigil} transcript ({len(recent)} of {len(messages)} message(s)) ==="]
+    for msg in recent:
+        urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""
+        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{urgent} ---")
+        out.append(str(msg.get("message", "")))
+    return "\n".join(out)
+
+
 _HANDLERS = {
     "teammate_register": _handle_register,
     "teammate_send": _handle_send,
@@ -417,6 +669,7 @@ _HANDLERS = {
     "teammate_whoami": _handle_whoami,
     "teammate_update": _handle_update,
     "teammate_profile": _handle_profile,
+    "teammate_group": _handle_group,
 }
 
 
