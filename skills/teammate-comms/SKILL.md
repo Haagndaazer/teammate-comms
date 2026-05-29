@@ -74,10 +74,17 @@ re-supply them (refresh the dynamic `status` with `teammate_update`).
 ## Launching a full instance (channel)
 
 No identity env var is required — launch with the channel flag, then register from
-inside the session:
+inside the session. Installed from the marketplace
+(`/plugin install teammate-comms@coltondyck`):
 
 ```powershell
-claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@colton-comms
+claude --dangerously-load-development-channels plugin:teammate-comms@coltondyck
+```
+
+Or load straight from a local checkout for development:
+
+```powershell
+claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 ```
 
 Then, at session start, call `teammate_register(agent: "Grant")` (add `team:` if

@@ -76,13 +76,26 @@ channels enabled (individual Pro/Max: on by default). On Windows the SessionStar
 hook runs under `bash`, so **git-bash must be on PATH** (it is if you already run
 other bash-hooked plugins).
 
-### Local development (recommended)
+### Install from the marketplace (recommended)
+
+```
+/plugin marketplace add Haagndaazer/colton-claude-plugins
+/plugin install teammate-comms@coltondyck
+```
+
+Then launch with the channel flag (the marketplace ref is `@coltondyck`):
+
+```powershell
+claude --dangerously-load-development-channels plugin:teammate-comms@coltondyck
+```
+
+### Local development
 
 `--plugin-dir` loads the plugin straight from this directory and bypasses
 marketplace registration entirely:
 
 ```powershell
-claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@colton-comms
+claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 ```
 
 No env var is required. At session start, call `teammate_register(agent: "Grant")`
@@ -116,23 +129,20 @@ session, **restart Claude Code once** — every session after is instant.
 
 ## Marketplace
 
-This repo ships its own marketplace named **`colton-comms`** (distinct from the
-`coltondyck` marketplace, which is registered to the **vibe-cognition** repo).
-Because the names differ, there is no collision — you can register this repo as its
-own marketplace without disturbing vibe-cognition:
+This plugin is published through the consolidated **`coltondyck`** marketplace at
+[`Haagndaazer/colton-claude-plugins`](https://github.com/Haagndaazer/colton-claude-plugins),
+which indexes both this plugin and `vibe-cognition` (each pinned to its own repo by
+commit SHA):
 
 ```
-/plugin marketplace add Haagndaazer/teammate-comms
-/plugin install teammate-comms@colton-comms
+/plugin marketplace add Haagndaazer/colton-claude-plugins
+/plugin install teammate-comms@coltondyck
 ```
 
-Or, for local development, skip registration entirely and load straight from the
-directory with `--plugin-dir` (see the launch command above).
-
-> If you later prefer a single shared marketplace for both plugins, add a
-> `teammate-comms` plugin entry to vibe-cognition's `coltondyck` `marketplace.json`
-> (one marketplace can list many plugins, each pointing at its own repo) instead of
-> shipping a second marketplace here.
+> This repo also still carries an in-repo `.claude-plugin/marketplace.json` (named
+> `colton-comms`) for direct `--plugin-dir` development, but the `coltondyck`
+> marketplace above is the canonical install path. Both are re-pinned to the same
+> release commit on each version bump.
 
 ## Development
 
