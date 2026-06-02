@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!-- Locked-down CSP: no external origins, only same-origin fetch. Inline style/script
-     are allowed (this is a single bundled file), but an injected <img onerror>/<script src>
-     cannot load or exfiltrate. Message bodies are rendered via textContent (never innerHTML),
-     so stored XSS from agent-authored text is defused. -->
+     are allowed (single bundled file), but an injected <img onerror>/<script src> cannot
+     load or exfiltrate. ALL agent-authored text is rendered via textContent (never
+     innerHTML), so stored XSS is defused. -->
 <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'">
 <title>teammate-comms console</title>
@@ -14,92 +14,103 @@
   :root {
     --bg: #1a1d21; --panel: #20242a; --panel2: #262b32; --line: #343a42;
     --fg: #e8eaed; --dim: #9aa3ad; --accent: #4a9eff; --urgent: #ff6b6b;
-    --on: #46d160; --off: #5a626c;
+    --on: #46d160; --off: #5a626c; --chip: #2f3640;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     background: var(--bg); color: var(--fg);
     font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    display: grid; grid-template-columns: 270px 1fr; grid-template-rows: 1fr auto;
+    display: grid; grid-template-columns: 260px 1fr 340px; grid-template-rows: 1fr auto;
     height: 100vh;
   }
-  #sidebar {
-    grid-row: 1 / 3; background: var(--panel); border-right: 1px solid var(--line);
-    overflow-y: auto; padding: 12px 0;
-  }
-  #sidebar h1 { font-size: 13px; color: var(--fg); margin: 0 0 10px 14px; letter-spacing: .3px; }
+  #sidebar { grid-row: 1 / 3; background: var(--panel); border-right: 1px solid var(--line);
+             overflow-y: auto; padding: 12px 0; }
+  #sidebar h1 { font-size: 13px; margin: 0 0 10px 14px; letter-spacing: .3px; }
   .section { margin: 14px 0 4px; }
-  .section .label {
-    font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
-    color: var(--dim); padding: 0 14px; margin-bottom: 4px;
-  }
-  .item {
-    padding: 5px 14px; cursor: pointer; display: flex; align-items: center;
-    gap: 7px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
+  .section .label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+                    color: var(--dim); padding: 0 14px; margin-bottom: 4px; }
+  .item { padding: 5px 14px; cursor: pointer; display: flex; align-items: center; gap: 7px;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .item:hover { background: var(--panel2); }
   .item.active { background: var(--accent); color: #fff; }
   .item .pre { color: var(--dim); }
-  .item.active .pre { color: #d7e8ff; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--off); }
   .dot.on { background: var(--on); }
   .meta { color: var(--dim); font-size: 12px; }
   .item.active .meta { color: #e6f0ff; }
-  #main { grid-row: 1; overflow-y: auto; padding: 16px 22px; }
+  #main { grid-row: 1; grid-column: 2; overflow-y: auto; padding: 16px 22px; }
   #convhead { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
   #convsub { color: var(--dim); font-size: 12px; margin-bottom: 14px; }
-  .msg { padding: 6px 0; border-top: 1px solid transparent; }
+  .banner { background: #3a2f10; color: #f0d890; padding: 6px 10px; border-radius: 6px;
+            font-size: 12px; margin-bottom: 12px; }
+  .msg { padding: 6px 0; }
   .msg .who { font-weight: 600; }
   .msg .when { color: var(--dim); font-size: 11px; margin-left: 8px; }
   .msg .body { white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
   .msg.urgent { border-left: 3px solid var(--urgent); padding-left: 8px; margin-left: -11px; }
-  .msg .tag { color: var(--dim); font-size: 11px; margin-left: 8px; }
-  #composewrap {
-    grid-row: 2; grid-column: 2; border-top: 1px solid var(--line);
-    background: var(--panel); padding: 12px 22px; display: flex; gap: 10px;
-  }
-  #compose {
-    flex: 1; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
-    border-radius: 8px; padding: 9px 12px; font: inherit; resize: none;
-  }
+  .tag { color: var(--dim); font-size: 11px; margin-left: 8px; }
+  .tag.pt { color: #8ab4f8; }
+  .tag.mention { color: #ffd166; }
+  .reply { color: var(--dim); font-size: 12px; margin-top: 1px; }
+  .reads { color: var(--on); font-size: 11px; margin-top: 1px; }
+  .rx { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .chip { background: var(--chip); border: 1px solid var(--line); border-radius: 10px;
+          padding: 0 7px; font-size: 12px; cursor: pointer; line-height: 18px; }
+  .chip.mine { border-color: var(--accent); }
+  .bar { opacity: .35; }
+  .msg:hover .bar { opacity: 1; }
+  .bar .chip { background: transparent; border-color: transparent; }
+  #composewrap { grid-row: 2; grid-column: 2; border-top: 1px solid var(--line);
+                 background: var(--panel); padding: 12px 22px; display: flex; gap: 10px; }
+  #compose { flex: 1; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+             border-radius: 8px; padding: 9px 12px; font: inherit; resize: none; }
   #compose:disabled { opacity: .5; }
-  #send {
-    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
-    padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
-  }
+  #send { background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+          padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer; }
   #send:disabled { opacity: .5; cursor: default; }
   .empty { color: var(--dim); margin-top: 30px; text-align: center; }
+  /* right-hand live activity firehose */
+  #activity { grid-row: 1 / 3; grid-column: 3; background: var(--panel);
+              border-left: 1px solid var(--line); display: flex; flex-direction: column; }
+  #activity .ahead { padding: 10px 12px; border-bottom: 1px solid var(--line);
+                     font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); }
+  #feed { flex: 1; overflow-y: auto; padding: 8px 12px; }
+  .frow { padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  .frow .route { color: var(--dim); font-size: 11px; }
+  .frow .arrow { color: var(--accent); }
+  .frow .fbody { white-space: pre-wrap; word-break: break-word; margin-top: 1px; }
 </style>
 </head>
 <body>
-  <aside id="sidebar">
-    <h1>teammate-comms</h1>
-    <div id="nav"></div>
-  </aside>
+  <aside id="sidebar"><h1>teammate-comms</h1><div id="nav"></div></aside>
   <section id="main"><div class="empty">Select a conversation.</div></section>
   <div id="composewrap">
     <textarea id="compose" rows="1" placeholder="Message…" disabled></textarea>
     <button id="send" disabled>Send</button>
   </div>
+  <aside id="activity">
+    <div class="ahead">Live activity · all traffic (last 200)</div>
+    <div id="feed"></div>
+  </aside>
 
 <script>
 "use strict";
-// Token is injected by the server (the placeholder "%TOKEN%" — quotes included — is
-// replaced with a JSON string literal). Strip it from the visible URL/history after load.
 window.__TOKEN = "%TOKEN%";
 try { history.replaceState(null, "", location.pathname); } catch (e) {}
-
 const TOKEN = window.__TOKEN;
-let ME = null;
-let cursor = "";
-const seen = new Set();                 // message ids already rendered (dedupe)
-const buckets = new Map();              // convId -> [records]
-const convs = new Map();                // convId -> {label, sub, sendable}
-let current = null;
+const EMOJI = { thumbsup: "👍", rofl: "🤣", smile: "😄", cry: "😢", "100": "💯", fire: "🔥" };
 
-const $ = (sel) => document.querySelector(sel);
-const el = (tag, cls) => { const n = document.createElement(tag); if (cls) n.className = cls; return n; };
+let ME = null, cursor = "", rcursor = "", current = null;
+const seen = new Set();              // message ids already ingested (dedupe)
+const buckets = new Map();           // convId -> [records]
+const convs = new Map();             // convId -> {label, sub, sendable}
+const rx = new Map();                // msgId -> Map(emoji -> Set(reactor))
+let groupReads = {};                 // "#g" -> {member: maxAckedId}
+
+const $ = (s) => document.querySelector(s);
+const el = (t, c) => { const n = document.createElement(t); if (c) n.className = c; return n; };
+const span = (c, txt) => { const s = el("span", c); s.textContent = txt; return s; };
 
 async function api(path, opts) {
   const init = Object.assign({}, opts);
@@ -110,114 +121,109 @@ async function api(path, opts) {
 }
 
 function convKey(rec) {
-  if (rec.kind === "group" || rec.group) return rec.group;           // "#design"
-  const from = rec.from, to = rec.to;
-  if (from === ME || to === ME) return "@" + (from === ME ? to : from);
-  return "@" + [from, to].sort().join(" ↔ ");                   // observed agent↔agent
+  if (rec.kind === "group" || rec.group) return rec.group;       // "#design"
+  const a = rec.from, b = rec.to;
+  if (a === ME || b === ME) return "@" + (a === ME ? b : a);     // my DM
+  return "~" + [a, b].sort().join(" ↔ ");                  // observed agent↔agent
 }
 
 function ensureConv(id) {
   if (convs.has(id)) return;
   let label = id, sub = "", sendable = true;
-  if (id.startsWith("#")) { label = id; sub = "group channel"; }
-  else if (id.indexOf(" ↔ ") !== -1) { label = id.slice(1); sub = "observed (read-only)"; sendable = false; }
+  if (id[0] === "#") { sub = "group channel"; }
+  else if (id[0] === "~") { label = id.slice(1); sub = "observed — read-only"; sendable = false; }
   else { label = id.slice(1); sub = "direct message"; }
   convs.set(id, { label, sub, sendable });
   renderNav();
 }
 
 function pushRecord(rec) {
-  if (!rec || !rec.id) return false;
-  if (seen.has(rec.id)) return false;
+  if (!rec || !rec.id || seen.has(rec.id)) return null;   // dedupe (poll boundary repeats)
   seen.add(rec.id);
   const id = convKey(rec);
   ensureConv(id);
   if (!buckets.has(id)) buckets.set(id, []);
   buckets.get(id).push(rec);
+  renderFeed(rec);                                        // firehose: every NEW record
   return id;
 }
 
+function applyReactions(events) {
+  for (const e of (events || [])) {
+    if (!e.target || !e.emoji || !e.from) continue;
+    if (!rx.has(e.target)) rx.set(e.target, new Map());
+    const m = rx.get(e.target);
+    if (!m.has(e.emoji)) m.set(e.emoji, new Set());
+    if (e.op === "remove") m.get(e.emoji).delete(e.from);
+    else m.get(e.emoji).add(e.from);
+  }
+}
+
+// ── sidebar ──
 async function loadConversations() {
-  const data = await api("/api/conversations");
-  ME = data.me;
-  // groups
-  for (const g of data.groups) convs.set(g.id, { label: g.id, sub: g.members.length + " member(s)", sendable: true, members: g.members });
-  // dm peers (roster minus me)
-  for (const d of data.dms) if (!convs.has(d.id)) convs.set(d.id, { label: d.peer, sub: "direct message", sendable: true });
-  window.__roster = data.roster || [];
+  const d = await api("/api/conversations");
+  ME = d.me;
+  groupReads = {};
+  for (const g of d.groups) { convs.set(g.id, { label: g.id, sub: g.members.length + " member(s)", sendable: true }); groupReads[g.id] = g.reads || {}; }
+  window.__roster = d.roster || [];
   renderNav();
 }
 
 function renderNav() {
-  const nav = $("#nav");
-  nav.textContent = "";
+  const nav = $("#nav"); nav.textContent = "";
   const roster = window.__roster || [];
+  const channels = [...convs.keys()].filter(k => k[0] === "#").sort();
+  const observed = [...convs.keys()].filter(k => k[0] === "~").sort();
 
-  const groups = [...convs.entries()].filter(([id]) => id.startsWith("#"));
-  const dms = [...convs.entries()].filter(([id]) => id.startsWith("@"));
-
-  nav.appendChild(sectionEl("Channels", groups.map(([id, c]) => navItem(id, c.label, null)) ));
-  nav.appendChild(sectionEl("Direct messages", dms.map(([id, c]) => navItem(id, c.label, null)) ));
-
-  const rosterItems = roster.map((r) => {
+  nav.appendChild(section("Channels", channels.map(id => navItem(id, convs.get(id).label, null))));
+  // Teammates = the sole DM entry point (also shows who's online)
+  nav.appendChild(section("Teammates", roster.map(r => {
     const it = navItem("@" + r.agent, r.agent, r.online);
-    if (r.agent === ME) { const m = el("span", "meta"); m.textContent = " (you)"; it.appendChild(m); }
-    else if (r.type === "human") { const m = el("span", "meta"); m.textContent = " 🧑"; it.appendChild(m); }
+    if (r.agent === ME) it.appendChild(span("meta", " (you)"));
+    else if (r.type === "human") it.appendChild(span("meta", " 🧑"));
     return it;
-  });
-  nav.appendChild(sectionEl("Teammates", rosterItems));
+  })));
+  // Observed = read-only agent↔agent DMs, directly below Teammates
+  nav.appendChild(section("Observed (read-only)", observed.map(id => navItem(id, convs.get(id).label, null))));
 }
 
-function sectionEl(label, items) {
+function section(label, items) {
   const s = el("div", "section");
-  const l = el("div", "label"); l.textContent = label; s.appendChild(l);
-  if (!items.length) { const e = el("div", "item meta"); e.textContent = "(none)"; s.appendChild(e); }
+  s.appendChild(span("label", label));
+  if (!items.length) s.appendChild(span("item meta", "(none)"));
   for (const it of items) s.appendChild(it);
   return s;
 }
 
 function navItem(id, label, online) {
   const it = el("div", "item" + (id === current ? " active" : ""));
-  if (online !== null && online !== undefined) {
-    const d = el("span", "dot" + (online ? " on" : "")); it.appendChild(d);
-  } else {
-    const p = el("span", "pre"); p.textContent = id.startsWith("#") ? "#" : "@"; it.appendChild(p);
-  }
-  const t = el("span"); t.textContent = id.startsWith("#") ? label.replace(/^#/, "") : label;
-  it.appendChild(t);
+  if (online !== null && online !== undefined) it.appendChild(el("span", "dot" + (online ? " on" : "")));
+  else it.appendChild(span("pre", id[0] === "#" ? "#" : (id[0] === "~" ? "~" : "@")));
+  it.appendChild(span(null, id[0] === "#" ? label.replace(/^#/, "") : label));
   it.addEventListener("click", () => selectConv(id));
   return it;
 }
 
+// ── center pane ──
 function selectConv(id) {
-  current = id;
-  ensureConv(id);
-  renderNav();
-  renderTranscript();
-  const c = convs.get(id) || {};
-  const sendable = c.sendable !== false;
-  $("#compose").disabled = !sendable;
-  $("#send").disabled = !sendable;
-  $("#compose").placeholder = sendable ? ("Message " + (c.label || id) + "…") : "Read-only (observed conversation)";
-  if (sendable) $("#compose").focus();
+  current = id; ensureConv(id); renderNav(); renderTranscript();
+  const c = convs.get(id) || {}; const ok = c.sendable !== false;
+  $("#compose").disabled = !ok; $("#send").disabled = !ok;
+  $("#compose").placeholder = ok ? ("Message " + (c.label || id) + "…") : "Read-only (you're not a participant)";
+  if (ok) $("#compose").focus();
 }
 
-function fmtWhen(id) {
-  // ids are "YYYY-MM-DDTHH:MM:SS.ffffff" — show HH:MM:SS
-  const m = /T(\d{2}:\d{2}:\d{2})/.exec(id || "");
-  return m ? m[1] : "";
-}
+function fmtWhen(id) { const m = /T(\d{2}:\d{2}:\d{2})/.exec(id || ""); return m ? m[1] : ""; }
 
 function renderTranscript() {
-  const main = $("#main");
-  main.textContent = "";
-  if (!current) { const e = el("div", "empty"); e.textContent = "Select a conversation."; main.appendChild(e); return; }
+  const main = $("#main"); main.textContent = "";
+  if (!current) { main.appendChild(span("empty", "Select a conversation.")); return; }
   const c = convs.get(current) || {};
   const head = el("div"); head.id = "convhead"; head.textContent = c.label || current; main.appendChild(head);
   const sub = el("div"); sub.id = "convsub"; sub.textContent = c.sub || ""; main.appendChild(sub);
-
+  if (c.sendable === false) { const b = el("div", "banner"); b.textContent = "Read-only — you're not a participant in this conversation."; main.appendChild(b); }
   const msgs = buckets.get(current) || [];
-  if (!msgs.length) { const e = el("div", "empty"); e.textContent = "No messages yet."; main.appendChild(e); return; }
+  if (!msgs.length) { main.appendChild(span("empty", "No messages yet.")); return; }
   for (const rec of msgs) main.appendChild(renderMsg(rec));
   main.scrollTop = main.scrollHeight;
 }
@@ -225,68 +231,104 @@ function renderTranscript() {
 function renderMsg(rec) {
   const row = el("div", "msg" + (rec.priority === "urgent" ? " urgent" : ""));
   const head = el("div");
-  const who = el("span", "who"); who.textContent = rec.from;            // textContent — XSS-safe
-  head.appendChild(who);
-  const when = el("span", "when"); when.textContent = fmtWhen(rec.id); head.appendChild(when);
-  if (rec.kind === "group" && rec.group && !String(current).startsWith("#")) {
-    const tag = el("span", "tag"); tag.textContent = rec.group; head.appendChild(tag);
-  }
-  if (rec.priority === "urgent") { const tag = el("span", "tag"); tag.textContent = "URGENT"; head.appendChild(tag); }
+  head.appendChild(span("who", rec.from));
+  head.appendChild(span("when", fmtWhen(rec.id)));
+  if (rec.kind === "group" && rec.group && current[0] !== "#") head.appendChild(span("tag", rec.group));
+  if (rec.post_type) head.appendChild(span("tag pt", rec.post_type));
+  if (rec.priority === "urgent") head.appendChild(span("tag", "URGENT"));
+  if ((rec.mentions || []).includes(ME)) head.appendChild(span("tag mention", "🔔 you"));
   row.appendChild(head);
-  const body = el("div", "body"); body.textContent = rec.message == null ? "" : String(rec.message);
-  row.appendChild(body);
+  if (rec.reply_to) row.appendChild(span("reply", "↳ re " + rec.reply_to));
+  row.appendChild(span("body", rec.message == null ? "" : String(rec.message)));
+  // read receipts for group messages
+  if (rec.group && groupReads[rec.group]) {
+    const readers = Object.entries(groupReads[rec.group]).filter(([m, pos]) => pos && pos >= rec.id).map(([m]) => m);
+    if (readers.length) row.appendChild(span("reads", "✓ read by " + readers.join(", ")));
+  }
+  row.appendChild(reactionFooter(rec.id));
   return row;
 }
 
+function reactionFooter(msgId) {
+  const wrap = el("div", "rx");
+  const m = rx.get(msgId);
+  if (m) for (const [emoji, who] of m) {
+    if (!who.size) continue;
+    const chip = el("span", "chip" + (who.has(ME) ? " mine" : ""));
+    chip.textContent = (EMOJI[emoji] || emoji) + " " + who.size;
+    chip.title = [...who].join(", ");
+    chip.addEventListener("click", () => toggleReact(msgId, emoji));
+    wrap.appendChild(chip);
+  }
+  const bar = el("span", "bar");
+  for (const name of Object.keys(EMOJI)) {
+    const b = el("span", "chip"); b.textContent = EMOJI[name];
+    b.addEventListener("click", () => toggleReact(msgId, name));
+    bar.appendChild(b);
+  }
+  wrap.appendChild(bar);
+  return wrap;
+}
+
+async function toggleReact(target, emoji) {
+  const mine = rx.get(target)?.get(emoji)?.has(ME);
+  // optimistic local update; the poll reconciles
+  applyReactions([{ target, emoji, from: ME, op: mine ? "remove" : "add" }]);
+  if (current) renderTranscript();
+  try { await api("/api/react", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target, emoji, remove: !!mine }) }); } catch (e) {}
+}
+
+// ── right-hand firehose ──
+function renderFeed(rec) {
+  const feed = $("#feed");
+  const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+  const row = el("div", "frow");
+  const route = el("div", "route");
+  route.appendChild(span(null, rec.from));
+  route.appendChild(span("arrow", " → "));
+  route.appendChild(span(null, rec.group ? rec.group : (rec.to || "?")));
+  route.appendChild(span(null, "  " + fmtWhen(rec.id)));
+  if (rec.post_type) route.appendChild(span(null, "  [" + rec.post_type + "]"));
+  if (rec.priority === "urgent") route.appendChild(span(null, "  URGENT"));
+  if ((rec.mentions || []).length) route.appendChild(span(null, "  🔔" + rec.mentions.join(",")));
+  if (rec.reply_to) route.appendChild(span(null, "  ↳"));
+  row.appendChild(route);
+  row.appendChild(span("fbody", rec.message == null ? "" : String(rec.message)));
+  feed.appendChild(row);
+  if (nearBottom) feed.scrollTop = feed.scrollHeight;   // don't yank a scrolled-up operator
+}
+
+// ── compose ──
+async function sendMsg() {
+  const box = $("#compose"); const text = box.value.trim();
+  if (!text || !current) return;
+  const c = convs.get(current) || {}; if (c.sendable === false) return;
+  const to = current[0] === "#" ? current : current.slice(1);
+  box.value = "";
+  try { await api("/api/send", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to, message: text }) }); }
+  catch (e) { box.value = text; }
+}
+$("#send").addEventListener("click", sendMsg);
+$("#compose").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
+
+// ── poll loop ──
 async function poll() {
   try {
-    const data = await api("/api/poll?cursor=" + encodeURIComponent(cursor));
-    let touchedCurrent = false;
-    for (const rec of (data.records || [])) {
-      const convId = pushRecord(rec);
-      if (convId && convId === current) touchedCurrent = true;
-    }
-    if (data.cursor) cursor = data.cursor;
-    if (touchedCurrent) renderTranscript();
-  } catch (e) { /* swallow, retry next tick */ }
+    const d = await api("/api/poll?cursor=" + encodeURIComponent(cursor) + "&rcursor=" + encodeURIComponent(rcursor));
+    let touched = false;
+    for (const rec of (d.records || [])) { if (pushRecord(rec) === current) touched = true; }
+    if (d.cursor) cursor = d.cursor;
+    if ((d.reactions || []).length) { applyReactions(d.reactions); touched = true; }
+    if (d.rcursor) rcursor = d.rcursor;
+    if (touched && current) renderTranscript();
+  } catch (e) {}
   setTimeout(poll, 1500);
 }
+async function refreshRoster() { try { await loadConversations(); } catch (e) {} setTimeout(refreshRoster, 5000); }
 
-async function refreshRoster() {
-  try { await loadConversations(); if (current) renderNav(); } catch (e) {}
-  setTimeout(refreshRoster, 5000);
-}
-
-async function sendMsg() {
-  const box = $("#compose");
-  const text = box.value.trim();
-  if (!text || !current) return;
-  const c = convs.get(current) || {};
-  if (c.sendable === false) return;
-  const to = current.startsWith("#") ? current : current.slice(1);   // "#grp" or peer name
-  box.value = "";
-  try {
-    await api("/api/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to, message: text }),
-    });
-    // the next poll pulls it back from the transcript (single source of truth)
-  } catch (e) {
-    box.value = text;  // restore on failure
-  }
-}
-
-$("#send").addEventListener("click", sendMsg);
-$("#compose").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
-});
-
-(async function init() {
-  try { await loadConversations(); } catch (e) {}
-  poll();
-  refreshRoster();
-})();
+(async function init() { try { await loadConversations(); } catch (e) {} poll(); refreshRoster(); })();
 </script>
 </body>
 </html>

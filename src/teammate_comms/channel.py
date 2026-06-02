@@ -31,15 +31,23 @@ HEARTBEAT_SECONDS = 5
 POLL_SECONDS = 0.5
 
 
-def emit_channel_event(send_message, agent, count, personality=None, groups=None):
+def emit_channel_event(send_message, agent, count, personality=None, groups=None,
+                       mentioned=False, senders=None):
     """Push one ``notifications/claude/channel`` event for ``count`` unread.
 
-    If ``personality`` is set, it leads the content so a woken idle instance is
-    reminded who it is before it acts. If ``groups`` (a set of ``#``-prefixed group
-    names whose messages triggered this wake) is non-empty, the content names the
-    group reply target so the agent replies to the group, not 1:1 to the sender.
+    Always names WHERE the messages came from (``senders`` for DMs, ``groups`` for
+    group posts) so the agent has at-a-glance context. ``personality`` is passed only
+    occasionally (the caller reminds every ~10 messages, not every wake — registration
+    already echoes it) so an idle instance stays in character without per-message token
+    waste. If ``groups`` is non-empty, the content names the group reply target so the
+    agent replies to the group, not 1:1 to the sender. If ``mentioned`` is True, the
+    content leads with a 🔔 note (content-only — does NOT change ``count``).
     """
     intro = f"You are {agent}: {personality.rstrip('. ')}. " if personality else ""
+    mention_line = "🔔 You were @mentioned in a group post — read it. " if mentioned else ""
+    # Name where these messages came from: DM senders + #groups (groups already carry '#').
+    sources = sorted(set(senders or [])) + sorted(groups or [])
+    from_line = f"New from {', '.join(sources)}. " if sources else ""
     if groups:
         # The `group` field already carries the leading '#', so render it verbatim.
         targets = " or ".join(f"to:'{g}'" for g in sorted(groups))
@@ -51,7 +59,7 @@ def emit_channel_event(send_message, agent, count, personality=None, groups=None
     else:
         group_line = ""
     content = (
-        f"{intro}You have {count} new teammate message(s). Use your teammate-comms "
+        f"{intro}{mention_line}{from_line}You have {count} new teammate message(s). Use your teammate-comms "
         f"tools to read them: call `teammate_inbox` to view, then `teammate_ack` "
         f"(id \"all\") once handled. Reply with `teammate_send`.{group_line} (Group "
         f"threads: the full history is in `teammate_group` action=history.) You are a "
@@ -75,6 +83,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     last_hb = 0.0
     known_ids = None  # ids already seeded-at-registration or already nudged; None until seeded
     last_agent = None
+    muted = set()     # cached muted_groups for this agent; refreshed on the heartbeat tick
+    msgs_since_reminder = 0  # personality reminder fires every ~10 received messages
 
     while not stop_evt.is_set():
         if not (initialized_evt.is_set() and registered_evt.is_set()):
@@ -87,10 +97,14 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             continue
 
         # Identity (re)set: re-seed for the new inbox (Identity.set already cleared
-        # its last_seen, so both reset together).
+        # its last_seen, so both reset together). last_hb=0 forces an immediate
+        # heartbeat + muted-cache refresh for the new identity.
         if agent != last_agent:
             known_ids = None
             last_agent = agent
+            muted = set()
+            last_hb = 0.0
+            msgs_since_reminder = 0
 
         now = time.monotonic()
         if now - last_hb >= HEARTBEAT_SECONDS:
@@ -100,10 +114,19 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 lastHeartbeat=now_timestamp(),
             )
             last_hb = now
+            # Refresh the muted-groups cache (≤5s staleness for a mute to take effect) so
+            # the per-poll wake filter below never adds a disk read.
+            hb_rec = read_agent_record(root, team, agent) or {}
+            muted = set(hb_rec.get("muted_groups", []))
 
         messages = read_json_readonly(unread_file)
         if messages is not None:  # None = unreadable mid-write; skip cycle
             unread_ids = {m.get("id") for m in messages if m.get("id") is not None}
+            # MUTE: ids of unread messages in a muted group. They stay in the inbox (seen
+            # via teammate_inbox) but are excluded from the WAKE (fresh/count/targets). A
+            # record without a 'group' key (a 1:1 DM) can never be muted → never-miss-a-DM.
+            muted_ids = {m.get("id") for m in messages
+                         if m.get("id") is not None and m.get("group") in muted}
             if known_ids is None:
                 # Seed at first read after registration: messages already present are
                 # drained by the agent's startup teammate_inbox — don't nudge for them.
@@ -111,12 +134,14 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             else:
                 # Nudge only for messages the agent hasn't been shown (not in last_seen)
                 # and we haven't already nudged for (not in known_ids). Count reflects
-                # all UNSEEN unread, so a read-but-unacked message never pads it.
+                # all UNSEEN unread, so a read-but-unacked message never pads it. Muted
+                # messages are excluded from fresh/unseen (no wake) but still tracked in
+                # known_ids below, so an unmute never retro-nudges them.
                 last_seen = identity.get_last_seen() or set()
-                fresh = unread_ids - known_ids - last_seen
+                fresh = (unread_ids - muted_ids) - known_ids - last_seen
                 if fresh:
                     record = read_agent_record(root, team, agent) or {}
-                    unseen_ids = unread_ids - last_seen
+                    unseen_ids = (unread_ids - muted_ids) - last_seen
                     unseen_count = len(unseen_ids)
                     # Name the group reply target for ANY unseen (unread, not-yet-read)
                     # group message — not just the one that triggered this wake — so a
@@ -124,9 +149,31 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                     # fix). (.get guards id-less / 1:1 records, which have no 'group' key.)
                     group_targets = {m.get("group") for m in messages
                                      if m.get("id") in unseen_ids and m.get("group")}
+                    # @mention of THIS agent in any unseen message → a 🔔 note on the wake
+                    # (content-only; does not affect the count). Shared-record mentions
+                    # list, checked locally — no per-member records.
+                    mentioned = any(agent in m.get("mentions", []) for m in messages
+                                    if m.get("id") in unseen_ids and m.get("mentions"))
+                    # Name where the messages came from: DM senders (no group) + #groups.
+                    senders = {m.get("from") for m in messages
+                               if m.get("id") in unseen_ids and not m.get("group") and m.get("from")}
+                    # Personality reminder only every ~10 received messages (registration
+                    # already echoed it) — avoids per-message token waste, still guards
+                    # against forgetting. Count the fresh (new) messages this wake.
+                    msgs_since_reminder += len(fresh)
+                    if msgs_since_reminder >= 10:
+                        personality = record.get("personality")
+                        msgs_since_reminder = 0
+                    else:
+                        personality = None
                     emit_channel_event(send_message, agent, unseen_count,
-                                       record.get("personality"), groups=group_targets)
+                                       personality, groups=group_targets,
+                                       mentioned=mentioned, senders=senders)
                     known_ids |= unread_ids
+                # Absorb muted ids as "known" every cycle (even with no fresh wake) so a
+                # later unmute finds them already-known → no retro-nudge for still-unread
+                # muted messages (safe under-nudge direction).
+                known_ids |= muted_ids
                 known_ids &= unread_ids  # prune acked/removed ids; keeps the set bounded
 
         stop_evt.wait(POLL_SECONDS)

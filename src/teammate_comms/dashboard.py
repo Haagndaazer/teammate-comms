@@ -30,9 +30,11 @@ from .comms import (
     CommsError,
     get_agents_dir,
     get_groups_dir,
+    group_read_positions,
     is_channel_alive,
     read_agent_record,
     read_group_meta,
+    read_reactions,
     read_transcript,
     register_human,
     set_human_presence,
@@ -145,7 +147,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 if path == "/api/conversations":
                     return self._api_conversations()
                 if path == "/api/poll":
-                    return self._api_poll(qs.get("cursor", [""])[0])
+                    return self._api_poll(qs.get("cursor", [""])[0],
+                                          qs.get("rcursor", [""])[0])
             return self._json(404, {"error": "not found"})
         except Exception as e:  # never leak a stack to stdout / never hang the socket
             _log(f"GET {self.path} failed: {e}")
@@ -161,7 +164,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "invalid host"})
             if not self._token_ok(self.headers.get("X-Dashboard-Token")):
                 return self._json(401, {"error": "missing or invalid token"})
-            if parsed.path != "/api/send":
+            if parsed.path not in ("/api/send", "/api/react"):
                 return self._json(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length > 0 else b""
@@ -169,6 +172,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
             except (ValueError, UnicodeDecodeError):
                 return self._json(400, {"error": "invalid json"})
+            if parsed.path == "/api/react":
+                return self._api_react(payload)
             return self._api_send(payload)
         except Exception as e:
             _log(f"POST {self.path} failed: {e}")
@@ -204,16 +209,35 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 meta = read_group_meta(root, team, gp.name)
                 if not isinstance(meta, dict):
                     continue
+                members = meta.get("members", [])
+                # read-receipt positions (read-only inference from each member's _read.json)
+                reads = group_read_positions(root, team, gp.name, members)
                 groups.append({"id": "#" + gp.name, "name": gp.name,
-                               "members": meta.get("members", [])})
+                               "members": members, "reads": reads})
         dms = [{"id": "@" + peer, "peer": peer} for peer in peers]
         return self._json(200, {"me": me, "groups": groups, "roster": roster, "dms": dms})
 
-    def _api_poll(self, cursor):
+    def _api_poll(self, cursor, rcursor):
         root, team = self.server.root, self.server.team
         records = read_transcript(root, team, since=(cursor or None), limit=200)
         new_cursor = records[-1]["id"] if records else cursor
-        return self._json(200, {"records": records, "cursor": new_cursor})
+        # Reaction events sub-stream (own cursor). The frontend folds add/remove into
+        # per-message chips client-side. Ambient — never woke anyone.
+        reactions = read_reactions(root, team, since=(rcursor or None), limit=500)
+        new_rcursor = reactions[-1]["id"] if reactions else rcursor
+        return self._json(200, {"records": records, "cursor": new_cursor,
+                                "reactions": reactions, "rcursor": new_rcursor})
+
+    def _api_react(self, payload):
+        root, team, me = self.server.root, self.server.team, self.server.human_name
+        if not me:
+            return self._json(409, {"error": "no human identity registered"})
+        try:
+            rec = _tools.react(root, team, me, payload.get("target"),
+                               payload.get("emoji"), bool(payload.get("remove")))
+        except CommsError as e:
+            return self._json(400, {"error": str(e)})
+        return self._json(200, {"ok": True, "id": rec.get("id")})
 
     def _api_send(self, payload):
         root, team, me = self.server.root, self.server.team, self.server.human_name

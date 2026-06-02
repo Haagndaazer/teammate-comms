@@ -13,14 +13,17 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
-| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** (e.g. `#design`) — fans out to every member. |
-| `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). Group messages are tagged `[group: #X]`. |
+| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** — fans out to every member; `@name` (a member) flags a mention; `post_type` builds a decision trail. |
+| `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. `"all"` clears only what you've **seen** as of your last `teammate_inbox` read — arrivals since then are kept. |
-| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. |
+| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. The human operator shows as `🧑 (operator)`. |
 | `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
-| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats. Post with `teammate_send(to="#<group>")`; read the shared transcript with `history`. Open membership; `delete` is creator-only. |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. Post with `teammate_send(to="#<group>")`; `history` reads the shared transcript (filterable into a decision trail). `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's acked up to where. |
+| `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id. Ambient — shows in inbox/history but never wakes anyone. |
+| `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers). Gated by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration — verify via `teammate_list`. |
+| `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) + register the human operator as a first-class teammate. |
 
 **Startup protocol:** as soon as the session begins, call
 `teammate_register(agent: "<your-name>")` (the human/lead tells you your name) —

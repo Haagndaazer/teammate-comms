@@ -48,6 +48,7 @@ teammate-comms/
 │   ├── comms.py                # storage / registry / liveness / transcript (§8)
 │   ├── channel.py              # background inbox watcher + push (§7)
 │   ├── tools.py                # MCP tool definitions + handlers (§9)
+│   ├── spawn.py                # teammate_reincarnate launcher (argv/env builders + spawn)
 │   ├── dashboard.py            # stdlib web console server (§9, teammate_dashboard)
 │   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
 ├── hooks/
@@ -273,19 +274,21 @@ namespacing carves out subsets.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **10 tools:**
+long-lived server. **12 tools:**
 
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, profile? (`project`/`role`/`personality`/`status`/`authority`) | Establish identity, register the inbox, arm the channel. Optionally set a profile (`project` is auto-filled). Re-registering only re-establishes identity + channel and **preserves** the existing profile. |
-| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`) | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. **A `#`-prefixed `to` posts to a group** (fan-out). |
-| `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). Group messages are tagged `[group: #X]`. |
+| `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. **A `#`-prefixed `to` posts to a group** (fan-out); `@name` tokens to group members become `mentions`. |
+| `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
 | `teammate_ack` | `id` (or `"all"`) | Move a message from unread → read. |
-| `teammate_list` | — | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. |
+| `teammate_list` | — | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Humans show `🧑 (operator)` + `presence`. |
 | `teammate_whoami` | — | Resolved identity, team, comms dir, and own profile (diagnostics). |
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
-| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats (see below). |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, `sender?`/`post_type?`/`since?`/`reply_to?` (history filters) | Manage group chats (see below) + mute/unmute a group's wakes + `reads` (read receipts). |
+| `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id. Ambient — recorded in `reactions.jsonl`, shown in inbox/history/dashboard, **never wakes anyone**. |
+| `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
@@ -327,6 +330,47 @@ watcher with **no `channel.py` change**.
 - **Lifecycle:** idempotent **per process** (a second call returns the same URL; two
   instances = two consoles); the server dies when the instance exits — `server.py`'s stdio
   `finally` calls `dashboard.shutdown_dashboard()` (marks the human `away`, frees the port).
+
+**Group polish + reactions + reincarnate (added 0.6.0).**
+- **Typed posts:** an optional `post_type` (`decision`/`blocker`/`fyi`/`chatter`) on a
+  message record (additive; named `post_type` to avoid colliding with the transcript's
+  `kind` and an agent record's `type`). `teammate_group history` filters by
+  `post_type`/`sender`/`since` (id cursor) + `reply_to` — the decision trail.
+- **@mentions:** `@name` tokens (intersected with group members — no phantoms) become a
+  shared `mentions` list on the one fan-out record; each member's OWN watcher checks
+  `agent in mentions` and adds a 🔔 line to its wake (content-only, no per-member records,
+  no count change).
+- **Mute:** `muted_groups` on the member's agent record (the watcher already reads that
+  record, cached on the 5s heartbeat). The watcher's `_audible` filter drops muted-group
+  messages from the wake/count but keeps them in the inbox; `known_ids` still tracks the
+  full unread set so an unmute never retro-nudges. A 1:1 DM (no `group` key) can never be
+  muted.
+- **Read receipts:** read-only inference — `group_read_positions` reads each member's
+  `_read.json` for the max acked group-message id (no write path, no ack change). Surfaced
+  via `teammate_group reads` + dashboard ticks. An ack/seen upper bound, groups-only.
+- **Threading:** an optional `reply_to` id stored unvalidated (a citation hint), rendered
+  flat (`↳ re <id>`); `history reply_to=<id>` pulls a thread. No send-path read.
+- **Reactions:** `teammate_react` appends to an always-on (NOT transcript-gated) NDJSON
+  `reactions.jsonl` keyed by target message id (covers DMs + groups without mutating the
+  append-only records); `aggregate_reactions` folds add/remove. Ambient — the watcher
+  ignores reactions, so a 👍 never wakes anyone.
+- **Channel wake (changed):** the wake now names WHERE messages came from (DM senders +
+  `#groups`); the personality reminder fires only every ~10 received messages (the
+  registration return still echoes it), not every wake — cuts per-message token waste.
+- **`teammate_reincarnate` + `spawn.py`:** spawns a new `claude` in a terminal with
+  `TEAMMATE_AGENT` + `CLAUDE_PROJECT_DIR` in the child env (auto-register handoff).
+  Default-off gate `TEAMMATE_REINCARNATE_ENABLED`; list-form exec only (the `prompt` is a
+  single trailing argv element — no shell injection); child stdio = DEVNULL; Windows
+  `wt.exe` primary / `CREATE_NEW_CONSOLE`+`BREAKAWAY_FROM_JOB` fallback; best-effort
+  live-name collision guard (refuse only if already live). The dev channel flag stays in
+  the default launch args (custom channel, not allowlisted) — overridable via
+  `TEAMMATE_LAUNCH_ARGS`.
+- **Dashboard upgrades:** dropped the redundant "Direct messages" section (Teammates is
+  the DM entry + shows presence); added an "Observed (read-only)" section (agent↔agent
+  DMs) directly under Teammates; a right-hand live activity firehose (FIFO, newly-seen
+  records only, scroll-aware, last-200); reaction chips + a clickable emoji bar
+  (`POST /api/react`, reactions sub-stream on `/api/poll`); read-receipt ticks; field
+  chips for `post_type`/mentions/`reply_to`.
 
 **Observability transcript (added 0.5.0-dev).** To let the console show *all* messaging
 (1:1 DMs were previously ephemeral — only in `_unread.json`, gone after ack), both send

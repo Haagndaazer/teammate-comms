@@ -92,6 +92,25 @@ def validate_profile_field(name, value):
     return collapsed
 
 
+def validate_project_dir(path):
+    """Resolve + validate a project directory (exists + is a dir). Raises CommsError.
+
+    Used by teammate_reincarnate to validate the spawn target in the PARENT before
+    launching. Resolves ``..``/symlinks so the value can't smuggle traversal.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise CommsError("'project_dir' is required (an existing directory path).")
+    try:
+        p = Path(path.strip()).expanduser().resolve()
+    except OSError as e:
+        raise CommsError(f"Invalid project_dir {path!r}: {e}")
+    if not p.exists():
+        raise CommsError(f"project_dir does not exist: {p}")
+    if not p.is_dir():
+        raise CommsError(f"project_dir is not a directory: {p}")
+    return p
+
+
 def validate_group_name(name):
     """Validate a group name (with or without a leading ``#``); return the clean name.
 
@@ -443,6 +462,25 @@ def set_human_presence(root, team, name, state):
     write_agent_record(root, team, name, presence=state)
 
 
+def group_read_positions(root, team, group, members):
+    """Read-only read-receipt inference: each member's furthest-acked group-message id.
+
+    Acked messages already move to ``<member>_read.json`` (no new write path, no ack
+    change). For each member, returns the max id among their read messages tagged with
+    this group's sigil — an ack/seen upper bound (gaps possible), groups-only. Returns
+    ``{member: id_or_None}``; reads are non-destructive.
+    """
+    sigil = group if str(group).startswith("#") else f"#{group}"
+    inboxes_dir = get_inboxes_dir(root, team)
+    positions = {}
+    for member in members:
+        msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
+        ids = [m.get("id") for m in msgs
+               if isinstance(m, dict) and m.get("group") == sigil and m.get("id")]
+        positions[member] = max(ids) if ids else None
+    return positions
+
+
 def get_transcript_file(root, team=None):
     """``<root>/TeammateComms/[<team>/]transcript.jsonl`` — the global NDJSON log."""
     base = Path(root) / "TeammateComms"
@@ -501,3 +539,77 @@ def read_transcript(root, team=None, since=None, limit=200):
     if limit and limit > 0 and len(records) > limit:
         records = records[-limit:]
     return records
+
+
+# ── Reactions ───────────────────────────────────────────────────────────────────
+#
+# Emoji reactions target a message BY ID, so the same store covers DMs and group posts
+# without mutating the append-only records. Their own NDJSON log, ALWAYS written (NOT
+# gated by TEAMMATE_TRANSCRIPT — reactions are a feature, not observability). Ambient:
+# nothing about a reaction wakes anyone (the channel watcher ignores reactions).
+
+
+def get_reactions_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]reactions.jsonl`` — the append-only reaction log."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "reactions.jsonl"
+
+
+def append_reaction(root, team, record):
+    """Append one reaction event (best-effort, never-raise) to the reactions log."""
+    try:
+        path = get_reactions_file(root, team)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock_optional(path, timeout=2) as acquired:
+            if not acquired:
+                return
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[teammate-comms] reaction append skipped: {e}", file=sys.stderr, flush=True)
+
+
+def read_reactions(root, team=None, since=None, limit=None):
+    """Read reaction events (non-destructive); optional ``id >= since`` + tail ``limit``."""
+    path = get_reactions_file(root, team)
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if since and rec.get("id", "") < since:
+                    continue
+                out.append(rec)
+    except (FileNotFoundError, OSError):
+        return []
+    if limit and limit > 0 and len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def aggregate_reactions(events):
+    """Fold chronological add/remove events → ``{target: {emoji: [reactors sorted]}}``
+    (last op per (target, emoji, reactor) wins; empty sets dropped)."""
+    state = {}  # (target, emoji) -> set of reactors
+    for e in events:
+        target, emoji, who = e.get("target"), e.get("emoji"), e.get("from")
+        if not (target and emoji and who):
+            continue
+        bucket = state.setdefault((target, emoji), set())
+        if e.get("op") == "remove":
+            bucket.discard(who)
+        else:
+            bucket.add(who)
+    out = {}
+    for (target, emoji), reactors in state.items():
+        if reactors:
+            out.setdefault(target, {})[emoji] = sorted(reactors)
+    return out

@@ -25,7 +25,8 @@ primary path). Asserts both halves of the unified server:
     - teammate_update changes status; teammate_list always shows project/status/
       authority and includes personality; teammate_profile returns the full profile;
       a profile field SURVIVES a heartbeat cycle
-    - the channel wake event leads with the personality reminder
+    - the channel wake names the message source (sender/group); the personality reminder
+      is every ~10 msgs (registration echoes it), NOT every wake
 
   Channel half:
     - initialize echoes the id and advertises BOTH experimental['claude/channel']
@@ -82,6 +83,22 @@ def send(proc, obj):
     proc.stdin.flush()
 
 
+def find_response(rid, timeout=4.0):
+    """Poll stdout_lines mid-run for a response with the given id (so a later request can
+    reference a dynamic message id)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for line in list(stdout_lines):
+            try:
+                m = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if m.get("id") == rid:
+                return ((m.get("result") or {}).get("content") or [{}])[0].get("text", "")
+        time.sleep(0.1)
+    return ""
+
+
 def inboxes_dir(root):
     return Path(root) / "TeammateComms" / TEAM / "inboxes"
 
@@ -90,10 +107,11 @@ def groups_dir(root):
     return Path(root) / "TeammateComms" / TEAM / "groups"
 
 
-def append_external_message(root, to, frm, message, group=None):
+def append_external_message(root, to, frm, message, group=None, mentions=None):
     """Simulate a peer's send by appending to <to>'s unread inbox directly.
 
-    Pass ``group`` to simulate a peer posting to a group (a group-tagged record).
+    Pass ``group`` to simulate a peer posting to a group (a group-tagged record);
+    ``mentions`` to simulate an @mention list on the shared record.
     """
     d = inboxes_dir(root)
     d.mkdir(parents=True, exist_ok=True)
@@ -102,6 +120,8 @@ def append_external_message(root, to, frm, message, group=None):
     rec = {"id": f"ext-{time.time()}", "from": frm, "priority": "normal", "message": message}
     if group:
         rec["group"] = group
+    if mentions:
+        rec["mentions"] = mentions
     msgs.append(rec)
     tmp = f.with_name(f.name + ".tmp")
     tmp.write_text(json.dumps(msgs), encoding="utf-8")
@@ -238,7 +258,9 @@ def main():
     send(proc, {"jsonrpc": "2.0", "id": 30, "method": "tools/call",
                 "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})   # clear leftover (seen)
     time.sleep(0.6)
-    append_external_message(root, AGENT, PEER, "mixed-group", group=GROUP_SIGIL)  # unread group msg
+    # carries an @mention of AGENT → the wake(s) for it must include the 🔔 line
+    append_external_message(root, AGENT, PEER, "mixed-group @test-chan", group=GROUP_SIGIL,
+                            mentions=[AGENT])  # unread group msg + mention
     time.sleep(1.3)   # nudged in its own poll -> known_ids, still unseen
     append_external_message(root, AGENT, PEER, "mixed-dm")                         # 1:1 DM
     time.sleep(1.3)   # DM wake: fresh={dm}, unseen={group,dm} -> count 2, names group
@@ -257,7 +279,75 @@ def main():
                 "params": {"name": "teammate_profile", "arguments": {"agent": HUMAN}}})
     time.sleep(0.5)
 
-    # Heartbeat cycle (5s) -> confirm type:"full" AND a profile field survive the merge.
+    # Typed posts + history filters (v0.6.0): a typed group post, then history filtered by
+    # post_type (decision trail) and by a future `since` cursor (should be empty).
+    send(proc, {"jsonrpc": "2.0", "id": 34, "method": "tools/call",
+                "params": {"name": "teammate_send",
+                           "arguments": {"to": GROUP_SIGIL, "message": "ship v0.6.0",
+                                         "post_type": "decision"}}})
+    time.sleep(0.5)
+    # Reactions (v0.6.0): capture the decision post's id, react to it (ambient — no wake),
+    # then re-read history to confirm the reaction renders. add fire + thumbsup, then
+    # remove thumbsup → only fire remains; a bogus emoji is rejected.
+    decision_id = ""
+    m = re.search(r"\(id: (.+?)\)", find_response(34))
+    if m:
+        decision_id = m.group(1)
+    for rid, emoji, rm in [(47, "fire", False), (48, "thumbsup", False), (49, "thumbsup", True)]:
+        send(proc, {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                    "params": {"name": "teammate_react",
+                               "arguments": {"to_message": decision_id, "emoji": emoji, "remove": rm}}})
+    send(proc, {"jsonrpc": "2.0", "id": 50, "method": "tools/call",
+                "params": {"name": "teammate_react",
+                           "arguments": {"to_message": decision_id, "emoji": "bogus"}}})
+    time.sleep(0.4)
+    send(proc, {"jsonrpc": "2.0", "id": 35, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "history", "group": GROUP_SIGIL, "post_type": "decision"}}})
+    send(proc, {"jsonrpc": "2.0", "id": 36, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "history", "group": GROUP_SIGIL, "since": "9999"}}})
+    send(proc, {"jsonrpc": "2.0", "id": 37, "method": "tools/call",
+                "params": {"name": "teammate_send",
+                           "arguments": {"to": GROUP_SIGIL, "message": "bad type", "post_type": "bogus"}}})
+    time.sleep(0.4)
+
+    # @mentions (record level): add the human to the group, then a post mentioning a real
+    # member (PEER), the human (Operator), and a non-member (stranger). Only real members
+    # are recorded — stranger is excluded (no phantom mentions).
+    send(proc, {"jsonrpc": "2.0", "id": 38, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "add", "group": GROUP_SIGIL, "members": [HUMAN]}}})
+    send(proc, {"jsonrpc": "2.0", "id": 39, "method": "tools/call",
+                "params": {"name": "teammate_send",
+                           "arguments": {"to": GROUP_SIGIL,
+                                         "message": f"review @{PEER} @stranger @{HUMAN}",
+                                         "reply_to": "2026-01-01T00:00:00.000000"}}})
+    # history filtered to that thread (reply_to) returns this message
+    send(proc, {"jsonrpc": "2.0", "id": 45, "method": "tools/call",
+                "params": {"name": "teammate_group",
+                           "arguments": {"action": "history", "group": GROUP_SIGIL,
+                                         "reply_to": "2026-01-01T00:00:00.000000"}}})
+    time.sleep(0.5)
+
+    # ── Mute (v0.6.0) ── drain to a clean slate, mute #brainstorm, then inject a muted
+    # group message + a 1:1 DM, then unmute + inject a new group message. The watcher's
+    # muted-cache refreshes on the 5s heartbeat, so each mute/unmute is followed by a
+    # heartbeat-length wait. Invariants proven by the LAST TWO nudges (both count "1"):
+    #   - DM woke WHILE the group was muted (never-mute-a-DM) — count 1, names no group;
+    #   - the new group woke AFTER unmute (restore) — count 1, names #brainstorm;
+    #   - count 1 (not 2) on each → the muted message neither padded the count nor
+    #     retro-nudged on unmute. (The global non_one==[one "2"] assertion guards this too.)
+    send(proc, {"jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                "params": {"name": "teammate_inbox", "arguments": {}}})       # drain-read
+    send(proc, {"jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})  # clear inbox
+    send(proc, {"jsonrpc": "2.0", "id": 42, "method": "tools/call",
+                "params": {"name": "teammate_group", "arguments": {"action": "mute", "group": GROUP_SIGIL}}})
+    time.sleep(0.5)
+
+    # Heartbeat cycle (5s): refreshes the watcher's muted cache AND confirms type:"full"
+    # + a profile field survive the registry merge.
     time.sleep(5.5)
     type_after_heartbeat = None
     status_after_heartbeat = None
@@ -265,6 +355,29 @@ def main():
         rec_hb = json.loads(record.read_text(encoding="utf-8"))
         type_after_heartbeat = rec_hb.get("type")
         status_after_heartbeat = rec_hb.get("status")
+
+    append_external_message(root, AGENT, PEER, "muted-grp-msg", group=GROUP_SIGIL)  # muted → NO wake
+    time.sleep(0.6)
+    append_external_message(root, AGENT, PEER, "dm-while-muted")                    # DM → wakes (count 1)
+    time.sleep(1.3)
+    send(proc, {"jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                "params": {"name": "teammate_inbox", "arguments": {}}})   # both present (mute keeps them)
+    send(proc, {"jsonrpc": "2.0", "id": 44, "method": "tools/call",
+                "params": {"name": "teammate_group", "arguments": {"action": "unmute", "group": GROUP_SIGIL}}})
+    time.sleep(5.5)   # heartbeat clears the muted cache
+    append_external_message(root, AGENT, PEER, "after-unmute-grp", group=GROUP_SIGIL)  # wakes (count 1, names group)
+    time.sleep(1.3)
+
+    # Read receipts (read-only inference): AGENT has acked group messages (ack-all above),
+    # so its position is a real id; PEER never acked → (none acked).
+    send(proc, {"jsonrpc": "2.0", "id": 46, "method": "tools/call",
+                "params": {"name": "teammate_group", "arguments": {"action": "reads", "group": GROUP_SIGIL}}})
+    # reincarnate is GATED off by default (env has no TEAMMATE_REINCARNATE_ENABLED) → isError,
+    # and must NOT spawn anything.
+    send(proc, {"jsonrpc": "2.0", "id": 52, "method": "tools/call",
+                "params": {"name": "teammate_reincarnate",
+                           "arguments": {"agent": "Echo", "project_dir": str(REPO)}}})
+    time.sleep(0.5)
 
     proc.stdin.close()
     try:
@@ -308,12 +421,12 @@ def main():
         if init.get("result", {}).get("protocolVersion") != "2025-06-18":
             failures.append("initialize did not echo protocolVersion")
 
-    # tools/list: 10 tools, each with an object inputSchema
+    # tools/list: 12 tools, each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_ack", "teammate_list", "teammate_whoami",
                       "teammate_update", "teammate_profile", "teammate_group",
-                      "teammate_dashboard"}
+                      "teammate_react", "teammate_reincarnate", "teammate_dashboard"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:
@@ -364,9 +477,13 @@ def main():
         failures.append("no notifications/claude/channel emitted for new message")
     elif notifications[0]["params"]["meta"].get("agent") != AGENT:
         failures.append(f"channel notification meta wrong: {notifications[0]['params']['meta']}")
-    # wake event leads with the personality reminder
-    elif PERSONALITY not in notifications[0]["params"].get("content", ""):
-        failures.append(f"channel notification missing personality reminder: {notifications[0]['params'].get('content')}")
+    # v0.6.0: the wake names WHERE the message came from (the DM sender), and does NOT
+    # lead with the personality reminder (that's now every ~10 msgs + at registration, not
+    # every wake — registration echo is asserted via text(5) above).
+    elif "tester" not in notifications[0]["params"].get("content", ""):
+        failures.append(f"channel wake did not name the source/sender: {notifications[0]['params'].get('content')}")
+    elif PERSONALITY in notifications[0]["params"].get("content", ""):
+        failures.append(f"early wake wrongly included the personality reminder (should be every ~10): {notifications[0]['params'].get('content')}")
     # v0.4.2: nudge count is the UNSEEN count and is never padded by read-but-unacked
     # messages. Every message in this run is read/acked before the next arrives, so the
     # unseen count at each nudge is exactly 1 — a notification with count>1 would mean a
@@ -512,6 +629,124 @@ def main():
             failures.append("transcript missing the DM tee (kind=dm, to=peer)")
         if not any(r.get("kind") == "group" and r.get("group") == GROUP_SIGIL and "group hello" in r.get("message", "") for r in tlines):
             failures.append("transcript missing the group tee (kind=group)")
+
+    # ── typed posts + history filters (v0.6.0) ──
+    # the typed group post was teed with post_type into the durable transcript
+    transcript_log = Path(root) / "TeammateComms" / TEAM / "transcript.jsonl"
+    if transcript_log.exists():
+        tl2 = [json.loads(l) for l in transcript_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if not any(r.get("post_type") == "decision" and "ship v0.6.0" in r.get("message", "") for r in tl2):
+            failures.append("typed post not teed with post_type=decision to transcript")
+    # ── reactions (v0.6.0) ──
+    if is_error(47) or "Reacted" not in text(47):
+        failures.append(f"teammate_react add failed: {text(47)}")
+    if not is_error(50):
+        failures.append(f"bogus emoji not isError: {by_id.get(50)}")
+    # reactions.jsonl recorded add/remove events; aggregate → only fire remains on the decision
+    reactions_log = Path(root) / "TeammateComms" / TEAM / "reactions.jsonl"
+    if not reactions_log.exists():
+        failures.append("reactions.jsonl not written")
+    elif decision_id:
+        revs = [json.loads(l) for l in reactions_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if not any(r.get("target") == decision_id and r.get("emoji") == "fire" and r.get("op") == "add" for r in revs):
+            failures.append("reactions.jsonl missing the fire add event")
+        if not any(r.get("emoji") == "thumbsup" and r.get("op") == "remove" for r in revs):
+            failures.append("reactions.jsonl missing the thumbsup remove event")
+    # history renders the surviving reaction (🔥) on the decision post, and NOT 👍 (removed)
+    if "🔥" not in text(35):
+        failures.append(f"history did not render the fire reaction: {text(35)}")
+    if "👍" in text(35):
+        failures.append(f"history rendered a removed reaction (👍 should be gone): {text(35)}")
+
+    # history post_type filter returns the decision, renders the [DECISION] tag, and EXCLUDES untyped
+    if is_error(35) or "ship v0.6.0" not in text(35) or "DECISION" not in text(35):
+        failures.append(f"history post_type=decision missing the typed post: {text(35)}")
+    if "group hello" in text(35):
+        failures.append(f"history post_type=decision wrongly included an untyped post: {text(35)}")
+    # history since=<future cursor> excludes everything
+    if "has no messages" not in text(36):
+        failures.append(f"history since=future not empty: {text(36)}")
+    # a bogus post_type is rejected
+    if not is_error(37):
+        failures.append(f"bogus post_type not isError: {by_id.get(37)}")
+
+    # ── @mentions (v0.6.0) ──
+    # the wake for the mention-carrying mixed-batch message included the 🔔 line
+    if not any("🔔" in n["params"].get("content", "") for n in notifications):
+        failures.append("no channel wake carried the @mention 🔔 line")
+    # record-level: only real members are recorded (stranger excluded; human included)
+    if transcript_log.exists():
+        tl3 = [json.loads(l) for l in transcript_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        mrec = next((r for r in tl3 if "review @" in r.get("message", "")), None)
+        if not mrec:
+            failures.append("mention post not found in transcript")
+        elif sorted(mrec.get("mentions", [])) != sorted([PEER, HUMAN]):
+            failures.append(f"mentions wrong (want {PEER}+{HUMAN}, no stranger): {mrec.get('mentions')}")
+        # threading: the reply_to hint was stored on the same record
+        elif mrec.get("reply_to") != "2026-01-01T00:00:00.000000":
+            failures.append(f"reply_to hint not stored: {mrec.get('reply_to')}")
+    # history reply_to filter returns the threaded message + renders the ↳ note
+    if is_error(45) or "review @" not in text(45) or "↳ re 2026-01-01" not in text(45):
+        failures.append(f"history reply_to filter/render wrong: {text(45)}")
+
+    # ── read receipts (v0.6.0, read-only inference) ──
+    if is_error(46) or "read positions" not in text(46):
+        failures.append(f"reads action failed: {text(46)}")
+    # AGENT acked group messages → a real position (not "(none acked)"); PEER never acked
+    if f"{AGENT}: (none acked)" in text(46) or f"{AGENT}: " not in text(46):
+        failures.append(f"reads: AGENT should have an acked group position: {text(46)}")
+    if f"{PEER}: (none acked)" not in text(46):
+        failures.append(f"reads: PEER never acked, should be (none acked): {text(46)}")
+
+    # ── mute (v0.6.0) ──
+    if is_error(42) or "Muted" not in text(42):
+        failures.append(f"mute action failed: {text(42)}")
+    if is_error(44) or "Unmuted" not in text(44):
+        failures.append(f"unmute action failed: {text(44)}")
+    # mute keeps messages in the inbox (it removes the WAKE, not the message)
+    if "muted-grp-msg" not in text(43) or "dm-while-muted" not in text(43):
+        failures.append(f"mute dropped a message from the inbox (should keep both): {text(43)}")
+    # the last two wakes prove the invariants:
+    if len(notifications) < 2:
+        failures.append("expected DM + post-unmute wakes for the mute test")
+    else:
+        dm_wake, grp_wake = notifications[-2], notifications[-1]
+        # [-2] = the DM that woke WHILE the group was muted: count 1, names NO group
+        if dm_wake["params"]["meta"].get("count") != "1" or "to:'#" in dm_wake["params"].get("content", ""):
+            failures.append(f"never-mute-a-DM: DM wake wrong (want count 1, no group): {dm_wake['params']}")
+        # [-1] = the new group post AFTER unmute: count 1 (no retro-nudge of the muted msg), names group
+        if grp_wake["params"]["meta"].get("count") != "1" or f"to:'{GROUP_SIGIL}'" not in grp_wake["params"].get("content", ""):
+            failures.append(f"unmute restore wrong (want count 1 naming {GROUP_SIGIL}): {grp_wake['params']}")
+
+    # ── teammate_reincarnate (v0.6.0) ──
+    # gate-off path (no TEAMMATE_REINCARNATE_ENABLED) is isError + spawns nothing
+    if not is_error(52) or "disabled" not in text(52):
+        failures.append(f"reincarnate gate-off not isError/disabled: {by_id.get(52)}")
+    # spawn.py pure builders (NO real spawn): list-form safety + handoff env + dir validation
+    try:
+        sys.path.insert(0, str(SRC))
+        from teammate_comms import spawn as _spawn
+        from teammate_comms.comms import validate_project_dir as _vpd, CommsError as _CE
+        hostile = "evil; rm -rf / & $(whoami) `id` | nc"
+        argv = _spawn.build_claude_command(hostile)
+        if "--permission-mode" not in argv or "bypassPermissions" not in argv:
+            failures.append(f"build_claude_command missing bypassPermissions: {argv}")
+        if argv[-1] != hostile:   # hostile prompt stays ONE argv element → no shell injection
+            failures.append(f"prompt not a single trailing argv element (injection risk): {argv}")
+        if "--name" in argv:
+            failures.append("build_claude_command should not pass --name (print-only)")
+        cenv = _spawn.build_child_env({}, "Echo", "/proj", team="t", comms_dir="/c")
+        if cenv.get("TEAMMATE_AGENT") != "Echo" or cenv.get("CLAUDE_PROJECT_DIR") != "/proj":
+            failures.append(f"build_child_env missing handoff vars: {cenv}")
+        if cenv.get("TEAMMATE_TEAM") != "t" or cenv.get("TEAMMATE_COMMS_DIR") != "/c":
+            failures.append(f"build_child_env missing team/comms_dir: {cenv}")
+        try:
+            _vpd("/no/such/dir/xyz123")
+            failures.append("validate_project_dir accepted a missing directory")
+        except _CE:
+            pass
+    except Exception as e:
+        failures.append(f"spawn unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

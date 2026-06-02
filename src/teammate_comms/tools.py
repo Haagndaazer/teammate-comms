@@ -14,11 +14,14 @@ JSON-RPC stream. Diagnostics go to stderr; failures go into the envelope.
 
 import json
 import os
+import re
 
 from .comms import (
     PROFILE_FIELDS,
     CommsError,
+    aggregate_reactions,
     append_group_message,
+    append_reaction,
     append_transcript,
     delete_group,
     ensure_inbox,
@@ -27,22 +30,36 @@ from .comms import (
     get_group_dir,
     get_groups_dir,
     get_inboxes_dir,
+    group_read_positions,
     is_channel_alive,
     now_timestamp,
     read_agent_record,
     read_group_messages,
     read_group_meta,
     read_json_safe,
+    read_reactions,
     validate_agent_name,
     validate_group_name,
     validate_profile_field,
+    validate_project_dir,
     write_agent_record,
     write_group_meta,
     write_json_atomic,
 )
 
 _PRIORITIES = ("normal", "urgent")
-_GROUP_ACTIONS = ("create", "delete", "join", "leave", "add", "members", "history")
+_GROUP_ACTIONS = ("create", "delete", "join", "leave", "add", "members", "history",
+                  "mute", "unmute", "reads")
+# Optional post label (a decision trail axis) — distinct from a message's transport
+# `kind` (dm/group) and an agent record's `type` (full/human). Default: untyped.
+_POST_TYPES = ("decision", "blocker", "fyi", "chatter")
+# Fixed basic emoji-reaction set (name → glyph). React to any message by id.
+_REACTIONS = {"thumbsup": "👍", "rofl": "🤣", "smile": "😄", "cry": "😢", "100": "💯", "fire": "🔥"}
+
+
+def _reaction_summary(reactions_by_emoji):
+    """Render a {emoji: [reactors]} dict as a compact summary line ('👍 2  🔥 1')."""
+    return "  ".join(f"{_REACTIONS.get(e, e)} {len(who)}" for e, who in reactions_by_emoji.items())
 
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
@@ -134,6 +151,15 @@ TOOL_DEFINITIONS = [
                     "enum": list(_PRIORITIES),
                     "description": "Message priority (default 'normal').",
                 },
+                "post_type": {
+                    "type": "string",
+                    "enum": list(_POST_TYPES),
+                    "description": "Optional post label — turns the thread into a decision trail (decision | blocker | fyi | chatter). Default untyped.",
+                },
+                "reply_to": {
+                    "type": "string",
+                    "description": "Optional id of the message this replies to (a threading hint/citation; rendered flat as '↳ re <id>').",
+                },
             },
             "required": ["to", "message"],
         },
@@ -208,7 +234,8 @@ TOOL_DEFINITIONS = [
             "action='history' as the canonical record (it survives inbox acks). "
             "Membership is open (anyone can join/add). Actions: create, delete "
             "(creator-only), join, leave, add (members), members (list), history (read "
-            "the shared transcript; optionally filter by 'sender')."
+            "the shared transcript; optionally filter by 'sender', 'post_type', and a "
+            "'since' id cursor — the decision trail)."
         ),
         "inputSchema": {
             "type": "object",
@@ -216,7 +243,7 @@ TOOL_DEFINITIONS = [
                 "action": {
                     "type": "string",
                     "enum": list(_GROUP_ACTIONS),
-                    "description": "create | delete | join | leave | add | members | history",
+                    "description": "create | delete | join | leave | add | members | history | mute | unmute (silence/restore this group's channel wakes for you; messages still arrive) | reads (who has acked up to where)",
                 },
                 "group": {"type": "string", "description": "Group name (a leading '#' is optional)."},
                 "members": {
@@ -226,8 +253,52 @@ TOOL_DEFINITIONS = [
                 },
                 "limit": {"type": "integer", "description": "For 'history': max messages to return (default 50)."},
                 "sender": {"type": "string", "description": "For 'history': only show messages from this teammate."},
+                "post_type": {"type": "string", "enum": list(_POST_TYPES), "description": "For 'history': only show posts of this type (the decision trail)."},
+                "since": {"type": "string", "description": "For 'history': only show messages with id >= this cursor (e.g. 'everything since I last checked')."},
+                "reply_to": {"type": "string", "description": "For 'history': only show replies to this message id (a thread)."},
             },
             "required": ["action", "group"],
+        },
+    },
+    {
+        "name": "teammate_react",
+        "description": (
+            "React to a message (by its id) with a basic emoji — thumbsup, rofl, smile, "
+            "cry, 100, or fire. Reactions are AMBIENT: they appear in teammate_inbox / "
+            "teammate_group history / the dashboard but never wake anyone. Pass "
+            "remove=true to take your reaction back."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to_message": {"type": "string", "description": "Id of the message to react to (shown in inbox/history)."},
+                "emoji": {"type": "string", "enum": list(_REACTIONS), "description": "thumbsup | rofl | smile | cry | 100 | fire"},
+                "remove": {"type": "boolean", "description": "Remove your reaction instead of adding it."},
+            },
+            "required": ["to_message", "emoji"],
+        },
+    },
+    {
+        "name": "teammate_reincarnate",
+        "description": (
+            "Spawn a NEW Claude Code teammate in a new terminal window, in a given "
+            "project directory, as a named teammate (often a known offline one). It "
+            "auto-registers + arms its channel and becomes reachable on the shared comms. "
+            "GATED: disabled unless TEAMMATE_REINCARNATE_ENABLED is truthy (it launches OS "
+            "processes). Confirms LAUNCH, not registration — verify with teammate_list a "
+            "few seconds later. The spawned window may need one human approval to arm the "
+            "custom channel."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Teammate name to (re)spawn."},
+                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the child's cwd AND CLAUDE_PROJECT_DIR)."},
+                "prompt": {"type": "string", "description": "Optional first instruction (defaults to an inbox-drain bootstrap)."},
+                "team": {"type": "string", "description": "Optional team (namespaced inboxes)."},
+                "comms_dir": {"type": "string", "description": "Optional comms-root override (default: inherit the shared global root)."},
+            },
+            "required": ["agent", "project_dir"],
         },
     },
     {
@@ -298,6 +369,30 @@ def _clean_priority(priority):
     return priority
 
 
+def _clean_post_type(value):
+    """Validate the optional post label. None/'' → None (untyped; store no key)."""
+    if value is None or value == "":
+        return None
+    if value not in _POST_TYPES:
+        raise CommsError(f"'post_type' must be one of {list(_POST_TYPES)}.")
+    return value
+
+
+_MENTION_RE = re.compile(r"@([a-zA-Z0-9][a-zA-Z0-9._-]*)")
+
+
+def _parse_mentions(content, members):
+    """Extract @name tokens from the body, keep only actual group members (no phantom
+    mentions of non-members), de-duped + order-preserved."""
+    members = set(members or [])
+    seen, out = set(), []
+    for name in _MENTION_RE.findall(content or ""):
+        if name in members and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
 def _validate_message(args):
     """Return the trimmed message body, or raise CommsError."""
     return _clean_message(args.get("message"))
@@ -307,7 +402,7 @@ def _validate_priority(args):
     return _clean_priority(args.get("priority", "normal"))
 
 
-def send_dm(root, team, sender, to, message, priority="normal"):
+def send_dm(root, team, sender, to, message, priority="normal", post_type=None, reply_to=None):
     """Core: deliver a 1:1 DM as ``sender``; return a dict for the wrapper to format.
 
     Sender-explicit (not derived from any MCP identity) so the dashboard can post AS
@@ -323,12 +418,17 @@ def send_dm(root, team, sender, to, message, priority="normal"):
         )
     content = _clean_message(message)
     priority = _clean_priority(priority)
+    pt = _clean_post_type(post_type)
 
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, to)
     unread_file = inboxes_dir / f"{to}_unread.json"
 
     record = {"id": now_timestamp(), "from": sender, "priority": priority, "message": content}
+    if pt:
+        record["post_type"] = pt  # additive: flows to inbox + NDJSON transcript
+    if isinstance(reply_to, str) and reply_to.strip():
+        record["reply_to"] = reply_to.strip()  # unvalidated hint (a citation)
     with file_lock(unread_file):
         messages = read_json_safe(unread_file)
         messages.append(record)
@@ -353,7 +453,8 @@ def _handle_send(args, ctx):
     if to.startswith("#"):
         return _send_to_group(agent, team, root, to, args)
 
-    res = send_dm(root, team, agent, to, args.get("message"), args.get("priority", "normal"))
+    res = send_dm(root, team, agent, to, args.get("message"), args.get("priority", "normal"),
+                  post_type=args.get("post_type"), reply_to=args.get("reply_to"))
 
     lines = [f"Message sent to {to} (id: {res['id']})."]
     if res["to_type"] == "full":
@@ -390,13 +491,21 @@ def _handle_inbox(args, ctx):
     if not messages:
         return "No unread messages."
 
+    rx_all = aggregate_reactions(read_reactions(root, team))
     out = [f"=== {len(messages)} unread message(s) for {agent} ==="]
     for msg in messages:
         tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
         grp = msg.get("group")
         gtag = f" [👥 group: {grp}]" if grp else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{tag} ---")
+        ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
+        mtag = " 🔔(@you)" if agent in (msg.get("mentions") or []) else ""
+        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{ptag}{tag}{mtag} ---")
+        if msg.get("reply_to"):
+            out.append(f"    ↳ re {msg['reply_to']}")
         out.append(str(msg.get("message", "")))
+        rx = rx_all.get(msg.get("id"))
+        if rx:
+            out.append("    " + _reaction_summary(rx))
     return "\n".join(out)
 
 
@@ -570,7 +679,7 @@ def _group_meta_file(root, team, group):
     return get_group_dir(root, team, group) / "meta.json"
 
 
-def send_group(root, team, sender, to_sigil, message, priority="normal"):
+def send_group(root, team, sender, to_sigil, message, priority="normal", post_type=None, reply_to=None):
     """Core: post to a group as ``sender``; return fan-out accounting for the wrapper.
 
     Sender-explicit so the dashboard can post AS the human. Writes the canonical
@@ -589,6 +698,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal"):
         )
     content = _clean_message(message)
     priority = _clean_priority(priority)
+    pt = _clean_post_type(post_type)
 
     # Open membership: posting auto-joins the sender (re-read under lock to add).
     members = list(meta.get("members", []))
@@ -603,6 +713,15 @@ def send_group(root, team, sender, to_sigil, message, priority="normal"):
 
     record = {"id": now_timestamp(), "from": sender, "group": sigil,
               "priority": priority, "message": content}
+    if pt:
+        record["post_type"] = pt  # additive: flows to inbox + group transcript + NDJSON
+    # @mentions: shared list on the one record; each member's own watcher checks if IT is
+    # mentioned (no per-member records). Only real members (no phantoms).
+    mentions = _parse_mentions(content, members)
+    if mentions:
+        record["mentions"] = mentions
+    if isinstance(reply_to, str) and reply_to.strip():
+        record["reply_to"] = reply_to.strip()  # unvalidated hint (a citation)
 
     # Group transcript is the canonical, ordered source of truth — write it first.
     append_group_message(root, team, group, record)
@@ -635,7 +754,8 @@ def send_group(root, team, sender, to_sigil, message, priority="normal"):
 
 def _send_to_group(agent, team, root, to_sigil, args):
     """Thin wrapper: format send_group()'s accounting into the human-readable summary."""
-    res = send_group(root, team, agent, to_sigil, args.get("message"), args.get("priority", "normal"))
+    res = send_group(root, team, agent, to_sigil, args.get("message"), args.get("priority", "normal"),
+                     post_type=args.get("post_type"), reply_to=args.get("reply_to"))
     delivered, live, deferred = res["delivered"], res["live"], res["deferred"]
     lines = [f"Posted to {res['sigil']} (id: {res['id']})."]
     if delivered:
@@ -740,6 +860,37 @@ def _handle_group(args, ctx):
         return (f"{sigil} — creator: {meta.get('creator')}, "
                 f"members ({len(mem)}): {', '.join(mem) or '(none)'}.")
 
+    if action in ("mute", "unmute"):
+        # Per-member preference on the caller's OWN agent record (the watcher already
+        # reads that record). Muting silences the channel WAKE for the group; messages
+        # still land in your inbox + the transcript. Never affects 1:1 DMs.
+        rec = read_agent_record(root, team, agent) or {}
+        muted = set(rec.get("muted_groups", []))
+        if action == "mute":
+            muted.add(sigil)
+        else:
+            muted.discard(sigil)
+        if not write_agent_record(root, team, agent, timeout=5, muted_groups=sorted(muted)):
+            raise CommsError("Could not update mute settings (registry busy). Try again.")
+        verb = "Muted" if action == "mute" else "Unmuted"
+        return (f"{verb} {sigil}. " + (
+            f"Its messages still land in your inbox (no channel wake). Now muted: "
+            f"{', '.join(sorted(muted)) or '(none)'}." if action == "mute"
+            else f"You'll be woken by {sigil} again. Still muted: "
+                 f"{', '.join(sorted(muted)) or '(none)'}."))
+
+    if action == "reads":
+        # Read-only read receipts (ack/seen position per member, inferred from _read.json).
+        meta = read_group_meta(root, team, group)
+        if meta is None:
+            raise CommsError(f"No group {sigil!r}.")
+        members = meta.get("members", [])
+        positions = group_read_positions(root, team, group, members)
+        lines = [f"{sigil} read positions (furthest-acked group message per member):"]
+        for m in members:
+            lines.append(f"  - {m}: {positions.get(m) or '(none acked)'}")
+        return "\n".join(lines)
+
     # action == "history"
     if read_group_meta(root, team, group) is None:
         raise CommsError(f"No group {sigil!r}.")
@@ -747,23 +898,120 @@ def _handle_group(args, ctx):
     if not isinstance(limit, int) or limit <= 0:
         limit = 50
     messages = read_group_messages(root, team, group)
-    # Filter by sender FIRST, then take the last `limit` (so limit counts post-filter).
+    # Filters compose, applied BEFORE the last-`limit` slice (so limit counts post-filter):
+    # sender, post_type, and a `since` id cursor (lexical >=, reusing read_transcript's
+    # scheme — ids are zero-padded TIMESTAMP_FMT, so string compare is chronological).
+    filt = []
     sender = args.get("sender")
-    by = ""
     if sender is not None:
         validate_agent_name(sender)
         messages = [m for m in messages if m.get("from") == sender]
-        by = f" from {sender}"
+        filt.append(f"from {sender}")
+    post_type = _clean_post_type(args.get("post_type"))
+    if post_type:
+        messages = [m for m in messages if m.get("post_type") == post_type]
+        filt.append(f"type={post_type}")
+    since = args.get("since")
+    if isinstance(since, str) and since:
+        messages = [m for m in messages if m.get("id", "") >= since]
+        filt.append(f"since {since}")
+    reply_to = args.get("reply_to")
+    if isinstance(reply_to, str) and reply_to:
+        messages = [m for m in messages if m.get("reply_to") == reply_to]
+        filt.append(f"replies to {reply_to}")
+    by = (" [" + ", ".join(filt) + "]") if filt else ""
     if not messages:
         return f"{sigil} has no messages{by} yet."
     total = len(messages)
     recent = messages[-limit:]
+    rx_all = aggregate_reactions(read_reactions(root, team))
     out = [f"=== {sigil} transcript{by} ({len(recent)} of {total} message(s)) ==="]
     for msg in recent:
         urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{urgent} ---")
+        ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
+        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{ptag}{urgent} ---")
+        if msg.get("reply_to"):
+            out.append(f"    ↳ re {msg['reply_to']}")
         out.append(str(msg.get("message", "")))
+        rx = rx_all.get(msg.get("id"))
+        if rx:
+            reactors = "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in rx.items())
+            out.append(f"    reactions: {reactors}")
     return "\n".join(out)
+
+
+def react(root, team, reactor, target, emoji, remove=False):
+    """Core: append a reaction add/remove event as ``reactor`` (sender-explicit so the
+    dashboard reacts AS the human). Ambient — no channel wake."""
+    if not isinstance(target, str) or not target.strip():
+        raise CommsError("'to_message' is required (the id of the message to react to).")
+    if emoji not in _REACTIONS:
+        raise CommsError(f"'emoji' must be one of {list(_REACTIONS)}.")
+    record = {"id": now_timestamp(), "target": target.strip(), "from": reactor,
+              "emoji": emoji, "op": "remove" if remove else "add"}
+    append_reaction(root, team, record)
+    return record
+
+
+def _handle_react(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    remove = bool(args.get("remove"))
+    emoji = args.get("emoji")
+    rec = react(root, team, agent, args.get("to_message"), emoji, remove)
+    glyph = _REACTIONS[emoji]
+    if remove:
+        return f"Removed your {glyph} ({emoji}) from message {rec['target']}."
+    return f"Reacted {glyph} ({emoji}) to message {rec['target']}."
+
+
+def _reincarnate_enabled():
+    v = os.environ.get("TEAMMATE_REINCARNATE_ENABLED")
+    return bool(v) and v.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _handle_reincarnate(args, ctx):
+    # Gate first (cheap) — opt-in only; spawning OS processes from a tool is high-power.
+    if not _reincarnate_enabled():
+        raise CommsError(
+            "teammate_reincarnate is disabled. Set TEAMMATE_REINCARNATE_ENABLED=1 in the "
+            "server's environment to enable it (it launches a new OS terminal + Claude "
+            "instance)."
+        )
+    agent, team, root = _require_registered(ctx)
+    target = args.get("agent")
+    validate_agent_name(target)
+    project_dir = validate_project_dir(args.get("project_dir"))
+    # Best-effort live-name collision guard (TOCTOU — the child's own auto-register only
+    # WARNS, server.py): refuse only if the name is already a LIVE channel. Reincarnating
+    # an OFFLINE name is the whole point.
+    existing = read_agent_record(root, team, target)
+    if existing and is_channel_alive(existing):
+        raise CommsError(
+            f"{target!r} is already live (pid={existing.get('pid')}, "
+            f"host={existing.get('host')}). Reincarnate is for OFFLINE teammates."
+        )
+    prompt = args.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = (f"You are {target}. Call teammate_inbox to drain any queued messages, "
+                  f"then await instructions.")
+    team_arg = (args.get("team") or "").strip() or team
+    comms_dir = args.get("comms_dir")
+
+    from . import spawn
+    argv = spawn.build_claude_command(prompt)
+    env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir)
+    try:
+        spawn.spawn_in_terminal(argv, project_dir, env)
+    except FileNotFoundError as e:
+        raise CommsError(f"Could not launch a terminal/claude: {e}")
+    except OSError as e:
+        raise CommsError(f"Spawn failed: {e}")
+    return (
+        f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
+        f"It will auto-register and arm its channel (approve the channel-load prompt in "
+        f"the new window if shown). This confirms LAUNCH, not registration — run "
+        f"teammate_list in a few seconds to see {target} go live."
+    )
 
 
 def _handle_dashboard(args, ctx):
@@ -796,6 +1044,8 @@ _HANDLERS = {
     "teammate_update": _handle_update,
     "teammate_profile": _handle_profile,
     "teammate_group": _handle_group,
+    "teammate_react": _handle_react,
+    "teammate_reincarnate": _handle_reincarnate,
     "teammate_dashboard": _handle_dashboard,
 }
 
