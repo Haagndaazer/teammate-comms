@@ -1,3 +1,3 @@
 """teammate-comms — agent-to-agent messaging + channel idle-wake for Claude Code."""
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"

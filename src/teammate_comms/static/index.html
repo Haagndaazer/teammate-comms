@@ -193,12 +193,12 @@ function renderNav() {
   const observed = [...convs.keys()].filter(k => k[0] === "~").sort();
 
   nav.appendChild(section("Channels", channels.map(id => navItem(id, convs.get(id).label, null))));
-  // Teammates = the sole DM entry point (also shows who's online)
+  // Teammates = the sole DM entry point (shows who's online + their project)
   nav.appendChild(section("Teammates", roster.map(r => {
-    const it = navItem("@" + r.agent, r.agent, r.online);
-    if (r.agent === ME) it.appendChild(span("meta", " (you)"));
-    else if (r.type === "human") it.appendChild(span("meta", " 🧑"));
-    return it;
+    let sub = r.project ? `(${r.project})` : "";          // e.g. Unger (TestSVN)
+    if (r.agent === ME) sub = ("(you) " + sub).trim();
+    else if (r.type === "human") sub = ("🧑 " + sub).trim();
+    return navItem("@" + r.agent, r.agent, r.online, sub);
   })));
   // Observed = read-only agent↔agent DMs, directly below Teammates
   nav.appendChild(section("Observed (read-only)", observed.map(id => navItem(id, convs.get(id).label, null))));
@@ -212,11 +212,12 @@ function section(label, items) {
   return s;
 }
 
-function navItem(id, label, online) {
+function navItem(id, label, online, sub) {
   const it = el("div", "item" + (id === current ? " active" : ""));
   if (online !== null && online !== undefined) it.appendChild(el("span", "dot" + (online ? " on" : "")));
   else it.appendChild(span("pre", id[0] === "#" ? "#" : (id[0] === "~" ? "~" : "@")));
   it.appendChild(span(null, id[0] === "#" ? label.replace(/^#/, "") : label));
+  if (sub) it.appendChild(span("meta", " " + sub));   // e.g. teammate's project
   // unread badge for channels + teammate DMs (never observed: no ME participant there)
   if (id[0] !== "~") { const n = unreadCount(id); if (n > 0) it.appendChild(span("badge", String(n))); }
   it.addEventListener("click", () => selectConv(id));
