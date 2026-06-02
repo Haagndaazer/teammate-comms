@@ -545,8 +545,13 @@ def read_transcript(root, team=None, since=None, limit=200):
 #
 # Emoji reactions target a message BY ID, so the same store covers DMs and group posts
 # without mutating the append-only records. Their own NDJSON log, ALWAYS written (NOT
-# gated by TEAMMATE_TRANSCRIPT — reactions are a feature, not observability). Ambient:
-# nothing about a reaction wakes anyone (the channel watcher ignores reactions).
+# gated by TEAMMATE_TRANSCRIPT — reactions are a feature, not observability). A reaction
+# wakes ONLY the author of the reacted-to message (its `target_from`), via the channel
+# watcher — never the group, never the reactor, never on `remove`.
+
+# Fixed basic emoji-reaction set (name → glyph). Single source — imported by tools.py
+# (as _REACTIONS) and channel.py (to render glyphs in a reaction wake).
+REACTION_EMOJI = {"thumbsup": "👍", "rofl": "🤣", "smile": "😄", "cry": "😢", "100": "💯", "fire": "🔥"}
 
 
 def get_reactions_file(root, team=None):

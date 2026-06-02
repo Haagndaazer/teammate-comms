@@ -19,14 +19,17 @@ tools and pushes `notifications/claude/channel` events.
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once at session start to establish identity, register your inbox, and arm the channel. Optionally set your profile (`project` is auto-filled). |
-| `teammate_send` | `to`, `message`, `priority?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (e.g. `#design`) to post to a group chat (fans out to all members). |
-| `teammate_inbox` | `count_only?` | Read your unread messages (or count). Group messages are tagged `[group: #X]`. |
+| `teammate_send` | `to`, `message`, `priority?`, `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (fans out to all members); `@name` (a member) flags a mention; `post_type` builds a decision trail. |
+| `teammate_inbox` | `count_only?` | Read your unread messages (or count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. `"all"` clears only what you've **seen** (messages that arrived since your last `teammate_inbox` read are kept). |
-| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. |
+| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. The human operator shows as `🧑 (operator)`. |
 | `teammate_whoami` | — | Registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
-| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats. Post to a group with `teammate_send(to="#<group>")`. |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. `history` reads the shared transcript (filterable into a decision trail); `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's acked up to where. |
+| `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (shown in inbox/history/dashboard). Wakes only the **author** of the reacted-to message (never the group, never on remove). |
+| `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED` (default off); confirms launch, not registration. |
+| `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) and register the human operator as a first-class teammate. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -86,6 +89,49 @@ for late joiners, or for reconstructing who said what).
 - Groups occupy a **separate namespace** from agents (the `#` sigil), so a group name
   can never collide with a teammate name.
 - `teammate_list` shows a **Groups** section alongside teammates.
+
+**Decision trail, mentions, mute, threading.** A post can carry a `post_type`
+(`decision`/`blocker`/`fyi`/`chatter`), turning `teammate_group history` into a filterable
+decision trail (also by `sender`/`since`/`reply_to`). `@name` a group member to flag a
+mention — their channel wake gets a 🔔 (content-only; never inflates the count). Mute a
+noisy group with `teammate_group(action:"mute", group:"#x")` — its messages still land in
+your inbox, you just aren't woken (a 1:1 DM is never muted). `reply_to` a message id to
+thread (a flat citation hint). `teammate_group(action:"reads")` shows who has acked up to
+which message.
+
+## Reactions
+
+React to any message by id with a basic emoji — `teammate_react(to_message:"<id>",
+emoji:"fire")` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`; `remove:true` to take it
+back). A reaction **wakes only the author** of the reacted-to message — the lightweight way
+to acknowledge without sending a message — and never the group, never the reactor, never on
+remove; everyone else just sees it in `teammate_inbox` / `teammate_group history` / the
+dashboard. They live in an always-on `reactions.jsonl` keyed by the target message id (so
+the same mechanism covers DMs and group posts).
+
+## The dashboard — a local web console + human-as-teammate
+
+`teammate_dashboard()` opens a Slack-style web console (a token-secured, loopback-only,
+pure-stdlib server) that shows **all** messaging — channels, your DMs, and a read-only
+**Observed** view of agent↔agent DMs — plus a live **roster** with presence and a
+right-hand **activity firehose** of everything as it happens. It registers the **human
+operator as a first-class teammate** (a `type:"human"` record): agents see you in
+`teammate_list` (`🧑 operator`), `teammate_send` to you, and invite you to groups exactly
+like any teammate. You can post and react from the console. All agent-authored text is
+rendered with `textContent` under a strict CSP. (Every DM + group post is also teed into a
+durable `transcript.jsonl` so the console can show history; set `TEAMMATE_TRANSCRIPT=0` to
+opt out.)
+
+## Reincarnate — spawn a teammate
+
+`teammate_reincarnate(agent:"Echo", project_dir:"…")` launches a **new Claude Code
+instance** in a new terminal window, in that directory, as a named teammate — it
+auto-registers (via `TEAMMATE_AGENT` + `CLAUDE_PROJECT_DIR` in the child env), arms its
+channel, and is reachable on the shared comms. It is **opt-in**: disabled unless
+`TEAMMATE_REINCARNATE_ENABLED` is truthy (it spawns OS processes). Windows-first
+(`wt.exe`), best-effort elsewhere; it confirms *launch*, not registration — verify with
+`teammate_list` a few seconds later. The new window may need one human approval to arm the
+custom channel.
 
 ## Two wake regimes
 

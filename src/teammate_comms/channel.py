@@ -25,7 +25,14 @@ import os
 import socket
 import time
 
-from .comms import now_timestamp, read_agent_record, read_json_readonly, write_agent_record
+from .comms import (
+    REACTION_EMOJI,
+    now_timestamp,
+    read_agent_record,
+    read_json_readonly,
+    read_reactions,
+    write_agent_record,
+)
 
 HEARTBEAT_SECONDS = 5
 POLL_SECONDS = 0.5
@@ -73,6 +80,30 @@ def emit_channel_event(send_message, agent, count, personality=None, groups=None
     })
 
 
+def emit_reaction_event(send_message, agent, reactions):
+    """Wake the AUTHOR of reacted-to messages. A reaction is an acknowledgement — nothing
+    to reply to. Distinct ``meta.kind="reaction"`` so consumers separate it from message
+    wakes (e.g. it never participates in the unseen-message count)."""
+    parts, seen = [], set()
+    for r in reactions[-6:]:
+        who, em = r.get("from"), r.get("emoji")
+        if (who, em) in seen:
+            continue
+        seen.add((who, em))
+        parts.append(f"{who} {REACTION_EMOJI.get(em, em)}")
+    content = (
+        f"💬 New reaction(s) on your message(s): {', '.join(parts)}. "
+        f"An acknowledgement — nothing to reply to (see them in `teammate_inbox` / "
+        f"`teammate_group` action=history)."
+    )
+    send_message({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {"content": content,
+                   "meta": {"count": str(len(reactions)), "agent": agent, "kind": "reaction"}},
+    })
+
+
 def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
     """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
 
@@ -85,6 +116,7 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     last_agent = None
     muted = set()     # cached muted_groups for this agent; refreshed on the heartbeat tick
     msgs_since_reminder = 0  # personality reminder fires every ~10 received messages
+    known_reaction_ids = None  # reaction ids already seeded/woken; None until first read
 
     while not stop_evt.is_set():
         if not (initialized_evt.is_set() and registered_evt.is_set()):
@@ -105,6 +137,7 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             muted = set()
             last_hb = 0.0
             msgs_since_reminder = 0
+            known_reaction_ids = None
 
         now = time.monotonic()
         if now - last_hb >= HEARTBEAT_SECONDS:
@@ -118,6 +151,23 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             # the per-poll wake filter below never adds a disk read.
             hb_rec = read_agent_record(root, team, agent) or {}
             muted = set(hb_rec.get("muted_groups", []))
+            # Reaction wakes (low-volume → only on the 5s heartbeat tick, not every poll):
+            # wake the AUTHOR of a reacted-to message. Seed at first read (no startup wake);
+            # then re-bind known_reaction_ids to the current tail (bounds it + prevents
+            # re-wakes). Only op=add, only target_from==me, never the reactor (from!=me).
+            reactions = read_reactions(root, team, limit=500)
+            rids = {r.get("id") for r in reactions if r.get("id")}
+            if known_reaction_ids is None:
+                known_reaction_ids = set(rids)
+            else:
+                fresh_rx = [r for r in reactions
+                            if r.get("id") not in known_reaction_ids
+                            and r.get("op") == "add"
+                            and r.get("target_from") == agent
+                            and r.get("from") != agent]
+                if fresh_rx:
+                    emit_reaction_event(send_message, agent, fresh_rx)
+                known_reaction_ids = set(rids)
 
         messages = read_json_readonly(unread_file)
         if messages is not None:  # None = unreadable mid-write; skip cycle

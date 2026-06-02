@@ -18,6 +18,7 @@ import re
 
 from .comms import (
     PROFILE_FIELDS,
+    REACTION_EMOJI,
     CommsError,
     aggregate_reactions,
     append_group_message,
@@ -38,6 +39,7 @@ from .comms import (
     read_group_meta,
     read_json_safe,
     read_reactions,
+    read_transcript,
     validate_agent_name,
     validate_group_name,
     validate_profile_field,
@@ -53,8 +55,8 @@ _GROUP_ACTIONS = ("create", "delete", "join", "leave", "add", "members", "histor
 # Optional post label (a decision trail axis) — distinct from a message's transport
 # `kind` (dm/group) and an agent record's `type` (full/human). Default: untyped.
 _POST_TYPES = ("decision", "blocker", "fyi", "chatter")
-# Fixed basic emoji-reaction set (name → glyph). React to any message by id.
-_REACTIONS = {"thumbsup": "👍", "rofl": "🤣", "smile": "😄", "cry": "😢", "100": "💯", "fire": "🔥"}
+# Fixed basic emoji-reaction set (name → glyph) — single source in comms.py.
+_REACTIONS = REACTION_EMOJI
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -264,9 +266,10 @@ TOOL_DEFINITIONS = [
         "name": "teammate_react",
         "description": (
             "React to a message (by its id) with a basic emoji — thumbsup, rofl, smile, "
-            "cry, 100, or fire. Reactions are AMBIENT: they appear in teammate_inbox / "
-            "teammate_group history / the dashboard but never wake anyone. Pass "
-            "remove=true to take your reaction back."
+            "cry, 100, or fire — a lightweight acknowledgement without sending a message. "
+            "It wakes ONLY the author of the reacted-to message (never the group, never on "
+            "remove); everyone sees it in teammate_inbox / teammate_group history / the "
+            "dashboard. Pass remove=true to take your reaction back."
         ),
         "inputSchema": {
             "type": "object",
@@ -942,13 +945,27 @@ def _handle_group(args, ctx):
 
 def react(root, team, reactor, target, emoji, remove=False):
     """Core: append a reaction add/remove event as ``reactor`` (sender-explicit so the
-    dashboard reacts AS the human). Ambient — no channel wake."""
+    dashboard reacts AS the human).
+
+    Stamps ``target_from`` (the reacted-to message's author, resolved from the durable
+    transcript) so the watcher can wake ONLY that author. If the author can't be resolved
+    (target not in the transcript, or TEAMMATE_TRANSCRIPT=0) the reaction still records but
+    won't wake anyone.
+    """
     if not isinstance(target, str) or not target.strip():
         raise CommsError("'to_message' is required (the id of the message to react to).")
     if emoji not in _REACTIONS:
         raise CommsError(f"'emoji' must be one of {list(_REACTIONS)}.")
-    record = {"id": now_timestamp(), "target": target.strip(), "from": reactor,
+    target = target.strip()
+    target_from = None
+    for rec in reversed(read_transcript(root, team, limit=None)):  # recent-first; break on hit
+        if rec.get("id") == target:
+            target_from = rec.get("from")
+            break
+    record = {"id": now_timestamp(), "target": target, "from": reactor,
               "emoji": emoji, "op": "remove" if remove else "add"}
+    if target_from:
+        record["target_from"] = target_from
     append_reaction(root, team, record)
     return record
 

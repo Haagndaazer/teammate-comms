@@ -128,6 +128,16 @@ def append_external_message(root, to, frm, message, group=None, mentions=None):
     os.replace(tmp, f)
 
 
+def append_external_reaction(root, target, target_from, frm, emoji, op="add"):
+    """Simulate a reaction by appending an event to reactions.jsonl directly."""
+    d = Path(root) / "TeammateComms" / TEAM
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"id": f"rxext-{time.time()}", "target": target, "target_from": target_from,
+           "from": frm, "emoji": emoji, "op": op}
+    with open(d / "reactions.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
 def main():
     root = tempfile.mkdtemp(prefix="teammate-comms-test-")
     record = Path(root) / "TeammateComms" / TEAM / "agents" / f"{AGENT}.json"
@@ -346,8 +356,15 @@ def main():
                 "params": {"name": "teammate_group", "arguments": {"action": "mute", "group": GROUP_SIGIL}}})
     time.sleep(0.5)
 
-    # Heartbeat cycle (5s): refreshes the watcher's muted cache AND confirms type:"full"
-    # + a profile field survive the registry merge.
+    # Reaction WAKES (v0.6.1): a reaction wakes ONLY the author of the reacted-to message.
+    # R1 (target_from=AGENT, from=PEER, add) → should wake AGENT; R2 (target_from=PEER) and
+    # R3 (op=remove) → must NOT wake. Processed on the next heartbeat tick (the 5.5s below).
+    append_external_reaction(root, decision_id or "x", AGENT, PEER, "fire", "add")    # → wake
+    append_external_reaction(root, "someones-msg", PEER, "Nancy", "smile", "add")     # not my msg
+    append_external_reaction(root, decision_id or "x", AGENT, PEER, "thumbsup", "remove")  # remove
+
+    # Heartbeat cycle (5s): refreshes the watcher's muted cache, processes reaction wakes,
+    # AND confirms type:"full" + a profile field survive the registry merge.
     time.sleep(5.5)
     type_after_heartbeat = None
     status_after_heartbeat = None
@@ -397,6 +414,9 @@ def main():
             bad_stdout.append(l)
     by_id = {m.get("id"): m for m in msgs if "id" in m}
     notifications = [m for m in msgs if m.get("method") == "notifications/claude/channel"]
+    # MESSAGE wakes only — v0.6.1 reaction wakes carry meta.kind=="reaction" and must NOT
+    # perturb any message-count/position assertion below (they use mwakes, not notifications).
+    mwakes = [n for n in notifications if n["params"]["meta"].get("kind") != "reaction"]
     failures = []
 
     def result(i):
@@ -473,17 +493,17 @@ def main():
         failures.append(f"unknown method not -32601: {by_id.get(12)}")
 
     # channel notification fired
-    if not notifications:
+    if not mwakes:
         failures.append("no notifications/claude/channel emitted for new message")
-    elif notifications[0]["params"]["meta"].get("agent") != AGENT:
-        failures.append(f"channel notification meta wrong: {notifications[0]['params']['meta']}")
+    elif mwakes[0]["params"]["meta"].get("agent") != AGENT:
+        failures.append(f"channel notification meta wrong: {mwakes[0]['params']['meta']}")
     # v0.6.0: the wake names WHERE the message came from (the DM sender), and does NOT
     # lead with the personality reminder (that's now every ~10 msgs + at registration, not
     # every wake — registration echo is asserted via text(5) above).
-    elif "tester" not in notifications[0]["params"].get("content", ""):
-        failures.append(f"channel wake did not name the source/sender: {notifications[0]['params'].get('content')}")
-    elif PERSONALITY in notifications[0]["params"].get("content", ""):
-        failures.append(f"early wake wrongly included the personality reminder (should be every ~10): {notifications[0]['params'].get('content')}")
+    elif "tester" not in mwakes[0]["params"].get("content", ""):
+        failures.append(f"channel wake did not name the source/sender: {mwakes[0]['params'].get('content')}")
+    elif PERSONALITY in mwakes[0]["params"].get("content", ""):
+        failures.append(f"early wake wrongly included the personality reminder (should be every ~10): {mwakes[0]['params'].get('content')}")
     # v0.4.2: nudge count is the UNSEEN count and is never padded by read-but-unacked
     # messages. Every message in this run is read/acked before the next arrives, so the
     # unseen count at each nudge is exactly 1 — a notification with count>1 would mean a
@@ -491,20 +511,20 @@ def main():
     # Counts are unseen-only (never padded). Every nudge in this flow is count "1"
     # EXCEPT the v0.4.4 mixed-batch DM wake — a legit count "2" (group + DM both unseen)
     # that must name the group reply target (proves the mixed-batch fix).
-    non_one = [n for n in notifications if n["params"]["meta"].get("count") != "1"]
+    non_one = [n for n in mwakes if n["params"]["meta"].get("count") != "1"]
     if len(non_one) != 1 or non_one[0]["params"]["meta"].get("count") != "2":
-        failures.append(f"unexpected nudge counts (want all '1' except one '2'): {[n['params']['meta'].get('count') for n in notifications]}")
+        failures.append(f"unexpected nudge counts (want all '1' except one '2'): {[n['params']['meta'].get('count') for n in mwakes]}")
     elif f"to:'{GROUP_SIGIL}'" not in non_one[0]["params"].get("content", ""):
         failures.append(f"mixed-batch DM nudge (count 2) did not name group target: {non_one[0]['params']['content']}")
     # v0.4.3: a group-message wake names the group reply target; a 1:1 wake does not.
-    group_nudges = [n for n in notifications if GROUP_SIGIL in n["params"].get("content", "")]
+    group_nudges = [n for n in mwakes if GROUP_SIGIL in n["params"].get("content", "")]
     if not group_nudges:
         failures.append("no channel nudge named the group reply target")
     elif f"to:'{GROUP_SIGIL}'" not in group_nudges[0]["params"]["content"]:
         failures.append(f"group nudge missing reply target to:'{GROUP_SIGIL}': {group_nudges[0]['params']['content']}")
-    # notifications[0] is the 1:1 "hello via channel" wake — must NOT name a group target
-    if notifications and "to:'#" in notifications[0]["params"].get("content", ""):
-        failures.append(f"1:1 nudge wrongly named a group target: {notifications[0]['params']['content']}")
+    # mwakes[0] is the 1:1 "hello via channel" wake — must NOT name a group target
+    if mwakes and "to:'#" in mwakes[0]["params"].get("content", ""):
+        failures.append(f"1:1 nudge wrongly named a group target: {mwakes[0]['params']['content']}")
     if "hello via channel" not in text(13):
         failures.append(f"teammate_inbox missing message: {text(13)}")
     if is_error(14) or "Acknowledged" not in text(14):
@@ -672,7 +692,7 @@ def main():
 
     # ── @mentions (v0.6.0) ──
     # the wake for the mention-carrying mixed-batch message included the 🔔 line
-    if not any("🔔" in n["params"].get("content", "") for n in notifications):
+    if not any("🔔" in n["params"].get("content", "") for n in mwakes):
         failures.append("no channel wake carried the @mention 🔔 line")
     # record-level: only real members are recorded (stranger excluded; human included)
     if transcript_log.exists():
@@ -706,17 +726,36 @@ def main():
     # mute keeps messages in the inbox (it removes the WAKE, not the message)
     if "muted-grp-msg" not in text(43) or "dm-while-muted" not in text(43):
         failures.append(f"mute dropped a message from the inbox (should keep both): {text(43)}")
-    # the last two wakes prove the invariants:
-    if len(notifications) < 2:
+    # the last two MESSAGE wakes prove the invariants (reaction wakes excluded via mwakes):
+    if len(mwakes) < 2:
         failures.append("expected DM + post-unmute wakes for the mute test")
     else:
-        dm_wake, grp_wake = notifications[-2], notifications[-1]
+        dm_wake, grp_wake = mwakes[-2], mwakes[-1]
         # [-2] = the DM that woke WHILE the group was muted: count 1, names NO group
         if dm_wake["params"]["meta"].get("count") != "1" or "to:'#" in dm_wake["params"].get("content", ""):
             failures.append(f"never-mute-a-DM: DM wake wrong (want count 1, no group): {dm_wake['params']}")
         # [-1] = the new group post AFTER unmute: count 1 (no retro-nudge of the muted msg), names group
         if grp_wake["params"]["meta"].get("count") != "1" or f"to:'{GROUP_SIGIL}'" not in grp_wake["params"].get("content", ""):
             failures.append(f"unmute restore wrong (want count 1 naming {GROUP_SIGIL}): {grp_wake['params']}")
+
+    # ── reaction wakes (v0.6.1) — only the AUTHOR is woken, add-only ──
+    reaction_wakes = [n for n in notifications if n["params"]["meta"].get("kind") == "reaction"]
+    if len(reaction_wakes) != 1:
+        # exactly R1 should have woken (R2 target_from!=AGENT, R3 op=remove, self-reacts from==agent)
+        failures.append(f"want exactly 1 reaction wake (author-only/add-only): {[r['params']['meta'] for r in reaction_wakes]}")
+    else:
+        rw = reaction_wakes[0]["params"]
+        if rw["meta"].get("agent") != AGENT:
+            failures.append(f"reaction wake not addressed to the author: {rw['meta']}")
+        if PEER not in rw.get("content", ""):
+            failures.append(f"reaction wake doesn't name the reactor: {rw.get('content')}")
+    # the count assertion (over mwakes) must be unperturbed by the reaction wake
+    # (reaction wakes carry kind:reaction → excluded) — already checked via non_one above.
+    # react() stamped target_from on the self-reactions (id 47-49 → decision post by AGENT)
+    if reactions_log.exists():
+        revs2 = [json.loads(l) for l in reactions_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if not any(r.get("from") == AGENT and r.get("target_from") == AGENT and r.get("op") == "add" for r in revs2):
+            failures.append("react() did not stamp target_from on a self-reaction")
 
     # ── teammate_reincarnate (v0.6.0) ──
     # gate-off path (no TEAMMATE_REINCARNATE_ENABLED) is isError + spawns nothing

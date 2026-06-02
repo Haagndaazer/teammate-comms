@@ -287,7 +287,7 @@ long-lived server. **12 tools:**
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, `sender?`/`post_type?`/`since?`/`reply_to?` (history filters) | Manage group chats (see below) + mute/unmute a group's wakes + `reads` (read receipts). |
-| `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id. Ambient — recorded in `reactions.jsonl`, shown in inbox/history/dashboard, **never wakes anyone**. |
+| `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (recorded in `reactions.jsonl`, shown in inbox/history/dashboard). **Wakes only the author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
 
@@ -352,8 +352,10 @@ watcher with **no `channel.py` change**.
   flat (`↳ re <id>`); `history reply_to=<id>` pulls a thread. No send-path read.
 - **Reactions:** `teammate_react` appends to an always-on (NOT transcript-gated) NDJSON
   `reactions.jsonl` keyed by target message id (covers DMs + groups without mutating the
-  append-only records); `aggregate_reactions` folds add/remove. Ambient — the watcher
-  ignores reactions, so a 👍 never wakes anyone.
+  append-only records); `aggregate_reactions` folds add/remove. A reaction stamps the
+  reacted-to message's author (`target_from`, resolved from the transcript) so the watcher
+  wakes **only that author** (a low-volume check on the 5s heartbeat tick) — never the
+  group, never the reactor, never on remove (v0.6.1; was ambient/no-wake in v0.6.0).
 - **Channel wake (changed):** the wake now names WHERE messages came from (DM senders +
   `#groups`); the personality reminder fires only every ~10 received messages (the
   registration return still echoes it), not every wake — cuts per-message token waste.
