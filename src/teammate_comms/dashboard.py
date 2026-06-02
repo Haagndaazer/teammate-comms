@@ -1,0 +1,326 @@
+"""A local, stdlib-only web console for teammate-comms (the ``teammate_dashboard`` tool).
+
+Opens a Slack-style page in the browser showing all teammate messaging (group chats +
+DMs) and a live roster, and lets the human operator participate as a first-class
+teammate. Mirrors the *pattern* of vibe-cognition's dashboard (token-secured localhost
+server in a background daemon thread, single-file frontend, browser auto-open) but is
+implemented with pure ``http.server`` so teammate-comms keeps its zero-dependency rule.
+
+Hard invariants:
+- **stdout is the JSON-RPC stream.** This server writes ONLY to its own sockets and to
+  stderr — never stdout. ``log_message``/``log_error`` and the server's ``handle_error``
+  are all routed to ``_log`` (stderr). The browser is opened via ``os.startfile`` on
+  Windows (no stdout inheritance).
+- Loopback-only bind (127.0.0.1), per-launch random token, Host-header allowlist.
+- The server lives in the hosting instance's process; it dies when that instance exits
+  (``shutdown_dashboard`` is called from the stdio ``finally``).
+"""
+
+import json
+import os
+import secrets
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from . import tools as _tools
+from .comms import (
+    CommsError,
+    get_agents_dir,
+    get_groups_dir,
+    is_channel_alive,
+    read_agent_record,
+    read_group_meta,
+    read_transcript,
+    register_human,
+    set_human_presence,
+)
+
+
+def _log(msg):
+    """Diagnostics → stderr ONLY (stdout is the JSON-RPC stream)."""
+    print(f"[teammate-comms] dashboard: {msg}", file=sys.stderr, flush=True)
+
+
+# ── single-file frontend ────────────────────────────────────────────────────────
+
+_INDEX_CACHE = None
+
+
+def _load_index():
+    """Load static/index.html once and cache it (token substituted per serve)."""
+    global _INDEX_CACHE
+    if _INDEX_CACHE is None:
+        primary = Path(__file__).resolve().parent / "static" / "index.html"
+        try:
+            _INDEX_CACHE = primary.read_text(encoding="utf-8")
+        except OSError:
+            try:  # wheel-install fallback
+                from importlib.resources import files
+                _INDEX_CACHE = (files("teammate_comms") / "static" / "index.html").read_text(encoding="utf-8")
+            except Exception as e:
+                _log(f"index.html missing: {e}")
+                _INDEX_CACHE = "<!doctype html><title>teammate dashboard</title><p>index.html missing</p>"
+    return _INDEX_CACHE
+
+
+# ── server + handler ────────────────────────────────────────────────────────────
+
+class _DashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, token, root, team, human_name):
+        super().__init__(addr, handler)
+        self.token = token
+        self.root = root
+        self.team = team
+        self.human_name = human_name
+
+    def handle_error(self, request, client_address):  # never dump to stdout
+        _log(f"request error from {client_address}")
+
+
+class _DashboardHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive → every response MUST set Content-Length
+    server_version = "teammate-comms-dashboard"
+
+    # Route ALL logging to stderr — the default writes to sys.stderr already, but be
+    # explicit so nothing can ever reach stdout.
+    def log_message(self, fmt, *args):
+        _log("http " + (fmt % args))
+
+    def log_error(self, fmt, *args):
+        _log("http " + (fmt % args))
+
+    # ── helpers ──
+    def _host_ok(self):
+        host = self.headers.get("Host", "")
+        if not host:
+            return False  # reject missing Host (don't default-allow)
+        if host.startswith("["):           # IPv6 literal: [::1]:7842
+            hostname = host[1:].split("]", 1)[0]
+        elif ":" in host:
+            hostname = host.rsplit(":", 1)[0]
+        else:
+            hostname = host
+        return hostname in ("127.0.0.1", "localhost")
+
+    def _token_ok(self, provided):
+        return bool(provided) and secrets.compare_digest(str(provided), self.server.token)
+
+    def _json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, body_str):
+        body = body_str.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ── verbs ──
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            path, qs = parsed.path, parse_qs(parsed.query)
+            if not self._host_ok():
+                return self._json(403, {"error": "invalid host"})
+            if path == "/":
+                if not self._token_ok(qs.get("token", [None])[0]):
+                    return self._json(403, {"error": "missing or invalid token"})
+                token_js = json.dumps(self.server.token)
+                return self._html(_load_index().replace('"%TOKEN%"', token_js))
+            if path.startswith("/api/"):
+                if not self._token_ok(self.headers.get("X-Dashboard-Token")):
+                    return self._json(401, {"error": "missing or invalid token"})
+                if path == "/api/conversations":
+                    return self._api_conversations()
+                if path == "/api/poll":
+                    return self._api_poll(qs.get("cursor", [""])[0])
+            return self._json(404, {"error": "not found"})
+        except Exception as e:  # never leak a stack to stdout / never hang the socket
+            _log(f"GET {self.path} failed: {e}")
+            try:
+                return self._json(500, {"error": "internal error"})
+            except Exception:
+                pass
+
+    def do_POST(self):
+        try:
+            parsed = urlparse(self.path)
+            if not self._host_ok():
+                return self._json(403, {"error": "invalid host"})
+            if not self._token_ok(self.headers.get("X-Dashboard-Token")):
+                return self._json(401, {"error": "missing or invalid token"})
+            if parsed.path != "/api/send":
+                return self._json(404, {"error": "not found"})
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError):
+                return self._json(400, {"error": "invalid json"})
+            return self._api_send(payload)
+        except Exception as e:
+            _log(f"POST {self.path} failed: {e}")
+            try:
+                return self._json(500, {"error": "internal error"})
+            except Exception:
+                pass
+
+    # ── REST endpoints ──
+    def _api_conversations(self):
+        root, team, me = self.server.root, self.server.team, self.server.human_name
+        roster, peers = [], []
+        agents_dir = get_agents_dir(root, team)
+        if agents_dir.exists():
+            for p in sorted(agents_dir.glob("*.json")):
+                rec = read_agent_record(root, team, p.stem)
+                if not isinstance(rec, dict):
+                    continue
+                kind = rec.get("type", "unknown")
+                online = (rec.get("presence") == "online") if kind == "human" \
+                    else is_channel_alive(rec, pid_check=False)
+                roster.append({
+                    "agent": p.stem, "type": kind, "online": bool(online),
+                    "project": rec.get("project"), "role": rec.get("role"),
+                    "status": rec.get("status"),
+                })
+                if p.stem != me:
+                    peers.append(p.stem)
+        groups = []
+        groups_dir = get_groups_dir(root, team)
+        if groups_dir.exists():
+            for gp in sorted(d for d in groups_dir.iterdir() if d.is_dir()):
+                meta = read_group_meta(root, team, gp.name)
+                if not isinstance(meta, dict):
+                    continue
+                groups.append({"id": "#" + gp.name, "name": gp.name,
+                               "members": meta.get("members", [])})
+        dms = [{"id": "@" + peer, "peer": peer} for peer in peers]
+        return self._json(200, {"me": me, "groups": groups, "roster": roster, "dms": dms})
+
+    def _api_poll(self, cursor):
+        root, team = self.server.root, self.server.team
+        records = read_transcript(root, team, since=(cursor or None), limit=200)
+        new_cursor = records[-1]["id"] if records else cursor
+        return self._json(200, {"records": records, "cursor": new_cursor})
+
+    def _api_send(self, payload):
+        root, team, me = self.server.root, self.server.team, self.server.human_name
+        if not me:
+            return self._json(409, {"error": "no human identity registered"})
+        to = (payload.get("to") or "").strip()
+        message = payload.get("message")
+        priority = payload.get("priority") or "normal"
+        if not to:
+            return self._json(400, {"error": "'to' is required"})
+        try:
+            if to.startswith("#"):
+                res = _tools.send_group(root, team, me, to, message, priority)
+            else:
+                res = _tools.send_dm(root, team, me, to, message, priority)
+        except CommsError as e:
+            return self._json(400, {"error": str(e)})
+        return self._json(200, {"ok": True, "id": res.get("id")})
+
+
+# ── lifecycle ───────────────────────────────────────────────────────────────────
+
+class _State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.httpd = None
+        self.thread = None
+        self.port = None
+        self.token = None
+        self.root = None
+        self.team = None
+        self.human_name = None
+
+
+_STATE = _State()
+
+
+def _open_browser(url):
+    """Open the page without ever letting a child process touch our stdout."""
+    try:
+        if os.name == "nt":
+            os.startfile(url)  # noqa: S606 — does not inherit our stdout
+            return
+        import webbrowser
+        webbrowser.open(url)  # POSIX best-effort
+    except Exception as e:
+        _log(f"could not open browser: {e}")
+
+
+def start_dashboard(root, team, human_name, port=7842, open_browser=True):
+    """Start (or return the already-running) dashboard for this process.
+
+    Idempotent PER PROCESS: a second call returns the same URL. Binds 127.0.0.1 first
+    (preferred port → +10 → OS-assigned); only after a successful bind does it register
+    the human + mark them online, so a bind failure never leaves a registered human
+    with no server. Returns ``{url, status, port}``.
+    """
+    with _STATE.lock:
+        if _STATE.httpd is not None:
+            url = f"http://127.0.0.1:{_STATE.port}/?token={_STATE.token}"
+            result = {"url": url, "status": "already-running", "port": _STATE.port}
+        else:
+            token = secrets.token_urlsafe(32)
+            httpd, chosen, last_err = None, None, None
+            for p in [port + i for i in range(11)] + [0]:
+                try:
+                    httpd = _DashboardServer(("127.0.0.1", p), _DashboardHandler,
+                                             token, root, team, human_name)
+                    chosen = httpd.server_address[1]
+                    break
+                except OSError as e:
+                    last_err = e
+            if httpd is None:
+                raise CommsError(f"Could not bind a dashboard port on 127.0.0.1: {last_err}")
+            try:
+                register_human(root, team, human_name)
+            except CommsError as e:
+                _log(f"human registration failed (continuing): {e}")
+            thread = threading.Thread(target=httpd.serve_forever,
+                                      name="teammate-dashboard", daemon=True)
+            thread.start()
+            _STATE.httpd, _STATE.thread, _STATE.port = httpd, thread, chosen
+            _STATE.token, _STATE.root, _STATE.team, _STATE.human_name = \
+                token, root, team, human_name
+            url = f"http://127.0.0.1:{chosen}/?token={token}"
+            result = {"url": url, "status": "running", "port": chosen}
+    if open_browser:
+        _open_browser(result["url"])
+    return result
+
+
+def shutdown_dashboard():
+    """Stop the dashboard (idempotent, never raises). Called from the stdio finally."""
+    with _STATE.lock:
+        httpd = _STATE.httpd
+        root, team, human_name = _STATE.root, _STATE.team, _STATE.human_name
+        _STATE.httpd = _STATE.thread = _STATE.port = None
+        _STATE.token = _STATE.root = _STATE.team = _STATE.human_name = None
+    if httpd is None:
+        return
+    if human_name and root is not None:
+        try:
+            set_human_presence(root, team, human_name, "away")
+        except Exception as e:
+            _log(f"presence-away failed: {e}")
+    try:
+        httpd.shutdown()
+        httpd.server_close()
+    except Exception as e:
+        _log(f"shutdown error: {e}")

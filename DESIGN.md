@@ -45,9 +45,11 @@ teammate-comms/
 ├── src/teammate_comms/
 │   ├── __init__.py             # __version__ (synced with plugin.json + pyproject)
 │   ├── server.py               # stdlib JSON-RPC server: tools + channel (§6)
-│   ├── comms.py                # storage / registry / liveness (§8)
+│   ├── comms.py                # storage / registry / liveness / transcript (§8)
 │   ├── channel.py              # background inbox watcher + push (§7)
-│   └── tools.py                # MCP tool definitions + handlers (§9)
+│   ├── tools.py                # MCP tool definitions + handlers (§9)
+│   ├── dashboard.py            # stdlib web console server (§9, teammate_dashboard)
+│   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
 ├── hooks/
 │   ├── hooks.json
 │   └── session-start.sh        # builds the venv before the server spawns
@@ -271,7 +273,7 @@ namespacing carves out subsets.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **9 tools:**
+long-lived server. **10 tools:**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -284,6 +286,7 @@ long-lived server. **9 tools:**
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`), `group`, `members?`, `limit?` | Manage group chats (see below). |
+| `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
 
@@ -299,6 +302,44 @@ catch up via `history`). Membership is **open** (`join`/`leave`/`add`; posting
 auto-joins the sender); `delete` is creator-only. Fan-out liveness uses
 `pid_check=False` (no per-member `tasklist`); all transcript/meta reads use
 `read_json_readonly` (never `read_json_safe`, which would reset a mid-write file to []).
+
+**Dashboard + human-as-teammate (added 0.5.0-dev).** `teammate_dashboard` opens a
+local **Slack-style web console** (`dashboard.py` — a pure-stdlib
+`http.server.ThreadingHTTPServer` in a daemon thread inside the calling instance's
+process) that shows all messaging (groups + DMs) and a live roster, and registers the
+**human operator as a first-class teammate** (a `type:"human"` registry record with an
+inbox — but **no `pid`/`channel`**, so it's never a wakeable channel and never trips the
+register-time collision guard). Agents see the human in `teammate_list`/`teammate_profile`
+marked `🧑 (operator)` with a `presence` (online/away) instead of `channel`, and can
+`teammate_send` to them / invite them to groups by flat name like any teammate. The
+console posts **as the human** by calling the **sender-explicit cores** `send_dm` /
+`send_group` (extracted from `_handle_send` / `_send_to_group`; the tool handlers are now
+thin wrappers), so a human message wakes live agents through the existing file-driven
+watcher with **no `channel.py` change**.
+- **Security:** loopback-only bind (`127.0.0.1`), a per-launch `secrets.token_urlsafe(32)`
+  (query token on `/`, `X-Dashboard-Token` header on `/api/*`, `compare_digest`), a
+  Host-header allowlist (DNS-rebind defense, missing Host rejected), and an
+  XSS-safe frontend (agent-authored text rendered via `textContent` only + a strict CSP).
+  The HTTP server writes only to its own sockets + **stderr — never stdout** (the
+  JSON-RPC stream); a standing test asserts stdout stays pure JSON-RPC after a launch.
+- **Live updates:** the page short-polls `/api/poll?cursor=` (~1.5s); message ids are the
+  sortable `now_timestamp()`, so the cursor is a string compare.
+- **Lifecycle:** idempotent **per process** (a second call returns the same URL; two
+  instances = two consoles); the server dies when the instance exits — `server.py`'s stdio
+  `finally` calls `dashboard.shutdown_dashboard()` (marks the human `away`, frees the port).
+
+**Observability transcript (added 0.5.0-dev).** To let the console show *all* messaging
+(1:1 DMs were previously ephemeral — only in `_unread.json`, gone after ack), both send
+cores **tee** every message into one append-only **NDJSON** log
+`TeammateComms/[<team>/]transcript.jsonl` (`{id,from,to?,group?,priority,message,kind}`,
+`kind` ∈ `dm`/`group`). NDJSON append (O(1), one line) avoids the O(n²) full-rewrite and
+whole-team lock serialization a JSON array would impose. The tee is **last and
+best-effort** (a short never-raise lock; disabled by `TEAMMATE_TRANSCRIPT=0`) so
+observability never precedes or delays the authoritative delivery write. **Privacy note:**
+this durably records previously-ephemeral agent↔agent DMs under the (global-by-default)
+comms root — intended for the operator overseeing their own agents, opt-out via the env
+flag. Reads are tail-bounded (`read_transcript(limit=200)`) so a large log never floods
+the browser.
 
 **Profile fields (0.2.0; `project` added 0.3.0).** Stored as plain keys on the agent
 registry record via `write_agent_record`'s field-level merge — additive,

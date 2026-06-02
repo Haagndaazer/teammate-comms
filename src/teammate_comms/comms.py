@@ -19,6 +19,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -409,3 +410,94 @@ def is_channel_alive(record, staleness=30, pid_check=True):
     except (ValueError, TypeError):
         return False
     return (datetime.now() - last).total_seconds() <= staleness
+
+
+# ── Human-as-teammate + observability transcript ────────────────────────────────
+#
+# The dashboard (teammate_dashboard) registers the human operator as a first-class
+# teammate so agents can see, DM, and invite them. A human record carries
+# type="human" and a "presence" field, but deliberately NO "pid"/"channel": it must
+# never be treated as a wakeable channel (is_channel_alive returns False with no
+# "channel" key) and never trips the register-time collision guard (keyed on pid +
+# is_channel_alive). The human is reachable by flat name like any other teammate.
+
+
+def register_human(root, team, name):
+    """Register a human operator as a teammate record (type="human") with an inbox.
+
+    Additive over write_agent_record's field-merge: no pid, no channel — so the
+    human is never a wakeable channel and never collides with a live agent of the
+    same name. Idempotent (re-register just refreshes presence/host).
+    """
+    validate_agent_name(name)
+    ensure_inbox(get_inboxes_dir(root, team), name)
+    write_agent_record(
+        root, team, name,
+        type="human", host=socket.gethostname(),
+        startedAt=now_timestamp(), presence="online",
+    )
+
+
+def set_human_presence(root, team, name, state):
+    """Merge a presence marker ("online"/"away") into a human's record. Best-effort."""
+    write_agent_record(root, team, name, presence=state)
+
+
+def get_transcript_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]transcript.jsonl`` — the global NDJSON log."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "transcript.jsonl"
+
+
+def append_transcript(root, team, record):
+    """Best-effort tee of one message into the global NDJSON observability log.
+
+    Append-only (O(1), one line per message) so the dashboard can show ALL DMs +
+    group posts in one ordered stream. NEVER raises and NEVER blocks delivery:
+    disabled by ``TEAMMATE_TRANSCRIPT=0``, uses a short non-blocking lock, and
+    swallows every error to stderr. This is observability, not a delivery guarantee.
+    """
+    if os.environ.get("TEAMMATE_TRANSCRIPT", "1").strip() == "0":
+        return
+    try:
+        path = get_transcript_file(root, team)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock_optional(path, timeout=2) as acquired:
+            if not acquired:
+                return
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:  # observability must never affect message delivery
+        print(f"[teammate-comms] transcript tee skipped: {e}", file=sys.stderr, flush=True)
+
+
+def read_transcript(root, team=None, since=None, limit=200):
+    """Read the global NDJSON transcript non-destructively, newest-bounded.
+
+    Returns at most the last ``limit`` records in chronological order. With ``since``
+    set, returns records whose id is ``>= since`` (the dashboard dedupes by id, so a
+    boundary record repeating across polls is harmless and a same-microsecond id
+    collision can never drop an unseen record). Missing file → []; bad lines skipped.
+    """
+    path = get_transcript_file(root, team)
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if since and rec.get("id", "") < since:
+                    continue
+                records.append(rec)
+    except (FileNotFoundError, OSError):
+        return []
+    if limit and limit > 0 and len(records) > limit:
+        records = records[-limit:]
+    return records

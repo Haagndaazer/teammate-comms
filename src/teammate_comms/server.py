@@ -269,6 +269,13 @@ def main():
         if agent and root is not None:
             write_agent_record(root, team, agent, timeout=2,
                                channel=False, lastHeartbeat=now_timestamp())
+        # Stop the dashboard HTTP server if one was launched this session. Wrapped so a
+        # shutdown hiccup can never prevent the offline-record write above.
+        try:
+            from . import dashboard
+            dashboard.shutdown_dashboard()
+        except Exception as e:
+            log(f"dashboard shutdown skipped: {e}")
 
 
 if __name__ == "__main__":

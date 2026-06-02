@@ -13,11 +13,13 @@ JSON-RPC stream. Diagnostics go to stderr; failures go into the envelope.
 """
 
 import json
+import os
 
 from .comms import (
     PROFILE_FIELDS,
     CommsError,
     append_group_message,
+    append_transcript,
     delete_group,
     ensure_inbox,
     file_lock,
@@ -228,6 +230,30 @@ TOOL_DEFINITIONS = [
             "required": ["action", "group"],
         },
     },
+    {
+        "name": "teammate_dashboard",
+        "description": (
+            "Open a local web console (a Slack-style window in the browser) showing all "
+            "teammate messaging — group chats AND direct messages — plus a live roster, "
+            "and register the human operator as a first-class teammate so agents can "
+            "teammate_send to them and invite them to groups exactly like any teammate. "
+            "Runs a localhost-only, token-secured HTTP server inside this instance's "
+            "process and returns the URL; the console is up while this instance runs. "
+            "The human is registered under 'human_name' (default $TEAMMATE_HUMAN_NAME, "
+            "else 'human')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "integer", "description": "Preferred port (default 7842; scans onward if taken)."},
+                "open_browser": {"type": "boolean", "description": "Open the page in a browser (default true)."},
+                "human_name": {
+                    "type": "string",
+                    "description": "Name the human appears as to the team (default $TEAMMATE_HUMAN_NAME, else 'human').",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -257,19 +283,63 @@ def _handle_register(args, ctx):
     return ctx["register"](agent, team.strip() if team else None, comms_dir, profile)
 
 
-def _validate_message(args):
-    """Return the trimmed message body, or raise CommsError."""
-    message = args.get("message")
+def _clean_message(message):
+    """Return the trimmed message body, or raise CommsError. Sender-explicit sibling
+    of _validate_message (which pulls from an args dict)."""
     if not isinstance(message, str) or not message.strip():
         raise CommsError("'message' is required and must be a non-empty string.")
     return message.strip()
 
 
-def _validate_priority(args):
-    priority = args.get("priority", "normal")
+def _clean_priority(priority):
+    priority = priority or "normal"
     if priority not in _PRIORITIES:
         raise CommsError(f"'priority' must be one of {list(_PRIORITIES)}.")
     return priority
+
+
+def _validate_message(args):
+    """Return the trimmed message body, or raise CommsError."""
+    return _clean_message(args.get("message"))
+
+
+def _validate_priority(args):
+    return _clean_priority(args.get("priority", "normal"))
+
+
+def send_dm(root, team, sender, to, message, priority="normal"):
+    """Core: deliver a 1:1 DM as ``sender``; return a dict for the wrapper to format.
+
+    Sender-explicit (not derived from any MCP identity) so the dashboard can post AS
+    the human. Writes the recipient's inbox (the delivery guarantee, which wakes a
+    live recipient via their own channel watcher), THEN tees the global transcript
+    (best-effort, LAST — observability never precedes or delays delivery).
+    """
+    validate_agent_name(to)
+    if to == sender:
+        raise CommsError(
+            "Cannot send to yourself. teammate_send targets another teammate; "
+            "use teammate_inbox to read your own messages."
+        )
+    content = _clean_message(message)
+    priority = _clean_priority(priority)
+
+    inboxes_dir = get_inboxes_dir(root, team)
+    ensure_inbox(inboxes_dir, to)
+    unread_file = inboxes_dir / f"{to}_unread.json"
+
+    record = {"id": now_timestamp(), "from": sender, "priority": priority, "message": content}
+    with file_lock(unread_file):
+        messages = read_json_safe(unread_file)
+        messages.append(record)
+        write_json_atomic(unread_file, messages)
+
+    to_record = read_agent_record(root, team, to)
+    to_type = to_record.get("type") if to_record else None
+    live = bool(to_record and to_type == "full" and is_channel_alive(to_record))
+
+    append_transcript(root, team, {**record, "to": to, "kind": "dm"})  # tee LAST
+    return {"id": record["id"], "to": to, "to_type": to_type, "live": live}
 
 
 def _handle_send(args, ctx):
@@ -283,36 +353,19 @@ def _handle_send(args, ctx):
     if to.startswith("#"):
         return _send_to_group(agent, team, root, to, args)
 
-    validate_agent_name(to)
-    if to == agent:
-        raise CommsError(
-            "Cannot send to yourself. teammate_send targets another teammate; "
-            "use teammate_inbox to read your own messages."
-        )
+    res = send_dm(root, team, agent, to, args.get("message"), args.get("priority", "normal"))
 
-    content = _validate_message(args)
-    priority = _validate_priority(args)
-
-    inboxes_dir = get_inboxes_dir(root, team)
-    ensure_inbox(inboxes_dir, to)
-    unread_file = inboxes_dir / f"{to}_unread.json"
-
-    record = {"id": now_timestamp(), "from": agent, "priority": priority, "message": content}
-    with file_lock(unread_file):
-        messages = read_json_safe(unread_file)
-        messages.append(record)
-        write_json_atomic(unread_file, messages)
-
-    lines = [f"Message sent to {to} (id: {record['id']})."]
-    to_record = read_agent_record(root, team, to)
-    if to_record and to_record.get("type") == "full":
-        if is_channel_alive(to_record):
+    lines = [f"Message sent to {to} (id: {res['id']})."]
+    if res["to_type"] == "full":
+        if res["live"]:
             lines.append(f"{to}'s channel is live — they will be nudged automatically.")
         else:
             lines.append(
                 f"WARNING: {to}'s channel is not running. The message is queued and "
                 f"will be seen when they next start their instance."
             )
+    elif res["to_type"] == "human":
+        lines.append(f"{to} is the human operator — they'll see this in their dashboard.")
     else:
         lines.append(
             f"{to} has no live channel. If they are a spawned subagent, their lead "
@@ -409,11 +462,17 @@ def _handle_list(args, ctx):
         record = read_agent_record(root, team, path.stem)
         if not isinstance(record, dict):
             continue
-        # Heartbeat-freshness only (no per-agent liveness subprocess).
-        live = is_channel_alive(record, pid_check=False)
         kind = record.get("type", "unknown")
         me = " (you)" if path.stem == _agent else ""
-        rows.append(f"  - {path.stem}{me}: type={kind}, channel={'live' if live else 'offline'}")
+        if kind == "human":
+            # A human has no channel — show their dashboard presence instead, marked
+            # distinctly so agents KNOW it's the operator (not just another agent).
+            rows.append(f"  - {path.stem}{me}: type=human 🧑 (operator), "
+                        f"presence={record.get('presence', 'away')}")
+        else:
+            # Heartbeat-freshness only (no per-agent liveness subprocess).
+            live = is_channel_alive(record, pid_check=False)
+            rows.append(f"  - {path.stem}{me}: type={kind}, channel={'live' if live else 'offline'}")
         # project + status + authority always surface — the at-a-glance fields
         # (project matters most now that comms are global across projects).
         rows.append(f"      project:   {record.get('project') or '(not set)'}")
@@ -478,13 +537,14 @@ def _handle_update(args, ctx):
 
 def _format_profile(record, name, is_self=False):
     """Render an agent record as a readable profile block (identity + profile fields)."""
-    live = is_channel_alive(record, pid_check=False)
+    kind = record.get("type", "unknown")
     me = " (you)" if is_self else ""
-    lines = [
-        f"Profile: {name}{me}",
-        f"  {'type:':<13}{record.get('type', 'unknown')}",
-        f"  {'channel:':<13}{'live' if live else 'offline'}",
-    ]
+    lines = [f"Profile: {name}{me}", f"  {'type:':<13}{kind}"]
+    if kind == "human":
+        lines.append(f"  {'presence:':<13}{record.get('presence', 'away')} (human operator)")
+    else:
+        live = is_channel_alive(record, pid_check=False)
+        lines.append(f"  {'channel:':<13}{'live' if live else 'offline'}")
     for field in PROFILE_FIELDS:
         value = record.get(field)
         lines.append(f"  {field + ':':<13}{value if value else '(not set)'}")
@@ -510,8 +570,15 @@ def _group_meta_file(root, team, group):
     return get_group_dir(root, team, group) / "meta.json"
 
 
-def _send_to_group(agent, team, root, to_sigil, args):
-    """Fan a message out to every member of a group + record it in the transcript."""
+def send_group(root, team, sender, to_sigil, message, priority="normal"):
+    """Core: post to a group as ``sender``; return fan-out accounting for the wrapper.
+
+    Sender-explicit so the dashboard can post AS the human. Writes the canonical
+    group transcript first (delivery), then best-effort fan-out into each other
+    member's inbox, then tees the global observability transcript LAST. Returns
+    ``{id, sigil, delivered, live, deferred}`` (the counts are computed in the loop
+    and are load-bearing for the wrapper's strings).
+    """
     group = validate_group_name(to_sigil)  # strips '#', validates
     sigil = f"#{group}"
     meta = read_group_meta(root, team, group)
@@ -520,24 +587,24 @@ def _send_to_group(agent, team, root, to_sigil, args):
             f"No group {sigil!r}. Create it with "
             f"teammate_group(action=\"create\", group=\"{sigil}\")."
         )
-    content = _validate_message(args)
-    priority = _validate_priority(args)
+    content = _clean_message(message)
+    priority = _clean_priority(priority)
 
     # Open membership: posting auto-joins the sender (re-read under lock to add).
     members = list(meta.get("members", []))
-    if agent not in members:
+    if sender not in members:
         with file_lock(_group_meta_file(root, team, group)):
             meta = read_group_meta(root, team, group) or meta
             members = list(meta.get("members", []))
-            if agent not in members:
-                members.append(agent)
+            if sender not in members:
+                members.append(sender)
                 meta["members"] = members
                 write_group_meta(root, team, group, meta)
 
-    record = {"id": now_timestamp(), "from": agent, "group": sigil,
+    record = {"id": now_timestamp(), "from": sender, "group": sigil,
               "priority": priority, "message": content}
 
-    # Transcript is the canonical, ordered source of truth — write it first.
+    # Group transcript is the canonical, ordered source of truth — write it first.
     append_group_message(root, team, group, record)
 
     # Best-effort fan-out into each other member's inbox. A locked/failed inbox is
@@ -545,7 +612,7 @@ def _send_to_group(agent, team, root, to_sigil, args):
     inboxes_dir = get_inboxes_dir(root, team)
     delivered, live, deferred = [], 0, []
     for member in members:
-        if member == agent:
+        if member == sender:
             continue
         try:
             ensure_inbox(inboxes_dir, member)
@@ -561,7 +628,16 @@ def _send_to_group(agent, team, root, to_sigil, args):
         except CommsError:
             deferred.append(member)
 
-    lines = [f"Posted to {sigil} (id: {record['id']})."]
+    append_transcript(root, team, {**record, "kind": "group"})  # tee LAST (firehose)
+    return {"id": record["id"], "sigil": sigil,
+            "delivered": delivered, "live": live, "deferred": deferred}
+
+
+def _send_to_group(agent, team, root, to_sigil, args):
+    """Thin wrapper: format send_group()'s accounting into the human-readable summary."""
+    res = send_group(root, team, agent, to_sigil, args.get("message"), args.get("priority", "normal"))
+    delivered, live, deferred = res["delivered"], res["live"], res["deferred"]
+    lines = [f"Posted to {res['sigil']} (id: {res['id']})."]
     if delivered:
         lines.append(
             f"Delivered to {len(delivered)} member(s) ({live} live, "
@@ -690,6 +766,26 @@ def _handle_group(args, ctx):
     return "\n".join(out)
 
 
+def _handle_dashboard(args, ctx):
+    _agent, team, root = _require_registered(ctx)
+    port = args.get("port")
+    if not isinstance(port, int) or port <= 0:
+        port = 7842
+    open_browser = args.get("open_browser")
+    open_browser = True if open_browser is None else bool(open_browser)
+    human_name = (args.get("human_name") or os.environ.get("TEAMMATE_HUMAN_NAME") or "human").strip()
+    validate_agent_name(human_name)
+    # Import lazily so the HTTP server module is only loaded when the tool is used.
+    from . import dashboard
+    info = dashboard.start_dashboard(root, team, human_name, port=port, open_browser=open_browser)
+    return (
+        f"Dashboard {info['status']} at {info['url']}\n"
+        f"You are '{human_name}' to the team — teammates can teammate_send to you and "
+        f"invite you to groups like any teammate. The console stays up while this "
+        f"instance runs."
+    )
+
+
 _HANDLERS = {
     "teammate_register": _handle_register,
     "teammate_send": _handle_send,
@@ -700,6 +796,7 @@ _HANDLERS = {
     "teammate_update": _handle_update,
     "teammate_profile": _handle_profile,
     "teammate_group": _handle_group,
+    "teammate_dashboard": _handle_dashboard,
 }
 
 

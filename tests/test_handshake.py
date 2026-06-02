@@ -5,7 +5,7 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 9 tools (register + 8), each with a valid object inputSchema
+    - tools/list returns 10 tools (register + 9), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
     - teammate_register (with a profile) establishes identity; teammate_whoami flips
       to registered and echoes the profile
@@ -64,6 +64,7 @@ AUTHORITY = "tests/**"
 PROJECT = "MyTestProject"  # basename auto-filled from CLAUDE_PROJECT_DIR
 GROUP = "brainstorm"
 GROUP_SIGIL = "#brainstorm"
+HUMAN = "Operator"  # the human operator registered by teammate_dashboard
 
 stdout_lines = []
 stderr_lines = []
@@ -242,6 +243,20 @@ def main():
     append_external_message(root, AGENT, PEER, "mixed-dm")                         # 1:1 DM
     time.sleep(1.3)   # DM wake: fresh={dm}, unseen={group,dm} -> count 2, names group
 
+    # teammate_dashboard: launch the stdlib console (no browser), which registers the
+    # human as a first-class teammate; then confirm the human shows in list/profile.
+    # (Tool calls only — these touch the human's record/inbox, NOT AGENT's, so they add
+    # no channel nudges and don't perturb the mixed-batch count assertion above.)
+    send(proc, {"jsonrpc": "2.0", "id": 31, "method": "tools/call",
+                "params": {"name": "teammate_dashboard",
+                           "arguments": {"human_name": HUMAN, "open_browser": False}}})
+    time.sleep(0.8)
+    send(proc, {"jsonrpc": "2.0", "id": 32, "method": "tools/call",
+                "params": {"name": "teammate_list", "arguments": {}}})
+    send(proc, {"jsonrpc": "2.0", "id": 33, "method": "tools/call",
+                "params": {"name": "teammate_profile", "arguments": {"agent": HUMAN}}})
+    time.sleep(0.5)
+
     # Heartbeat cycle (5s) -> confirm type:"full" AND a profile field survive the merge.
     time.sleep(5.5)
     type_after_heartbeat = None
@@ -258,7 +273,15 @@ def main():
         proc.kill()
 
     # ── assertions ──
-    msgs = [json.loads(l) for l in stdout_lines]
+    # stdout-purity: EVERY stdout line must parse as JSON-RPC. A stray print (e.g. from
+    # the dashboard HTTP server) would corrupt the JSON-RPC stream — catch it as a clean
+    # failure rather than crashing the parse.
+    msgs, bad_stdout = [], []
+    for l in stdout_lines:
+        try:
+            msgs.append(json.loads(l))
+        except (json.JSONDecodeError, ValueError):
+            bad_stdout.append(l)
     by_id = {m.get("id"): m for m in msgs if "id" in m}
     notifications = [m for m in msgs if m.get("method") == "notifications/claude/channel"]
     failures = []
@@ -285,11 +308,12 @@ def main():
         if init.get("result", {}).get("protocolVersion") != "2025-06-18":
             failures.append("initialize did not echo protocolVersion")
 
-    # tools/list: 9 tools, each with an object inputSchema
+    # tools/list: 10 tools, each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_ack", "teammate_list", "teammate_whoami",
-                      "teammate_update", "teammate_profile", "teammate_group"}
+                      "teammate_update", "teammate_profile", "teammate_group",
+                      "teammate_dashboard"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:
@@ -447,6 +471,47 @@ def main():
         failures.append(f"type:'full' did not survive heartbeat (got {type_after_heartbeat!r})")
     if status_after_heartbeat != STATUS_NEW:
         failures.append(f"profile status did not survive heartbeat (got {status_after_heartbeat!r})")
+
+    # ── dashboard + human-as-teammate + durable observability transcript ──
+    # stdout stayed pure JSON-RPC even after the HTTP server launched (no stray prints)
+    if bad_stdout:
+        failures.append(f"non-JSON-RPC line(s) on stdout (stdout-purity): {bad_stdout[:3]}")
+    # teammate_dashboard launched and returned a localhost URL
+    if is_error(31) or "http://127.0.0.1:" not in text(31) or "Dashboard" not in text(31):
+        failures.append(f"teammate_dashboard did not return a localhost URL: {text(31)}")
+    # the human is a first-class teammate: type=human, an inbox, NO pid/channel, online
+    human_record = Path(root) / "TeammateComms" / TEAM / "agents" / f"{HUMAN}.json"
+    if not human_record.exists():
+        failures.append(f"human record not written at {human_record}")
+    else:
+        hr = json.loads(human_record.read_text(encoding="utf-8"))
+        if hr.get("type") != "human":
+            failures.append(f"human record type not 'human': {hr}")
+        if "pid" in hr or hr.get("channel"):
+            failures.append(f"human record should have no pid/channel: {hr}")
+        # presence is read AFTER the process exits, so the clean shutdown has marked it
+        # "away" — assert it's a valid presence value; "online while running" is checked
+        # via the live teammate_list below.
+        if hr.get("presence") not in ("online", "away"):
+            failures.append(f"human presence not a valid state: {hr}")
+    if not (inboxes_dir(root) / f"{HUMAN}_unread.json").exists():
+        failures.append("human has no inbox")
+    # teammate_list (live, while the dashboard runs) marks the human as an online operator
+    if HUMAN not in text(32) or "operator" not in text(32) or "presence=online" not in text(32):
+        failures.append(f"teammate_list did not mark the human as online operator: {text(32)}")
+    # teammate_profile of the human renders type: human + presence
+    if "human" not in text(33) or "presence:" not in text(33):
+        failures.append(f"teammate_profile(human) missing type/presence: {text(33)}")
+    # durable transcript: the DM (id 7) and the group post (id 22) were both teed
+    transcript_log = Path(root) / "TeammateComms" / TEAM / "transcript.jsonl"
+    if not transcript_log.exists():
+        failures.append(f"transcript.jsonl not written at {transcript_log}")
+    else:
+        tlines = [json.loads(l) for l in transcript_log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if not any(r.get("kind") == "dm" and r.get("to") == PEER and "hi peer" in r.get("message", "") for r in tlines):
+            failures.append("transcript missing the DM tee (kind=dm, to=peer)")
+        if not any(r.get("kind") == "group" and r.get("group") == GROUP_SIGIL and "group hello" in r.get("message", "") for r in tlines):
+            failures.append("transcript missing the group tee (kind=group)")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
