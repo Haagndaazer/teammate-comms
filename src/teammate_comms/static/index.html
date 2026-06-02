@@ -30,6 +30,8 @@
   .section { margin: 14px 0 4px; }
   .section .label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
                     color: var(--dim); padding: 0 14px; margin-bottom: 4px; }
+  .subhead { font-size: 11px; color: var(--dim); font-weight: 600; padding: 6px 14px 1px;
+             opacity: .85; }
   .item { padding: 5px 14px; cursor: pointer; display: flex; align-items: center; gap: 7px;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .item:hover { background: var(--panel2); }
@@ -193,13 +195,27 @@ function renderNav() {
   const observed = [...convs.keys()].filter(k => k[0] === "~").sort();
 
   nav.appendChild(section("Channels", channels.map(id => navItem(id, convs.get(id).label, null))));
-  // Teammates = the sole DM entry point (shows who's online + their project)
-  nav.appendChild(section("Teammates", roster.map(r => {
-    let sub = r.project ? `(${r.project})` : "";          // e.g. Unger (TestSVN)
-    if (r.agent === ME) sub = ("(you) " + sub).trim();
-    else if (r.type === "human") sub = ("🧑 " + sub).trim();
-    return navItem("@" + r.agent, r.agent, r.online, sub);
-  })));
+  // Teammates = the sole DM entry point, grouped into project sub-sections so teammates
+  // on the same project are together. (Online dot + you/🧑 markers per row.)
+  const ts = el("div", "section");
+  ts.appendChild(span("label", "Teammates"));
+  if (!roster.length) ts.appendChild(span("item meta", "(none)"));
+  const byProject = new Map();
+  for (const r of roster) {
+    const p = r.project || "(no project)";
+    if (!byProject.has(p)) byProject.set(p, []);
+    byProject.get(p).push(r);
+  }
+  const projOrder = [...byProject.keys()].sort((a, b) =>
+    a === "(no project)" ? 1 : b === "(no project)" ? -1 : a.localeCompare(b));
+  for (const p of projOrder) {
+    ts.appendChild(span("subhead", p));
+    for (const r of byProject.get(p)) {
+      const sub = r.agent === ME ? "(you)" : (r.type === "human" ? "🧑" : "");
+      ts.appendChild(navItem("@" + r.agent, r.agent, r.online, sub));
+    }
+  }
+  nav.appendChild(ts);
   // Observed = read-only agent↔agent DMs, directly below Teammates
   nav.appendChild(section("Observed (read-only)", observed.map(id => navItem(id, convs.get(id).label, null))));
 }
