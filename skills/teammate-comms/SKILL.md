@@ -109,6 +109,9 @@ Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled
 (individual Pro/Max: on by default). Custom channels require
 `--dangerously-load-development-channels` (they are not on Anthropic's allowlist;
 the flag only bypasses that allowlist — org `channelsEnabled` policy still applies).
+To launch without that flag/prompt, pre-trust the channel via a machine-wide
+managed-settings allowlist and use `--channels` instead (see the README's "Trusting the
+channel" section).
 
 Storage lives at `<comms-root>/TeammateComms/[<team>/]inboxes/`. The comms root is
 **global by default** — `comms_dir` passed to `teammate_register`, else

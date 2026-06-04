@@ -441,7 +441,9 @@ namespaced inboxes); the channel arms on registration. **Power-user shortcut:** 
 Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled (individual
 Pro/Max: on by default). Custom channels require `--dangerously-load-development-channels`
 (not on Anthropic's allowlist; the flag only bypasses that — org `channelsEnabled`
-policy still applies).
+policy still applies). To skip that flag (and its prompt), pre-trust the channel via a
+machine-wide managed-settings allowlist and launch with `--channels` instead — see the
+README's "Trusting the channel" section; `spawn.py` auto-detects this file for reincarnate.
 
 ---
 

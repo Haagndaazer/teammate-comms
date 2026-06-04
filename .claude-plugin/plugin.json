@@ -1,6 +1,6 @@
 {
   "name": "teammate-comms",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances.",
   "author": { "name": "ColtonDyck" },
   "license": "MIT",

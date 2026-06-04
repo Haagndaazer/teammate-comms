@@ -767,13 +767,50 @@ def main():
         from teammate_comms import spawn as _spawn
         from teammate_comms.comms import validate_project_dir as _vpd, CommsError as _CE
         hostile = "evil; rm -rf / & $(whoami) `id` | nc"
-        argv = _spawn.build_claude_command(hostile)
+        # Pass an absent settings path so the channel-flag branch is DETERMINISTIC regardless
+        # of the test machine (a real managed-settings file would otherwise flip it to --channels).
+        no_settings = ["/no/such/managed-settings.json"]
+        argv = _spawn.build_claude_command(hostile, settings_paths=no_settings)
         if "--permission-mode" not in argv or "bypassPermissions" not in argv:
             failures.append(f"build_claude_command missing bypassPermissions: {argv}")
         if argv[-1] != hostile:   # hostile prompt stays ONE argv element → no shell injection
             failures.append(f"prompt not a single trailing argv element (injection risk): {argv}")
         if "--name" in argv:
             failures.append("build_claude_command should not pass --name (print-only)")
+        # ── channel-flag auto-detect (v0.6.5) — ALWAYS pass explicit settings_paths (hermetic) ──
+        # (a) no allowlist file → dangerous flag, never plain --channels
+        if "--dangerously-load-development-channels" not in argv or "--channels" in argv:
+            failures.append(f"no-allowlist should use dangerous flag, not --channels: {argv}")
+        # (b) a managed-settings file trusting this plugin → plain --channels, never the dangerous flag
+        _d = tempfile.mkdtemp()   # mkdtemp (NOT NamedTemporaryFile): Windows can't reopen an open handle
+        _ms = os.path.join(_d, "managed-settings.json")
+        with open(_ms, "w", encoding="utf-8") as _f:
+            json.dump({"channelsEnabled": True,
+                       "allowedChannelPlugins": [{"marketplace": "coltondyck", "plugin": "teammate-comms"}]}, _f)
+        argv_allow = _spawn.build_claude_command("p", settings_paths=[_ms])
+        if "--channels" not in argv_allow or "--dangerously-load-development-channels" in argv_allow:
+            failures.append(f"allowlisted should use --channels, not the dangerous flag: {argv_allow}")
+        # (c) channelsEnabled false → NOT trusted → fall back to the dangerous flag
+        with open(_ms, "w", encoding="utf-8") as _f:
+            json.dump({"channelsEnabled": False,
+                       "allowedChannelPlugins": [{"marketplace": "coltondyck", "plugin": "teammate-comms"}]}, _f)
+        if _spawn.channel_allowlisted(settings_paths=[_ms]):
+            failures.append("channel_allowlisted true despite channelsEnabled=false")
+        # (d) the real default-path resolver must not throw and returns a bool (covers managed_settings_paths)
+        if not isinstance(_spawn.channel_allowlisted(), bool):
+            failures.append("channel_allowlisted() default-path call did not return a bool")
+        # (e) $TEAMMATE_LAUNCH_ARGS overrides BOTH branches — try/finally so a failure can't leak the env
+        _prev = os.environ.get("TEAMMATE_LAUNCH_ARGS")
+        try:
+            os.environ["TEAMMATE_LAUNCH_ARGS"] = "claude --foo"
+            argv_ovr = _spawn.build_claude_command("p", settings_paths=[_ms])
+            if "--foo" not in argv_ovr or "--channels" in argv_ovr or "--dangerously-load-development-channels" in argv_ovr:
+                failures.append(f"TEAMMATE_LAUNCH_ARGS did not override auto-detect: {argv_ovr}")
+        finally:
+            if _prev is None:
+                os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            else:
+                os.environ["TEAMMATE_LAUNCH_ARGS"] = _prev
         cenv = _spawn.build_child_env({}, "Echo", "/proj", team="t", comms_dir="/c")
         if cenv.get("TEAMMATE_AGENT") != "Echo" or cenv.get("CLAUDE_PROJECT_DIR") != "/proj":
             failures.append(f"build_child_env missing handoff vars: {cenv}")

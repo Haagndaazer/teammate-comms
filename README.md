@@ -131,7 +131,9 @@ channel, and is reachable on the shared comms. It is **opt-in**: disabled unless
 `TEAMMATE_REINCARNATE_ENABLED` is truthy (it spawns OS processes). Windows-first
 (`wt.exe`), best-effort elsewhere; it confirms *launch*, not registration — verify with
 `teammate_list` a few seconds later. The new window may need one human approval to arm the
-custom channel.
+custom channel — **unless** you've installed the managed-settings allowlist
+([Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)), which reincarnate
+auto-detects to launch the child with `--channels` (no prompt).
 
 ## Two wake regimes
 
@@ -176,6 +178,47 @@ bypasses the plugin allowlist; your org's `channelsEnabled` policy still applies
 **First install:** a SessionStart hook builds the (zero-dep) venv so the server
 launches with `uv run --no-sync`. If the server isn't connected on the very first
 session, **restart Claude Code once** — every session after is instant.
+
+### Trusting the channel (skip the dangerous flag)
+
+`--dangerously-load-development-channels` works, but it shows a one-time approval prompt
+each launch (the flag bypasses the plugin allowlist; `bypassPermissions` does **not**
+suppress this prompt). If you'd rather pre-trust *this* channel so it loads with the plain
+`--channels` flag and **no prompt**, place a machine-wide **managed-settings** file (highest
+precedence) allowlisting the plugin:
+
+| OS | Path (needs admin/elevation to write) |
+|----|----|
+| Windows | `C:\Program Files\ClaudeCode\managed-settings.json` |
+| macOS | `/Library/Application Support/ClaudeCode/managed-settings.json` |
+| Linux | `/etc/claude-code/managed-settings.json` |
+
+```json
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "coltondyck", "plugin": "teammate-comms" }
+  ]
+}
+```
+
+Then launch **without** the dangerous flag:
+
+```powershell
+claude --channels plugin:teammate-comms@coltondyck
+```
+
+Notes:
+- Managed settings are **machine-wide and highest precedence** — they override user/project
+  settings and can't be overridden locally. Delete the file (also needs elevation) to undo.
+- `channelsEnabled` is the master switch; `allowedChannelPlugins` marks this specific plugin
+  trusted. Both are required.
+- On Windows, save as UTF-8 — if Notepad writes a BOM and the channel later fails to parse,
+  re-save without one.
+- **`teammate_reincarnate` auto-detects this file** and spawns child teammates with
+  `--channels` (no prompt) when present, falling back to the dangerous flag otherwise — so
+  reincarnated windows arm silently once the allowlist is in place. (Override the whole
+  spawn line with `$TEAMMATE_LAUNCH_ARGS` if you need to.)
 
 ## Identity & storage
 

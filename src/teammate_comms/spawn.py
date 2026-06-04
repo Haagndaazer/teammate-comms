@@ -13,25 +13,88 @@ terminal launcher. Design rules:
   a new console; POSIX: ``start_new_session``.
 """
 
+import json
 import os
 import shlex
 import subprocess
 import sys
 
-# Default base invocation. The dev channel flag is still required (the teammate-comms
-# channel is custom / not on Anthropic's allowlist); overridable so a future allowlisting
-# needs no code change.
-DEFAULT_LAUNCH_ARGS = "claude --dangerously-load-development-channels plugin:teammate-comms@coltondyck"
+# The custom teammate-comms channel is not on Anthropic's built-in allowlist, so by default
+# it must be loaded with --dangerously-load-development-channels (which triggers a one-time
+# trust prompt the spawned, DEVNULL-stdio child can't answer). BUT if the operator has placed
+# a managed-settings file allowlisting this plugin, the channel is trusted and loads with the
+# plain --channels flag and NO prompt — so we auto-detect that and prefer it (see
+# channel_allowlisted). $TEAMMATE_LAUNCH_ARGS overrides both, verbatim.
+PLUGIN_NAME = "teammate-comms"
+MARKETPLACE = "coltondyck"
+PLUGIN_SPEC = f"plugin:{PLUGIN_NAME}@{MARKETPLACE}"
+DANGEROUS_LAUNCH_ARGS = f"claude --dangerously-load-development-channels {PLUGIN_SPEC}"
+ALLOWLISTED_LAUNCH_ARGS = f"claude --channels {PLUGIN_SPEC}"
+# Back-compat alias (was the only launch constant pre-0.6.5).
+DEFAULT_LAUNCH_ARGS = DANGEROUS_LAUNCH_ARGS
 
 
-def build_claude_command(prompt, extra_args=None):
+def managed_settings_paths():
+    """Candidate managed-settings.json paths Claude Code reads (highest-precedence), per OS.
+
+    Returns a LIST (first match wins in channel_allowlisted). Windows lists both the
+    Program Files location (verified working) and the conventionally-documented ProgramData
+    one; macOS/Linux use the documented enterprise locations.
+    """
+    if os.name == "nt":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pd = os.environ.get("ProgramData", r"C:\ProgramData")
+        return [
+            os.path.join(pf, "ClaudeCode", "managed-settings.json"),
+            os.path.join(pd, "ClaudeCode", "managed-settings.json"),
+        ]
+    if sys.platform == "darwin":
+        return ["/Library/Application Support/ClaudeCode/managed-settings.json"]
+    return ["/etc/claude-code/managed-settings.json"]
+
+
+def channel_allowlisted(plugin=PLUGIN_NAME, marketplace=MARKETPLACE, settings_paths=None):
+    """True iff a managed-settings file marks this channel trusted, so it loads with the
+    plain --channels flag (no dangerous flag, no startup prompt).
+
+    Trusted = ``channelsEnabled`` truthy AND an ``allowedChannelPlugins`` entry matching this
+    plugin+marketplace. We REQUIRE ``channelsEnabled`` deliberately (do not relax it): if we
+    guess wrong and fall back to the dangerous flag, the channel still loads (maybe a prompt);
+    if we wrongly returned True, the child would launch with --channels but no dangerous flag
+    and the channel might not load at all — the worse failure. So we fail toward the safe flag.
+
+    Best-effort: a missing/unreadable/malformed file (incl. PermissionError reading a
+    Program Files file as non-admin) is skipped → False. utf-8-sig tolerates a Notepad BOM.
+    """
+    for path in (settings_paths if settings_paths is not None else managed_settings_paths()):
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):  # OSError covers PermissionError; ValueError covers JSONDecodeError
+            continue
+        if not isinstance(data, dict) or not data.get("channelsEnabled"):
+            continue
+        for entry in data.get("allowedChannelPlugins") or []:
+            if (isinstance(entry, dict)
+                    and entry.get("plugin") == plugin
+                    and entry.get("marketplace") == marketplace):
+                return True
+    return False
+
+
+def build_claude_command(prompt, extra_args=None, settings_paths=None):
     """Build the ``claude`` argv as a LIST (never a shell string).
 
-    Base = shlex-split of ``$TEAMMATE_LAUNCH_ARGS`` (default the coltondyck dev-channel
-    line), then ``--permission-mode bypassPermissions``, then ``extra_args``, then the
-    ``prompt`` as a single trailing element. (No ``--name``: that flag is print-only.)
+    Base = shlex-split of ``$TEAMMATE_LAUNCH_ARGS`` if set (verbatim override), else the
+    allowlisted ``--channels`` line when a managed-settings file trusts this channel, else
+    the ``--dangerously-load-development-channels`` line. Then ``--permission-mode
+    bypassPermissions``, then ``extra_args``, then the ``prompt`` as a single trailing
+    element. (No ``--name``: that flag is print-only.)
     """
-    base = os.environ.get("TEAMMATE_LAUNCH_ARGS") or DEFAULT_LAUNCH_ARGS
+    base = os.environ.get("TEAMMATE_LAUNCH_ARGS")
+    if not base:
+        base = (ALLOWLISTED_LAUNCH_ARGS if channel_allowlisted(settings_paths=settings_paths)
+                else DANGEROUS_LAUNCH_ARGS)
     argv = shlex.split(base)
     argv += ["--permission-mode", "bypassPermissions"]
     if extra_args:
