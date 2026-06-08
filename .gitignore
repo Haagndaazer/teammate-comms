@@ -11,4 +11,8 @@ dist/
 # config for working in this repo; do not commit it.
 .mcp.json
 
+# vibe-cognition: commit the append-only journal (shared project history),
+# ignore the regenerable binary embeddings cache (rebuilt from the journal).
+.cognition/chromadb/
+
 # Keep uv.lock tracked (reproducible installs) — do not add it here.
