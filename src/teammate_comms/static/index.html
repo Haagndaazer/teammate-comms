@@ -66,6 +66,14 @@
   .bar { opacity: .35; }
   .msg:hover .bar { opacity: 1; }
   .bar .chip { background: transparent; border-color: transparent; }
+  /* delete affordances + tombstone */
+  .del { cursor: pointer; font-size: 12px; padding: 0 2px; opacity: .45; }
+  .del:hover { opacity: 1; }
+  .msg .del { margin-left: 8px; }
+  .item .del { margin-left: 6px; opacity: 0; }
+  .item:hover .del { opacity: .6; }
+  .item .del:hover { opacity: 1; }
+  .body.deleted, .fbody.deleted { color: var(--dim); font-style: italic; }
   #composewrap { grid-row: 2; grid-column: 2; border-top: 1px solid var(--line);
                  background: var(--panel); padding: 12px 22px; display: flex; gap: 10px; }
   #compose { flex: 1; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
@@ -106,7 +114,7 @@ try { history.replaceState(null, "", location.pathname); } catch (e) {}
 const TOKEN = window.__TOKEN;
 const EMOJI = { thumbsup: "👍", rofl: "🤣", smile: "😄", cry: "😢", "100": "💯", fire: "🔥" };
 
-let ME = null, cursor = "", rcursor = "", current = null;
+let ME = null, cursor = "", rcursor = "", dcursor = "", current = null;
 const seen = new Set();              // message ids already ingested (dedupe)
 const buckets = new Map();           // convId -> [records]
 const convs = new Map();             // convId -> {label, sub, sendable}
@@ -114,6 +122,11 @@ const rx = new Map();                // msgId -> Map(emoji -> Set(reactor))
 let groupReads = {};                 // "#g" -> {member: maxAckedId}
 const lastRead = {};                 // convId -> max msg id the operator has viewed there
 let firstPollDone = false;           // seed lastRead once the backlog has loaded
+const deleted = new Map();           // deleted target (msg id, or "#group"/"@name") -> by
+// The transcript keeps the ORIGINAL body (we don't rewrite the firehose); the deletions
+// sub-stream only marks ids, so the dashboard supplies its own placeholder. Mirrors
+// comms.DELETED_MARKER; durable inbox/group reads carry the real marker for MCP surfaces.
+const DELETED_TEXT = "— message deleted —";
 
 const $ = (s) => document.querySelector(s);
 const el = (t, c) => { const n = document.createElement(t); if (c) n.className = c; return n; };
@@ -123,7 +136,11 @@ async function api(path, opts) {
   const init = Object.assign({}, opts);
   init.headers = Object.assign({ "X-Dashboard-Token": TOKEN }, init.headers || {});
   const res = await fetch(path, init);
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  if (!res.ok) {
+    let msg = "HTTP " + res.status;                 // surface the server's reason if present
+    try { const j = await res.json(); if (j && j.error) msg = j.error; } catch (e) {}
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -166,11 +183,25 @@ function applyReactions(events) {
   }
 }
 
+// Deletion events: mark a target id deleted (idempotent), and on a whole-group delete
+// drop that channel + its messages from the sidebar. Teammate removals reflect via the
+// 5s roster refresh, so they need no message-level fold here.
+function applyDeletions(events) {
+  for (const e of (events || [])) {
+    const t = e.target; if (!t) continue;
+    deleted.set(t, e.by || "");
+    if (e.kind === "group") {
+      convs.delete(t); buckets.delete(t); delete lastRead[t]; delete groupReads[t];
+      if (current === t) { current = null; renderTranscript(); }
+    }
+  }
+}
+
 // ── unread tracking (badges) ──
 function maxId(msgs) { let m = ""; for (const r of msgs) if (r.id > m) m = r.id; return m; }
 function unreadCount(convId) {
   const msgs = buckets.get(convId) || []; const lr = lastRead[convId] || "";
-  let n = 0; for (const r of msgs) if (r.id > lr && r.from !== ME) n++;
+  let n = 0; for (const r of msgs) if (r.id > lr && r.from !== ME && !deleted.has(r.id)) n++;
   return n;
 }
 function markRead(convId) {
@@ -183,7 +214,17 @@ async function loadConversations() {
   const d = await api("/api/conversations");
   ME = d.me;
   groupReads = {};
+  const liveGroups = new Set((d.groups || []).map(g => g.id));
   for (const g of d.groups) { convs.set(g.id, { label: g.id, sub: g.members.length + " member(s)", sendable: true }); groupReads[g.id] = g.reads || {}; }
+  // Reconcile: prune groups that no longer exist server-side (scoped to '#' keys only —
+  // '@'/'~' convs are built from records, not this endpoint). So a deleted channel leaves
+  // the sidebar instead of lingering. Clear its state + reset the pane if it was open.
+  for (const k of [...convs.keys()]) {
+    if (k[0] === "#" && !liveGroups.has(k)) {
+      convs.delete(k); buckets.delete(k); delete lastRead[k]; delete groupReads[k];
+      if (current === k) { current = null; renderTranscript(); }
+    }
+  }
   window.__roster = d.roster || [];
   renderNav();
 }
@@ -212,7 +253,8 @@ function renderNav() {
     ts.appendChild(span("subhead", p));
     for (const r of byProject.get(p)) {
       const sub = r.agent === ME ? "(you)" : (r.type === "human" ? "🧑" : "");
-      ts.appendChild(navItem("@" + r.agent, r.agent, r.online, sub));
+      // removable: real offline-eligible teammates only — not you, not the human operator
+      ts.appendChild(navItem("@" + r.agent, r.agent, r.online, sub, r.agent !== ME && r.type !== "human"));
     }
   }
   nav.appendChild(ts);
@@ -228,7 +270,7 @@ function section(label, items) {
   return s;
 }
 
-function navItem(id, label, online, sub) {
+function navItem(id, label, online, sub, removable) {
   const it = el("div", "item" + (id === current ? " active" : ""));
   if (online !== null && online !== undefined) it.appendChild(el("span", "dot" + (online ? " on" : "")));
   else it.appendChild(span("pre", id[0] === "#" ? "#" : (id[0] === "~" ? "~" : "@")));
@@ -237,6 +279,11 @@ function navItem(id, label, online, sub) {
   // unread badge for channels + teammate DMs (never observed: no ME participant there)
   if (id[0] !== "~") { const n = unreadCount(id); if (n > 0) it.appendChild(span("badge", String(n))); }
   it.addEventListener("click", () => selectConv(id));
+  if (removable) {
+    const del = el("span", "del"); del.textContent = "🗑"; del.title = "Remove teammate " + label;
+    del.addEventListener("click", (e) => { e.stopPropagation(); removeTeammate(label); });
+    it.appendChild(del);
+  }
   return it;
 }
 
@@ -265,14 +312,23 @@ function renderTranscript() {
 }
 
 function renderMsg(rec) {
-  const row = el("div", "msg" + (rec.priority === "urgent" ? " urgent" : ""));
+  const isDel = deleted.has(rec.id);
+  const row = el("div", "msg" + (rec.priority === "urgent" && !isDel ? " urgent" : ""));
   const head = el("div");
   head.appendChild(span("who", rec.from));
   head.appendChild(span("when", fmtWhen(rec.id)));
+  if (isDel) {                                  // tombstone: identity kept, body + extras suppressed
+    row.appendChild(head);
+    row.appendChild(span("body deleted", DELETED_TEXT));
+    return row;
+  }
   if (rec.kind === "group" && rec.group && current[0] !== "#") head.appendChild(span("tag", rec.group));
   if (rec.post_type) head.appendChild(span("tag pt", rec.post_type));
   if (rec.priority === "urgent") head.appendChild(span("tag", "URGENT"));
   if ((rec.mentions || []).includes(ME)) head.appendChild(span("tag mention", "🔔 you"));
+  const del = el("span", "del"); del.textContent = "🗑"; del.title = "Delete this message";
+  del.addEventListener("click", () => deleteMessage(rec.id));
+  head.appendChild(del);
   row.appendChild(head);
   if (rec.reply_to) row.appendChild(span("reply", "↳ re " + rec.reply_to));
   row.appendChild(span("body", rec.message == null ? "" : String(rec.message)));
@@ -315,6 +371,26 @@ async function toggleReact(target, emoji) {
         body: JSON.stringify({ target, emoji, remove: !!mine }) }); } catch (e) {}
 }
 
+async function deleteMessage(id) {
+  if (!confirm("Delete this message? It will show as deleted for everyone.")) return;
+  deleted.set(id, ME);                                  // optimistic; the poll confirms
+  if (current) renderTranscript();
+  renderNav();
+  try {
+    await api("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: id }) });
+  } catch (e) { alert("Delete failed: " + e.message); }  // surface the real reason (N6)
+}
+
+async function removeTeammate(name) {
+  if (!confirm("Remove teammate " + name + "?\nThis deletes their inbox + registry entry (offline teammates only).")) return;
+  try {
+    await api("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ teammate: name }) });
+    await loadConversations();                           // refresh roster immediately
+  } catch (e) { alert("Remove failed: " + e.message); }
+}
+
 // ── right-hand firehose ──
 function renderFeed(rec) {
   const feed = $("#feed");
@@ -330,7 +406,9 @@ function renderFeed(rec) {
   if ((rec.mentions || []).length) route.appendChild(span(null, "  🔔" + rec.mentions.join(",")));
   if (rec.reply_to) route.appendChild(span(null, "  ↳"));
   row.appendChild(route);
-  row.appendChild(span("fbody", rec.message == null ? "" : String(rec.message)));
+  const isDel = deleted.has(rec.id);
+  row.appendChild(span("fbody" + (isDel ? " deleted" : ""),
+                       isDel ? DELETED_TEXT : (rec.message == null ? "" : String(rec.message))));
   feed.appendChild(row);
   if (nearBottom) feed.scrollTop = feed.scrollHeight;   // don't yank a scrolled-up operator
 }
@@ -352,16 +430,23 @@ $("#compose").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.s
 // ── poll loop ──
 async function poll() {
   try {
-    const d = await api("/api/poll?cursor=" + encodeURIComponent(cursor) + "&rcursor=" + encodeURIComponent(rcursor));
-    const gotRecords = (d.records || []).length > 0;
+    const d = await api("/api/poll?cursor=" + encodeURIComponent(cursor)
+                        + "&rcursor=" + encodeURIComponent(rcursor)
+                        + "&dcursor=" + encodeURIComponent(dcursor));
     let touched = false;
+    // Apply deletions BEFORE pushing records, so a fresh-load backlog renders any
+    // tombstoned message as deleted with no flash of its original body.
+    const gotDeletions = (d.deletions || []).length > 0;
+    if (gotDeletions) { applyDeletions(d.deletions); touched = true; }
+    if (d.dcursor) dcursor = d.dcursor;
+    const gotRecords = (d.records || []).length > 0;
     for (const rec of (d.records || [])) { if (pushRecord(rec) === current) touched = true; }
     if (d.cursor) cursor = d.cursor;
     if ((d.reactions || []).length) { applyReactions(d.reactions); touched = true; }
     if (d.rcursor) rcursor = d.rcursor;
     if (!firstPollDone) { seedLastRead(); firstPollDone = true; }  // backlog isn't "unread"
     if (touched && current) { markRead(current); renderTranscript(); }  // viewing = read
-    if (gotRecords) renderNav();                                   // refresh unread badges
+    if (gotRecords || gotDeletions) renderNav();                   // refresh badges/sidebar
   } catch (e) {}
   setTimeout(poll, 1500);
 }

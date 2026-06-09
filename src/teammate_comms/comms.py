@@ -346,6 +346,116 @@ def file_lock_optional(lock_path, timeout=2):
                 pass
 
 
+# ── Deletion / tombstone helpers ──────────────────────────────────────────────────
+#
+# A "delete" of a message is a TOMBSTONE: the record keeps its id/from/to/group/
+# reply_to/post_type/priority/kind, the body is replaced with DELETED_MARKER, and two
+# flags are added. Tombstoning (not removal) keeps reply_to citations + group/thread
+# continuity intact. The same id can live in several stores (a group post is copied
+# into messages.json, every member's inbox, and the transcript) — tombstone each
+# durable store under the SAME lock the normal writers use. Teammate removal is a hard
+# delete of the registry + inbox files (their authored messages elsewhere stay
+# attributed).
+
+DELETED_MARKER = "— message deleted —"
+
+
+def tombstone_fields(deleted_by):
+    """The in-place mutation for a deleted message (single source of truth)."""
+    return {"message": DELETED_MARKER, "deleted": True, "deleted_by": deleted_by}
+
+
+def _apply_tombstone(records, msg_id, deleted_by):
+    """Tombstone every record with a matching id in a list (mutates in place). -> found?"""
+    found = False
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("id") == msg_id:
+            rec.update(tombstone_fields(deleted_by))
+            found = True
+    return found
+
+
+def tombstone_in_inbox(root, team, member, msg_id, deleted_by):
+    """Tombstone a message (by id) in a member's inbox — BOTH ``_unread.json`` and
+    ``_read.json`` under the UNREAD file's lock (mirrors ``_handle_ack``, which protects
+    ``_read.json`` with the unread lock; locking each file separately would race ack).
+    Lock-then-read so ``read_json_safe``'s reset-corrupt-to-[] can't clobber a concurrent
+    partial write. Writes a file only when it actually changed. -> found in either?"""
+    inboxes_dir = get_inboxes_dir(root, team)
+    unread_file = inboxes_dir / f"{member}_unread.json"
+    read_file = inboxes_dir / f"{member}_read.json"
+    found = False
+    with file_lock(unread_file):
+        for f in (unread_file, read_file):
+            msgs = read_json_safe(f)
+            if _apply_tombstone(msgs, msg_id, deleted_by):
+                write_json_atomic(f, msgs)
+                found = True
+    return found
+
+
+def tombstone_in_group_messages(root, team, group, msg_id, deleted_by):
+    """Tombstone a message (by id) in ``groups/<group>/messages.json`` under its lock."""
+    messages_file = get_group_dir(root, team, group) / "messages.json"
+    with file_lock(messages_file):
+        messages = read_group_messages(root, team, group)
+        if _apply_tombstone(messages, msg_id, deleted_by):
+            write_json_atomic(messages_file, messages)
+            return True
+    return False
+
+
+def remove_messages_from_inbox(root, team, member, msg_ids):
+    """Hard-remove messages (by id) from a member's inbox (both files) under the unread
+    lock. Used by whole-group delete — the group is gone, so there's no thread to keep."""
+    ids = set(msg_ids)
+    if not ids:
+        return
+    inboxes_dir = get_inboxes_dir(root, team)
+    unread_file = inboxes_dir / f"{member}_unread.json"
+    read_file = inboxes_dir / f"{member}_read.json"
+    with file_lock(unread_file):
+        for f in (unread_file, read_file):
+            msgs = read_json_safe(f)
+            kept = [m for m in msgs if not (isinstance(m, dict) and m.get("id") in ids)]
+            if len(kept) != len(msgs):
+                write_json_atomic(f, kept)
+
+
+def remove_agent(root, team, name):
+    """Hard-delete an agent's registry record + inbox files (best-effort, never raises)."""
+    agents_dir = get_agents_dir(root, team)
+    inboxes_dir = get_inboxes_dir(root, team)
+    for path in (agents_dir / f"{name}.json",
+                 inboxes_dir / f"{name}_unread.json",
+                 inboxes_dir / f"{name}_read.json"):
+        try:
+            path.unlink()
+        except OSError:
+            pass  # already gone / locked — best-effort, matches the codebase style
+
+
+def strip_member_from_groups(root, team, name):
+    """Remove ``name`` from ``members[]`` of every group's meta (under each meta's lock).
+    Leaves their authored posts attributed. -> list of group names they were removed from."""
+    groups_dir = get_groups_dir(root, team)
+    removed_from = []
+    if not groups_dir.exists():
+        return removed_from
+    for gdir in sorted(d for d in groups_dir.iterdir() if d.is_dir()):
+        group = gdir.name
+        with file_lock(gdir / "meta.json"):
+            meta = read_group_meta(root, team, group)
+            if not isinstance(meta, dict):
+                continue
+            members = meta.get("members", [])
+            if name in members:
+                meta["members"] = [m for m in members if m != name]
+                write_group_meta(root, team, group, meta)
+                removed_from.append(group)
+    return removed_from
+
+
 def write_agent_record(root, team, name, timeout=5, **fields):
     """Field-level merge of ``fields`` into ``agents/<name>.json`` under a lock.
 
@@ -617,4 +727,60 @@ def aggregate_reactions(events):
     for (target, emoji), reactors in state.items():
         if reactors:
             out.setdefault(target, {})[emoji] = sorted(reactors)
+    return out
+
+
+# ── Deletions sub-stream ──────────────────────────────────────────────────────────
+#
+# An append-only event log of deletions, mirroring reactions.jsonl: its own NDJSON file
+# + cursor, folded client-side by the dashboard (idempotent — keyed by target). The
+# durable tombstone always lands in the inbox/group stores regardless; this stream
+# exists ONLY so the dashboard can reflect a mutation live (the firehose is append-only
+# and keyed by id, so an in-place tombstone never re-crosses the poll cursor). Replayed
+# from the start on a fresh dashboard load — so previously-deleted messages render as
+# deleted. Event shape: {id, target, kind: "message"|"group"|"teammate", by, op:"delete"}.
+
+def get_deletions_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]deletions.jsonl`` — append-only deletion events."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "deletions.jsonl"
+
+
+def append_deletion(root, team, record):
+    """Append one deletion event (best-effort, never-raise) to the deletions log."""
+    try:
+        path = get_deletions_file(root, team)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock_optional(path, timeout=2) as acquired:
+            if not acquired:
+                return
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[teammate-comms] deletion append skipped: {e}", file=sys.stderr, flush=True)
+
+
+def read_deletions(root, team=None, since=None, limit=1000):
+    """Read deletion events (non-destructive); optional ``id >= since`` + tail ``limit``."""
+    path = get_deletions_file(root, team)
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if since and rec.get("id", "") < since:
+                    continue
+                out.append(rec)
+    except (FileNotFoundError, OSError):
+        return []
+    if limit and limit > 0 and len(out) > limit:
+        out = out[-limit:]
     return out

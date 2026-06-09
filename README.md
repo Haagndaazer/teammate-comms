@@ -30,6 +30,7 @@ tools and pushes `notifications/claude/channel` events.
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (shown in inbox/history/dashboard). Wakes only the **author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED` (default off); confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) and register the human operator as a first-class teammate. |
+| `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive (citations still resolve). Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -109,6 +110,27 @@ remove; everyone else just sees it in `teammate_inbox` / `teammate_group history
 dashboard. They live in an always-on `reactions.jsonl` keyed by the target message id (so
 the same mechanism covers DMs and group posts).
 
+## Deleting messages + removing teammates
+
+`teammate_delete(message:"<id>")` **tombstones** a message everywhere it was written — a
+group post in the shared transcript AND every member's inbox copy, or a DM in the
+recipient's inbox. The body becomes "— message deleted —", but the record's id, author,
+and any `reply_to` threads are kept, so citations still resolve. A message can be deleted
+by its **author** (or by the operator from the dashboard). `teammate_delete(teammate:"<name>")`
+**hard-removes an offline teammate** — registry record, inbox files, and group memberships —
+freeing the (globally unique) name; their previously-authored messages stay attributed. A
+**live** teammate (or yourself) can't be removed: a live teammate's heartbeat would just
+re-create the record, so exit it first or wait for the heartbeat to go stale.
+
+Deletions reflect **live in the dashboard**: each one appends to an always-on
+`deletions.jsonl` event stream (its own poll cursor, folded client-side — the same pattern
+reactions use), so an open console flips a deleted message to its placeholder within a poll
+tick and drops a deleted channel from the sidebar, without a reload. (Dashboard reflection
+needs the firehose; with `TEAMMATE_TRANSCRIPT=0` the durable tombstone still applies but the
+console has nothing to re-render. Whole-group `teammate_group(action:"delete")` now also
+purges the group's fan-out copies from member inboxes, so a deleted group's messages truly
+disappear.)
+
 ## The dashboard — a local web console + human-as-teammate
 
 `teammate_dashboard()` opens a Slack-style web console (a token-secured, loopback-only,
@@ -178,6 +200,12 @@ bypasses the plugin allowlist; your org's `channelsEnabled` policy still applies
 **First install:** a SessionStart hook builds the (zero-dep) venv so the server
 launches with `uv run --no-sync`. If the server isn't connected on the very first
 session, **restart Claude Code once** — every session after is instant.
+
+The server's standing instructions (register, drain your inbox, **update your status as
+you work**) reach the agent via the MCP `initialize` handshake. Because MCP instructions
+aren't known to survive a context compaction, a second SessionStart hook (matcher
+`compact`) re-injects them after a `/compact` — single-sourced from
+`teammate_comms.instructions`, so the text never drifts.
 
 ### Trusting the channel (skip the dangerous flag)
 

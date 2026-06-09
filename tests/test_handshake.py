@@ -5,7 +5,7 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 10 tools (register + 9), each with a valid object inputSchema
+    - tools/list returns 13 tools (register + 12), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
     - teammate_register (with a profile) establishes identity; teammate_whoami flips
       to registered and echoes the profile
@@ -440,13 +440,18 @@ def main():
             failures.append(f"initialize missing tools capability: {caps}")
         if init.get("result", {}).get("protocolVersion") != "2025-06-18":
             failures.append("initialize did not echo protocolVersion")
+        # the handshake surfaces the standing instructions, incl. the status rule (v0.7.0)
+        instr = init.get("result", {}).get("instructions", "")
+        if "teammate_register" not in instr or "status as you work" not in instr:
+            failures.append(f"initialize instructions missing/incomplete: {instr[:80]!r}")
 
-    # tools/list: 12 tools, each with an object inputSchema
+    # tools/list: 13 tools, each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_ack", "teammate_list", "teammate_whoami",
                       "teammate_update", "teammate_profile", "teammate_group",
-                      "teammate_react", "teammate_reincarnate", "teammate_dashboard"}
+                      "teammate_react", "teammate_reincarnate", "teammate_dashboard",
+                      "teammate_delete"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:
@@ -823,6 +828,156 @@ def main():
             pass
     except Exception as e:
         failures.append(f"spawn unit checks errored: {e}")
+
+    # ── teammate_delete (v0.7.0) — hermetic unit checks on the cores (own temp root) ──
+    try:
+        import socket as _socket
+
+        from teammate_comms import comms as _c
+        from teammate_comms import tools as _t
+        droot = tempfile.mkdtemp(prefix="tc-del-")
+        dteam = None
+        A, B, OP = "alice", "bob", "Operator"
+
+        def _inbox(member):
+            return _c.read_json_safe(_c.get_inboxes_dir(droot, dteam) / f"{member}_unread.json")
+
+        # group with both members; alice posts (canonical messages.json + fan-out + transcript)
+        _c.write_group_meta(droot, dteam, "g", {"name": "g", "members": [A, B],
+                                                "creator": A, "createdAt": _c.now_timestamp()})
+        gmid = _t.send_group(droot, dteam, A, "#g", "hello team")["id"]
+        _t.send_group(droot, dteam, B, "#g", "re: hello", reply_to=gmid)   # a reply citing it
+
+        # (1) group-post tombstone: AUTHOR deletes → messages.json + every member inbox copy
+        _t.delete_message(droot, dteam, A, gmid, is_operator=False)
+        gm = _c.read_group_messages(droot, dteam, "g")
+        grec = next((m for m in gm if m.get("id") == gmid), None)
+        if not (grec and grec.get("deleted") and grec.get("from") == A
+                and grec.get("message") == _c.DELETED_MARKER):
+            failures.append(f"group tombstone not applied to messages.json: {grec}")
+        bcopy = next((m for m in _inbox(B) if m.get("id") == gmid), None)
+        if not (bcopy and bcopy.get("deleted")):
+            failures.append(f"group tombstone not propagated to member inbox: {bcopy}")
+        if not any(m.get("reply_to") == gmid for m in gm):   # reply thread still resolves
+            failures.append("reply citing the deleted message no longer resolves")
+        if not any(d.get("target") == gmid and d.get("kind") == "message"
+                   for d in _c.read_deletions(droot, dteam)):
+            failures.append("no message deletion event emitted")
+
+        # (2) permission: unknown id raises; non-author refused; operator can delete any
+        try:
+            _t.delete_message(droot, dteam, B, "no-such-id", is_operator=False)
+            failures.append("delete of unknown id did not raise")
+        except _c.CommsError:
+            pass
+        mid2 = _t.send_group(droot, dteam, A, "#g", "second")["id"]
+        try:
+            _t.delete_message(droot, dteam, B, mid2, is_operator=False)
+            failures.append("non-author delete not refused")
+        except _c.CommsError:
+            pass
+        _t.delete_message(droot, dteam, OP, mid2, is_operator=True)   # operator override OK
+
+        # (3) DM tombstone hits the recipient inbox
+        dmid = _t.send_dm(droot, dteam, A, B, "secret")["id"]
+        _t.delete_message(droot, dteam, A, dmid, is_operator=False)
+        if not any(m.get("id") == dmid and m.get("deleted") for m in _inbox(B)):
+            failures.append("DM tombstone not applied to recipient inbox")
+
+        # (4) TEAMMATE_TRANSCRIPT=0 → resolve via the inbox-scan fallback, still tombstones
+        _prevT = os.environ.get("TEAMMATE_TRANSCRIPT")
+        try:
+            os.environ["TEAMMATE_TRANSCRIPT"] = "0"
+            dmid2 = _t.send_dm(droot, dteam, A, B, "no-firehose")["id"]
+            _t.delete_message(droot, dteam, A, dmid2, is_operator=False)
+            if not any(m.get("id") == dmid2 and m.get("deleted") for m in _inbox(B)):
+                failures.append("delete with TEAMMATE_TRANSCRIPT=0 did not tombstone via fallback")
+        finally:
+            if _prevT is None:
+                os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+            else:
+                os.environ["TEAMMATE_TRANSCRIPT"] = _prevT
+
+        # (5) XOR guard in the handler (neither / both → CommsError)
+        class _IdA:
+            def snapshot(self):
+                return (A, dteam, droot, None)
+        _ctxA = {"identity": _IdA()}
+        for bad in ({}, {"message": "x", "teammate": "y"}):
+            try:
+                _t._handle_delete(bad, _ctxA)
+                failures.append(f"XOR guard did not raise for {bad}")
+            except _c.CommsError:
+                pass
+
+        # (6) teammate removal: offline teammate gone (record + inbox + memberships) + event
+        _c.write_agent_record(droot, dteam, "carol", type="full", channel=False)
+        _c.ensure_inbox(_c.get_inboxes_dir(droot, dteam), "carol")
+        _c.write_group_meta(droot, dteam, "g2", {"name": "g2", "members": [A, "carol"],
+                                                 "creator": A, "createdAt": _c.now_timestamp()})
+        _t.remove_teammate(droot, dteam, A, "carol", is_operator=False)
+        if (_c.get_agents_dir(droot, dteam) / "carol.json").exists():
+            failures.append("remove_teammate left the agent record")
+        if (_c.get_inboxes_dir(droot, dteam) / "carol_unread.json").exists():
+            failures.append("remove_teammate left the inbox")
+        g2 = _c.read_group_meta(droot, dteam, "g2")
+        if "carol" in (g2.get("members") if g2 else []):
+            failures.append("remove_teammate did not strip group membership")
+        if not any(d.get("target") == "@carol" and d.get("kind") == "teammate"
+                   for d in _c.read_deletions(droot, dteam)):
+            failures.append("no teammate deletion event emitted")
+
+        # (7) removal guards: self refused; LIVE teammate refused (fresh heartbeat)
+        try:
+            _t.remove_teammate(droot, dteam, A, A, is_operator=False)
+            failures.append("self-removal not refused")
+        except _c.CommsError:
+            pass
+        _c.write_agent_record(droot, dteam, "dave", type="full", channel=True,
+                              host=_socket.gethostname(), pid=999999,
+                              lastHeartbeat=_c.now_timestamp())
+        try:
+            _t.remove_teammate(droot, dteam, A, "dave", is_operator=False)
+            failures.append("live-teammate removal not refused")
+        except _c.CommsError:
+            pass
+
+        # (8) whole-group delete purges fan-out copies + emits a group deletion event (B4)
+        _c.write_group_meta(droot, dteam, "g3", {"name": "g3", "members": [A, B],
+                                                 "creator": A, "createdAt": _c.now_timestamp()})
+        g3id = _t.send_group(droot, dteam, A, "#g3", "doomed")["id"]
+        _t._handle_group({"action": "delete", "group": "#g3"}, _ctxA)
+        if any(m.get("id") == g3id for m in _inbox(B)):
+            failures.append("whole-group delete left fan-out copies in member inbox")
+        if not any(d.get("target") == "#g3" and d.get("kind") == "group"
+                   for d in _c.read_deletions(droot, dteam)):
+            failures.append("whole-group delete did not emit a group deletion event")
+    except Exception as e:
+        failures.append(f"delete unit checks errored: {e}")
+
+    # ── compact re-injection (v0.7.0): instructions.py single-sources the text + emits
+    #    valid SessionStart additionalContext JSON for the matcher:"compact" hook ──
+    try:
+        import io as _io
+        from contextlib import redirect_stdout as _redirect
+
+        from teammate_comms import instructions as _ins
+        from teammate_comms.server import INSTRUCTIONS as _srv_instr
+        if _ins.INSTRUCTIONS is not _srv_instr:
+            failures.append("server INSTRUCTIONS is not single-sourced from instructions.py")
+        if "status as you work" not in _ins.INSTRUCTIONS:
+            failures.append("INSTRUCTIONS missing the 'update your status as you work' standing rule")
+        _buf = _io.StringIO()
+        with _redirect(_buf):
+            _ins.main()
+        _emitted = json.loads(_buf.getvalue())  # must be valid JSON
+        _hso = _emitted.get("hookSpecificOutput", {})
+        if _hso.get("hookEventName") != "SessionStart":
+            failures.append(f"reinject hookEventName wrong: {_hso.get('hookEventName')}")
+        if "status as you work" not in _hso.get("additionalContext", ""):
+            failures.append("reinject additionalContext missing the standing rule")
+    except Exception as e:
+        failures.append(f"instructions/reinject checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

@@ -33,6 +33,7 @@ from .comms import (
     group_read_positions,
     is_channel_alive,
     read_agent_record,
+    read_deletions,
     read_group_meta,
     read_reactions,
     read_transcript,
@@ -148,7 +149,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     return self._api_conversations()
                 if path == "/api/poll":
                     return self._api_poll(qs.get("cursor", [""])[0],
-                                          qs.get("rcursor", [""])[0])
+                                          qs.get("rcursor", [""])[0],
+                                          qs.get("dcursor", [""])[0])
             return self._json(404, {"error": "not found"})
         except Exception as e:  # never leak a stack to stdout / never hang the socket
             _log(f"GET {self.path} failed: {e}")
@@ -164,7 +166,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "invalid host"})
             if not self._token_ok(self.headers.get("X-Dashboard-Token")):
                 return self._json(401, {"error": "missing or invalid token"})
-            if parsed.path not in ("/api/send", "/api/react"):
+            if parsed.path not in ("/api/send", "/api/react", "/api/delete"):
                 return self._json(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length > 0 else b""
@@ -174,6 +176,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "invalid json"})
             if parsed.path == "/api/react":
                 return self._api_react(payload)
+            if parsed.path == "/api/delete":
+                return self._api_delete(payload)
             return self._api_send(payload)
         except Exception as e:
             _log(f"POST {self.path} failed: {e}")
@@ -217,7 +221,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         dms = [{"id": "@" + peer, "peer": peer} for peer in peers]
         return self._json(200, {"me": me, "groups": groups, "roster": roster, "dms": dms})
 
-    def _api_poll(self, cursor, rcursor):
+    def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team
         records = read_transcript(root, team, since=(cursor or None), limit=200)
         new_cursor = records[-1]["id"] if records else cursor
@@ -225,8 +229,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         # per-message chips client-side. Ambient — never woke anyone.
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500)
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
+        # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set
+        # and re-renders affected messages/groups — the firehose is append-only and
+        # id-keyed, so an in-place tombstone never re-crosses `cursor`. Replayed from the
+        # start on a fresh load so previously-deleted messages render as deleted.
+        deletions = read_deletions(root, team, since=(dcursor or None), limit=1000)
+        new_dcursor = deletions[-1]["id"] if deletions else dcursor
         return self._json(200, {"records": records, "cursor": new_cursor,
-                                "reactions": reactions, "rcursor": new_rcursor})
+                                "reactions": reactions, "rcursor": new_rcursor,
+                                "deletions": deletions, "dcursor": new_dcursor})
 
     def _api_react(self, payload):
         root, team, me = self.server.root, self.server.team, self.server.human_name
@@ -238,6 +249,31 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         except CommsError as e:
             return self._json(400, {"error": str(e)})
         return self._json(200, {"ok": True, "id": rec.get("id")})
+
+    def _api_delete(self, payload):
+        # The console acts AS the human operator, so it has operator delete power over
+        # ANY message (author-or-operator) and may remove offline teammates. It can NOT
+        # remove the operator's own identity (guarded here + in remove_teammate).
+        root, team, me = self.server.root, self.server.team, self.server.human_name
+        if not me:
+            return self._json(409, {"error": "no human identity registered"})
+        msg = payload.get("message")
+        who = payload.get("teammate")
+        has_msg = bool(isinstance(msg, str) and msg.strip())
+        has_who = bool(isinstance(who, str) and who.strip())
+        if has_msg == has_who:
+            return self._json(400, {"error": "provide exactly one of 'message' or 'teammate'"})
+        try:
+            if has_msg:
+                _tools.delete_message(root, team, me, msg, is_operator=True)
+            else:
+                name = who.strip()
+                if name == me:
+                    return self._json(400, {"error": "the operator can't be removed from the console"})
+                _tools.remove_teammate(root, team, me, name, is_operator=True)
+        except CommsError as e:
+            return self._json(400, {"error": str(e)})
+        return self._json(200, {"ok": True})
 
     def _api_send(self, payload):
         root, team, me = self.server.root, self.server.team, self.server.human_name

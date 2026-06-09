@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import __version__, channel
 from . import tools as tools_mod
+from .instructions import INSTRUCTIONS
 from .comms import (
     PROFILE_FIELDS,
     CommsError,
@@ -41,21 +42,8 @@ from .comms import (
 
 SERVER_NAME = "teammate-comms"
 
-INSTRUCTIONS = (
-    "This is teammate-comms. Call teammate_register(agent=\"<your-name>\") once at "
-    "session start to establish your identity and start your channel, then "
-    "teammate_inbox to drain any queued messages. Optionally set a profile at "
-    "register (role, personality, status, authority; your project is auto-filled) "
-    "and keep your status current with teammate_update so teammates can see what "
-    "you're doing, which project you're in, and which areas you own, via "
-    "teammate_list / teammate_profile, without interrupting you. Comms are global by "
-    "default (all projects share one space), so you can message agents in other "
-    "projects too. A "
-    "channel event (notifications/claude/channel) means a teammate messaged you "
-    "while idle — read with teammate_inbox, then teammate_ack. Reply with "
-    "teammate_send. You are a full instance: the channel wakes you, so no polling "
-    "loop is needed."
-)
+# INSTRUCTIONS lives in instructions.py (single source of truth) so the compact-matched
+# SessionStart hook (hooks/reinject-instructions.sh) can re-emit the exact same text.
 
 _stdout_lock = threading.Lock()
 _initialized = threading.Event()

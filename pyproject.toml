@@ -1,6 +1,6 @@
 [project]
 name = "teammate-comms"
-version = "0.6.5"
+version = "0.7.0"
 description = "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances."
 authors = [{ name = "ColtonDyck" }]
 license = { text = "MIT" }

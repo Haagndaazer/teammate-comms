@@ -17,10 +17,12 @@ import os
 import re
 
 from .comms import (
+    DELETED_MARKER,
     PROFILE_FIELDS,
     REACTION_EMOJI,
     CommsError,
     aggregate_reactions,
+    append_deletion,
     append_group_message,
     append_reaction,
     append_transcript,
@@ -37,9 +39,15 @@ from .comms import (
     read_agent_record,
     read_group_messages,
     read_group_meta,
+    read_json_readonly,
     read_json_safe,
     read_reactions,
     read_transcript,
+    remove_agent,
+    remove_messages_from_inbox,
+    strip_member_from_groups,
+    tombstone_in_group_messages,
+    tombstone_in_inbox,
     validate_agent_name,
     validate_group_name,
     validate_profile_field,
@@ -325,6 +333,27 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Name the human appears as to the team (default $TEAMMATE_HUMAN_NAME, else 'human').",
                 },
+            },
+        },
+    },
+    {
+        "name": "teammate_delete",
+        "description": (
+            "Delete a message OR remove a teammate. Provide EXACTLY ONE of 'message' or "
+            "'teammate'. message=<id>: tombstones that message everywhere it was written "
+            "(a group post in the shared transcript AND every member's inbox copy; a DM in "
+            "the recipient's inbox) — the body becomes a deleted-marker but its id/author/"
+            "reply threads are kept, so citations still resolve. Allowed for the message's "
+            "author (or the operator via the dashboard). teammate=<name>: hard-removes an "
+            "OFFLINE teammate (registry record + inbox + group memberships); their past "
+            "messages stay attributed. A live teammate or yourself can't be removed. "
+            "Deletions reflect in the dashboard live."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Id of the message to delete (tombstone). Mutually exclusive with 'teammate'."},
+                "teammate": {"type": "string", "description": "Name of the OFFLINE teammate to remove. Mutually exclusive with 'message'."},
             },
         },
     },
@@ -818,8 +847,20 @@ def _handle_group(args, ctx):
         # Creator-only, OR any member if the creator is no longer a member (orphan).
         if not (agent == creator or (creator not in members and agent in members)):
             raise CommsError(f"Only the creator ({creator}) can delete {sigil}.")
+        # Resolve the group's message ids BEFORE rmtree so we can purge the fan-out
+        # copies that linger in member inboxes. (The old bug: delete removed only the
+        # group dir, leaving those copies + the transcript behind, so a "deleted" group's
+        # messages still showed.) Order: clean inboxes -> rmtree -> emit the deletion
+        # event LAST, so a best-effort partial rmtree can't desync the dashboard.
+        msg_ids = [m.get("id") for m in read_group_messages(root, team, group)
+                   if isinstance(m, dict) and m.get("id")]
+        for member in members:
+            remove_messages_from_inbox(root, team, member, msg_ids)
         delete_group(root, team, group)
-        return f"Deleted group {sigil}."
+        append_deletion(root, team, {"id": now_timestamp(), "target": sigil,
+                                     "kind": "group", "by": agent, "op": "delete"})
+        return (f"Deleted group {sigil} (purged {len(msg_ids)} message(s) from "
+                f"member inboxes).")
 
     if action == "join":
         def mutate(meta):
@@ -981,6 +1022,121 @@ def _handle_react(args, ctx):
     return f"Reacted {glyph} ({emoji}) to message {rec['target']}."
 
 
+def resolve_message(root, team, msg_id):
+    """Resolve a message id → ``{from, kind, group?, to?}`` or None if not found.
+
+    Primary source is the global transcript (it carries from/kind/to/group for every DM
+    and group post). Falls back to scanning group transcripts then inboxes when the
+    firehose is disabled (TEAMMATE_TRANSCRIPT=0) or rotated. Returns None on a clean miss.
+    """
+    for rec in reversed(read_transcript(root, team, limit=None)):  # recent-first; break on hit
+        if rec.get("id") == msg_id:
+            kind = rec.get("kind") or ("group" if rec.get("group") else "dm")
+            out = {"from": rec.get("from"), "kind": kind}
+            if rec.get("group"):
+                out["group"] = rec["group"]
+            if rec.get("to"):
+                out["to"] = rec["to"]
+            return out
+    # Fallback: group transcripts (canonical for group posts).
+    groups_dir = get_groups_dir(root, team)
+    if groups_dir.exists():
+        for gdir in sorted(d for d in groups_dir.iterdir() if d.is_dir()):
+            for rec in read_group_messages(root, team, gdir.name):
+                if isinstance(rec, dict) and rec.get("id") == msg_id:
+                    return {"from": rec.get("from"), "kind": "group",
+                            "group": rec.get("group") or f"#{gdir.name}"}
+    # Fallback: inboxes (DMs). The record has 'from'; the owning file name IS the
+    # recipient. Non-destructive read (no lock held during resolution).
+    inboxes_dir = get_inboxes_dir(root, team)
+    if inboxes_dir.exists():
+        for f in (sorted(inboxes_dir.glob("*_unread.json"))
+                  + sorted(inboxes_dir.glob("*_read.json"))):
+            for rec in (read_json_readonly(f) or []):
+                if isinstance(rec, dict) and rec.get("id") == msg_id:
+                    if rec.get("group"):
+                        return {"from": rec.get("from"), "kind": "group", "group": rec["group"]}
+                    owner = f.name.rsplit("_", 1)[0]  # strip _unread.json / _read.json
+                    return {"from": rec.get("from"), "kind": "dm", "to": owner}
+    return None
+
+
+def delete_message(root, team, caller, msg_id, is_operator=False):
+    """Tombstone a message everywhere it was written (author-or-operator).
+
+    Returns a summary string; raises CommsError if not found or not permitted. The
+    durable tombstone lands in the group transcript + member inboxes (group) or the
+    recipient inbox (DM); a deletion event is appended for the dashboard sub-stream.
+    """
+    if not isinstance(msg_id, str) or not msg_id.strip():
+        raise CommsError("'message' is required (the id of the message to delete).")
+    msg_id = msg_id.strip()
+    info = resolve_message(root, team, msg_id)
+    if info is None:
+        raise CommsError(f"No message with id {msg_id!r} found.")
+    author = info.get("from")
+    if not is_operator and caller != author:
+        raise CommsError(f"Only the author ({author}) or the operator can delete that message.")
+    if info.get("kind") == "group":
+        group = validate_group_name(info.get("group") or "")
+        tombstone_in_group_messages(root, team, group, msg_id, caller)
+        meta = read_group_meta(root, team, group)
+        for member in (meta.get("members", []) if meta else []):
+            tombstone_in_inbox(root, team, member, msg_id, caller)
+        where = f"#{group}"
+    else:
+        to = info.get("to")
+        if to:
+            tombstone_in_inbox(root, team, to, msg_id, caller)
+        if author:
+            tombstone_in_inbox(root, team, author, msg_id, caller)  # self-copy safety
+        where = f"DM to {to}" if to else "DM"
+    append_deletion(root, team, {"id": now_timestamp(), "target": msg_id,
+                                 "kind": "message", "by": caller, "op": "delete"})
+    return f"Deleted message {msg_id} ({where}) — tombstoned everywhere it appeared."
+
+
+def remove_teammate(root, team, caller, name, is_operator=False):
+    """Hard-remove an OFFLINE teammate: registry record + inbox files + group
+    memberships. Their authored messages stay attributed. Raises CommsError on a guard
+    violation (self, the human operator, a missing name, or a LIVE teammate).
+    """
+    validate_agent_name(name)
+    if name == caller:
+        raise CommsError("You can't remove yourself.")
+    record = read_agent_record(root, team, name)
+    if record is None:
+        raise CommsError(f"No teammate named {name!r} is registered.")
+    if record.get("type") == "human":
+        raise CommsError(f"{name!r} is the human operator — not removable via teammate_delete.")
+    if is_channel_alive(record, pid_check=False):
+        raise CommsError(
+            f"{name!r} is live — ask them to exit (or wait for their heartbeat to go "
+            f"stale) before removing; a live teammate's heartbeat would just re-create "
+            f"the record."
+        )
+    removed_from = strip_member_from_groups(root, team, name)
+    remove_agent(root, team, name)
+    append_deletion(root, team, {"id": now_timestamp(), "target": "@" + name,
+                                 "kind": "teammate", "by": caller, "op": "delete"})
+    extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
+             if removed_from else "")
+    return f"Removed teammate {name} (registry + inbox).{extra}"
+
+
+def _handle_delete(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    msg = args.get("message")
+    who = args.get("teammate")
+    has_msg = bool(isinstance(msg, str) and msg.strip())
+    has_who = bool(isinstance(who, str) and who.strip())
+    if has_msg == has_who:  # neither, or both
+        raise CommsError("Provide exactly one of 'message' or 'teammate'.")
+    if has_msg:
+        return delete_message(root, team, agent, msg, is_operator=False)
+    return remove_teammate(root, team, agent, who.strip(), is_operator=False)
+
+
 def _reincarnate_enabled():
     v = os.environ.get("TEAMMATE_REINCARNATE_ENABLED")
     return bool(v) and v.strip().lower() not in ("", "0", "false", "no", "off")
@@ -1064,6 +1220,7 @@ _HANDLERS = {
     "teammate_react": _handle_react,
     "teammate_reincarnate": _handle_reincarnate,
     "teammate_dashboard": _handle_dashboard,
+    "teammate_delete": _handle_delete,
 }
 
 

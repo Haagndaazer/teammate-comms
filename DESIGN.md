@@ -79,6 +79,12 @@ fast, predictable spawn:
 - The MCP server is launched with **`uv run --no-sync`** (venv already present).
 - **First-session UX:** on a fresh install the hook builds the venv and the server
   connects after a **restart** — identical to vibe-cognition. Documented in the README.
+- A **second SessionStart hook** (`hooks/reinject-instructions.sh`, `matcher:"compact"`)
+  re-emits the server `INSTRUCTIONS` as `additionalContext` after a `/compact` (added
+  0.7.0). The MCP `initialize` handshake surfaces them at session start, but those aren't
+  known to survive a compaction; the text is single-sourced in `teammate_comms.instructions`
+  (stdlib-only `main()` → SessionStart JSON, run via the same `uv run --no-sync` launch) so
+  server + hook never drift. Mirrors vibe-cognition's pattern.
 
 `mcpServers` is declared **inline in `plugin.json`** with `${CLAUDE_PLUGIN_ROOT}`, so
 the plugin is self-contained and does not write into a project's `.mcp.json`.
@@ -290,8 +296,39 @@ long-lived server. **12 tools:**
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (recorded in `reactions.jsonl`, shown in inbox/history/dashboard). **Wakes only the author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
+| `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one (XOR, enforced in the handler) | Delete a message (**tombstone**) or remove an **offline** teammate (see below). |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
+
+**Deletion (added 0.7.0).** `teammate_delete` covers two destructive ops, in a codebase
+that is otherwise append-only:
+- **Message = tombstone, not erase.** `tombstone_fields()` rewrites a record in place —
+  body → `"— message deleted —"`, `deleted:true`, `deleted_by` — while keeping `id`,
+  `from`, `to`/`group`, `reply_to`, `post_type`. A group post shares ONE id across the
+  group `messages.json`, every member's inbox copy, and the transcript, so the tombstone is
+  applied to each durable store (the inbox helper locks the **unread** file and rewrites
+  both `_unread`/`_read` under it — same lock discipline as `teammate_ack`). Keeping the id
+  + `reply_to` means citations and thread/group continuity survive. Permission is
+  **author-or-operator** (`is_operator=True` only on the dashboard path).
+- **Teammate = hard remove, offline only.** Deletes the registry record + inbox files +
+  strips the name from every group's `members`; their authored messages stay attributed. A
+  **live** teammate is refused (its ~5s heartbeat would re-create the record while its inbox
+  was deleted — dropping queued messages); self / the human operator are refused too.
+- **`resolve_message`** finds a message's author + locations via the transcript first, with
+  a scan fallback over group transcripts + inboxes when `TEAMMATE_TRANSCRIPT=0`.
+- **`transcript.jsonl` is NOT rewritten** (the append-only firehose invariant is kept).
+  Instead deletions flow through a dedicated **`deletions.jsonl`** event stream — the same
+  shape as `reactions.jsonl`: append-only, its own dashboard poll cursor (`dcursor`), folded
+  client-side into a `deleted` set (idempotent, keyed by target). That's how an open console
+  reflects a mutation the firehose can't (it's id-keyed and append-only): the message flips
+  to its placeholder within a poll tick; a `kind:"group"` event drops the channel from the
+  sidebar. Whole-group `teammate_group(action="delete")` now also hard-removes the group's
+  fan-out copies from member inboxes (resolved **before** the `rmtree`) and emits a
+  `kind:"group"` deletion event — fixing the old "deleted group's messages lingered" bug.
+- **Intentional, documented behaviors:** dashboard reflection requires the firehose
+  (`TEAMMATE_TRANSCRIPT=1`); a tombstoned message's reactions persist in MCP reads
+  (inbox/history) though the dashboard hides them; reacting to a deleted message still wakes
+  its author (the tombstone preserves `from`).
 
 **Group chat (added 0.4.0).** Named group chats addressed with a `#` sigil
 (`teammate_send(to="#design")`) — a separate namespace from agents, so names can't
