@@ -385,13 +385,19 @@ that is otherwise append-only:
     exactly why the fresh-load read must stay a **full** `read_deletions(limit=None)` and must
     **never** be "optimized" back to the bounded newest-N tail (that would skip an un-folded middle
     event sitting between the retained tail and the gate).
-  - **Accepted ECs (self-healing).** (1) A **cursored** client (live console mid-poll) does *not*
-    replay the baseline; one that lags **more than `DELETIONS_RETAIN` deletions between two polls**
-    (e.g. a long-suspended browser tab) skips the compacted-away tombstones until its next **full
-    reload**, which recovers them — same class as the firehose/reaction cursors. (2) A group
+  - **Lagged-cursor rescue (no reload needed).** A **cursored** client (live console mid-poll)
+    normally replays *no* baseline. But if it lags so far that its `dcursor` is **older than the
+    jsonl's oldest surviving id** (`floor`) — a suspended tab resuming after `>DELETIONS_RETAIN`
+    deletions — the events in `(dcursor, floor)` were compacted into the set-file and it never saw
+    them. The poll detects `dcursor < floor` and replays the **complete baseline∪jsonl union that
+    one poll** (the rescue), so a message deleted while the tab slept can't silently render
+    *undeleted* until the user happens to reload ("recovers on reload" is self-*concealing*, not
+    self-healing). It fires once — `dcursor` then advances past `floor` and the steady state falls
+    back to the cheap incremental walk, so live polls pay nothing extra.
+  - **Accepted ECs (self-healing).** (1) A group
     hard-deleted then **recreated with the same name** has its old `kind:"group"` tombstone (target
     is the group *name* `#x`, not a unique id) replayed on every fresh load, hiding the new group
-    until its first message re-pushes it — pre-existing, now with a wider replay window. (3) Under
+    until its first message re-pushes it — pre-existing, now with a wider replay window. (2) Under
     sustained `file_lock_optional` contention a group/teammate delete may skip both its append and
     compaction; the jsonl stays correct (full-file fresh read), just larger.
 - **Intentional, documented behaviors:** dashboard reflection requires the firehose

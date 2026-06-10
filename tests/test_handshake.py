@@ -1853,11 +1853,12 @@ def main():
                 _pc = {e["target"] for e in _poll(_pf.get("dcursor", "")).get("deletions", [])}
                 if _pc & {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"} or not _pc <= {"msg-5", "msg-6", "msg-7"}:
                     failures.append(f"P2 cursored poll leaked the baseline or non-tail ids: {sorted(_pc)}")
-                # LAGGED cursor (older than the jsonl floor): skips the folded-away tombstones
-                # (self-heal contract) — they only come back on a full reload (asserted by _pf).
+                # LAGGED cursor (older than the jsonl floor) — the RESCUE (wire-the-fallback CR):
+                # the compacted-away tombstones must ARRIVE IN THIS poll, NOT after a reload. A
+                # message deleted while the tab was suspended can't silently render undeleted.
                 _pl = {e["target"] for e in _poll("0000").get("deletions", [])}
-                if _pl & {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"}:
-                    failures.append(f"P2 lagged cursored unexpectedly replayed folded tombstones: {sorted(_pl)}")
+                if _pl != {f"msg-{i}" for i in range(8)}:
+                    failures.append(f"P2 lagged cursored did NOT rescue the folded tombstones in-poll: {sorted(_pl)}")
             finally:
                 _dash2.shutdown_dashboard()
         finally:

@@ -34,6 +34,7 @@ MAX_BODY_BYTES = 1024 * 1024
 from . import tools as _tools
 from .comms import (
     CommsError,
+    _window,   # collision-safe burst-paging window, shared with the read_* helpers
     get_agents_dir,
     get_groups_dir,
     group_read_positions,
@@ -254,23 +255,30 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
         # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set and
         # re-renders affected messages/groups — the firehose is append-only and id-keyed, so an
-        # in-place tombstone never re-crosses `cursor`.
+        # in-place tombstone never re-crosses `cursor`. One full read of the live jsonl (bounded
+        # near DELETIONS_RETAIN by compaction — same cost as the old cursored since-scan) drives
+        # all three cases below; `floor` is its oldest id.
         #   FRESH load (no dcursor): the COMPLETE deleted-set = the compacted baseline (set-file)
-        #   UNIONed with the ENTIRE live jsonl. The full jsonl read (limit=None) is DELIBERATE and
-        #   load-bearing for C-2: the bounded newest-N tail would skip any event sitting between
-        #   the retained tail and the compaction gate (not yet folded into the set) — do NOT
-        #   "optimize" this back to a tail read. The jsonl is bounded near DELETIONS_RETAIN by
-        #   compaction, so this stays cheap; the union folds idempotently (keyed by target).
-        #   CURSORED walk: page oldest-first from the cursor (A-1 burst paging), NO baseline.
-        # EC (self-healing): a cursored client that lags > DELETIONS_RETAIN deletions between
-        # polls skips the compacted-away tombstones until its next full reload — see DESIGN.md.
-        if dcursor:
-            deletions = read_deletions(root, team, since=dcursor, limit=1000, oldest_first=True)
-            new_dcursor = deletions[-1]["id"] if deletions else dcursor
-        else:
-            jsonl = read_deletions(root, team, limit=None)   # entire live file (bounded), oldest→newest
+        #   UNIONed with the ENTIRE live jsonl. The FULL jsonl read (limit=None) is DELIBERATE and
+        #   load-bearing for C-2: a bounded newest-N tail would skip any event sitting between the
+        #   retained tail and the compaction gate (not yet folded into the set) — do NOT "optimize"
+        #   this back to a tail read. The union folds idempotently (keyed by target).
+        #   LAGGED cursored (dcursor < floor): events in (dcursor, floor) were compacted into the
+        #   set-file and this client never saw them — a suspended tab resuming. Replay the SAME
+        #   complete union THIS poll (the rescue), so a deleted message can't silently render
+        #   undeleted until the user happens to reload. Fires once: new_dcursor then advances past
+        #   the floor, so the steady state falls through to the cheap incremental walk.
+        #   INCREMENTAL cursored (dcursor >= floor): only events since the cursor, burst-paged
+        #   oldest-first via _window (A-1: advance to the last RETURNED id so a burst > limit pages
+        #   out across polls; the cut swallows any same-id collision group so the cursor can't stall).
+        jsonl = read_deletions(root, team, limit=None)   # entire live file (bounded), oldest→newest
+        floor = jsonl[0]["id"] if jsonl else ""
+        if (not dcursor) or (floor and dcursor < floor):
             deletions = list(read_deletions_set(root, team).values()) + jsonl
-            new_dcursor = jsonl[-1]["id"] if jsonl else dcursor   # cursor tracks the JSONL tail only
+            new_dcursor = jsonl[-1]["id"] if jsonl else dcursor   # caught fully up; track the tail
+        else:
+            deletions = _window([e for e in jsonl if e.get("id", "") >= dcursor], 1000, True)
+            new_dcursor = deletions[-1]["id"] if deletions else dcursor   # last RETURNED id (burst paging)
         return self._json(200, {"records": records, "cursor": new_cursor,
                                 "reactions": reactions, "rcursor": new_rcursor,
                                 "deletions": deletions, "dcursor": new_dcursor})
