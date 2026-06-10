@@ -147,6 +147,11 @@ def main():
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("TEAMMATE_AGENT", None)   # force explicit registration (no auto-register)
     env.pop("TEAMMATE_TEAM", None)
+    # Keep the reincarnate gate OFF in the child regardless of the ambient env — otherwise a
+    # box with TEAMMATE_REINCARNATE_ENABLED exported fails the gate-off assertion AND spawns a
+    # real terminal window. CI has a clean env so it passes; this makes local runs match it
+    # (no more manual `unset` before every run).
+    env.pop("TEAMMATE_REINCARNATE_ENABLED", None)
     # Comms root comes from TEAMMATE_COMMS_DIR above; CLAUDE_PROJECT_DIR now only
     # feeds the auto-filled `project` profile field (no longer the comms root).
     env["CLAUDE_PROJECT_DIR"] = f"C:/some/path/{PROJECT}"
