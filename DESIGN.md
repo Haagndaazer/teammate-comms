@@ -366,6 +366,18 @@ that is otherwise append-only:
   (`TEAMMATE_TRANSCRIPT=1`); a tombstoned message's reactions persist in MCP reads
   (inbox/history) though the dashboard hides them; reacting to a deleted message still wakes
   its author (the tombstone preserves `from`).
+- **Delete races are eventually-consistent, not atomic (A-4/A-5, documented).** Per-store
+  locking has no cross-store atomicity (a recorded v0.7.0 decision), so two narrow windows are
+  accepted rather than closed: (A-4) a member who **joins during** a group-message tombstone
+  fan-out can keep a live copy of that message — the fan-out reads `members` once; (A-5) a
+  whole-group delete purges member inboxes by the **`group == sigil` predicate** (catching a
+  fan-out copy that lands before the purge — strictly better than the old id-snapshot), but a
+  `send_group` that passes its meta-exists check before the `rmtree` yet fans out **after** the
+  purge can still orphan an inbox copy. Both are bounded and self-heal on the consumer side: a
+  fresh dashboard load omits the absent group, and `resolve_message`'s group-dir fallback finds
+  nothing. Closing either would require holding the group meta lock across the inbox fan-out —
+  the cross-store atomicity deliberately not built. The MCP inbox read is the only surface that
+  briefly shows the orphan, until it's acked.
 
 **Group chat (added 0.4.0).** Named group chats addressed with a `#` sigil
 (`teammate_send(to="#design")`) — a separate namespace from agents, so names can't
@@ -489,6 +501,21 @@ burst larger than the window pages out across polls instead of being sliced off 
 stall). The reactions/deletions sub-streams thread the same `oldest_first` policy. (Separate
 known limit, audit C-2 / WP-7: a fresh deletions load only replays the newest `limit` events,
 so a very old deletion past that window can render undeleted until rotation/compaction lands.)
+
+> **Known firehose limit — out-of-order tee (audit N-1, accepted).** A message's `id` is
+> stamped at *send* (before the inbox lock) and is **load-bearing** — it's the inbox-record
+> id, the ack id, and the react/delete resolution key — so it CANNOT be re-stamped under the
+> transcript lock the way reactions/deletions were (WP-1 CR-1); moving it would desync the
+> transcript id from the ack/react identity. Two concurrent sends can therefore tee
+> out-of-order (`[T2, T1]`); if a record is teed *after* the dashboard cursor already advanced
+> past its id, that record never appears in the **firehose** (the message is still delivered,
+> acked, reacted, and deletion-resolvable — only the observability view skips it). Accepted
+> under the best-effort-observability stance. The real fix is a **file-offset/byte cursor** for
+> the transcript stream (immune to id order), which must be co-designed with WP-7's NDJSON
+> rotation (a byte offset is invalidated by rotation) — deferred there, not bodged here.
+> **Audit C-1 is deferred to the same WP-7 work:** `react()`/`resolve_message` scanning a
+> "bounded recent tail" gives no real speedup while `read_transcript` parses the whole file to
+> build its window — the genuine fix is the same seek-from-tail read C-2 needs.
 
 **Profile fields (0.2.0; `project` added 0.3.0).** Stored as plain keys on the agent
 registry record via `write_agent_record`'s field-level merge — additive,
