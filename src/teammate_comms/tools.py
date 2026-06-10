@@ -15,6 +15,8 @@ JSON-RPC stream. Diagnostics go to stderr; failures go into the envelope.
 import json
 import os
 import re
+import sys
+import traceback
 
 from .comms import (
     DELETED_MARKER,
@@ -65,6 +67,11 @@ _GROUP_ACTIONS = ("create", "delete", "join", "leave", "add", "members", "histor
 _POST_TYPES = ("decision", "blocker", "fyi", "chatter")
 # Fixed basic emoji-reaction set (name → glyph) — single source in comms.py.
 _REACTIONS = REACTION_EMOJI
+# Max message length (chars). Profile fields were capped at v0.2.0 but message bodies never
+# were (audit D-3); an unbounded body is stored and re-served to every poller forever. Kept
+# well UNDER the dashboard's 1 MB POST-body cap so an over-long message returns this
+# informative error (→ 400) rather than the opaque 413 the transport cap would give.
+MAX_MESSAGE_CHARS = 64 * 1024
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -387,10 +394,15 @@ def _handle_register(args, ctx):
 
 
 def _clean_message(message):
-    """Return the trimmed message body, or raise CommsError."""
+    """Return the trimmed message body, or raise CommsError (single chokepoint for both the
+    MCP teammate_send and the dashboard, so the length cap covers both)."""
     if not isinstance(message, str) or not message.strip():
         raise CommsError("'message' is required and must be a non-empty string.")
-    return message.strip()
+    cleaned = message.strip()
+    if len(cleaned) > MAX_MESSAGE_CHARS:
+        raise CommsError(f"'message' exceeds the {MAX_MESSAGE_CHARS}-character limit "
+                         f"({len(cleaned)} chars).")
+    return cleaned
 
 
 def _clean_priority(priority):
@@ -1234,4 +1246,9 @@ def dispatch(name, arguments, ctx):
     except CommsError as e:
         return (f"{name} failed: {e}", True)
     except Exception as e:  # defensive: never let a tool kill the server
+        # A non-CommsError is a PROGRAMMING bug, not bad input — trace it to stderr (never
+        # stdout: that's the JSON-RPC stream) so a refactor regression surfaces in the logs
+        # instead of hiding behind a generic isError (audit A-9). The loop still survives.
+        print(f"[teammate-comms] unexpected error in tool {name!r}:", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         return (f"{name} failed unexpectedly: {e}", True)

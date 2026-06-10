@@ -523,6 +523,30 @@ live server on this host already owns the same agent name) are logged to stderr 
 > setup-style tool is cleaner. The server **never exits on missing identity**; it
 > simply waits to be registered.
 
+**Trust model — the boundary it ISN'T.** teammate-comms is a **single-user, cooperative,
+localhost** tool; its security posture is exactly that — *not* authentication. Stated plainly
+so no future feature mistakes a convenience for a boundary:
+
+- **`from` is caller-asserted, never authenticated.** A sender supplies its own name (the
+  sender-explicit cores are what enable the human-as-teammate dashboard — decision
+  `a9594b942f2b`); any local process can author a record as any name. `from` is **advisory**.
+- **The author-only delete check and reaction/mention wake-routing consume `from` as a
+  convenience, not authorization.** "Only the author (or operator) can delete" is an
+  **anti-footgun** guard against deleting someone else's message by mistake — not access
+  control; a process asserting a different `from` bypasses it trivially, and a forged
+  `target_from`/`mentions` can wake an arbitrary victim.
+- **Any local process of this OS user can read any inbox.** The comms root is a shared
+  directory tree (global by default — decision `ef4af8135c03`) with default OS-user file
+  permissions; there is no per-agent secret. The trust domain is *all processes of this OS
+  user*, full stop.
+
+This is **correct and intentional** for the threat model — your own agents, on your own
+machine, cooperating. The hard rule: a future cross-host / multi-user feature must **NOT**
+build on the author-check or `from` as if they were real authentication; it would need an
+actual auth layer added first. (The dashboard's per-launch token *is* a real secret —
+loopback-bound, constant-time-compared, query-string-redacted in logs — but it guards the
+**HTTP console**, not the file-level comms.)
+
 ---
 
 ## 11. `skills/teammate-comms/SKILL.md` & launch
