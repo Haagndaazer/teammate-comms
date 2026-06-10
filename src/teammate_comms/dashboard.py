@@ -34,17 +34,21 @@ MAX_BODY_BYTES = 1024 * 1024
 from . import tools as _tools
 from .comms import (
     CommsError,
+    _window,   # collision-safe burst-paging window, shared with the read_* helpers
     get_agents_dir,
     get_groups_dir,
     group_read_positions,
     is_channel_alive,
+    get_transcript_file,
     read_agent_record,
     read_deletions,
+    read_deletions_set,
     read_group_meta,
     read_reactions,
-    read_transcript,
+    read_transcript_after,
     register_human,
     set_human_presence,
+    transcript_tail_and_cursor,
 )
 
 
@@ -239,26 +243,57 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team
-        # oldest_first=bool(cursor): a fresh load (no cursor) takes the newest tail; once
-        # walking a cursor we page OLDEST-first and advance the cursor only to the last
-        # returned id, so a burst larger than `limit` drains across polls instead of being
-        # skipped (audit A-1). All three sub-streams thread the same policy.
-        records = read_transcript(root, team, since=(cursor or None), limit=200,
-                                  oldest_first=bool(cursor))
-        new_cursor = records[-1]["id"] if records else cursor
+        # Records sub-stream — BYTE cursor (P3). UNLIKE the id-based reactions/deletions cursors
+        # below, this cursor is "<offset>|<generation>" (a byte position + a first-line crc) and is
+        # OPAQUE to the browser. The two cursor families do NOT share reset semantics: a transcript
+        # recreation re-tails the records stream (transparently — the id-dedup folds repeats),
+        # while the id-based streams keep their own cursors. A live cursored poll reads only the
+        # bytes appended since last poll (vs the old O(file) `since` scan), and byte-streaming fixes
+        # N-1 too (a late/out-of-order tee lands at EOF, so it's emitted, not skipped — it then
+        # shows in arrival order; shown late beats never shown).
+        _tpath = get_transcript_file(root, team)
+        if cursor:
+            _off_s, _, _gen = cursor.partition("|")   # split on the FIRST "|"; empty RHS ≡ fresh sentinel
+            try:
+                _off = int(_off_s)
+            except ValueError:
+                _off, _gen = 0, ""                    # malformed cursor → force a clean re-tail
+            records, _new_off, _new_gen, _reset = read_transcript_after(_tpath, _off, _gen, limit=200)
+            new_cursor = f"{_new_off}|{_new_gen}"
+        else:
+            records, _off0, _gen0 = transcript_tail_and_cursor(_tpath, limit=200)   # fresh: tail + mint
+            new_cursor = f"{_off0}|{_gen0}"
         # Reaction events sub-stream (own cursor). The frontend folds add/remove into
         # per-message chips client-side. Ambient — never woke anyone.
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500,
                                    oldest_first=bool(rcursor))
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
-        # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set
-        # and re-renders affected messages/groups — the firehose is append-only and
-        # id-keyed, so an in-place tombstone never re-crosses `cursor`. Replayed from the
-        # start on a fresh load so previously-deleted messages render as deleted (after the
-        # 1000-tail window — see audit C-2, full fix is WP-7).
-        deletions = read_deletions(root, team, since=(dcursor or None), limit=1000,
-                                   oldest_first=bool(dcursor))
-        new_dcursor = deletions[-1]["id"] if deletions else dcursor
+        # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set and
+        # re-renders affected messages/groups — the firehose is append-only and id-keyed, so an
+        # in-place tombstone never re-crosses `cursor`. One full read of the live jsonl (bounded
+        # near DELETIONS_RETAIN by compaction — same cost as the old cursored since-scan) drives
+        # all three cases below; `floor` is its oldest id.
+        #   FRESH load (no dcursor): the COMPLETE deleted-set = the compacted baseline (set-file)
+        #   UNIONed with the ENTIRE live jsonl. The FULL jsonl read (limit=None) is DELIBERATE and
+        #   load-bearing for C-2: a bounded newest-N tail would skip any event sitting between the
+        #   retained tail and the compaction gate (not yet folded into the set) — do NOT "optimize"
+        #   this back to a tail read. The union folds idempotently (keyed by target).
+        #   LAGGED cursored (dcursor < floor): events in (dcursor, floor) were compacted into the
+        #   set-file and this client never saw them — a suspended tab resuming. Replay the SAME
+        #   complete union THIS poll (the rescue), so a deleted message can't silently render
+        #   undeleted until the user happens to reload. Fires once: new_dcursor then advances past
+        #   the floor, so the steady state falls through to the cheap incremental walk.
+        #   INCREMENTAL cursored (dcursor >= floor): only events since the cursor, burst-paged
+        #   oldest-first via _window (A-1: advance to the last RETURNED id so a burst > limit pages
+        #   out across polls; the cut swallows any same-id collision group so the cursor can't stall).
+        jsonl = read_deletions(root, team, limit=None)   # entire live file (bounded), oldest→newest
+        floor = jsonl[0]["id"] if jsonl else ""
+        if (not dcursor) or (floor and dcursor < floor):
+            deletions = list(read_deletions_set(root, team).values()) + jsonl
+            new_dcursor = jsonl[-1]["id"] if jsonl else dcursor   # caught fully up; track the tail
+        else:
+            deletions = _window([e for e in jsonl if e.get("id", "") >= dcursor], 1000, True)
+            new_dcursor = deletions[-1]["id"] if deletions else dcursor   # last RETURNED id (burst paging)
         return self._json(200, {"records": records, "cursor": new_cursor,
                                 "reactions": reactions, "rcursor": new_rcursor,
                                 "deletions": deletions, "dcursor": new_dcursor})

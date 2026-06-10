@@ -1615,6 +1615,431 @@ def main():
     except Exception as e:
         failures.append(f"WP-6 race+scale unit checks errored: {e}")
 
+    # ── WP-7 P4 (C-3) — teammate_inbox since/limit windowing; the SILENT-LOSS guard: ack("all")
+    #    after a LIMITED read clears only what was SHOWN, never unshown messages. ──
+    try:
+        from teammate_comms import comms as _c7
+        from teammate_comms import tools as _t7
+
+        class _Id7:
+            def __init__(self, agent, root):
+                self.agent, self.root, self._seen = agent, root, None
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+            def set_last_seen(self, ids):
+                self._seen = set(ids)
+
+            def get_last_seen(self):
+                return self._seen
+        proot7 = tempfile.mkdtemp(prefix="tc-wp7-p4-")
+        for i in range(5):
+            _t7.send_dm(proot7, None, "alice", "bob", f"m{i}")
+        _ctx7 = {"identity": _Id7("bob", proot7)}
+        _binb = _c7.get_inboxes_dir(proot7, None) / "bob_unread.json"
+        # limited read → most recent 2; header notes it; set_last_seen reflects ONLY those 2.
+        _out = _t7._handle_inbox({"limit": 2}, _ctx7)
+        if "showing 2 of 5" not in _out:
+            failures.append(f"P4: limited inbox didn't note 'showing 2 of 5': {_out[:90]!r}")
+        _seen = _ctx7["identity"].get_last_seen()
+        if _seen is None or len(_seen) != 2:
+            failures.append(f"P4: set_last_seen did not reflect ONLY the 2 shown ids ({_seen})")
+        # ack-all now clears ONLY the 2 shown — the other 3 remain unread (NO silent loss).
+        _t7._handle_ack({"id": "all"}, _ctx7)
+        _rem = _c7.read_json_safe(_binb)
+        if len(_rem) != 3:
+            failures.append(f"P4 SILENT-LOSS: ack('all') after limit=2 left {len(_rem)} unread (want 3)")
+        # since filter: only ids >= the cursor (page forward). The 3 remaining are the oldest 3.
+        _ids = sorted(m["id"] for m in _rem)
+        _sout = _t7._handle_inbox({"since": _ids[-1]}, {"identity": _Id7("bob", proot7)})
+        if "1 unread message(s)" not in _sout:
+            failures.append(f"P4 since filter: expected 1 message at/after the newest remaining: {_sout[:90]!r}")
+        # _read.json cap is module-level (_READ_CAP) and trims on ack — assert the constant is
+        # sane (a heavy 1000-ack test isn't worth the runtime; the trim is a plain slice).
+        if not (isinstance(_t7._READ_CAP, int) and _t7._READ_CAP > 0):
+            failures.append("P4: _READ_CAP is not a positive int")
+        # P4 CR (v0.4.2 composition): an id SHOWN on an earlier page must STAY in last_seen when
+        # a later windowed read shows a DIFFERENT page — else it re-counts as unseen and the
+        # watcher would re-nudge a message the agent already read. last_seen is union-with-prune.
+        uroot = tempfile.mkdtemp(prefix="tc-wp7-p4u-")
+        for i in range(5):
+            _t7.send_dm(uroot, None, "alice", "bob", f"u{i}")
+        _uctx = {"identity": _Id7("bob", uroot)}
+        _uids = sorted(m["id"] for m in _c7.read_json_safe(_c7.get_inboxes_dir(uroot, None) / "bob_unread.json"))
+        _t7._handle_inbox({"since": _uids[1]}, _uctx)     # page A: shows ids >= id1 (incl _uids[1])
+        _t7._handle_inbox({"limit": 1}, _uctx)            # page B: shows only the newest id
+        if _uids[1] not in (_uctx["identity"].get_last_seen() or set()):
+            failures.append("P4 CR: an earlier-page id fell out of last_seen on a later windowed "
+                            "read (would re-nudge an already-read message)")
+    except Exception as e:
+        failures.append(f"WP-7 P4 inbox-windowing unit checks errored: {e}")
+
+    # ── WP-7 P1 (C-1) — read_jsonl_tail: seek-from-tail NDJSON reader. Reads only the file's
+    #    tail, byte-identical to read_transcript(...)[-N:]; the react/resolve scans use it
+    #    tail-first with a full-scan fallback. Edge cases stress chunk-boundary straddles. ──
+    try:
+        from teammate_comms import comms as _cp1
+        from teammate_comms import tools as _tp1
+
+        def _wb(_path, _data):
+            with open(_path, "wb") as _f:
+                _f.write(_data)
+
+        _d1 = tempfile.mkdtemp(prefix="tc-wp7-p1-")
+        _p = os.path.join(_d1, "t.jsonl")
+
+        # (1) no trailing newline — the last (unterminated) record must still be returned.
+        _wb(_p, b'{"id":"a","n":1}\n{"id":"b","n":2}')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 2)] != ["a", "b"]:
+            failures.append("P1 no-trailing-newline: last record dropped")
+
+        # (2) trailing newline (window ends ON a newline) — no phantom empty record.
+        _wb(_p, b'{"id":"a"}\n{"id":"b"}\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 5)] != ["a", "b"]:
+            failures.append("P1 trailing-newline: miscounted")
+
+        # (3) single line at BOF, no newline — the leading line at pos==0 is complete.
+        _wb(_p, b'{"id":"solo"}')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 3)] != ["solo"]:
+            failures.append("P1 single-line-BOF: not returned")
+
+        # (4) n > count — clamp to all available, newest-last order preserved.
+        _wb(_p, b'{"id":"1"}\n{"id":"2"}\n{"id":"3"}\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 99)] != ["1", "2", "3"]:
+            failures.append("P1 n>count clamp wrong")
+
+        # (5)+(6) records AND a multibyte UTF-8 char straddling back-chunks: force a tiny
+        #         chunk_size so the 3-byte → and record boundaries fall mid-chunk and must be
+        #         rejoined before decode (else replacement chars / dropped records).
+        _recs = [{"id": f"{i:02d}", "msg": "cafe→unicode"} for i in range(20)]
+        _wb(_p, ("\n".join(json.dumps(r, ensure_ascii=False) for r in _recs) + "\n").encode("utf-8"))
+        _r = _cp1.read_jsonl_tail(_p, 6, chunk_size=4)
+        if [x.get("id") for x in _r] != ["14", "15", "16", "17", "18", "19"]:
+            failures.append(f"P1 chunk-straddle ids wrong: {[x.get('id') for x in _r]}")
+        if any(x.get("msg") != "cafe→unicode" for x in _r):
+            failures.append("P1 multibyte-straddle: a record decoded with replacement chars")
+
+        # (7) CRLF line endings — .strip() drops the \r; clean parse (matches the line readers).
+        _wb(_p, b'{"id":"x"}\r\n{"id":"y"}\r\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 2)] != ["x", "y"]:
+            failures.append("P1 CRLF not stripped")
+
+        # (8) garbage / blank lines skipped — 'newest N' is N PARSEABLE records, not raw lines.
+        _wb(_p, b'{"id":"g1"}\n\nnot json\n{"id":"g2"}\n   \n{"id":"g3"}\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 2)] != ["g2", "g3"]:
+            failures.append("P1 garbage/blank lines not skipped to N parseable")
+
+        # (9) byte-identical to the full read's tail across realistic data x chunk sizes.
+        _troot = tempfile.mkdtemp(prefix="tc-wp7-p1bi-")
+        for i in range(50):
+            _cp1.append_transcript(_troot, None, {"id": f"2026-02-01T00:00:00.{i:06d}", "message": f"m{i}"})
+        _path = _cp1.get_transcript_file(_troot, None)
+        _whole = _cp1.read_transcript(_troot, None, limit=None)  # limit=None bypasses the fast path
+        for _n in (1, 7, 50, 200):
+            for _cs in (8, 64, 8192):
+                _tail = _cp1.read_jsonl_tail(_path, _n, chunk_size=_cs)
+                _want = _whole[-_n:] if _n <= len(_whole) else _whole
+                if [r.get("id") for r in _tail] != [r.get("id") for r in _want]:
+                    failures.append(f"P1 NOT byte-identical to full read: n={_n} cs={_cs}")
+                    break
+
+        # (10) since filter — only ids >= the cursor survive.
+        _r = _cp1.read_jsonl_tail(_path, 100, since="2026-02-01T00:00:00.000045")
+        if [r.get("id") for r in _r] != [f"2026-02-01T00:00:00.{i:06d}" for i in range(45, 50)]:
+            failures.append(f"P1 since filter wrong: {[r.get('id') for r in _r]}")
+
+        # ---- _scan_transcript_for_id: in-window hit, beyond-window full-scan fallback, true miss.
+        if (_tp1._scan_transcript_for_id(_troot, None, "2026-02-01T00:00:00.000049") or {}).get("message") != "m49":
+            failures.append("P1 _scan: recent (in-window) id did not resolve")
+        _save = _tp1._RESOLVE_TAIL
+        try:
+            _tp1._RESOLVE_TAIL = 5  # shrink so id 0 predates the tail → must full-scan
+            if (_tp1._scan_transcript_for_id(_troot, None, "2026-02-01T00:00:00.000000") or {}).get("message") != "m0":
+                failures.append("P1 _scan: older-than-window id did not resolve via full-scan fallback")
+            if _tp1._scan_transcript_for_id(_troot, None, "no-such-id") is not None:
+                failures.append("P1 _scan: a true miss past a saturated window did not return None")
+        finally:
+            _tp1._RESOLVE_TAIL = _save
+    except Exception as e:
+        failures.append(f"WP-7 P1 seek-tail unit checks errored: {e}")
+
+    # ── WP-7 P2 (C-2) — deletions.jsonl compaction: fold tail-evicted events into a target-keyed
+    #    set-file so a FRESH dashboard load (baseline-set UNION the FULL live jsonl) reflects EVERY
+    #    deletion ever — a tombstone can't reappear once it ages past the jsonl tail. ──
+    try:
+        import http.client as _hc2
+        from urllib.parse import quote as _q2
+
+        from teammate_comms import comms as _cp2
+        from teammate_comms import dashboard as _dash2
+
+        _save_retain, _save_bytes = _cp2.DELETIONS_RETAIN, _cp2.DELETIONS_COMPACT_BYTES
+        try:
+            _cp2.DELETIONS_RETAIN = 3          # keep only the newest 3 events in the live jsonl
+            _cp2.DELETIONS_COMPACT_BYTES = 1   # trip the gate on every append (any line > 1 byte)
+            p2root = tempfile.mkdtemp(prefix="tc-wp7-p2-")
+            # 8 message-deletes; RETAIN=3 → the oldest 5 fold into the set-file, jsonl keeps 3.
+            for i in range(8):
+                _cp2.append_deletion(p2root, None,
+                                     {"target": f"msg-{i}", "kind": "message", "by": "op", "op": "delete"})
+            _djsonl = _cp2.get_deletions_file(p2root, None)
+            _dset = _cp2.read_deletions_set(p2root, None)
+            _live_targets = [e["target"] for e in _cp2.read_deletions(p2root, None, limit=None)]
+            # (a) jsonl trimmed to exactly the newest RETAIN (file order); (b) the rest are folded.
+            if _live_targets != ["msg-5", "msg-6", "msg-7"]:
+                failures.append(f"P2 jsonl not trimmed to newest RETAIN: {_live_targets}")
+            if set(_dset) != {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"}:
+                failures.append(f"P2 set-file missing folded targets: {sorted(_dset)}")
+            # (c) COMPLETENESS / C-2 close: baseline UNION full jsonl = ALL 8 incl the oldest.
+            if (set(_dset) | set(_live_targets)) != {f"msg-{i}" for i in range(8)}:
+                failures.append("P2 fresh-load union is not the complete deleted-set")
+            # (d) idempotent: re-compacting (lock held) loses nothing and dups nothing.
+            with _cp2.file_lock(_djsonl, timeout=10):
+                _cp2._compact_deletions_locked(p2root, None)
+            _live2 = [e["target"] for e in _cp2.read_deletions(p2root, None, limit=None)]
+            if len(_live2) != 3 or (set(_cp2.read_deletions_set(p2root, None)) | set(_live2)) != {f"msg-{i}" for i in range(8)}:
+                failures.append(f"P2 re-compaction not idempotent: live={_live2}")
+            # (e) THE GAP CASE — un-compacted oversized steady state (RETAIN < count, gate OFF):
+            #     the fresh read is FULL-FILE, so the oldest is STILL present (the bug a bounded
+            #     newest-1000 tail read would have reintroduced).
+            _cp2.DELETIONS_COMPACT_BYTES = 10**9        # never trip
+            gaproot = tempfile.mkdtemp(prefix="tc-wp7-p2gap-")
+            for i in range(6):                          # 6 > RETAIN(3) but NO compaction fires
+                _cp2.append_deletion(gaproot, None,
+                                     {"target": f"g-{i}", "kind": "message", "by": "op", "op": "delete"})
+            if _cp2.read_deletions_set(gaproot, None) != {}:
+                failures.append("P2 gap-case: compaction fired with the gate disabled")
+            if {e["target"] for e in _cp2.read_deletions(gaproot, None, limit=None)} != {f"g-{i}" for i in range(6)}:
+                failures.append("P2 gap-case: full-file fresh read dropped the oldest un-folded event")
+            _cp2.DELETIONS_COMPACT_BYTES = 1            # re-arm
+            # (f) block=False (whole-group/teammate delete) never raises, records the event, and
+            #     compaction still runs under the optional lock.
+            bfroot = tempfile.mkdtemp(prefix="tc-wp7-p2bf-")
+            for i in range(8):
+                _cp2.append_deletion(bfroot, None,
+                                     {"target": f"grp-{i}", "kind": "group", "by": "op", "op": "delete"},
+                                     block=False)
+            _bf_union = set(_cp2.read_deletions_set(bfroot, None)) | {
+                e["target"] for e in _cp2.read_deletions(bfroot, None, limit=None)}
+            if _bf_union != {f"grp-{i}" for i in range(8)}:
+                failures.append(f"P2 block=False path lost a deletion: {sorted(_bf_union)}")
+            # (g) corrupt set-file → read_deletions_set coerces to {} (no crash; fresh load still works).
+            with open(_cp2.get_deletions_set_file(bfroot, None), "w", encoding="utf-8") as _f:
+                _f.write("{ this is not json")
+            if _cp2.read_deletions_set(bfroot, None) != {}:
+                failures.append("P2 corrupt set-file did not coerce to {}")
+
+            # (h) _api_poll fresh-vs-cursored over a REAL loopback server (ephemeral port) — pins the
+            #     C-2 close AND the documented cursored-lag self-heal. try/finally shutdown.
+            _dres2 = _dash2.start_dashboard(p2root, None, "Operator", port=0, open_browser=False)
+            _dport2, _dtok2 = _dres2["port"], _dash2._STATE.token
+            try:
+                def _poll(dc):
+                    c = _hc2.HTTPConnection("127.0.0.1", _dport2, timeout=5)
+                    c.putrequest("GET", f"/api/poll?cursor=&rcursor=&dcursor={_q2(dc)}",
+                                 skip_host=True, skip_accept_encoding=True)
+                    c.putheader("Host", "127.0.0.1")
+                    c.putheader("X-Dashboard-Token", _dtok2)
+                    c.endheaders()
+                    r = c.getresponse()
+                    d = json.loads(r.read())
+                    c.close()
+                    return d
+                _pf = _poll("")                                     # FRESH load
+                if {e["target"] for e in _pf.get("deletions", [])} != {f"msg-{i}" for i in range(8)}:
+                    failures.append("P2 _api_poll FRESH load did not return the complete deleted-set")
+                # CAUGHT-UP cursored poll: NO baseline (folded msg-0..4 absent); only live tail ids.
+                _pc = {e["target"] for e in _poll(_pf.get("dcursor", "")).get("deletions", [])}
+                if _pc & {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"} or not _pc <= {"msg-5", "msg-6", "msg-7"}:
+                    failures.append(f"P2 cursored poll leaked the baseline or non-tail ids: {sorted(_pc)}")
+                # LAGGED cursor (older than the jsonl floor) — the RESCUE (wire-the-fallback CR):
+                # the compacted-away tombstones must ARRIVE IN THIS poll, NOT after a reload. A
+                # message deleted while the tab was suspended can't silently render undeleted.
+                _pl = {e["target"] for e in _poll("0000").get("deletions", [])}
+                if _pl != {f"msg-{i}" for i in range(8)}:
+                    failures.append(f"P2 lagged cursored did NOT rescue the folded tombstones in-poll: {sorted(_pl)}")
+            finally:
+                _dash2.shutdown_dashboard()
+        finally:
+            _cp2.DELETIONS_RETAIN, _cp2.DELETIONS_COMPACT_BYTES = _save_retain, _save_bytes
+    except Exception as e:
+        failures.append(f"WP-7 P2 deletions-compaction unit checks errored: {e}")
+
+    # ── WP-7 P3 (firehose/N-1) — transcript BYTE cursor: read_transcript_after streams only the
+    #    bytes appended since the last poll (no O(file) re-scan), with offset|generation validity
+    #    and a transparent re-tail on recreation. BYTE-EXACT new_offset is the load-bearing detail. ──
+    try:
+        import http.client as _hc3
+        from urllib.parse import quote as _q3
+
+        from teammate_comms import comms as _cp3
+        from teammate_comms import dashboard as _dash3
+
+        _td = tempfile.mkdtemp(prefix="tc-wp7-p3-")
+        _tp = os.path.join(_td, "transcript.jsonl")
+
+        def _wb3(data, mode="wb"):
+            with open(_tp, mode) as _f:
+                _f.write(data)
+
+        # (1) missing file → reset, empty.
+        _r = _cp3.read_transcript_after(os.path.join(_td, "nope.jsonl"), 0, "", 200)
+        if _r != ([], 0, "", True):
+            failures.append(f"P3 missing file: {_r}")
+
+        # (2) BYTE-EXACT new_offset under \n + CRLF + blank + garbage + multibyte (the centerpiece).
+        _img = (b'{"id":"a","m":"x"}' + b"\n"
+                + '{"id":"b","m":"café→"}'.encode("utf-8") + b"\r\n"   # multibyte body + CRLF
+                + b"\n"                                                          # blank line
+                + b"not json at all" + b"\n"                                     # garbage line
+                + b'{"id":"c","m":"y"}' + b"\n")
+        _wb3(_img)
+        # First read with the fresh sentinel ("") forces a transparent RE-TAIL (not an increment).
+        recs, noff, ngen, rst = _cp3.read_transcript_after(_tp, 0, "", 200)
+        if not rst:
+            failures.append("P3 empty-gen first read did not reset (re-tail)")
+        if [r.get("id") for r in recs] != ["a", "b", "c"]:
+            failures.append(f"P3 re-tail dropped/added records (blank/garbage skip?): {[r.get('id') for r in recs]}")
+        if noff != len(_img):
+            failures.append(f"P3 re-tail offset != file size: {noff} vs {len(_img)}")
+        # Valid INCREMENT from 0 with the correct generation → byte-exact advance to EOF.
+        _gen = ngen
+        recs2, noff2, ngen2, rst2 = _cp3.read_transcript_after(_tp, 0, _gen, 200)
+        if rst2 or [r.get("id") for r in recs2] != ["a", "b", "c"] or ngen2 != _gen:
+            failures.append(f"P3 valid increment wrong: reset={rst2} ids={[r.get('id') for r in recs2]}")
+        if noff2 != len(_img):
+            failures.append(f"P3 BYTE-EXACT new_offset != raw byte length: {noff2} vs {len(_img)}")
+        if recs2[1].get("m") != "café→":
+            failures.append(f"P3 multibyte body corrupted: {recs2[1].get('m')!r}")
+
+        # (3) no new bytes (offset==size) → [] and offset unchanged (the cheap steady-state path).
+        _r3 = _cp3.read_transcript_after(_tp, len(_img), _gen, 200)
+        if _r3 != ([], len(_img), _gen, False):
+            failures.append(f"P3 no-new-bytes not a clean no-op: {_r3}")
+
+        # (4) TORN tail: a complete line + a partial (no \n). Only the complete one is consumed;
+        #     offset stops BEFORE the partial; completing the partial yields it on the next read.
+        _comp = b'{"id":"d","m":"z"}'
+        _wb3(_comp + b"\n" + b'{"id":"e","m":"incompl', mode="ab")
+        recs4, noff4, _, _ = _cp3.read_transcript_after(_tp, len(_img), _gen, 200)
+        if [r.get("id") for r in recs4] != ["d"]:
+            failures.append(f"P3 torn-tail consumed a partial line: {[r.get('id') for r in recs4]}")
+        if noff4 != len(_img) + len(_comp) + 1:
+            failures.append(f"P3 torn-tail offset crossed the partial: {noff4} vs {len(_img)+len(_comp)+1}")
+        _wb3(b'ete"}\n', mode="ab")                                    # complete the partial line
+        recs4b, _, _, _ = _cp3.read_transcript_after(_tp, noff4, _gen, 200)
+        if [r.get("id") for r in recs4b] != ["e"]:
+            failures.append(f"P3 completed line not returned next read: {[r.get('id') for r in recs4b]}")
+
+        # (4b) divergence-free: a RESET (re-tail, gen="") and a from-zero INCREMENT return the SAME
+        #      records (blank/garbage skipping must agree, or the re-tail dedup would leak/double-count).
+        _reset_ids = [r.get("id") for r in _cp3.read_transcript_after(_tp, 0, "", 200)[0]]
+        _incr_ids = [r.get("id") for r in _cp3.read_transcript_after(_tp, 0, _gen, 200)[0]]
+        if _reset_ids != _incr_ids:
+            failures.append(f"P3 reset vs increment record divergence: {_reset_ids} != {_incr_ids}")
+
+        # (5) offset > size → reset; (6) generation mismatch → reset; (6b) NEGATIVE offset (a
+        #     hand-crafted cursor) must re-tail cleanly, never wedge the stream on seek().
+        if not _cp3.read_transcript_after(_tp, 10**9, _gen, 200)[3]:
+            failures.append("P3 offset>size did not reset")
+        if not _cp3.read_transcript_after(_tp, 5, "deadbeef", 200)[3]:
+            failures.append("P3 generation mismatch did not reset")
+        _neg = _cp3.read_transcript_after(_tp, -5, _gen, 200)
+        if not _neg[3] or _neg[1] < 0:
+            failures.append(f"P3 negative offset did not reset (livelock risk): {_neg[:1]} reset={_neg[3]}")
+
+        # (6c) N-1 FIX: a record teed OUT OF ID ORDER (a lower id appended AFTER a higher one) is
+        #      byte-streamed in FILE order — the old id cursor (id>=since) would have skipped it.
+        _ooo = b'{"id":"2026-01-01T00:00:05.000000","m":"late-high"}\n' \
+               b'{"id":"2026-01-01T00:00:01.000000","m":"earlier-low"}\n'   # lower id appended LAST
+        _wb3(_ooo)
+        _ogen = _cp3._transcript_generation(_tp, len(_ooo))
+        _oids = [r.get("id") for r in _cp3.read_transcript_after(_tp, 0, _ogen, 200)[0]]
+        if _oids != ["2026-01-01T00:00:05.000000", "2026-01-01T00:00:01.000000"]:
+            failures.append(f"P3 N-1: out-of-order tee not byte-streamed in file order: {_oids}")
+
+        # (7) burst > limit: 10 lines, limit=3 → first 3 records, offset BYTE-EXACT at the 3rd \n;
+        #     the rest page out next call (A-1 parity) with byte-exact continuity across the page.
+        _lines = [('{"id":"n%d"}' % i).encode("utf-8") for i in range(10)]
+        _bimg = b"".join(l + b"\n" for l in _lines)
+        _wb3(_bimg)
+        _bgen = _cp3._transcript_generation(_tp, len(_bimg))
+        recb, noffb, _, _ = _cp3.read_transcript_after(_tp, 0, _bgen, 3)
+        _exp_off = sum(len(_lines[i]) + 1 for i in range(3))          # bytes through the 3rd \n
+        if [r.get("id") for r in recb] != ["n0", "n1", "n2"] or noffb != _exp_off:
+            failures.append(f"P3 burst cap page1 wrong: ids={[r.get('id') for r in recb]} off={noffb} vs {_exp_off}")
+        recb2, _, _, _ = _cp3.read_transcript_after(_tp, noffb, _bgen, 3)
+        if [r.get("id") for r in recb2] != ["n3", "n4", "n5"]:
+            failures.append(f"P3 burst cap page2 (paging continuity) wrong: {[r.get('id') for r in recb2]}")
+
+        # (7b) burst cap with INTERLEAVED blank/garbage at the boundary: the cap counts RECORDS, the
+        #      offset counts RAW bytes — junk between the limit-th record and the next is left for
+        #      page 2 (offset stops at the limit-th record's \n), and page 2 resumes byte-continuous.
+        _jimg = (b'{"id":"j0"}\n' + b'{"id":"j1"}\n' + b"\n" + b"junk\n"   # 2 recs, then blank+garbage
+                 + b'{"id":"j2"}\n' + b'{"id":"j3"}\n')
+        _wb3(_jimg)
+        _jgen = _cp3._transcript_generation(_tp, len(_jimg))
+        recj, noffj, _, _ = _cp3.read_transcript_after(_tp, 0, _jgen, 2)        # cap after j1
+        _jexp = len(b'{"id":"j0"}\n') + len(b'{"id":"j1"}\n')                   # stops at j1's \n, junk deferred
+        if [r.get("id") for r in recj] != ["j0", "j1"] or noffj != _jexp:
+            failures.append(f"P3 burst+junk page1 wrong: ids={[r.get('id') for r in recj]} off={noffj} vs {_jexp}")
+        recj2, _, _, _ = _cp3.read_transcript_after(_tp, noffj, _jgen, 2)       # page 2 skips the junk
+        if [r.get("id") for r in recj2] != ["j2", "j3"]:
+            failures.append(f"P3 burst+junk page2 did not skip interleaved junk: {[r.get('id') for r in recj2]}")
+
+        # (8) transcript_tail_and_cursor: stat-then-tail mint — offset == file size, gen set, full tail.
+        _wb3(_bimg)                                                    # re-establish a known 10-line image
+        _trecs, _toff, _tgen = _cp3.transcript_tail_and_cursor(_tp, 200)
+        if _toff != len(_bimg) or _tgen != _bgen or [r.get("id") for r in _trecs] != [f"n{i}" for i in range(10)]:
+            failures.append(f"P3 tail_and_cursor mint wrong: off={_toff} gen={_tgen}")
+
+        # (9) real loopback _api_poll: fresh mints a byte cursor; append → cursored returns ONLY the
+        #     new record + advances; caught-up → empty; recreate (new first line) → reset re-tails.
+        proot3 = tempfile.mkdtemp(prefix="tc-wp7-p3api-")
+        _tf3 = _cp3.get_transcript_file(proot3, None)
+        _tf3.parent.mkdir(parents=True, exist_ok=True)
+        with open(_tf3, "w", encoding="utf-8") as _f:                 # write the firehose bytes directly
+            for i in range(2):
+                _f.write(json.dumps({"id": f"r{i}", "from": "a", "message": f"m{i}", "kind": "dm"}) + "\n")
+        _dres3 = _dash3.start_dashboard(proot3, None, "Operator", port=0, open_browser=False)
+        _dport3, _dtok3 = _dres3["port"], _dash3._STATE.token
+        try:
+            def _poll3(cur):
+                c = _hc3.HTTPConnection("127.0.0.1", _dport3, timeout=5)
+                c.putrequest("GET", f"/api/poll?cursor={_q3(cur)}&rcursor=&dcursor=",
+                             skip_host=True, skip_accept_encoding=True)
+                c.putheader("Host", "127.0.0.1")
+                c.putheader("X-Dashboard-Token", _dtok3)
+                c.endheaders()
+                r = c.getresponse()
+                d = json.loads(r.read())
+                c.close()
+                return d
+            _pf3 = _poll3("")                                         # fresh → tail + minted byte cursor
+            if [r.get("id") for r in _pf3.get("records", [])] != ["r0", "r1"]:
+                failures.append(f"P3 _api_poll fresh records wrong: {_pf3.get('records')}")
+            _c3 = _pf3.get("cursor", "")
+            if "|" not in _c3:
+                failures.append(f"P3 _api_poll fresh cursor is not a byte cursor: {_c3!r}")
+            with open(_tf3, "a", encoding="utf-8") as _f:             # one new record appended
+                _f.write(json.dumps({"id": "r2", "from": "a", "message": "m2", "kind": "dm"}) + "\n")
+            _pc3 = _poll3(_c3)
+            if [r.get("id") for r in _pc3.get("records", [])] != ["r2"]:
+                failures.append(f"P3 _api_poll cursored did not stream ONLY the new record: {_pc3.get('records')}")
+            if _pc3.get("cursor") == _c3:
+                failures.append("P3 _api_poll cursored did not advance the byte cursor")
+            if _poll3(_pc3.get("cursor")).get("records"):
+                failures.append("P3 _api_poll caught-up unexpectedly returned records")
+            with open(_tf3, "w", encoding="utf-8") as _f:             # RECREATE with a different first line
+                _f.write(json.dumps({"id": "z0", "from": "b", "message": "new", "kind": "dm"}) + "\n")
+            if [r.get("id") for r in _poll3(_pc3.get("cursor")).get("records", [])] != ["z0"]:
+                failures.append("P3 _api_poll recreation did not reset + re-tail")
+        finally:
+            _dash3.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-7 P3 byte-cursor unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

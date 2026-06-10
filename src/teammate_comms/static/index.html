@@ -133,6 +133,10 @@ try { history.replaceState(null, "", location.pathname); } catch (e) {}
 const TOKEN = window.__TOKEN;
 const EMOJI = { thumbsup: "👍", rofl: "🤣", smile: "😄", cry: "😢", "100": "💯", fire: "🔥" };
 
+// `cursor` is an OPAQUE server token for the records stream (a byte "offset|generation" since
+// P3) — NEVER parse or compare it here; just echo back whatever /api/poll returns. rcursor/dcursor
+// stay id-based (reactions/deletions). The seen-set below dedupes a record the server re-serves on
+// a transparent re-tail (transcript recreated), so no reload handling is needed client-side.
 let ME = null, cursor = "", rcursor = "", dcursor = "", current = null;
 const seen = new Set();              // message ids already ingested (dedupe)
 const buckets = new Map();           // convId -> [records]

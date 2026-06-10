@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import time
+import zlib
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -762,6 +763,69 @@ def _window(records, limit, oldest_first):
     return records[:cut]
 
 
+def read_jsonl_tail(path, n_records, since=None, chunk_size=8192):
+    """Return ~the last ``n_records`` VALID JSON records of an NDJSON file WITHOUT parsing the
+    whole file — seek from EOF and read backward in chunks until enough complete records are
+    assembled (or BOF). The C-1/C-2 read-cost relief: a fresh dashboard tail load and the
+    react/resolve scans stop streaming the entire log.
+
+    BINARY mode is mandatory: text-mode ``tell``/``seek`` lies about byte positions under CRLF
+    translation. Lines are assembled from raw bytes (so a multi-byte UTF-8 char or a record
+    straddling a chunk boundary is rejoined before decode), then decoded + ``.strip()``'d
+    (dropping a Windows ``\\r`` and surrounding whitespace) — reproducing the line readers'
+    semantics, so 'newest N' is N PARSEABLE records (blank/garbage lines skipped), NOT N raw
+    lines, and the result is byte-identical to ``read_transcript(...)[-N:]``. With ``since``,
+    keeps only records whose id is ``>= since``. Missing/empty file → [].
+
+    Documented divergence (the ONLY behavioral difference from the full text-mode reader): this
+    reader is MORE TOLERANT of undecodable bytes — it decodes with ``errors='replace'`` and skips
+    unparseable lines, where the full reader would RAISE ``UnicodeDecodeError`` on invalid UTF-8.
+    So the 'byte-identical' claim holds for every well-formed log; only a CORRUPT file diverges,
+    and in the better direction (skip, never raise)."""
+    if not (n_records and n_records > 0):
+        return []
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    if size == 0:
+        return []
+    records = []
+    try:
+        with open(path, "rb") as f:
+            leftover = b""        # the (possibly partial) leading line carried to the next chunk
+            pos = size
+            while pos > 0:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                buf = f.read(read_size) + leftover
+                parts = buf.split(b"\n")
+                if pos > 0:
+                    leftover = parts[0]        # window started mid-line — complete it next chunk
+                    complete = parts[1:]
+                else:
+                    complete = parts           # at BOF the leading line is complete too
+                batch = []
+                for raw in complete:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if since and rec.get("id", "") < since:
+                        continue
+                    batch.append(rec)
+                records = batch + records       # prepend (we read older bytes each iteration)
+                if len(records) >= n_records:
+                    break
+    except OSError:
+        return []
+    return records[-n_records:] if len(records) > n_records else records
+
+
 def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
     """Read the global NDJSON transcript non-destructively, ``limit``-bounded.
 
@@ -773,6 +837,11 @@ def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
     burst is paged out instead of skipped. Missing file → []; bad lines skipped.
     """
     path = get_transcript_file(root, team)
+    # Fast path (C-1/C-2): a pure newest-N tail (no cursor, no forward-pagination) reads only
+    # the file's tail via read_jsonl_tail instead of parsing the whole file. Byte-identical to
+    # the full-read + records[-limit:] below.
+    if not oldest_first and since is None and limit and limit > 0:
+        return read_jsonl_tail(path, limit)
     records = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -790,6 +859,106 @@ def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
     except (FileNotFoundError, OSError):
         return []
     return _window(records, limit, oldest_first)
+
+
+# ── Transcript byte cursor (P3, audit firehose/N-1) ─────────────────────────────
+#
+# The dashboard's records stream walks the transcript by a BYTE offset, not an id, so a live
+# cursored poll reads only the bytes appended since last poll (vs the O(file) full scan an id
+# `since` forces). The opaque cursor is "<offset>|<generation>": `offset` is a byte position,
+# `generation` is a crc32 of the file's first line — append-stable (byte 0 never moves on the
+# append-only transcript), changing only on recreation, so a stale offset (truncation/recreation)
+# is detected and the reader transparently re-tails. This ALSO fixes N-1: an out-of-order tee
+# lands at EOF, so byte-streaming emits it where the id cursor (id >= since) skipped it.
+
+GEN_BOUND = 64 * 1024   # bytes scanned for the first-line terminator when computing a generation
+
+
+def _transcript_generation(path, size):
+    """crc32 (as a decimal string) of the transcript's first line — bytes ``0..first \\n`` — or
+    ``""`` when that line isn't yet terminated within ``GEN_BOUND`` (a cold-start torn head, an
+    empty file, or a pathological mega-line). ``""`` is the fresh/unknown sentinel: it ALWAYS
+    forces a re-tail, never a validation against a half-written first line. Append-stable, so an
+    append never changes it; recreation does. ``size`` is the caller's single stat (no re-stat)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(min(size, GEN_BOUND))   # absolute position 0 on a fresh handle
+    except OSError:
+        return ""
+    nl0 = head.find(b"\n")
+    return "" if nl0 == -1 else str(zlib.crc32(head[:nl0]))
+
+
+def transcript_tail_and_cursor(path, limit=200):
+    """Fresh-load tail + the byte cursor to resume live-streaming from ~EOF. Returns
+    ``(records, offset, generation)``.
+
+    Stat-THEN-tail: the offset is the file size captured BEFORE the tail read, so it is ``<=`` the
+    size the tail observed (the transcript only grows). A record appended BETWEEN the two
+    observations is therefore both shown by the tail AND re-streamed by the next cursored poll
+    (the dashboard folds the repeat by id) — never lost (the tail-then-stat order would drop it).
+    The offset sits at ~EOF, so old pre-tail history is not re-streamed: subsequent polls stream
+    only NEW appends, preserving today's 'fresh shows newest N, then live-stream' behavior."""
+    try:
+        offset = os.path.getsize(path)
+    except OSError:
+        return ([], 0, "")                        # no file (e.g. TEAMMATE_TRANSCRIPT=0) → cursor "0|"
+    gen = _transcript_generation(path, offset)
+    return (read_jsonl_tail(path, limit), offset, gen)
+
+
+def read_transcript_after(path, offset, generation, limit=200):
+    """Forward byte-cursor read of the append-only transcript. Returns
+    ``(records, new_offset, new_generation, reset)``.
+
+    ``records`` are the NEW complete records since ``offset`` (oldest-first), capped at ``limit``;
+    ``new_offset``/``new_generation`` form the next cursor. ``reset`` is True when the offset was
+    invalidated (file missing / recreated / truncated) — then ``records`` is instead the newest-
+    ``limit`` TAIL (a transparent re-tail; the dashboard's id-dedup folds any re-served record).
+
+    ONE stat per call (NIT-2); the generation read and the increment read use SEPARATE opens, each
+    with an absolute seek so no file position is ever inherited (NIT-1). BINARY mode (text seek/tell
+    lies under CRLF). ``new_offset`` is advanced by RAW newline geometry — every consumed byte,
+    including blank/garbage lines and each ``\\n``, is counted; it is NEVER reconstructed from the
+    parsed/stripped records (which would desync on the first blank/garbage/CRLF/multibyte line).
+    Offsets always land on a ``\\n``-boundary, so the next seek can't split a line or a codepoint.
+    A partial final line (no ``\\n`` yet) is left UNCONSUMED — torn-tail safe."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ([], 0, "", True)                  # no file → empty re-tail; caller mints "0|"
+    cur_gen = _transcript_generation(path, size)  # open #1 (bounded first-line read)
+    if generation == "" or cur_gen == "" or generation != cur_gen or not (0 <= offset <= size):
+        # fresh/unknown sentinel, empty/torn head, recreation, truncation, OR a malformed
+        # out-of-range offset (a negative offset would raise on seek and wedge the stream — a
+        # hand-crafted cursor must still re-tail cleanly, never livelock) → transparent re-tail.
+        return (read_jsonl_tail(path, limit), size, cur_gen, True)
+    try:
+        with open(path, "rb") as f:               # open #2 — absolute seek, never an inherited pos
+            f.seek(offset)
+            buf = f.read(size - offset)            # bounded by THIS poll's stat (a later append
+    except OSError:                                # is caught next poll, keeping offset math exact)
+        return ([], offset, generation, False)    # transient read error → no progress, retry
+    records = []
+    consumed = 0          # raw bytes consumed since `offset` (drives new_offset)
+    count = 0             # complete RECORDS emitted (drives the limit cap; blank/garbage excluded)
+    start = 0
+    while True:
+        nl = buf.find(b"\n", start)
+        if nl == -1:
+            break                                 # remaining bytes are a partial final line — defer
+        line = buf[start:nl].decode("utf-8", "replace").strip()   # .strip() drops a CRLF's \r + ws
+        if line:
+            try:
+                records.append(json.loads(line))
+                count += 1
+            except (json.JSONDecodeError, ValueError):
+                pass                              # garbage line: skip the record but STILL advance
+        consumed = nl + 1                         # past this line + its \n (blank/garbage included)
+        start = consumed
+        if limit and count >= limit:
+            break                                 # burst cap: the rest pages out next poll (A-1)
+    return (records, offset + consumed, cur_gen, False)
 
 
 # ── Reactions ───────────────────────────────────────────────────────────────────
@@ -850,6 +1019,8 @@ def read_reactions(root, team=None, since=None, limit=None, oldest_first=False):
     pagination from a cursor (the dashboard poll and the channel reaction-wake driver set
     this so a burst pages out instead of scrolling past the tail)."""
     path = get_reactions_file(root, team)
+    if not oldest_first and since is None and limit and limit > 0:
+        return read_jsonl_tail(path, limit)       # pure newest-N tail — read only the file's tail
     out = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -907,6 +1078,96 @@ def get_deletions_file(root, team=None):
     return base / "deletions.jsonl"
 
 
+def get_deletions_set_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]deletions_set.json`` — the COMPACTED deleted-set.
+
+    A target-keyed dict ``{target: event}`` holding every deletion that has been folded out of
+    the jsonl tail (see ``_compact_deletions_locked``). It is the durable BASELINE the dashboard
+    unions with the live jsonl on a fresh load so a deleted message can never reappear once its
+    event ages past the jsonl tail (audit C-2). Deduped by target (deletions are monotonic — op
+    is always 'delete', there is no undelete)."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "deletions_set.json"
+
+
+# Compaction thresholds (C-2). ``RETAIN`` events stay in the live jsonl tail; older events fold
+# into the set-file. The byte gate is a CHEAP getsize trip on append — it bounds the live-file
+# SIZE only, it is NOT a correctness input: the dashboard's fresh-load read is the FULL live jsonl
+# unioned with the full set-file, so completeness holds no matter when (or whether) the gate fires.
+DELETIONS_RETAIN = 1000
+DELETIONS_COMPACT_BYTES = 256 * 1024
+
+
+def read_deletions_set(root, team=None):
+    """Return the compacted deleted-set dict ``{target: event}`` (the C-2 baseline).
+
+    Read-only and lock-free (write_json_atomic gives the reader old-or-new, never partial); any
+    miss/corruption/non-dict → ``{}`` so the caller's ``.values()`` is always safe."""
+    v = read_json_readonly(get_deletions_set_file(root, team))
+    return v if isinstance(v, dict) else {}
+
+
+def _compact_deletions_locked(root, team):
+    """Fold all-but-the-newest ``DELETIONS_RETAIN`` deletion events into the target-keyed set-file,
+    then trim the jsonl to that tail. MUST be called with the deletions.jsonl lock already held
+    (so no appender interleaves the read-fold-trim). Best-effort: any failure leaves the jsonl
+    intact (the set write is the durable half; the trim is pure size relief and self-heals next
+    run). Ordering is load-bearing: write the SET FIRST (atomic), THEN trim the jsonl (atomic) —
+    a crash/failure in between leaves the jsonl still holding everything AND the set holding the
+    folded head (idempotent overlap), so a fresh load reads a superset, never a gap. The reverse
+    order could drop tombstones. The mkdir-lock keys off the path STRING (a sibling .lock dir);
+    os.replace swaps the FILE inode only, never the lock dir, so re-reading + replacing the jsonl
+    under its own lock is deadlock-free."""
+    path = get_deletions_file(root, team)
+    all_events = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    all_events.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except (FileNotFoundError, OSError):
+        return
+    if len(all_events) <= DELETIONS_RETAIN:
+        return
+    head, tail = all_events[:-DELETIONS_RETAIN], all_events[-DELETIONS_RETAIN:]
+    folded = read_deletions_set(root, team)
+    for e in head:
+        t = e.get("target")
+        if t:
+            folded[t] = e          # union by target (monotonic; last delete wins, all are deletes)
+    write_json_atomic(get_deletions_set_file(root, team), folded)   # SET FIRST (atomic)
+    tmp = path.with_name(path.name + ".compact.tmp")               # distinct from set-file's .tmp
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in tail:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)      # THEN trim (atomic; a lockless reader sees old-full or new-tail)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()       # orphan cleanup if os.replace raised (e.g. Windows read race)
+        except OSError:
+            pass
+
+
+def _maybe_compact_deletions(root, team):
+    """Cheap getsize gate → compact. FULLY self-contained: never raises (so neither append path
+    can mislabel a successful event append as failed), best-effort. Call only with the lock held."""
+    try:
+        path = get_deletions_file(root, team)
+        if os.path.getsize(path) > DELETIONS_COMPACT_BYTES:
+            _compact_deletions_locked(root, team)
+    except Exception as e:
+        print(f"[teammate-comms] deletions compaction skipped: {e}", file=sys.stderr, flush=True)
+
+
 def append_deletion(root, team, record, block=True, timeout=5):
     """Append one deletion event to the deletions sub-stream.
 
@@ -937,6 +1198,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
                 record["id"] = now_timestamp()
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
         except Exception as e:
             print(f"[teammate-comms] deletion append skipped: {e}", file=sys.stderr, flush=True)
         return
@@ -947,6 +1209,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
             record["id"] = now_timestamp()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
     except CommsError:
         raise CommsError(
             f"Deletion not recorded: deletions.jsonl stayed locked for {timeout}s "
@@ -962,6 +1225,8 @@ def read_deletions(root, team=None, since=None, limit=1000, oldest_first=False):
     False = newest ``limit`` (tail view); True = oldest ``limit`` for forward pagination
     from the dashboard's deletion cursor (a burst pages out instead of being skipped)."""
     path = get_deletions_file(root, team)
+    if not oldest_first and since is None and limit and limit > 0:
+        return read_jsonl_tail(path, limit)       # pure newest-N tail — read only the file's tail
     out = []
     try:
         with open(path, "r", encoding="utf-8") as f:

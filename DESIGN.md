@@ -362,6 +362,44 @@ that is otherwise append-only:
   the event (the recorded "emit event LAST so a partial `rmtree` can't desync" ordering), so a
   raised append would be lost permanently on retry — and they self-heal anyway, since a fresh
   load simply omits the absent group/teammate.
+- **Deletions compaction (v0.7.1, C-2).** `deletions.jsonl` is append-only, so a fresh console
+  load used to replay only its newest `limit` (1000) events — past that window an old tombstone
+  was lost and the message **reappeared**. Fix: events older than the newest `DELETIONS_RETAIN`
+  (1000) are folded into a **target-keyed set-file** `deletions_set.json` (`{target: event}`,
+  deduped — deletions are monotonic, there is no undelete). A fresh load now reads the
+  **complete** deleted-set = that baseline **unioned with the ENTIRE live `jsonl`** (a full read,
+  *not* a bounded tail — see the invariant below); both halves fold idempotently by target.
+  - **Compaction (`_compact_deletions_locked`)** runs inline under the appender's already-held
+    lock (a cheap `getsize` gate on each append; both the blocking and best-effort paths), and is
+    **always best-effort — it never fails a delete** (the event append is the durable op;
+    compaction is pure size relief). Ordering is load-bearing: **write the set-file FIRST**
+    (atomic temp+rename), **THEN trim the jsonl** (atomic temp+rename). A crash/failure in between
+    leaves the jsonl still holding everything *and* the set holding the folded head (idempotent
+    overlap) → a fresh load reads a superset, never a gap; the reverse order could drop tombstones.
+    The mkdir-lock keys off the path *string* (a sibling `.lock` dir); `os.replace` swaps the file
+    inode only, so re-reading + atomically replacing the jsonl under its own lock is deadlock-free.
+  - **Completeness invariant (gate-independent).** The live jsonl holds every not-yet-folded
+    event; the set-file holds every folded (older) target; their union is every deletion ever —
+    *no matter when or whether the size-gate fired*. The byte gate (`DELETIONS_COMPACT_BYTES`)
+    therefore only bounds the live-file **size**, it is **not** a correctness input — which is
+    exactly why the fresh-load read must stay a **full** `read_deletions(limit=None)` and must
+    **never** be "optimized" back to the bounded newest-N tail (that would skip an un-folded middle
+    event sitting between the retained tail and the gate).
+  - **Lagged-cursor rescue (no reload needed).** A **cursored** client (live console mid-poll)
+    normally replays *no* baseline. But if it lags so far that its `dcursor` is **older than the
+    jsonl's oldest surviving id** (`floor`) — a suspended tab resuming after `>DELETIONS_RETAIN`
+    deletions — the events in `(dcursor, floor)` were compacted into the set-file and it never saw
+    them. The poll detects `dcursor < floor` and replays the **complete baseline∪jsonl union that
+    one poll** (the rescue), so a message deleted while the tab slept can't silently render
+    *undeleted* until the user happens to reload ("recovers on reload" is self-*concealing*, not
+    self-healing). It fires once — `dcursor` then advances past `floor` and the steady state falls
+    back to the cheap incremental walk, so live polls pay nothing extra.
+  - **Accepted ECs (self-healing).** (1) A group
+    hard-deleted then **recreated with the same name** has its old `kind:"group"` tombstone (target
+    is the group *name* `#x`, not a unique id) replayed on every fresh load, hiding the new group
+    until its first message re-pushes it — pre-existing, now with a wider replay window. (2) Under
+    sustained `file_lock_optional` contention a group/teammate delete may skip both its append and
+    compaction; the jsonl stays correct (full-file fresh read), just larger.
 - **Intentional, documented behaviors:** dashboard reflection requires the firehose
   (`TEAMMATE_TRANSCRIPT=1`); a tombstoned message's reactions persist in MCP reads
   (inbox/history) though the dashboard hides them; reacting to a deleted message still wakes
@@ -492,30 +530,46 @@ gates **only this firehose** — `reactions.jsonl` and `deletions.jsonl` are alw
 post) can't resolve its `target_from` so its author-wake is skipped. **Privacy note:**
 this durably records previously-ephemeral agent↔agent DMs under the (global-by-default)
 comms root — intended for the operator overseeing their own agents, opt-out via the env
-flag. Reads are window-bounded (`read_transcript(limit=200)`) so a large log never floods
-the browser. **Cursor pagination (v0.7.1):** the dashboard poll passes `oldest_first=bool(cursor)`
-— a fresh load takes the newest tail (unchanged), but once walking a cursor the reader keeps
-the **oldest** window and the poll advances the cursor only to the last *returned* id, so a
-burst larger than the window pages out across polls instead of being sliced off and skipped
-(the cut also swallows any same-id collision group at the boundary, so the cursor can't
-stall). The reactions/deletions sub-streams thread the same `oldest_first` policy. (Separate
-known limit, audit C-2 / WP-7: a fresh deletions load only replays the newest `limit` events,
-so a very old deletion past that window can render undeleted until rotation/compaction lands.)
+flag. Reads are window-bounded (`read_jsonl_tail(200)` on a fresh load) so a large log never floods
+the browser. **Records BYTE cursor (P3).** The dashboard's records stream is paged by a **byte
+offset**, not an id: the opaque poll cursor is `"<offset>|<generation>"` (a byte position + a
+crc32 of the file's first line). A fresh load takes the newest tail and mints the cursor at ~EOF
+via a **stat-then-tail** order — the offset is the size captured *before* the tail, so it is `≤`
+the tail's size; a record appended between the two observations is shown by the tail *and*
+re-streamed next poll, where the browser's id-dedup folds the repeat (the reverse order would
+drop it). A cursored poll then reads **only the bytes appended since** that offset (one bounded
+read vs the old O(file) `since` scan), advancing the offset by **raw newline geometry** so it
+always lands on a `\n` boundary; a partial trailing line is left for the next poll (torn-tail
+safe), and a burst larger than `limit` pages out across polls. **Validity / transparent re-tail:**
+if the offset exceeds the file size (truncation/recreation-smaller) or the first-line
+`generation` no longer matches (recreation), the byte position is meaningless, so the reader
+**re-tails** (newest `limit`) and re-mints — transparently, since the browser's `seen` id-set
+dedups any re-served record (no reload signal, no frontend change). **Generation contract (for
+WP-10 rotation):** `generation` changes iff the bytes of the first line (byte 0 .. first `\n`)
+change — append-stable (byte 0 never moves on the append-only log), recreation-sensitive; a
+future WP-10 NDJSON **rotation** MUST bump the generation explicitly (it replaces byte 0) rather
+than rely on the crc, and the one out-of-contract hole — a recreated file whose first line is
+byte-identical *and* whose size ≥ the old offset — is unreachable in practice (it needs the same
+first message down to its microsecond-timestamp id). The **reactions/deletions** sub-streams keep
+their **id**-based `oldest_first` pagination — a different cursor family with NO shared reset
+semantics (a transcript recreation re-tails records but does not reset those streams). (Audit C-2 — a fresh
+deletions load replaying only the newest `limit` events, so a very old deletion rendered
+undeleted — is **fixed in v0.7.1** by deletions compaction: the fresh load unions a target-keyed
+`deletions_set.json` baseline with the full live jsonl. See the deletions-compaction bullet in §8.)
 
-> **Known firehose limit — out-of-order tee (audit N-1, accepted).** A message's `id` is
-> stamped at *send* (before the inbox lock) and is **load-bearing** — it's the inbox-record
-> id, the ack id, and the react/delete resolution key — so it CANNOT be re-stamped under the
+> **Out-of-order tee (audit N-1) — FIXED in P3 by the byte cursor.** A message's `id` is
+> stamped at *send* (before the inbox lock) and is **load-bearing** — it's the inbox-record id,
+> the ack id, and the react/delete resolution key — so it CANNOT be re-stamped under the
 > transcript lock the way reactions/deletions were (WP-1 CR-1); moving it would desync the
-> transcript id from the ack/react identity. Two concurrent sends can therefore tee
-> out-of-order (`[T2, T1]`); if a record is teed *after* the dashboard cursor already advanced
-> past its id, that record never appears in the **firehose** (the message is still delivered,
-> acked, reacted, and deletion-resolvable — only the observability view skips it). Accepted
-> under the best-effort-observability stance. The real fix is a **file-offset/byte cursor** for
-> the transcript stream (immune to id order), which must be co-designed with WP-7's NDJSON
-> rotation (a byte offset is invalidated by rotation) — deferred there, not bodged here.
-> **Audit C-1 is deferred to the same WP-7 work:** `react()`/`resolve_message` scanning a
-> "bounded recent tail" gives no real speedup while `read_transcript` parses the whole file to
-> build its window — the genuine fix is the same seek-from-tail read C-2 needs.
+> transcript id from the ack/react identity. Two concurrent sends can therefore tee out-of-order
+> (`[T2, T1]`). The old **id** cursor (`id >= since`) skipped a record teed *after* the cursor
+> had advanced past its id: it never appeared in the **firehose** (the message was still
+> delivered, acked, reacted, and deletion-resolvable — only the observability view lost it). The
+> **byte cursor makes id order irrelevant**: a late tee still lands at **EOF** (`open "a"`), so
+> byte-streaming emits it — it then renders in **arrival order** in the feed. **Shown late beats
+> never shown.** **Audit C-1** (`react()`/`resolve_message` scanning a bounded recent tail) is
+> likewise resolved in P1's `read_jsonl_tail` `_scan_transcript_for_id`; NDJSON **rotation**
+> itself stays deferred to **WP-10**, with the generation contract above written to receive it.
 
 **Profile fields (0.2.0; `project` added 0.3.0).** Stored as plain keys on the agent
 registry record via `write_agent_record`'s field-level merge — additive,
