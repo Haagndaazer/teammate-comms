@@ -762,6 +762,63 @@ def _window(records, limit, oldest_first):
     return records[:cut]
 
 
+def read_jsonl_tail(path, n_records, since=None, chunk_size=8192):
+    """Return ~the last ``n_records`` VALID JSON records of an NDJSON file WITHOUT parsing the
+    whole file — seek from EOF and read backward in chunks until enough complete records are
+    assembled (or BOF). The C-1/C-2 read-cost relief: a fresh dashboard tail load and the
+    react/resolve scans stop streaming the entire log.
+
+    BINARY mode is mandatory: text-mode ``tell``/``seek`` lies about byte positions under CRLF
+    translation. Lines are assembled from raw bytes (so a multi-byte UTF-8 char or a record
+    straddling a chunk boundary is rejoined before decode), then decoded + ``.strip()``'d
+    (dropping a Windows ``\\r`` and surrounding whitespace) — reproducing the line readers'
+    semantics, so 'newest N' is N PARSEABLE records (blank/garbage lines skipped), NOT N raw
+    lines, and the result is byte-identical to ``read_transcript(...)[-N:]``. With ``since``,
+    keeps only records whose id is ``>= since``. Missing/empty file → []."""
+    if not (n_records and n_records > 0):
+        return []
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    if size == 0:
+        return []
+    records = []
+    try:
+        with open(path, "rb") as f:
+            leftover = b""        # the (possibly partial) leading line carried to the next chunk
+            pos = size
+            while pos > 0:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                buf = f.read(read_size) + leftover
+                parts = buf.split(b"\n")
+                if pos > 0:
+                    leftover = parts[0]        # window started mid-line — complete it next chunk
+                    complete = parts[1:]
+                else:
+                    complete = parts           # at BOF the leading line is complete too
+                batch = []
+                for raw in complete:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if since and rec.get("id", "") < since:
+                        continue
+                    batch.append(rec)
+                records = batch + records       # prepend (we read older bytes each iteration)
+                if len(records) >= n_records:
+                    break
+    except OSError:
+        return []
+    return records[-n_records:] if len(records) > n_records else records
+
+
 def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
     """Read the global NDJSON transcript non-destructively, ``limit``-bounded.
 
@@ -773,6 +830,11 @@ def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
     burst is paged out instead of skipped. Missing file → []; bad lines skipped.
     """
     path = get_transcript_file(root, team)
+    # Fast path (C-1/C-2): a pure newest-N tail (no cursor, no forward-pagination) reads only
+    # the file's tail via read_jsonl_tail instead of parsing the whole file. Byte-identical to
+    # the full-read + records[-limit:] below.
+    if not oldest_first and since is None and limit and limit > 0:
+        return read_jsonl_tail(path, limit)
     records = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -850,6 +912,8 @@ def read_reactions(root, team=None, since=None, limit=None, oldest_first=False):
     pagination from a cursor (the dashboard poll and the channel reaction-wake driver set
     this so a burst pages out instead of scrolling past the tail)."""
     path = get_reactions_file(root, team)
+    if not oldest_first and since is None and limit and limit > 0:
+        return read_jsonl_tail(path, limit)       # pure newest-N tail — read only the file's tail
     out = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -962,6 +1026,8 @@ def read_deletions(root, team=None, since=None, limit=1000, oldest_first=False):
     False = newest ``limit`` (tail view); True = oldest ``limit`` for forward pagination
     from the dashboard's deletion cursor (a burst pages out instead of being skipped)."""
     path = get_deletions_file(root, team)
+    if not oldest_first and since is None and limit and limit > 0:
+        return read_jsonl_tail(path, limit)       # pure newest-N tail — read only the file's tail
     out = []
     try:
         with open(path, "r", encoding="utf-8") as f:

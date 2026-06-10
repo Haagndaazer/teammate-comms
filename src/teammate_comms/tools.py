@@ -35,6 +35,7 @@ from .comms import (
     get_group_dir,
     get_groups_dir,
     get_inboxes_dir,
+    get_transcript_file,
     group_read_positions,
     is_channel_alive,
     now_timestamp,
@@ -43,6 +44,7 @@ from .comms import (
     read_group_meta,
     read_json_readonly,
     read_json_safe,
+    read_jsonl_tail,
     read_reactions,
     read_transcript,
     remove_agent,
@@ -75,6 +77,11 @@ MAX_MESSAGE_CHARS = 64 * 1024
 # Cap on _read.json (acked-message history) entries — trimmed to the most recent N on ack so
 # the append-forever log can't grow without bound (audit C-3).
 _READ_CAP = 1000
+# react()/resolve_message() resolve a target id from the transcript newest-first. The target is
+# almost always recent, so scan the last _RESOLVE_TAIL records first (read only the file's tail,
+# C-1) and only full-scan the whole stream if that window is saturated and missed (an older
+# target, or a log longer than the window).
+_RESOLVE_TAIL = 500
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -1030,6 +1037,30 @@ def _handle_group(args, ctx):
     return "\n".join(out)
 
 
+def _scan_transcript_for_id(root, team, target_id):
+    """Find a transcript record by id, newest-first, without parsing the whole file in the
+    common (recent-target) case.
+
+    Reads the last ``_RESOLVE_TAIL`` records via ``read_jsonl_tail`` and scans them recent-first;
+    falls back to a full reverse stream ONLY when that window is saturated (``>= _RESOLVE_TAIL``
+    records) and the target wasn't in it — i.e. the target predates the window. A window that
+    held the whole log (``< _RESOLVE_TAIL`` records) IS the full scan, so a miss there is final.
+    Returns the matching record dict or None. Honors TEAMMATE_TRANSCRIPT=0 implicitly: an
+    empty/absent transcript yields [] from both reads → None (callers keep their own fallbacks).
+    """
+    path = get_transcript_file(root, team)
+    tail = read_jsonl_tail(path, _RESOLVE_TAIL)
+    for rec in reversed(tail):
+        if rec.get("id") == target_id:
+            return rec
+    if len(tail) < _RESOLVE_TAIL:
+        return None  # the window held the entire log — no older records exist to scan
+    for rec in reversed(read_transcript(root, team, limit=None)):  # older than the window
+        if rec.get("id") == target_id:
+            return rec
+    return None
+
+
 def react(root, team, reactor, target, emoji, remove=False):
     """Core: append a reaction add/remove event as ``reactor`` (sender-explicit so the
     dashboard reacts AS the human).
@@ -1044,11 +1075,8 @@ def react(root, team, reactor, target, emoji, remove=False):
     if emoji not in _REACTIONS:
         raise CommsError(f"'emoji' must be one of {list(_REACTIONS)}.")
     target = target.strip()
-    target_from = None
-    for rec in reversed(read_transcript(root, team, limit=None)):  # recent-first; break on hit
-        if rec.get("id") == target:
-            target_from = rec.get("from")
-            break
+    _hit = _scan_transcript_for_id(root, team, target)  # tail-first; full-scan fallback (C-1)
+    target_from = _hit.get("from") if _hit else None
     # id is stamped inside append_reaction under the lock (file order == id order — see its
     # docstring); we read it back off `record` for the return value.
     record = {"target": target, "from": reactor,
@@ -1077,15 +1105,15 @@ def resolve_message(root, team, msg_id):
     and group post). Falls back to scanning group transcripts then inboxes when the
     firehose is disabled (TEAMMATE_TRANSCRIPT=0) or rotated. Returns None on a clean miss.
     """
-    for rec in reversed(read_transcript(root, team, limit=None)):  # recent-first; break on hit
-        if rec.get("id") == msg_id:
-            kind = rec.get("kind") or ("group" if rec.get("group") else "dm")
-            out = {"from": rec.get("from"), "kind": kind}
-            if rec.get("group"):
-                out["group"] = rec["group"]
-            if rec.get("to"):
-                out["to"] = rec["to"]
-            return out
+    rec = _scan_transcript_for_id(root, team, msg_id)  # tail-first; full-scan fallback (C-1)
+    if rec is not None:
+        kind = rec.get("kind") or ("group" if rec.get("group") else "dm")
+        out = {"from": rec.get("from"), "kind": kind}
+        if rec.get("group"):
+            out["group"] = rec["group"]
+        if rec.get("to"):
+            out["to"] = rec["to"]
+        return out
     # Fallback: group transcripts (canonical for group posts).
     groups_dir = get_groups_dir(root, team)
     if groups_dir.exists():

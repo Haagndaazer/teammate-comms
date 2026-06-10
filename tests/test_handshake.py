@@ -1675,6 +1675,95 @@ def main():
     except Exception as e:
         failures.append(f"WP-7 P4 inbox-windowing unit checks errored: {e}")
 
+    # ── WP-7 P1 (C-1) — read_jsonl_tail: seek-from-tail NDJSON reader. Reads only the file's
+    #    tail, byte-identical to read_transcript(...)[-N:]; the react/resolve scans use it
+    #    tail-first with a full-scan fallback. Edge cases stress chunk-boundary straddles. ──
+    try:
+        from teammate_comms import comms as _cp1
+        from teammate_comms import tools as _tp1
+
+        def _wb(_path, _data):
+            with open(_path, "wb") as _f:
+                _f.write(_data)
+
+        _d1 = tempfile.mkdtemp(prefix="tc-wp7-p1-")
+        _p = os.path.join(_d1, "t.jsonl")
+
+        # (1) no trailing newline — the last (unterminated) record must still be returned.
+        _wb(_p, b'{"id":"a","n":1}\n{"id":"b","n":2}')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 2)] != ["a", "b"]:
+            failures.append("P1 no-trailing-newline: last record dropped")
+
+        # (2) trailing newline (window ends ON a newline) — no phantom empty record.
+        _wb(_p, b'{"id":"a"}\n{"id":"b"}\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 5)] != ["a", "b"]:
+            failures.append("P1 trailing-newline: miscounted")
+
+        # (3) single line at BOF, no newline — the leading line at pos==0 is complete.
+        _wb(_p, b'{"id":"solo"}')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 3)] != ["solo"]:
+            failures.append("P1 single-line-BOF: not returned")
+
+        # (4) n > count — clamp to all available, newest-last order preserved.
+        _wb(_p, b'{"id":"1"}\n{"id":"2"}\n{"id":"3"}\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 99)] != ["1", "2", "3"]:
+            failures.append("P1 n>count clamp wrong")
+
+        # (5)+(6) records AND a multibyte UTF-8 char straddling back-chunks: force a tiny
+        #         chunk_size so the 3-byte → and record boundaries fall mid-chunk and must be
+        #         rejoined before decode (else replacement chars / dropped records).
+        _recs = [{"id": f"{i:02d}", "msg": "cafe→unicode"} for i in range(20)]
+        _wb(_p, ("\n".join(json.dumps(r, ensure_ascii=False) for r in _recs) + "\n").encode("utf-8"))
+        _r = _cp1.read_jsonl_tail(_p, 6, chunk_size=4)
+        if [x.get("id") for x in _r] != ["14", "15", "16", "17", "18", "19"]:
+            failures.append(f"P1 chunk-straddle ids wrong: {[x.get('id') for x in _r]}")
+        if any(x.get("msg") != "cafe→unicode" for x in _r):
+            failures.append("P1 multibyte-straddle: a record decoded with replacement chars")
+
+        # (7) CRLF line endings — .strip() drops the \r; clean parse (matches the line readers).
+        _wb(_p, b'{"id":"x"}\r\n{"id":"y"}\r\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 2)] != ["x", "y"]:
+            failures.append("P1 CRLF not stripped")
+
+        # (8) garbage / blank lines skipped — 'newest N' is N PARSEABLE records, not raw lines.
+        _wb(_p, b'{"id":"g1"}\n\nnot json\n{"id":"g2"}\n   \n{"id":"g3"}\n')
+        if [x.get("id") for x in _cp1.read_jsonl_tail(_p, 2)] != ["g2", "g3"]:
+            failures.append("P1 garbage/blank lines not skipped to N parseable")
+
+        # (9) byte-identical to the full read's tail across realistic data x chunk sizes.
+        _troot = tempfile.mkdtemp(prefix="tc-wp7-p1bi-")
+        for i in range(50):
+            _cp1.append_transcript(_troot, None, {"id": f"2026-02-01T00:00:00.{i:06d}", "message": f"m{i}"})
+        _path = _cp1.get_transcript_file(_troot, None)
+        _whole = _cp1.read_transcript(_troot, None, limit=None)  # limit=None bypasses the fast path
+        for _n in (1, 7, 50, 200):
+            for _cs in (8, 64, 8192):
+                _tail = _cp1.read_jsonl_tail(_path, _n, chunk_size=_cs)
+                _want = _whole[-_n:] if _n <= len(_whole) else _whole
+                if [r.get("id") for r in _tail] != [r.get("id") for r in _want]:
+                    failures.append(f"P1 NOT byte-identical to full read: n={_n} cs={_cs}")
+                    break
+
+        # (10) since filter — only ids >= the cursor survive.
+        _r = _cp1.read_jsonl_tail(_path, 100, since="2026-02-01T00:00:00.000045")
+        if [r.get("id") for r in _r] != [f"2026-02-01T00:00:00.{i:06d}" for i in range(45, 50)]:
+            failures.append(f"P1 since filter wrong: {[r.get('id') for r in _r]}")
+
+        # ---- _scan_transcript_for_id: in-window hit, beyond-window full-scan fallback, true miss.
+        if (_tp1._scan_transcript_for_id(_troot, None, "2026-02-01T00:00:00.000049") or {}).get("message") != "m49":
+            failures.append("P1 _scan: recent (in-window) id did not resolve")
+        _save = _tp1._RESOLVE_TAIL
+        try:
+            _tp1._RESOLVE_TAIL = 5  # shrink so id 0 predates the tail → must full-scan
+            if (_tp1._scan_transcript_for_id(_troot, None, "2026-02-01T00:00:00.000000") or {}).get("message") != "m0":
+                failures.append("P1 _scan: older-than-window id did not resolve via full-scan fallback")
+            if _tp1._scan_transcript_for_id(_troot, None, "no-such-id") is not None:
+                failures.append("P1 _scan: a true miss past a saturated window did not return None")
+        finally:
+            _tp1._RESOLVE_TAIL = _save
+    except Exception as e:
+        failures.append(f"WP-7 P1 seek-tail unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
