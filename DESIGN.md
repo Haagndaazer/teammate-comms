@@ -325,6 +325,14 @@ that is otherwise append-only:
   sidebar. Whole-group `teammate_group(action="delete")` now also hard-removes the group's
   fan-out copies from member inboxes (resolved **before** the `rmtree`) and emits a
   `kind:"group"` deletion event — fixing the old "deleted group's messages lingered" bug.
+  **Append durability (v0.7.1):** a *message* deletion's event uses a **blocking** lock and
+  surfaces a lock failure to the caller — the firehose still carries the live message, so a
+  lost event there is *persistent* dashboard inconsistency (no self-heal even on reload), and
+  the caller's retry re-tombstones idempotently. *Group* and *teammate* deletions keep a
+  **best-effort** append (`block=False`): they destroy the group dir / agent record **before**
+  the event (the recorded "emit event LAST so a partial `rmtree` can't desync" ordering), so a
+  raised append would be lost permanently on retry — and they self-heal anyway, since a fresh
+  load simply omits the absent group/teammate.
 - **Intentional, documented behaviors:** dashboard reflection requires the firehose
   (`TEAMMATE_TRANSCRIPT=1`); a tombstoned message's reactions persist in MCP reads
   (inbox/history) though the dashboard hides them; reacting to a deleted message still wakes
@@ -393,6 +401,16 @@ watcher with **no `channel.py` change**.
   reacted-to message's author (`target_from`, resolved from the transcript) so the watcher
   wakes **only that author** (a low-volume check on the 5s heartbeat tick) — never the
   group, never the reactor, never on remove (v0.6.1; was ambient/no-wake in v0.6.0).
+  Unlike the observability transcript, the reaction append is **durable, not droppable**
+  (a reaction is a feature — a drop loses a wake + a chip): a short blocking lock that
+  surfaces failure to the caller, who retries (adds fold idempotently). **Missed-wake
+  hardening (v0.7.1):** the wake check is driven by a **high-water cursor** over
+  `reactions.jsonl` (the pure `compute_reaction_wakes` decides; `known_ids` holds only the
+  previous tick's ids for exact boundary dedup), so a burst larger than the read window
+  pages **forward** across heartbeats instead of scrolling past a fixed tail and silently
+  missing an author's wake. A very large burst drains at the read-window size per ~5s tick
+  — bounded extra latency, never a drop (the same missed-event guarantee the message-wake
+  path got in v0.4.x).
 - **Channel wake (changed):** the wake now names WHERE messages came from (DM senders +
   `#groups`); the personality reminder fires only every ~10 received messages (the
   registration return still echoes it), not every wake — cuts per-message token waste.
@@ -421,8 +439,15 @@ best-effort** (a short never-raise lock; disabled by `TEAMMATE_TRANSCRIPT=0`) so
 observability never precedes or delays the authoritative delivery write. **Privacy note:**
 this durably records previously-ephemeral agent↔agent DMs under the (global-by-default)
 comms root — intended for the operator overseeing their own agents, opt-out via the env
-flag. Reads are tail-bounded (`read_transcript(limit=200)`) so a large log never floods
-the browser.
+flag. Reads are window-bounded (`read_transcript(limit=200)`) so a large log never floods
+the browser. **Cursor pagination (v0.7.1):** the dashboard poll passes `oldest_first=bool(cursor)`
+— a fresh load takes the newest tail (unchanged), but once walking a cursor the reader keeps
+the **oldest** window and the poll advances the cursor only to the last *returned* id, so a
+burst larger than the window pages out across polls instead of being sliced off and skipped
+(the cut also swallows any same-id collision group at the boundary, so the cursor can't
+stall). The reactions/deletions sub-streams thread the same `oldest_first` policy. (Separate
+known limit, audit C-2 / WP-7: a fresh deletions load only replays the newest `limit` events,
+so a very old deletion past that window can render undeleted until rotation/compaction lands.)
 
 **Profile fields (0.2.0; `project` added 0.3.0).** Stored as plain keys on the agent
 registry record via `write_agent_record`'s field-level merge — additive,

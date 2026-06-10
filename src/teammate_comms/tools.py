@@ -857,8 +857,12 @@ def _handle_group(args, ctx):
         for member in members:
             remove_messages_from_inbox(root, team, member, msg_ids)
         delete_group(root, team, group)
-        append_deletion(root, team, {"id": now_timestamp(), "target": sigil,
-                                     "kind": "group", "by": agent, "op": "delete"})
+        # best-effort (block=False): the group dir is already gone, so emitting the event
+        # LAST is the recorded v0.7.0 ordering (a partial rmtree can't desync the
+        # dashboard) and a blocking raise here would lose the event permanently on retry
+        # (re-entry hits "No group"). A fresh dashboard load omits the absent group anyway.
+        append_deletion(root, team, {"target": sigil,  # id stamped under the lock inside append_deletion
+                                     "kind": "group", "by": agent, "op": "delete"}, block=False)
         return (f"Deleted group {sigil} (purged {len(msg_ids)} message(s) from "
                 f"member inboxes).")
 
@@ -1003,7 +1007,9 @@ def react(root, team, reactor, target, emoji, remove=False):
         if rec.get("id") == target:
             target_from = rec.get("from")
             break
-    record = {"id": now_timestamp(), "target": target, "from": reactor,
+    # id is stamped inside append_reaction under the lock (file order == id order — see its
+    # docstring); we read it back off `record` for the return value.
+    record = {"target": target, "from": reactor,
               "emoji": emoji, "op": "remove" if remove else "add"}
     if target_from:
         record["target_from"] = target_from
@@ -1091,7 +1097,7 @@ def delete_message(root, team, caller, msg_id, is_operator=False):
         if author:
             tombstone_in_inbox(root, team, author, msg_id, caller)  # self-copy safety
         where = f"DM to {to}" if to else "DM"
-    append_deletion(root, team, {"id": now_timestamp(), "target": msg_id,
+    append_deletion(root, team, {"target": msg_id,  # id stamped under the lock inside append_deletion
                                  "kind": "message", "by": caller, "op": "delete"})
     return f"Deleted message {msg_id} ({where}) — tombstoned everywhere it appeared."
 
@@ -1117,8 +1123,11 @@ def remove_teammate(root, team, caller, name, is_operator=False):
         )
     removed_from = strip_member_from_groups(root, team, name)
     remove_agent(root, team, name)
-    append_deletion(root, team, {"id": now_timestamp(), "target": "@" + name,
-                                 "kind": "teammate", "by": caller, "op": "delete"})
+    # best-effort (block=False): the record is already unlinked, so a blocking raise here
+    # would lose the event permanently on retry (re-entry hits "No teammate named …"). A
+    # fresh dashboard load omits the absent teammate; emit-event-LAST stays consistent.
+    append_deletion(root, team, {"target": "@" + name,  # id stamped under the lock inside append_deletion
+                                 "kind": "teammate", "by": caller, "op": "delete"}, block=False)
     extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
              if removed_from else "")
     return f"Removed teammate {name} (registry + inbox).{extra}"

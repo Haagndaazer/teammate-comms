@@ -223,17 +223,25 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team
-        records = read_transcript(root, team, since=(cursor or None), limit=200)
+        # oldest_first=bool(cursor): a fresh load (no cursor) takes the newest tail; once
+        # walking a cursor we page OLDEST-first and advance the cursor only to the last
+        # returned id, so a burst larger than `limit` drains across polls instead of being
+        # skipped (audit A-1). All three sub-streams thread the same policy.
+        records = read_transcript(root, team, since=(cursor or None), limit=200,
+                                  oldest_first=bool(cursor))
         new_cursor = records[-1]["id"] if records else cursor
         # Reaction events sub-stream (own cursor). The frontend folds add/remove into
         # per-message chips client-side. Ambient — never woke anyone.
-        reactions = read_reactions(root, team, since=(rcursor or None), limit=500)
+        reactions = read_reactions(root, team, since=(rcursor or None), limit=500,
+                                   oldest_first=bool(rcursor))
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
         # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set
         # and re-renders affected messages/groups — the firehose is append-only and
         # id-keyed, so an in-place tombstone never re-crosses `cursor`. Replayed from the
-        # start on a fresh load so previously-deleted messages render as deleted.
-        deletions = read_deletions(root, team, since=(dcursor or None), limit=1000)
+        # start on a fresh load so previously-deleted messages render as deleted (after the
+        # 1000-tail window — see audit C-2, full fix is WP-7).
+        deletions = read_deletions(root, team, since=(dcursor or None), limit=1000,
+                                   oldest_first=bool(dcursor))
         new_dcursor = deletions[-1]["id"] if deletions else dcursor
         return self._json(200, {"records": records, "cursor": new_cursor,
                                 "reactions": reactions, "rcursor": new_rcursor,

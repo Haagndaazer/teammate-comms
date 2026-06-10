@@ -104,6 +104,37 @@ def emit_reaction_event(send_message, agent, reactions):
     })
 
 
+def compute_reaction_wakes(reactions, known_ids, agent):
+    """Pure reaction-wake decision for one heartbeat tick (no I/O — hermetically testable).
+
+    ``reactions`` is the batch read this tick (driven by a high-water cursor, so a burst
+    larger than the read limit pages forward across ticks instead of scrolling past a
+    fixed tail — the missed-wake hole the message-wake path was hardened against, audit
+    A-2). ``known_ids`` is the PREVIOUS tick's returned id set, or None on the first
+    (seed) read. Returns ``(fresh_rx, new_known_ids, new_cursor)``:
+
+      * seed read (``known_ids is None``) NEVER wakes — it only establishes the baseline,
+        so reactions already present at registration don't nudge.
+      * otherwise ``fresh_rx`` = adds targeting ``agent`` (by another teammate) whose id
+        wasn't in the previous batch. Comparing against the previous batch (not a strict
+        ``> cursor``) gives exact boundary dedup: the ``id >= cursor`` read re-includes the
+        cursor record every tick, so without this it would re-wake forever; and it can't
+        drop a distinct event that happens to share the boundary's microsecond id.
+      * ``new_cursor`` = max id seen this tick (None if the batch was empty, so the caller
+        keeps its prior cursor — an empty window must not rewind it).
+    """
+    rids = {r.get("id") for r in reactions if r.get("id")}
+    new_cursor = max(rids) if rids else None
+    if known_ids is None:
+        return [], set(rids), new_cursor
+    fresh_rx = [r for r in reactions
+                if r.get("id") not in known_ids
+                and r.get("op") == "add"
+                and r.get("target_from") == agent
+                and r.get("from") != agent]
+    return fresh_rx, set(rids), new_cursor
+
+
 def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
     """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
 
@@ -116,7 +147,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     last_agent = None
     muted = set()     # cached muted_groups for this agent; refreshed on the heartbeat tick
     msgs_since_reminder = 0  # personality reminder fires every ~10 received messages
-    known_reaction_ids = None  # reaction ids already seeded/woken; None until first read
+    known_reaction_ids = None  # previous tick's returned reaction ids; None until first read
+    reaction_cursor = None     # high-water mark (max reaction id seen) driving the read window
 
     while not stop_evt.is_set():
         if not (initialized_evt.is_set() and registered_evt.is_set()):
@@ -138,6 +170,7 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             last_hb = 0.0
             msgs_since_reminder = 0
             known_reaction_ids = None
+            reaction_cursor = None
 
         now = time.monotonic()
         if now - last_hb >= HEARTBEAT_SECONDS:
@@ -152,22 +185,20 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             hb_rec = read_agent_record(root, team, agent) or {}
             muted = set(hb_rec.get("muted_groups", []))
             # Reaction wakes (low-volume → only on the 5s heartbeat tick, not every poll):
-            # wake the AUTHOR of a reacted-to message. Seed at first read (no startup wake);
-            # then re-bind known_reaction_ids to the current tail (bounds it + prevents
-            # re-wakes). Only op=add, only target_from==me, never the reactor (from!=me).
-            reactions = read_reactions(root, team, limit=500)
-            rids = {r.get("id") for r in reactions if r.get("id")}
-            if known_reaction_ids is None:
-                known_reaction_ids = set(rids)
-            else:
-                fresh_rx = [r for r in reactions
-                            if r.get("id") not in known_reaction_ids
-                            and r.get("op") == "add"
-                            and r.get("target_from") == agent
-                            and r.get("from") != agent]
-                if fresh_rx:
-                    emit_reaction_event(send_message, agent, fresh_rx)
-                known_reaction_ids = set(rids)
+            # wake the AUTHOR of a reacted-to message. A high-water cursor drives the read
+            # window forward (since=reaction_cursor, oldest_first once seeded) so a burst
+            # larger than the limit pages across ticks instead of scrolling past a fixed
+            # tail and silently missing a wake (audit A-2). A giant burst drains at
+            # 500/tick (~5s/tick) — bounded delay, never a drop. Decision logic lives in
+            # the pure compute_reaction_wakes (hermetically tested). Seed = no startup wake.
+            reactions = read_reactions(root, team, since=reaction_cursor, limit=500,
+                                       oldest_first=(reaction_cursor is not None))
+            fresh_rx, known_reaction_ids, new_rcursor = compute_reaction_wakes(
+                reactions, known_reaction_ids, agent)
+            if fresh_rx:
+                emit_reaction_event(send_message, agent, fresh_rx)
+            if new_rcursor is not None:
+                reaction_cursor = new_rcursor
 
         messages = read_json_readonly(unread_file)
         if messages is not None:  # None = unreadable mid-write; skip cycle
