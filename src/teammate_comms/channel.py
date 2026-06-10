@@ -17,12 +17,18 @@ a message you've read but not yet acked never pads the count. Reading — not ac
 is what silences a nudge. This is missed-nudge-safe: a genuinely new message has a
 fresh id in neither set, so it always nudges.
 
-Reliability contract: the inbox JSON is the source of truth. A dropped push (session
-closed) loses nothing — it's recovered on the next inbox read.
+Reliability contract: the inbox JSON is the source of truth, but a dropped channel push
+is NOT auto-recovered — an idle agent never reads its inbox unprompted, so the old
+"recovered on the next inbox read" assumption does not hold for one. Claude Code drops
+channel notifications (GH #38736 — mid-turn notifications dropped, not queued, despite the
+docs; GH #61797 — sporadic silent drops at idle; both unresolved), so the watcher
+RE-NUDGES still-unseen unread with capped exponential backoff (see ``compute_reemit`` +
+``run_watcher``) to compensate, while preserving the v0.4.2 no-noise gating above.
 """
 
 import os
 import socket
+import sys
 import time
 
 from .comms import (
@@ -36,6 +42,20 @@ from .comms import (
 
 HEARTBEAT_SECONDS = 5
 POLL_SECONDS = 0.5
+
+# Re-nudge (WP-9): a dropped channel push leaves an idle agent unaware of its unread.
+# Re-emit the wake for still-UNSEEN unread after an exponential-backoff quiet period
+# (REEMIT_BASE_SECONDS × 2**attempt: 120, 240, 480 s), capped at REEMIT_MAX_ATTEMPTS.
+REEMIT_BASE_SECONDS = 120
+REEMIT_MAX_ATTEMPTS = 3
+
+
+def _log_emit(kind, unseen, attempt):
+    """One stable, greppable stderr line per ACTUAL wake emit — evidence-grade for an
+    upstream Claude Code bug report (lets us tell server-emitted from client-dropped).
+    stderr ONLY: stdout is the JSON-RPC stream and the harness asserts its purity."""
+    print(f"[teammate-comms] wake-emit kind={kind} unseen={unseen} attempt={attempt}",
+          file=sys.stderr, flush=True)
 
 
 def emit_channel_event(send_message, agent, count, personality=None, groups=None,
@@ -135,6 +155,47 @@ def compute_reaction_wakes(reactions, known_ids, agent):
     return fresh_rx, set(rids), new_cursor
 
 
+def compute_reemit(unseen_ids, now_mono, last_emit_mono, attempts):
+    """Pure re-nudge decision (no I/O — hermetically testable). A dropped channel push
+    leaves an idle agent unaware of unread messages; re-emit the wake for STILL-UNSEEN
+    unread after an exponential-backoff quiet period (``REEMIT_BASE_SECONDS × 2**attempts``
+    → 120, 240, 480 s), capped at ``REEMIT_MAX_ATTEMPTS``.
+
+    ``unseen_ids`` MUST be the same ``(unread - muted) - last_seen`` set the fresh path
+    uses, so a read-but-unacked or muted message can never re-nudge — that single shared
+    computation is what keeps the v0.4.2 no-noise contract provably intact.
+
+    Returns ``(should_reemit, new_attempts, new_last_emit_mono)``:
+      * empty unseen → ``(False, 0, now_mono)``: caught up — reset attempts + clock.
+      * no prior emit (``last_emit_mono is None``) or attempts exhausted → no re-nudge (the
+        seed/pre-first-emit window stays nudge-silent; the cap stops an indefinite repeat —
+        the agent's next inbox read or next message re-arms it anyway).
+      * else fire iff the current quiet period has elapsed, advancing attempt + clock.
+    """
+    if not unseen_ids:
+        return (False, 0, now_mono)
+    if last_emit_mono is None or attempts >= REEMIT_MAX_ATTEMPTS:
+        return (False, attempts, last_emit_mono)
+    threshold = REEMIT_BASE_SECONDS * (2 ** attempts)
+    if (now_mono - last_emit_mono) >= threshold:
+        return (True, attempts + 1, now_mono)
+    return (False, attempts, last_emit_mono)
+
+
+def _wake_payload(messages, unseen_ids, agent):
+    """Pure: the wake's at-a-glance context for ``unseen_ids`` → ``(count, group_targets,
+    mentioned, senders)``. Shared by the fresh-nudge and re-nudge paths so a re-nudge is
+    the same wake. Deliberately EXCLUDES the personality / ``msgs_since_reminder``
+    bookkeeping and reads no agent record (a re-nudge is not a received message)."""
+    group_targets = {m.get("group") for m in messages
+                     if m.get("id") in unseen_ids and m.get("group")}
+    mentioned = any(agent in m.get("mentions", []) for m in messages
+                    if m.get("id") in unseen_ids and m.get("mentions"))
+    senders = {m.get("from") for m in messages
+               if m.get("id") in unseen_ids and not m.get("group") and m.get("from")}
+    return len(unseen_ids), group_targets, mentioned, senders
+
+
 def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
     """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
 
@@ -149,6 +210,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     msgs_since_reminder = 0  # personality reminder fires every ~10 received messages
     known_reaction_ids = None  # previous tick's returned reaction ids; None until first read
     reaction_cursor = None     # high-water mark (max reaction id seen) driving the read window
+    last_emit_mono = None      # monotonic time of the last wake emit (fresh or re-nudge); None until first
+    reemit_attempts = 0        # re-nudge attempts in the current quiet period (capped)
 
     while not stop_evt.is_set():
         if not (initialized_evt.is_set() and registered_evt.is_set()):
@@ -171,6 +234,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             msgs_since_reminder = 0
             known_reaction_ids = None
             reaction_cursor = None
+            last_emit_mono = None
+            reemit_attempts = 0
 
         now = time.monotonic()
         if now - last_hb >= HEARTBEAT_SECONDS:
@@ -197,6 +262,7 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 reactions, known_reaction_ids, agent)
             if fresh_rx:
                 emit_reaction_event(send_message, agent, fresh_rx)
+                _log_emit("reaction", len(fresh_rx), 0)
             if new_rcursor is not None:
                 reaction_cursor = new_rcursor
 
@@ -213,44 +279,51 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 # drained by the agent's startup teammate_inbox — don't nudge for them.
                 known_ids = set(unread_ids)
             else:
-                # Nudge only for messages the agent hasn't been shown (not in last_seen)
-                # and we haven't already nudged for (not in known_ids). Count reflects
-                # all UNSEEN unread, so a read-but-unacked message never pads it. Muted
-                # messages are excluded from fresh/unseen (no wake) but still tracked in
-                # known_ids below, so an unmute never retro-nudges them.
+                # UNSEEN = (unread - muted) - last_seen — the ONE set both the first-nudge
+                # and the WP-9 re-nudge gate on. A read-but-unacked message (in last_seen)
+                # and any muted-group message are excluded, so neither can ever (re-)nudge:
+                # that shared computation is what keeps the v0.4.2 no-noise contract intact.
+                # Muted ids are still tracked in known_ids below, so an unmute never
+                # retro-nudges.
                 last_seen = identity.get_last_seen() or set()
-                fresh = (unread_ids - muted_ids) - known_ids - last_seen
+                unseen_ids = (unread_ids - muted_ids) - last_seen
+                fresh = unseen_ids - known_ids
                 if fresh:
-                    record = read_agent_record(root, team, agent) or {}
-                    unseen_ids = (unread_ids - muted_ids) - last_seen
-                    unseen_count = len(unseen_ids)
-                    # Name the group reply target for ANY unseen (unread, not-yet-read)
-                    # group message — not just the one that triggered this wake — so a
-                    # DM-triggered wake still surfaces a pending group thread (mixed-batch
-                    # fix). (.get guards id-less / 1:1 records, which have no 'group' key.)
-                    group_targets = {m.get("group") for m in messages
-                                     if m.get("id") in unseen_ids and m.get("group")}
-                    # @mention of THIS agent in any unseen message → a 🔔 note on the wake
-                    # (content-only; does not affect the count). Shared-record mentions
-                    # list, checked locally — no per-member records.
-                    mentioned = any(agent in m.get("mentions", []) for m in messages
-                                    if m.get("id") in unseen_ids and m.get("mentions"))
-                    # Name where the messages came from: DM senders (no group) + #groups.
-                    senders = {m.get("from") for m in messages
-                               if m.get("id") in unseen_ids and not m.get("group") and m.get("from")}
+                    # A genuinely-new message → first nudge. group_targets name the reply
+                    # target for ANY unseen group message (mixed-batch fix); mentioned/
+                    # senders name the 🔔 and the sources. All from the shared payload.
+                    unseen_count, group_targets, mentioned, senders = _wake_payload(
+                        messages, unseen_ids, agent)
                     # Personality reminder only every ~10 received messages (registration
-                    # already echoed it) — avoids per-message token waste, still guards
-                    # against forgetting. Count the fresh (new) messages this wake.
+                    # already echoed it). Fresh-path ONLY — a re-nudge is not a new message,
+                    # so it never bumps the counter or reads the record.
                     msgs_since_reminder += len(fresh)
                     if msgs_since_reminder >= 10:
-                        personality = record.get("personality")
+                        personality = (read_agent_record(root, team, agent) or {}).get("personality")
                         msgs_since_reminder = 0
                     else:
                         personality = None
                     emit_channel_event(send_message, agent, unseen_count,
                                        personality, groups=group_targets,
                                        mentioned=mentioned, senders=senders)
+                    _log_emit("fresh", unseen_count, 0)
                     known_ids |= unread_ids
+                    last_emit_mono = now      # (re)arm the re-nudge backoff for this batch
+                    reemit_attempts = 0
+                else:
+                    # No NEW message, but a dropped channel push may have left the agent
+                    # unaware of still-unseen unread (GH #38736/#61797). Re-nudge with capped
+                    # backoff. compute_reemit also RESETS the clock+attempts when unseen is
+                    # empty (caught up), so an ack/read re-arms the next batch cleanly.
+                    do_reemit, reemit_attempts, last_emit_mono = compute_reemit(
+                        unseen_ids, now, last_emit_mono, reemit_attempts)
+                    if do_reemit:
+                        unseen_count, group_targets, mentioned, senders = _wake_payload(
+                            messages, unseen_ids, agent)
+                        emit_channel_event(send_message, agent, unseen_count,
+                                           None, groups=group_targets,
+                                           mentioned=mentioned, senders=senders)
+                        _log_emit("renudge", unseen_count, reemit_attempts)
                 # Absorb muted ids as "known" every cycle (even with no fresh wake) so a
                 # later unmute finds them already-known → no retro-nudge for still-unread
                 # muted messages (safe under-nudge direction).

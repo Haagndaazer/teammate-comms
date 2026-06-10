@@ -1196,6 +1196,50 @@ def main():
     except Exception as e:
         failures.append(f"WP-1 missed-event unit checks errored: {e}")
 
+    # ── WP-9 — wake reliability: re-nudge still-unseen unread with capped exponential
+    #    backoff after a dropped channel push. compute_reemit is pure → hermetic. ──
+    try:
+        from teammate_comms.channel import REEMIT_BASE_SECONDS as _RB
+        from teammate_comms.channel import REEMIT_MAX_ATTEMPTS as _RMAX
+        from teammate_comms.channel import compute_reemit as _cre
+        U = {"m1", "m2"}  # a non-empty unseen set
+
+        # (1) first-emit guard: with no prior emit (last_emit None) re-nudge NEVER fires,
+        #     even with unseen unread — the seed/pre-first-emit window stays nudge-silent.
+        if _cre(U, 1000.0, None, 0) != (False, 0, None):
+            failures.append("WP-9 first-emit guard: re-nudged with no prior emit")
+        # (2) before the first threshold → no fire, clock + attempts unchanged.
+        if _cre(U, 1000.0 + _RB - 1, 1000.0, 0) != (False, 0, 1000.0):
+            failures.append("WP-9 fired before the base threshold")
+        # (3) at the threshold → fire, attempt+1, clock advances to now.
+        t1 = 1000.0 + _RB
+        if _cre(U, t1, 1000.0, 0) != (True, 1, t1):
+            failures.append("WP-9 did not fire at the base threshold")
+        # (4) exponential backoff: attempt k waits BASE * 2**k (120, 240, 480 …).
+        for k in range(_RMAX):
+            wait = _RB * (2 ** k)
+            if _cre(U, 5000.0 + wait - 1, 5000.0, k)[0]:
+                failures.append(f"WP-9 attempt {k}: fired before its {wait}s backoff")
+            if _cre(U, 5000.0 + wait, 5000.0, k) != (True, k + 1, 5000.0 + wait):
+                failures.append(f"WP-9 attempt {k}: did not fire at {wait}s")
+        # (5) cap: at REEMIT_MAX_ATTEMPTS, never fire again no matter how long it's been.
+        if _cre(U, 1e9, 0.0, _RMAX)[0]:
+            failures.append("WP-9 re-nudged past the attempt cap")
+        # (6) caught up (unseen empty) → reset to (False, 0, now), clearing any attempts.
+        if _cre(set(), 9000.0, 1000.0, _RMAX) != (False, 0, 9000.0):
+            failures.append("WP-9 empty-unseen did not reset clock+attempts")
+        # (7) read-position (v0.4.2) suppression: a fully-read batch reduces unseen to empty
+        #     upstream, so even after an eternity nothing re-nudges (no waking a read message).
+        unread, muted, seen = {"a", "b"}, set(), {"a", "b"}
+        if _cre((unread - muted) - seen, 1e9, 0.0, 0)[0]:
+            failures.append("WP-9 re-nudged for fully-read (last_seen) messages")
+        # (8) cap-reset round-trip: a fresh emit (caller sets attempts=0, last_emit=now)
+        #     re-arms the backoff — the next batch fires again after BASE.
+        if not _cre(U, 100.0 + _RB, 100.0, 0)[0]:
+            failures.append("WP-9 did not re-arm after a fresh-emit reset")
+    except Exception as e:
+        failures.append(f"WP-9 re-nudge unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

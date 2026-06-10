@@ -242,8 +242,20 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   group thread (the mixed-batch case). 1:1-only wakes keep the generic text.
 - Heartbeats the agent's registry record every ~5s.
 
-Dropped pushes (session closed) never lose a message — the inbox JSON is the source of
-truth and is drained on the next `teammate_inbox`.
+**Wake-reliability contract (honest, v0.7.x / WP-9).** The inbox JSON is the durable source
+of truth, but a dropped channel push is **not** auto-recovered: an idle agent never reads its
+inbox unprompted, so "drained on the next `teammate_inbox`" only holds once *something else*
+wakes it. Claude Code is known to drop channel notifications — GH **#38736** (mid-turn
+notifications dropped, not queued, despite the docs) and **#61797** (sporadic silent drops at
+idle), both unresolved — so after one emit the watcher **re-nudges** still-unseen unread with
+capped exponential backoff: if `unseen = (unread − muted) − last_seen` persists, re-emit the
+same wake at 120 s, then 240 s, then 480 s, capped at 3 attempts, resetting on any read/ack or
+new message. Re-nudge gates on the **exact same `unseen` set** the first nudge uses, so the
+v0.4.2 no-noise contract is preserved verbatim — a read-but-unacked or muted message can
+never re-nudge. Every emit (fresh / re-nudge / reaction) logs one greppable stderr line
+(`[teammate-comms] wake-emit kind=… unseen=… attempt=…`) so server-emitted can be told from
+client-dropped for an upstream bug report. `compute_reemit` is a pure, hermetically-tested
+decision; a still-lost wake after the cap is no worse than the prior one-and-done behavior.
 
 ---
 
