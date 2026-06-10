@@ -574,6 +574,14 @@ actual auth layer added first. (The dashboard's per-launch token *is* a real sec
 loopback-bound, constant-time-compared, query-string-redacted in logs — but it guards the
 **HTTP console**, not the file-level comms.)
 
+**Cross-host note (WP-6 / A-7).** On a *shared* comms root that spans hosts, the `file_lock`
+dead-holder steal is **host-gated**: the lock dir records the holder's pid **and host**, and a
+contender steals only when the holder is on *its own* host (`socket.gethostname()`) and that
+pid is verified dead — `_pid_alive` is purely local, so a remote pid is unknowable (mirrors
+`is_channel_alive`'s host-gated pid trust). Consequence: a **dead remote** holder's lock is
+never auto-stolen (it's recovered only manually, bounded by the lock timeout's raise/drop) —
+strictly safer than stealing a possibly-live remote and getting two writers.
+
 ---
 
 ## 11. `skills/teammate-comms/SKILL.md` & launch

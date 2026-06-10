@@ -287,12 +287,18 @@ def write_json_atomic(filepath, data):
     os.replace(tmp, filepath)
 
 
+# A claim marker (see _claim_if_dead) lives microseconds; one older than this is an orphan
+# left by a stealer killed mid-claim, and is reclaimed so a dead holder's lock can't get stuck.
+CLAIM_STALE_SECONDS = 30
+
+
 def _write_lock_pid(lock_dir):
-    """Best-effort: record the holder's pid inside the lock dir, so a contender can tell a
-    DEAD holder (steal-able) from a slow-but-alive one (never steal). A failed/absent write
-    reads back as 'unknown' → never stolen (fail toward the live holder)."""
+    """Best-effort: record the holder's pid AND host inside the lock dir, so a contender can
+    tell a DEAD-on-THIS-HOST holder (steal-able) from a slow-but-alive one, OR a holder on a
+    DIFFERENT host (whose pid is meaningless locally — never steal). A failed/absent/foreign
+    write reads back as 'unknown/foreign' → never stolen (fail toward the live holder)."""
     try:
-        (lock_dir / "pid").write_text(str(os.getpid()))
+        (lock_dir / "pid").write_text(f"{os.getpid()}\n{socket.gethostname()}")
     except OSError:
         pass
 
@@ -322,18 +328,46 @@ def _claim_if_dead(lock_dir):
     ``os.replace`` rename of the lock DIRECTORY proved non-exclusive under concurrency on
     Windows — empirically 4/8 stealers 'won' — so mkdir is the reliable choice.) After winning
     the claim we re-check the stale dir still exists (a slightly-later caller mustn't 'win'
-    a lock an earlier stealer already removed), remove it, then drop the claim marker."""
+    a lock an earlier stealer already removed), remove it, then drop the claim marker.
+
+    Liveness is HOST-GATED (mirrors ``is_channel_alive``): ``_pid_alive`` is purely local, so a
+    holder on a DIFFERENT host is never stolen (its pid is meaningless here) — a dead remote
+    holder's lock is recovered only manually, bounded by the timeout raise/drop; strictly safer
+    than stealing a live remote. And the ``.claim`` marker is AGE-GATED: one older than
+    ``CLAIM_STALE_SECONDS`` (a stealer killed mid-claim) is reclaimed, so a dead holder's lock
+    can't get permanently stuck behind a dead claim."""
     try:
-        pid = int((lock_dir / "pid").read_text().strip())
-    except (OSError, ValueError):
+        lines = (lock_dir / "pid").read_text().splitlines()
+        pid = int(lines[0].strip())
+    except (OSError, ValueError, IndexError):
         return False                          # missing/unreadable pid → unknown → don't steal
+    host = lines[1].strip() if len(lines) > 1 else ""
+    if host != socket.gethostname():
+        return False                          # holder on a DIFFERENT host → local pid is meaningless
     if _pid_alive(pid) is not False:
         return False                          # alive (True) or undetermined (None) → don't steal
     claim = Path(str(lock_dir) + ".claim")
     try:
         claim.mkdir(parents=False, exist_ok=False)   # atomic exclusive — exactly one winner
     except OSError:
-        return False                          # another stealer holds the claim → don't steal
+        # Another stealer holds the claim — normally micro-lived. If it's STALE (a stealer was
+        # killed between mkdir and its finally), reclaim it: rmdir + one retry. Two concurrent
+        # cleaners race the fresh mkdir → exactly one wins (the same exclusive primitive), so a
+        # dead holder's lock can't get permanently stuck behind a dead claim marker.
+        try:
+            stale = (time.time() - claim.stat().st_mtime) > CLAIM_STALE_SECONDS
+        except OSError:
+            return False                      # claim vanished under us → let the caller loop
+        if not stale:
+            return False
+        try:
+            claim.rmdir()
+        except OSError:
+            pass
+        try:
+            claim.mkdir(parents=False, exist_ok=False)
+        except OSError:
+            return False                      # another cleaner won the fresh claim → don't steal
     try:
         if not lock_dir.exists():
             return False                      # already stolen+removed by an earlier winner

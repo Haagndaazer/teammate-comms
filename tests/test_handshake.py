@@ -1488,10 +1488,12 @@ def main():
         tm6 = None
         wroot6 = tempfile.mkdtemp(prefix="tc-wp6-")
 
-        def _mklock(name, pid):
+        import socket as _sock6
+
+        def _mklock(name, pid, host=None):
             ld = Path(wroot6) / f"{name}.lock"
             ld.mkdir(parents=True, exist_ok=True)
-            (ld / "pid").write_text(str(pid))
+            (ld / "pid").write_text(f"{pid}\n{_sock6.gethostname() if host is None else host}")
             return ld
 
         # ---- A-7 (a): an ALIVE holder (this very process) is NEVER stolen — file_lock RAISES.
@@ -1517,7 +1519,8 @@ def main():
             except _c6.CommsError:
                 failures.append("A-7: did NOT steal a lock from a verified-dead holder")
             # exactly-one-winner: 8 concurrent stealers on one dead lock → exactly one claims
-            # (os.replace renames the stale dir to a UNIQUE name; only one wins, Windows-safe).
+            # (the claim is a `mkdir` of a sibling .claim marker — the same atomic primitive the
+            # lock uses; exactly one of N concurrent mkdirs wins, cross-platform incl. Windows).
             _two = _mklock("two", 99999)
             _wins = []
 
@@ -1546,6 +1549,41 @@ def main():
         finally:
             _c6._pid_alive = _orig_pa
             _sh6.rmtree(Path(wroot6) / "unk.lock", ignore_errors=True)
+
+        # ---- A-7 (e) CR-1: a FRESH .claim marker is respected (not stolen past), but an
+        #      ORPHANED one (older than CLAIM_STALE_SECONDS — a stealer killed mid-claim) is
+        #      reclaimed so a dead holder's lock can't get permanently stuck.
+        _c6._pid_alive = lambda pid: False
+        try:
+            _af = _mklock("aged", 99999)
+            _fresh = Path(str(_af) + ".claim")
+            _fresh.mkdir()
+            if _c6._claim_if_dead(_af):
+                failures.append("A-7 CR-1: stole past a FRESH claim marker")
+            _fresh.rmdir()
+            _ag2 = _mklock("aged2", 99999)
+            _stale = Path(str(_ag2) + ".claim")
+            _stale.mkdir()
+            _old = time.time() - (_c6.CLAIM_STALE_SECONDS + 60)
+            os.utime(_stale, (_old, _old))
+            if not _c6._claim_if_dead(_ag2):
+                failures.append("A-7 CR-1: did NOT reclaim an ORPHANED (aged) claim → lock would stick")
+        finally:
+            _c6._pid_alive = _orig_pa
+            for _p in Path(wroot6).glob("aged*"):
+                _sh6.rmtree(_p, ignore_errors=True)
+
+        # ---- A-7 (f) CR-2: a holder on a DIFFERENT host with a locally-dead pid is NOT stolen
+        #      (host-gated liveness — local _pid_alive can't judge a remote pid; A-7 must not
+        #      relocate cross-host).
+        _c6._pid_alive = lambda pid: False
+        try:
+            _rem = _mklock("remote", 99999, host="some-other-host-xyz")
+            if _c6._claim_if_dead(_rem):
+                failures.append("A-7 CR-2: stole a lock held on a DIFFERENT host (cross-host steal)")
+        finally:
+            _c6._pid_alive = _orig_pa
+            _sh6.rmtree(Path(wroot6) / "remote.lock", ignore_errors=True)
 
         # ---- A-5: the predicate purge removes a member's group copies (group==sigil) ONLY —
         #      including a copy injected AFTER an id snapshot (the race-window-shrink) — and
