@@ -634,6 +634,9 @@ def _window(records, limit, oldest_first):
     newest-id cursor advance). To guarantee the cursor strictly advances, the cut is
     extended to swallow any id-collision group straddling the boundary — never split
     records sharing one id across two pages, or the cursor could stall on them.
+    (The one unhandled case — MORE than ``limit`` records sharing a single id — is
+    accepted as unreachable: ids are per-write timestamps and the OS clock granularity
+    (~1ms on Windows) makes hundreds in one microsecond physically impossible.)
     """
     if not (limit and limit > 0 and len(records) > limit):
         return records
@@ -705,11 +708,18 @@ def append_reaction(root, team, record, timeout=5):
     (and retries — reaction adds fold idempotently in ``aggregate_reactions``) instead of
     losing it silently. ``timeout`` is short (the server request loop is single-threaded,
     audit A-6 — a long block stalls every tool call) and injectable so tests don't wait
-    the default. Must not be called while holding any ``file_lock`` (it is not reentrant)."""
+    the default. Must not be called while holding any ``file_lock`` (it is not reentrant).
+
+    The event ``id`` is stamped HERE, under the lock, and written into ``record`` in place
+    (the caller reads it back). Stamping inside the lock makes file order == id order even
+    when two writers contend: a caller-stamped id + a blocking wait could otherwise commit a
+    LOWER id AFTER a watcher/dashboard cursor already advanced past it (since=cursor then
+    excludes it forever → silent missed wake). Stamp-on-write closes that race at the source."""
     path = get_reactions_file(root, team)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
+            record["id"] = now_timestamp()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except CommsError:
@@ -799,6 +809,10 @@ def append_deletion(root, team, record, block=True, timeout=5):
     there would be lost permanently on retry (the re-entry guard rejects an already-gone
     group/teammate) — strictly worse. They self-heal instead: a fresh dashboard load omits
     the absent group/teammate outright. Must not be called while holding any ``file_lock``.
+
+    The event ``id`` is stamped HERE, under whichever lock is held when the write actually
+    happens (in place into ``record``) — file order == id order, so a contending writer can
+    never commit a lower id after a cursor advanced past it (same race as ``append_reaction``).
     """
     if not block:
         try:
@@ -807,6 +821,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
             with file_lock_optional(path, timeout=2) as acquired:
                 if not acquired:
                     return
+                record["id"] = now_timestamp()
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
@@ -816,6 +831,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
+            record["id"] = now_timestamp()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except CommsError:

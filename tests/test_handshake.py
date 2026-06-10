@@ -991,6 +991,15 @@ def main():
                     "emoji": "fire", "op": op, "target_from": target_from}
         ME = "alice"
 
+        def _seed_jsonl(path, records):
+            # Write records with their ids INTACT — append_reaction/append_deletion now stamp
+            # their OWN id under the lock (CR-1), so tests that need controlled ids to drive
+            # the read/cursor logic must write the file directly instead of via the appenders.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                for r in records:
+                    fh.write(json.dumps(r) + "\n")
+
         # ---- A-1: forward-pagination window never skips a burst, tail view unchanged ----
         # (i) _window unit: oldest_first swallows an id-collision group at the boundary so a
         #     cursor set to the last returned id strictly advances (no stall); tail unaffected.
@@ -1060,14 +1069,13 @@ def main():
         # legacy newest-500 read scrolls past it; the cursor-driven read pages forward and
         # still delivers it — exactly once.
         rroot = tempfile.mkdtemp(prefix="tc-wp1rx-")
-        _c.append_reaction(rroot, tm, _rx(0, target_from="carol"))
-        _c.append_reaction(rroot, tm, _rx(1, target_from="carol"))
+        rx_file = _c.get_reactions_file(rroot, tm)
+        _seed_jsonl(rx_file, [_rx(0, target_from="carol"), _rx(1, target_from="carol")])
         _, known, rcur = cw(_c.read_reactions(rroot, tm, since=None, limit=500), None, ME)
         BURST, HIT = 600, 70
-        for i in range(10, 10 + BURST):
-            is_hit = (i == HIT)
-            _c.append_reaction(rroot, tm, _rx(i, target_from=(ME if is_hit else "carol"),
-                                              frm=("bob" if is_hit else "dave")))
+        _seed_jsonl(rx_file, [_rx(i, target_from=(ME if i == HIT else "carol"),
+                                  frm=("bob" if i == HIT else "dave"))
+                              for i in range(10, 10 + BURST)])
         hit_id = _rx(HIT)["id"]
         if any(r["id"] == hit_id for r in _c.read_reactions(rroot, tm, limit=500)):
             failures.append("A-2 precondition broken: the hit fell inside the newest-500 tail")
@@ -1086,9 +1094,12 @@ def main():
             failures.append(f"A-2 hit delivered {woke.count(hit_id)}x (want exactly 1)")
 
         # ---- A-3: append_reaction/append_deletion BLOCK then succeed under contention ----
-        # Hold the file's lock briefly in a background thread; the blocking append must WAIT
-        # then write (legacy file_lock_optional returned WITHOUT writing — a silent drop).
-        # (file_lock steals only AFTER its timeout; we release well before, so it acquires.)
+        # Hold the file's lock for ~2.5s in a background thread; the blocking append must WAIT
+        # then write. The hold MUST exceed the legacy file_lock_optional(timeout=2) give-up —
+        # at 0.4s the legacy code would also wait it out and write, so the test wouldn't
+        # discriminate (CR-2). At 2.5s legacy drops unwritten at 2s while the new blocking
+        # append (timeout=5) acquires on release and writes. (file_lock steals only AFTER its
+        # timeout; we release at 2.5s < 5s, so it acquires cleanly without stealing.)
         def _hold_then_release(lock_dir, secs, done):
             lock_dir.mkdir(parents=True, exist_ok=True)
             time.sleep(secs)
@@ -1102,23 +1113,23 @@ def main():
             (_c.get_reactions_file,
              lambda: _c.append_reaction(aroot, tm, _rx(0), timeout=5), "append_reaction"),
             (_c.get_deletions_file,
-             lambda: _c.append_deletion(aroot, tm, {"id": _c.now_timestamp(), "target": "m",
-                                                    "kind": "message", "by": "a", "op": "delete"},
-                                        timeout=5), "append_deletion"),
+             lambda: _c.append_deletion(aroot, tm, {"target": "m", "kind": "message",
+                                                    "by": "a", "op": "delete"}, timeout=5),
+             "append_deletion"),
         ):
             p = path_fn(aroot, tm)
             p.parent.mkdir(parents=True, exist_ok=True)
             done = threading.Event()
             ld = Path(str(p) + ".lock")
-            threading.Thread(target=_hold_then_release, args=(ld, 0.4, done), daemon=True).start()
+            threading.Thread(target=_hold_then_release, args=(ld, 2.5, done), daemon=True).start()
             time.sleep(0.05)  # ensure the holder grabbed the lock first
             t0 = time.monotonic()
             call()
             waited = time.monotonic() - t0
             if not done.is_set():
                 failures.append(f"A-3 {ident} returned before the lock was released")
-            if waited < 0.3:
-                failures.append(f"A-3 {ident} did not block under contention ({waited:.2f}s)")
+            if waited < 2.0:  # blocked PAST legacy's 2s give-up (so the test discriminates)
+                failures.append(f"A-3 {ident} did not block past 2s under contention ({waited:.2f}s)")
             if p.stat().st_size == 0:
                 failures.append(f"A-3 {ident} blocked but wrote nothing (lost the record)")
 
@@ -1130,12 +1141,39 @@ def main():
         bld = Path(str(bp) + ".lock")
         bld.mkdir()
         try:
-            _c.append_deletion(broot, tm, {"id": _c.now_timestamp(), "target": "#g",
-                                           "kind": "group", "by": "a", "op": "delete"}, block=False)
+            _c.append_deletion(broot, tm, {"target": "#g", "kind": "group",
+                                           "by": "a", "op": "delete"}, block=False)
         except Exception as e:
             failures.append(f"A-3 append_deletion(block=False) raised under contention: {e}")
         finally:
             bld.rmdir()
+
+        # ---- CR-1: event ids are stamped UNDER the lock, so file order == id order even
+        # under contention. A pre-stamped id + the now-blocking lock could otherwise commit a
+        # LOWER id after a cursor advanced past it (since=cursor excludes it forever → silent
+        # missed wake). Concurrent appenders must yield a monotonically non-decreasing id
+        # sequence in the file, with zero drops. (Fails against a pre-lock-stamp implementation.)
+        croot = tempfile.mkdtemp(prefix="tc-wp1cr1-")
+        def _spam_reactions(n):
+            for _ in range(n):
+                _c.append_reaction(croot, tm, {"target": "m", "from": "bob", "emoji": "fire",
+                                               "op": "add", "target_from": "alice"}, timeout=5)
+        def _spam_deletions(n):
+            for _ in range(n):
+                _c.append_deletion(croot, tm, {"target": "m", "kind": "message",
+                                               "by": "bob", "op": "delete"}, timeout=5)
+        for spam, read_fn, label, total in ((_spam_reactions, _c.read_reactions, "reaction", 80),
+                                            (_spam_deletions, _c.read_deletions, "deletion", 80)):
+            ths = [threading.Thread(target=spam, args=(20,)) for _ in range(4)]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join()
+            ids = [r["id"] for r in read_fn(croot, tm)]
+            if ids != sorted(ids):
+                failures.append(f"CR-1 {label} ids not monotonic under contention (out-of-order race)")
+            if len(ids) != total:
+                failures.append(f"CR-1 {label} dropped events under contention: {len(ids)}/{total}")
     except Exception as e:
         failures.append(f"WP-1 missed-event unit checks errored: {e}")
 
