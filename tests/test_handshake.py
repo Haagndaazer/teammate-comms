@@ -1154,14 +1154,31 @@ def main():
         # missed wake). Concurrent appenders must yield a monotonically non-decreasing id
         # sequence in the file, with zero drops. (Fails against a pre-lock-stamp implementation.)
         croot = tempfile.mkdtemp(prefix="tc-wp1cr1-")
+        # Generous timeout AND explicit worker-exception capture: 80-way synthetic contention can
+        # drive file_lock past its timeout into the steal path, which can RAISE CommsError (this
+        # flake was the first empirical sighting of that path — audit A-7). timeout=30 keeps the
+        # synthetic burst from reaching it (real callers catch the raise anyway); the try/except
+        # surfaces any FUTURE lock-path raise as a LABELED failure rather than a confusing
+        # drop-count (a silently-dying worker is how the original 61/80 mystery read). Net:
+        # the ordering invariant is isolated AND any regression is diagnosable.
+        worker_errors = []
+
         def _spam_reactions(n):
             for _ in range(n):
-                _c.append_reaction(croot, tm, {"target": "m", "from": "bob", "emoji": "fire",
-                                               "op": "add", "target_from": "alice"}, timeout=5)
+                try:
+                    _c.append_reaction(croot, tm, {"target": "m", "from": "bob", "emoji": "fire",
+                                                   "op": "add", "target_from": "alice"}, timeout=30)
+                except Exception as e:
+                    worker_errors.append(f"append_reaction raised: {e!r}")
+
         def _spam_deletions(n):
             for _ in range(n):
-                _c.append_deletion(croot, tm, {"target": "m", "kind": "message",
-                                               "by": "bob", "op": "delete"}, timeout=5)
+                try:
+                    _c.append_deletion(croot, tm, {"target": "m", "kind": "message",
+                                                   "by": "bob", "op": "delete"}, timeout=30)
+                except Exception as e:
+                    worker_errors.append(f"append_deletion raised: {e!r}")
+
         for spam, read_fn, label, total in ((_spam_reactions, _c.read_reactions, "reaction", 80),
                                             (_spam_deletions, _c.read_deletions, "deletion", 80)):
             ths = [threading.Thread(target=spam, args=(20,)) for _ in range(4)]
@@ -1174,6 +1191,8 @@ def main():
                 failures.append(f"CR-1 {label} ids not monotonic under contention (out-of-order race)")
             if len(ids) != total:
                 failures.append(f"CR-1 {label} dropped events under contention: {len(ids)}/{total}")
+        if worker_errors:  # any lock-path raise → labeled, not a silent drop-count mystery
+            failures.append(f"CR-1 worker raised under lock contention (steal-path A-7): {worker_errors[:3]}")
     except Exception as e:
         failures.append(f"WP-1 missed-event unit checks errored: {e}")
 
