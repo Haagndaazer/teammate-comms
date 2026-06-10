@@ -290,13 +290,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         to = (payload.get("to") or "").strip()
         message = payload.get("message")
         priority = payload.get("priority") or "normal"
+        # Thread + type from the console (B-1): pass reply_to/post_type through to the cores,
+        # which validate them (a bad post_type → CommsError → 400; reply_to is an unvalidated
+        # citation hint). '' → None so the core stores no key.
+        post_type = payload.get("post_type") or None
+        reply_to = payload.get("reply_to") or None
         if not to:
             return self._json(400, {"error": "'to' is required"})
         try:
             if to.startswith("#"):
-                res = _tools.send_group(root, team, me, to, message, priority)
+                res = _tools.send_group(root, team, me, to, message, priority,
+                                        post_type=post_type, reply_to=reply_to)
             else:
-                res = _tools.send_dm(root, team, me, to, message, priority)
+                res = _tools.send_dm(root, team, me, to, message, priority,
+                                     post_type=post_type, reply_to=reply_to)
         except CommsError as e:
             return self._json(400, {"error": str(e)})
         return self._json(200, {"ok": True, "id": res.get("id")})
