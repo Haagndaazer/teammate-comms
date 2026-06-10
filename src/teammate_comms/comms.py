@@ -621,13 +621,40 @@ def append_transcript(root, team, record):
         print(f"[teammate-comms] transcript tee skipped: {e}", file=sys.stderr, flush=True)
 
 
-def read_transcript(root, team=None, since=None, limit=200):
-    """Read the global NDJSON transcript non-destructively, newest-bounded.
+def _window(records, limit, oldest_first):
+    """Apply a ``limit`` window to chronologically-ordered ``records``.
 
-    Returns at most the last ``limit`` records in chronological order. With ``since``
-    set, returns records whose id is ``>= since`` (the dashboard dedupes by id, so a
-    boundary record repeating across polls is harmless and a same-microsecond id
-    collision can never drop an unseen record). Missing file → []; bad lines skipped.
+    ``oldest_first=False`` (default) keeps the NEWEST ``limit`` (``records[-limit:]``)
+    — a tail view, correct for a fresh load that wants recent history.
+
+    ``oldest_first=True`` keeps the OLDEST ``limit`` — forward pagination from a
+    cursor. A caller that then advances its cursor to the LAST returned id resumes
+    exactly there next poll, so a burst larger than ``limit`` drains across polls with
+    **no record ever skipped** (the bug when a tail-slice was paired with a
+    newest-id cursor advance). To guarantee the cursor strictly advances, the cut is
+    extended to swallow any id-collision group straddling the boundary — never split
+    records sharing one id across two pages, or the cursor could stall on them.
+    """
+    if not (limit and limit > 0 and len(records) > limit):
+        return records
+    if not oldest_first:
+        return records[-limit:]
+    cut = limit
+    boundary_id = records[cut - 1].get("id")
+    while cut < len(records) and records[cut].get("id") == boundary_id:
+        cut += 1
+    return records[:cut]
+
+
+def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
+    """Read the global NDJSON transcript non-destructively, ``limit``-bounded.
+
+    With ``since`` set, returns records whose id is ``>= since`` (the dashboard dedupes
+    by id, so a boundary record repeating across polls is harmless). ``oldest_first``
+    selects the windowing when more than ``limit`` records match: False keeps the newest
+    ``limit`` (tail view); True keeps the oldest ``limit`` for forward pagination — the
+    caller (e.g. the dashboard poll) sets this when walking a cursor so a >``limit``
+    burst is paged out instead of skipped. Missing file → []; bad lines skipped.
     """
     path = get_transcript_file(root, team)
     records = []
@@ -646,9 +673,7 @@ def read_transcript(root, team=None, since=None, limit=200):
                 records.append(rec)
     except (FileNotFoundError, OSError):
         return []
-    if limit and limit > 0 and len(records) > limit:
-        records = records[-limit:]
-    return records
+    return _window(records, limit, oldest_first)
 
 
 # ── Reactions ───────────────────────────────────────────────────────────────────
@@ -672,22 +697,35 @@ def get_reactions_file(root, team=None):
     return base / "reactions.jsonl"
 
 
-def append_reaction(root, team, record):
-    """Append one reaction event (best-effort, never-raise) to the reactions log."""
+def append_reaction(root, team, record, timeout=5):
+    """Append one reaction event under a BLOCKING lock — reactions are a feature, not
+    observability (unlike ``append_transcript``), so a drop is feature-data loss (no wake,
+    no chip, ever). Blocks up to ``timeout`` rather than skipping under contention; a
+    genuine lock failure raises an actionable ``CommsError`` so the caller surfaces it
+    (and retries — reaction adds fold idempotently in ``aggregate_reactions``) instead of
+    losing it silently. ``timeout`` is short (the server request loop is single-threaded,
+    audit A-6 — a long block stalls every tool call) and injectable so tests don't wait
+    the default. Must not be called while holding any ``file_lock`` (it is not reentrant)."""
+    path = get_reactions_file(root, team)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path = get_reactions_file(root, team)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock_optional(path, timeout=2) as acquired:
-            if not acquired:
-                return
+        with file_lock(path, timeout=timeout):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[teammate-comms] reaction append skipped: {e}", file=sys.stderr, flush=True)
+    except CommsError:
+        raise CommsError(
+            f"Reaction not recorded: reactions.jsonl stayed locked for {timeout}s "
+            f"(transient write contention). Nothing was lost — try the reaction again."
+        )
 
 
-def read_reactions(root, team=None, since=None, limit=None):
-    """Read reaction events (non-destructive); optional ``id >= since`` + tail ``limit``."""
+def read_reactions(root, team=None, since=None, limit=None, oldest_first=False):
+    """Read reaction events (non-destructive); optional ``id >= since`` + ``limit`` window.
+
+    ``oldest_first`` selects the window when more than ``limit`` match (see ``_window``):
+    False = newest ``limit`` (tail/seed view); True = oldest ``limit`` for forward
+    pagination from a cursor (the dashboard poll and the channel reaction-wake driver set
+    this so a burst pages out instead of scrolling past the tail)."""
     path = get_reactions_file(root, team)
     out = []
     try:
@@ -705,9 +743,7 @@ def read_reactions(root, team=None, since=None, limit=None):
                 out.append(rec)
     except (FileNotFoundError, OSError):
         return []
-    if limit and limit > 0 and len(out) > limit:
-        out = out[-limit:]
-    return out
+    return _window(out, limit, oldest_first)
 
 
 def aggregate_reactions(events):
@@ -748,22 +784,54 @@ def get_deletions_file(root, team=None):
     return base / "deletions.jsonl"
 
 
-def append_deletion(root, team, record):
-    """Append one deletion event (best-effort, never-raise) to the deletions log."""
+def append_deletion(root, team, record, block=True, timeout=5):
+    """Append one deletion event to the deletions sub-stream.
+
+    ``block=True`` (default, used by single-message ``delete_message``): a BLOCKING lock,
+    errors propagate. A lost deletion event there is *persistent* dashboard inconsistency
+    — the firehose still carries the live message and nothing tombstones it on the
+    dashboard even on reload — and the caller's retry is idempotent (the message stays
+    resolvable, re-tombstones harmlessly).
+
+    ``block=False`` (whole-group delete + teammate removal): best-effort, never-raise.
+    Those callers destroy the group dir / agent record BEFORE this append and emit the
+    event LAST by design (so a partial rmtree can't desync the dashboard); a raised append
+    there would be lost permanently on retry (the re-entry guard rejects an already-gone
+    group/teammate) — strictly worse. They self-heal instead: a fresh dashboard load omits
+    the absent group/teammate outright. Must not be called while holding any ``file_lock``.
+    """
+    if not block:
+        try:
+            path = get_deletions_file(root, team)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with file_lock_optional(path, timeout=2) as acquired:
+                if not acquired:
+                    return
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[teammate-comms] deletion append skipped: {e}", file=sys.stderr, flush=True)
+        return
+    path = get_deletions_file(root, team)
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        path = get_deletions_file(root, team)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock_optional(path, timeout=2) as acquired:
-            if not acquired:
-                return
+        with file_lock(path, timeout=timeout):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[teammate-comms] deletion append skipped: {e}", file=sys.stderr, flush=True)
+    except CommsError:
+        raise CommsError(
+            f"Deletion not recorded: deletions.jsonl stayed locked for {timeout}s "
+            f"(transient write contention). The message is already tombstoned — retry to "
+            f"sync the dashboard."
+        )
 
 
-def read_deletions(root, team=None, since=None, limit=1000):
-    """Read deletion events (non-destructive); optional ``id >= since`` + tail ``limit``."""
+def read_deletions(root, team=None, since=None, limit=1000, oldest_first=False):
+    """Read deletion events (non-destructive); optional ``id >= since`` + ``limit`` window.
+
+    ``oldest_first`` selects the window when more than ``limit`` match (see ``_window``):
+    False = newest ``limit`` (tail view); True = oldest ``limit`` for forward pagination
+    from the dashboard's deletion cursor (a burst pages out instead of being skipped)."""
     path = get_deletions_file(root, team)
     out = []
     try:
@@ -781,6 +849,4 @@ def read_deletions(root, team=None, since=None, limit=1000):
                 out.append(rec)
     except (FileNotFoundError, OSError):
         return []
-    if limit and limit > 0 and len(out) > limit:
-        out = out[-limit:]
-    return out
+    return _window(out, limit, oldest_first)

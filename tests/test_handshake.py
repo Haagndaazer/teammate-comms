@@ -979,6 +979,166 @@ def main():
     except Exception as e:
         failures.append(f"instructions/reinject checks errored: {e}")
 
+    # ── WP-1 (v0.7.1) — missed-event correctness: poll-cursor burst (A-1), reaction-wake
+    #    high-water cursor (A-2), blocking reaction/deletion appends (A-3). Hermetic, own roots.
+    try:
+        from teammate_comms import channel as _ch
+        from teammate_comms import comms as _c
+        tm = None
+
+        def _rx(i, target_from="alice", frm="bob", op="add"):
+            return {"id": f"2026-06-10T01:00:00.{i:06d}", "target": "msg", "from": frm,
+                    "emoji": "fire", "op": op, "target_from": target_from}
+        ME = "alice"
+
+        # ---- A-1: forward-pagination window never skips a burst, tail view unchanged ----
+        # (i) _window unit: oldest_first swallows an id-collision group at the boundary so a
+        #     cursor set to the last returned id strictly advances (no stall); tail unaffected.
+        w = _c._window
+        coll = [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "c"}, {"id": "c"}, {"id": "d"}]
+        if [r["id"] for r in w(coll, 3, True)] != ["a", "b", "c", "c", "c"]:
+            failures.append("A-1 _window did not swallow the boundary collision group")
+        if [r["id"] for r in w(coll, 3, False)] != ["c", "c", "d"]:
+            failures.append("A-1 _window tail (oldest_first=False) regressed from newest-N")
+        if w(coll, 6, True) is not coll:   # len == limit → return as-is, no copy
+            failures.append("A-1 _window len==limit should return the list unchanged")
+
+        # (ii) integration on the transcript: a >limit burst drains EVERY id with no skip
+        #      and the cursor walk terminates; first load (no cursor) is byte-identical tail.
+        wroot = tempfile.mkdtemp(prefix="tc-wp1a1-")
+        N = 450  # spans 3 pages of the 200 transcript window
+        all_ids = [f"2026-06-10T00:00:00.{i:06d}" for i in range(N)]
+        for i in range(N):
+            _c.append_transcript(wroot, tm, {"id": all_ids[i], "from": "a", "to": "b",
+                                             "kind": "dm", "message": f"m{i}"})
+        first = _c.read_transcript(wroot, tm, since=None, limit=200, oldest_first=False)
+        if [r["id"] for r in first] != all_ids[-200:]:
+            failures.append("A-1 first-load (no cursor) is not the newest-200 tail (legacy parity)")
+        seen, cursor, hops = set(), all_ids[0], 0
+        while hops < 100:
+            hops += 1
+            page = _c.read_transcript(wroot, tm, since=cursor, limit=200, oldest_first=True)
+            ids = [r["id"] for r in page]
+            seen.update(ids)
+            nxt = ids[-1] if ids else cursor
+            if nxt == cursor:
+                break
+            cursor = nxt
+        if sorted(seen) != all_ids:
+            failures.append(f"A-1 burst walk skipped ids (drained {len(seen)}/{N})")
+        if hops >= 100:
+            failures.append("A-1 burst walk failed to terminate (cursor stall)")
+
+        # (iii) missing file → [] for all three readers (no crash; dashboard keeps its cursor)
+        eroot = tempfile.mkdtemp(prefix="tc-wp1empty-")
+        if (_c.read_transcript(eroot, tm, since="x", limit=200, oldest_first=True) != []
+                or _c.read_reactions(eroot, tm, since="x", limit=500, oldest_first=True) != []
+                or _c.read_deletions(eroot, tm, since="x", limit=1000, oldest_first=True) != []):
+            failures.append("A-1 reader on a missing file did not return []")
+
+        # ---- A-2: reaction-wake high-water cursor — pure helper + the real >500 burst hole ----
+        cw = _ch.compute_reaction_wakes
+        # seed read never wakes, sets the cursor to the max id seen
+        f0, k0, c0 = cw([_rx(0), _rx(1)], None, ME)
+        if f0 != [] or c0 != _rx(1)["id"]:
+            failures.append(f"A-2 seed read woke or set a bad cursor: fresh={f0} cursor={c0}")
+        # next tick: only the genuinely-new add targeting ME wakes (boundary _rx(1) re-read
+        # but in the previous batch → not re-woken); cursor advances to the max id.
+        f1, k1, c1 = cw([_rx(1), _rx(2)], k0, ME)
+        if [r["id"] for r in f1] != [_rx(2)["id"]] or c1 != _rx(2)["id"]:
+            failures.append(f"A-2 fresh wake/cursor wrong: fresh={[r['id'] for r in f1]} cursor={c1}")
+        # filters: a reaction BY me, one targeting someone else, and a remove → none wake
+        ff, _, _ = cw([_rx(3, frm=ME), _rx(4, target_from="carol"), _rx(5, op="remove")], k1, ME)
+        if ff != []:
+            failures.append(f"A-2 wake filter leaked: {[r['id'] for r in ff]}")
+        # empty batch leaves the cursor untouched (None return → caller keeps its prior cursor)
+        if cw([], k1, ME)[2] is not None:
+            failures.append("A-2 empty batch returned a non-None cursor (would rewind)")
+
+        # The actual hole: the watcher is ALREADY seeded, then >500 reactions land in one
+        # window with a target-ME reaction OLDER than the post-burst newest-500 tail. The
+        # legacy newest-500 read scrolls past it; the cursor-driven read pages forward and
+        # still delivers it — exactly once.
+        rroot = tempfile.mkdtemp(prefix="tc-wp1rx-")
+        _c.append_reaction(rroot, tm, _rx(0, target_from="carol"))
+        _c.append_reaction(rroot, tm, _rx(1, target_from="carol"))
+        _, known, rcur = cw(_c.read_reactions(rroot, tm, since=None, limit=500), None, ME)
+        BURST, HIT = 600, 70
+        for i in range(10, 10 + BURST):
+            is_hit = (i == HIT)
+            _c.append_reaction(rroot, tm, _rx(i, target_from=(ME if is_hit else "carol"),
+                                              frm=("bob" if is_hit else "dave")))
+        hit_id = _rx(HIT)["id"]
+        if any(r["id"] == hit_id for r in _c.read_reactions(rroot, tm, limit=500)):
+            failures.append("A-2 precondition broken: the hit fell inside the newest-500 tail")
+        woke, guard = [], 0
+        while guard < 50:
+            guard += 1
+            b = _c.read_reactions(rroot, tm, since=rcur, limit=500, oldest_first=True)
+            fr, known, nc = cw(b, known, ME)
+            woke.extend(x["id"] for x in fr)
+            if nc is None or nc == rcur:
+                break
+            rcur = nc
+        if hit_id not in woke:
+            failures.append("A-2 target-author reaction beyond the 500-tail was never delivered")
+        elif woke.count(hit_id) != 1:
+            failures.append(f"A-2 hit delivered {woke.count(hit_id)}x (want exactly 1)")
+
+        # ---- A-3: append_reaction/append_deletion BLOCK then succeed under contention ----
+        # Hold the file's lock briefly in a background thread; the blocking append must WAIT
+        # then write (legacy file_lock_optional returned WITHOUT writing — a silent drop).
+        # (file_lock steals only AFTER its timeout; we release well before, so it acquires.)
+        def _hold_then_release(lock_dir, secs, done):
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            time.sleep(secs)
+            try:
+                lock_dir.rmdir()
+            finally:
+                done.set()
+
+        aroot = tempfile.mkdtemp(prefix="tc-wp1a3-")
+        for path_fn, call, ident in (
+            (_c.get_reactions_file,
+             lambda: _c.append_reaction(aroot, tm, _rx(0), timeout=5), "append_reaction"),
+            (_c.get_deletions_file,
+             lambda: _c.append_deletion(aroot, tm, {"id": _c.now_timestamp(), "target": "m",
+                                                    "kind": "message", "by": "a", "op": "delete"},
+                                        timeout=5), "append_deletion"),
+        ):
+            p = path_fn(aroot, tm)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            done = threading.Event()
+            ld = Path(str(p) + ".lock")
+            threading.Thread(target=_hold_then_release, args=(ld, 0.4, done), daemon=True).start()
+            time.sleep(0.05)  # ensure the holder grabbed the lock first
+            t0 = time.monotonic()
+            call()
+            waited = time.monotonic() - t0
+            if not done.is_set():
+                failures.append(f"A-3 {ident} returned before the lock was released")
+            if waited < 0.3:
+                failures.append(f"A-3 {ident} did not block under contention ({waited:.2f}s)")
+            if p.stat().st_size == 0:
+                failures.append(f"A-3 {ident} blocked but wrote nothing (lost the record)")
+
+        # best-effort path (block=False, used by group-delete + teammate-removal) must NEVER
+        # raise under contention — a destructive caller depends on it being safe to drop.
+        broot = tempfile.mkdtemp(prefix="tc-wp1be-")
+        bp = _c.get_deletions_file(broot, tm)
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bld = Path(str(bp) + ".lock")
+        bld.mkdir()
+        try:
+            _c.append_deletion(broot, tm, {"id": _c.now_timestamp(), "target": "#g",
+                                           "kind": "group", "by": "a", "op": "delete"}, block=False)
+        except Exception as e:
+            failures.append(f"A-3 append_deletion(block=False) raised under contention: {e}")
+        finally:
+            bld.rmdir()
+    except Exception as e:
+        failures.append(f"WP-1 missed-event unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

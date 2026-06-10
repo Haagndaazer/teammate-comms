@@ -857,8 +857,12 @@ def _handle_group(args, ctx):
         for member in members:
             remove_messages_from_inbox(root, team, member, msg_ids)
         delete_group(root, team, group)
+        # best-effort (block=False): the group dir is already gone, so emitting the event
+        # LAST is the recorded v0.7.0 ordering (a partial rmtree can't desync the
+        # dashboard) and a blocking raise here would lose the event permanently on retry
+        # (re-entry hits "No group"). A fresh dashboard load omits the absent group anyway.
         append_deletion(root, team, {"id": now_timestamp(), "target": sigil,
-                                     "kind": "group", "by": agent, "op": "delete"})
+                                     "kind": "group", "by": agent, "op": "delete"}, block=False)
         return (f"Deleted group {sigil} (purged {len(msg_ids)} message(s) from "
                 f"member inboxes).")
 
@@ -1117,8 +1121,11 @@ def remove_teammate(root, team, caller, name, is_operator=False):
         )
     removed_from = strip_member_from_groups(root, team, name)
     remove_agent(root, team, name)
+    # best-effort (block=False): the record is already unlinked, so a blocking raise here
+    # would lose the event permanently on retry (re-entry hits "No teammate named …"). A
+    # fresh dashboard load omits the absent teammate; emit-event-LAST stays consistent.
     append_deletion(root, team, {"id": now_timestamp(), "target": "@" + name,
-                                 "kind": "teammate", "by": caller, "op": "delete"})
+                                 "kind": "teammate", "by": caller, "op": "delete"}, block=False)
     extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
              if removed_from else "")
     return f"Removed teammate {name} (registry + inbox).{extra}"
