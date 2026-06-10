@@ -19,6 +19,8 @@ import shlex
 import subprocess
 import sys
 
+from .comms import CommsError
+
 # The custom teammate-comms channel is not on Anthropic's built-in allowlist, so by default
 # it must be loaded with --dangerously-load-development-channels (which triggers a one-time
 # trust prompt the spawned, DEVNULL-stdio child can't answer). BUT if the operator has placed
@@ -107,7 +109,8 @@ def build_child_env(base, agent, project_dir, team=None, comms_dir=None):
 
     Sets ``TEAMMATE_AGENT`` (→ auto-register as that name) and ``CLAUDE_PROJECT_DIR``
     (→ fills the ``project`` field; the server reads the env var, not cwd). Optionally
-    ``TEAMMATE_TEAM`` / ``TEAMMATE_COMMS_DIR``. Asserts the two handoff vars are set.
+    ``TEAMMATE_TEAM`` / ``TEAMMATE_COMMS_DIR``. Raises ``CommsError`` if the two handoff
+    vars aren't set (a real raise, not an ``assert`` — asserts are a no-op under ``-O``).
     """
     env = dict(base)
     env["TEAMMATE_AGENT"] = agent
@@ -116,7 +119,13 @@ def build_child_env(base, agent, project_dir, team=None, comms_dir=None):
         env["TEAMMATE_TEAM"] = team
     if comms_dir:
         env["TEAMMATE_COMMS_DIR"] = str(comms_dir)
-    assert env.get("TEAMMATE_AGENT") and env.get("CLAUDE_PROJECT_DIR")
+    # Strip the reincarnate GATE so a spawned child can't itself re-spawn unless its operator
+    # explicitly opts back in (the reincarnate gate is opt-in-default-off by design, F-1). This
+    # is the gate ONLY — TEAMMATE_LAUNCH_ARGS is a launch override the child SHOULD inherit so
+    # it spawns the same (e.g. allowlisted --channels), so it is deliberately NOT stripped.
+    env.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+    if not (env.get("TEAMMATE_AGENT") and env.get("CLAUDE_PROJECT_DIR")):
+        raise CommsError("build_child_env requires a non-empty agent and project_dir.")
     return env
 
 

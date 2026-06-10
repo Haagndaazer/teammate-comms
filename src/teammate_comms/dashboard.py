@@ -18,12 +18,18 @@ Hard invariants:
 
 import json
 import os
+import re
 import secrets
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+# Reject a POST body larger than this before reading it (audit D-3). A multi-MB body would be
+# stored and re-served to every poller forever; the message-length cap (tools.MAX_MESSAGE_CHARS,
+# 64 KB) sits well under this so an over-long message returns an informative 400, not this 413.
+MAX_BODY_BYTES = 1024 * 1024
 
 from . import tools as _tools
 from .comms import (
@@ -45,6 +51,14 @@ from .comms import (
 def _log(msg):
     """Diagnostics → stderr ONLY (stdout is the JSON-RPC stream)."""
     print(f"[teammate-comms] dashboard: {msg}", file=sys.stderr, flush=True)
+
+
+def _redact_query(s):
+    """Scrub any URL query string from a log line. The dashboard token rides `?token=...` in
+    the bootstrap GET, so request lines and error logs would otherwise leak the secret to
+    stderr / the debug log (audit D-2). Replaces `?<query>` (up to the next whitespace/quote)
+    with `?<redacted>`. Apply at EVERY sink that logs a path or request line."""
+    return re.sub(r'\?[^\s"\']*', '?<redacted>', s)
 
 
 # ── single-file frontend ────────────────────────────────────────────────────────
@@ -93,10 +107,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
     # Route ALL logging to stderr — the default writes to sys.stderr already, but be
     # explicit so nothing can ever reach stdout.
     def log_message(self, fmt, *args):
-        _log("http " + (fmt % args))
+        _log("http " + _redact_query(fmt % args))      # request line carries ?token= — redact (D-2)
 
     def log_error(self, fmt, *args):
-        _log("http " + (fmt % args))
+        _log("http " + _redact_query(fmt % args))
 
     # ── helpers ──
     def _host_ok(self):
@@ -153,7 +167,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                                           qs.get("dcursor", [""])[0])
             return self._json(404, {"error": "not found"})
         except Exception as e:  # never leak a stack to stdout / never hang the socket
-            _log(f"GET {self.path} failed: {e}")
+            _log(_redact_query(f"GET {self.path} failed: {e}"))   # path carries ?token= (D-2)
             try:
                 return self._json(500, {"error": "internal error"})
             except Exception:
@@ -169,6 +183,8 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path not in ("/api/send", "/api/react", "/api/delete"):
                 return self._json(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY_BYTES:                 # reject before reading (D-3)
+                return self._json(413, {"error": "request body too large"})
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 payload = json.loads(raw.decode("utf-8")) if raw else {}
@@ -180,7 +196,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 return self._api_delete(payload)
             return self._api_send(payload)
         except Exception as e:
-            _log(f"POST {self.path} failed: {e}")
+            _log(_redact_query(f"POST {self.path} failed: {e}"))
             try:
                 return self._json(500, {"error": "internal error"})
             except Exception:

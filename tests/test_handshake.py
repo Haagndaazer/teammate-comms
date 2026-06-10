@@ -826,6 +826,21 @@ def main():
             failures.append(f"build_child_env missing handoff vars: {cenv}")
         if cenv.get("TEAMMATE_TEAM") != "t" or cenv.get("TEAMMATE_COMMS_DIR") != "/c":
             failures.append(f"build_child_env missing team/comms_dir: {cenv}")
+        # F-1 (hostile direction): a parent that HAS the reincarnate gate set must NOT pass it
+        # to the child — else a spawned child could itself re-spawn (gate is opt-in-default-off).
+        _genv = _spawn.build_child_env({"TEAMMATE_REINCARNATE_ENABLED": "1"}, "Echo", "/proj")
+        if "TEAMMATE_REINCARNATE_ENABLED" in _genv:
+            failures.append("F-1: build_child_env carried the reincarnate gate into the child env")
+        # F-1 corollary: TEAMMATE_LAUNCH_ARGS (a launch override, NOT the gate) IS inherited.
+        _lenv = _spawn.build_child_env({"TEAMMATE_LAUNCH_ARGS": "claude --foo"}, "Echo", "/proj")
+        if _lenv.get("TEAMMATE_LAUNCH_ARGS") != "claude --foo":
+            failures.append("F-1: build_child_env wrongly stripped TEAMMATE_LAUNCH_ARGS")
+        # F-6: a REAL raise (not a no-op assert) when a handoff var is empty.
+        try:
+            _spawn.build_child_env({}, "", "/proj")
+            failures.append("F-6: build_child_env did not raise on an empty agent")
+        except _CE:
+            pass
         try:
             _vpd("/no/such/dir/xyz123")
             failures.append("validate_project_dir accepted a missing directory")
@@ -1370,6 +1385,30 @@ def main():
             # unknown path → 404.
             if _dreq("GET", "/api/bogus", token=_dtok)[0] != 404:
                 failures.append("WP-3 unknown /api path did not 404")
+            # ── WP-5 (D-2) — the token must NOT leak into the dashboard's stderr logs. Capture
+            #    stderr around a token-bearing GET (its request line is logged) and assert the
+            #    token is ABSENT (hostile direction: prove the secret doesn't leak).
+            import io as _io2
+            from contextlib import redirect_stderr as _rse
+            _sbuf = _io2.StringIO()
+            with _rse(_sbuf):
+                _dreq("GET", f"/?token={_dtok}")
+                time.sleep(0.2)                      # let the server thread's access-log line flush
+            if _dtok in _sbuf.getvalue():
+                failures.append("WP-5 D-2: token leaked into the dashboard log (query not redacted)")
+            # ── WP-5 (D-3) — a POST whose Content-Length exceeds the 1 MB cap is rejected with
+            #    413 BEFORE the body is read (claim the size; the server never reads the bytes).
+            from teammate_comms.dashboard import MAX_BODY_BYTES as _MBB
+            _bconn = _hc.HTTPConnection("127.0.0.1", _dport, timeout=5)
+            _bconn.putrequest("POST", "/api/send", skip_host=True, skip_accept_encoding=True)
+            _bconn.putheader("Host", "127.0.0.1")
+            _bconn.putheader("X-Dashboard-Token", _dtok)
+            _bconn.putheader("Content-Type", "application/json")
+            _bconn.putheader("Content-Length", str(_MBB + 1))   # claim oversize → reject pre-read
+            _bconn.endheaders(message_body=b"{}")
+            if _bconn.getresponse().status != 413:
+                failures.append("WP-5 D-3: oversized POST body was not rejected with 413")
+            _bconn.close()
         finally:
             _dash.shutdown_dashboard()
     except Exception as e:
@@ -1399,6 +1438,44 @@ def main():
                                 f"rc={_pc.returncode}")
     except Exception as e:
         failures.append(f"WP-3 hooks unit checks errored: {e}")
+
+    # ── WP-5 — hardening units: _redact_query (D-2), message-length cap (D-3), dispatch
+    #    stderr-trace for unexpected (non-CommsError) bugs (A-9). All pure/in-process. ──
+    try:
+        from teammate_comms import comms as _c5
+        from teammate_comms import tools as _t5
+        from teammate_comms.dashboard import _redact_query as _rq
+        # D-2: the helper scrubs a token-bearing query but leaves a query-less line intact.
+        if "SECRET123" in _rq('"GET /?token=SECRET123 HTTP/1.1" 200 -'):
+            failures.append("WP-5 D-2: _redact_query left the token in the request line")
+        if "<redacted>" not in _rq("GET /?token=x HTTP/1.1"):
+            failures.append("WP-5 D-2: _redact_query did not redact the query")
+        if _rq('"GET /api/poll HTTP/1.1" 200 -') != '"GET /api/poll HTTP/1.1" 200 -':
+            failures.append("WP-5 D-2: _redact_query mangled a query-less line")
+        # D-3: message-length cap — exactly the limit passes, one over raises CommsError.
+        _t5._clean_message("a" * _t5.MAX_MESSAGE_CHARS)
+        try:
+            _t5._clean_message("a" * (_t5.MAX_MESSAGE_CHARS + 1))
+            failures.append("WP-5 D-3: _clean_message accepted an over-limit message")
+        except _c5.CommsError:
+            pass
+        # A-9: a non-CommsError handler bug traces to STDERR (never stdout) and the dispatch
+        # still returns an isError (the loop survives). _require_registered calls
+        # ctx["identity"].snapshot(); a snapshot that raises KeyError is the unexpected path.
+        import io as _io5
+        from contextlib import redirect_stderr as _rse5
+
+        class _BoomId:
+            def snapshot(self):
+                raise KeyError("boom")
+        _ebuf = _io5.StringIO()
+        with _rse5(_ebuf):
+            _txt, _err = _t5.dispatch("teammate_send", {"to": "x", "message": "y"},
+                                      {"identity": _BoomId()})
+        if not _err or "Traceback" not in _ebuf.getvalue():
+            failures.append(f"WP-5 A-9: unexpected error not traced to stderr / not isError (err={_err})")
+    except Exception as e:
+        failures.append(f"WP-5 hardening unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
