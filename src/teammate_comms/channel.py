@@ -165,15 +165,26 @@ def compute_reemit(unseen_ids, now_mono, last_emit_mono, attempts):
     uses, so a read-but-unacked or muted message can never re-nudge — that single shared
     computation is what keeps the v0.4.2 no-noise contract provably intact.
 
+    The clock (``last_emit_mono``) is armed ONLY by a real fresh emit (the caller stamps it
+    there), never by this function — so a batch that was never first-nudged (a message that
+    arrived while its group was muted and is later unmuted, or the seed window) stays
+    permanently re-nudge-silent via the first-emit guard until a genuinely new message
+    re-arms through the fresh path. That is what makes "muted can never re-nudge" hold even
+    across an unmute (the v0.4.2 retro-nudge sin).
+
     Returns ``(should_reemit, new_attempts, new_last_emit_mono)``:
-      * empty unseen → ``(False, 0, now_mono)``: caught up — reset attempts + clock.
-      * no prior emit (``last_emit_mono is None``) or attempts exhausted → no re-nudge (the
-        seed/pre-first-emit window stays nudge-silent; the cap stops an indefinite repeat —
-        the agent's next inbox read or next message re-arms it anyway).
+      * empty unseen → ``(False, 0, None)``: caught up — reset attempts + DISARM the clock
+        (do NOT re-stamp it; re-stamping here would arm a never-emitted batch, so an unmute
+        that reveals an absorbed message would wrongly re-nudge it).
+      * no prior emit (``last_emit_mono is None``) or attempts exhausted → no re-nudge.
       * else fire iff the current quiet period has elapsed, advancing attempt + clock.
+
+    Accepted edge (documented, consistent with fresh-wake semantics): if the clock IS armed
+    (a real emit happened) and a muted message is unmuted INTO the still-unseen batch, the
+    re-nudge COUNT includes it — same "count reflects all unseen" rule a fresh wake uses.
     """
     if not unseen_ids:
-        return (False, 0, now_mono)
+        return (False, 0, None)
     if last_emit_mono is None or attempts >= REEMIT_MAX_ATTEMPTS:
         return (False, attempts, last_emit_mono)
     threshold = REEMIT_BASE_SECONDS * (2 ** attempts)

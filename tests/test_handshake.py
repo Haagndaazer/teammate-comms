@@ -1225,9 +1225,10 @@ def main():
         # (5) cap: at REEMIT_MAX_ATTEMPTS, never fire again no matter how long it's been.
         if _cre(U, 1e9, 0.0, _RMAX)[0]:
             failures.append("WP-9 re-nudged past the attempt cap")
-        # (6) caught up (unseen empty) → reset to (False, 0, now), clearing any attempts.
-        if _cre(set(), 9000.0, 1000.0, _RMAX) != (False, 0, 9000.0):
-            failures.append("WP-9 empty-unseen did not reset clock+attempts")
+        # (6) caught up (unseen empty) → reset attempts AND DISARM (last_emit → None), so a
+        #     never-emitted batch can't later be re-nudged (CR fix). NOT (False, 0, now).
+        if _cre(set(), 9000.0, 1000.0, _RMAX) != (False, 0, None):
+            failures.append("WP-9 empty-unseen did not disarm (must return last_emit=None)")
         # (7) read-position (v0.4.2) suppression: a fully-read batch reduces unseen to empty
         #     upstream, so even after an eternity nothing re-nudges (no waking a read message).
         unread, muted, seen = {"a", "b"}, set(), {"a", "b"}
@@ -1237,6 +1238,28 @@ def main():
         #     re-arms the backoff — the next batch fires again after BASE.
         if not _cre(U, 100.0 + _RB, 100.0, 0)[0]:
             failures.append("WP-9 did not re-arm after a fresh-emit reset")
+        # (9) BLOCKER regression — arrived-while-muted then unmuted must NEVER re-nudge (the
+        #     v0.4.2 retro-nudge sin). While muted, unseen is empty every tick → the caught-up
+        #     branch DISARMS (last_emit=None), so no non-emit ever arms the clock. On unmute
+        #     the message is revealed into unseen but the clock is still None → first-emit
+        #     guard → silent forever, until a genuinely new message fresh-emits (re-arms).
+        le = 500.0                                   # clock as if some earlier emit existed
+        for _t in range(0, 2000, 5):                 # 400 muted ticks: unseen stays empty
+            _, _a, le = _cre(set(), float(_t), le, 0)
+        if le is not None:
+            failures.append("WP-9 muted-window left the clock armed (would retro-nudge)")
+        revealed = {"m_muted"}                       # unmute reveals the absorbed message
+        if _cre(revealed, 1e9, le, 0)[0]:
+            failures.append("WP-9 retro-nudged an arrived-muted message after unmute (B1)")
+        # (10) mute-flap: rapidly toggling muted/unmuted (empty ↔ {m}) across many ticks must
+        #      never fire — the clock stays disarmed the whole time (never armed by a non-emit).
+        le2, fired = None, 0
+        for i in range(2000):
+            unseen_tick = set() if (i % 2 == 0) else {"m_flap"}
+            do, _a2, le2 = _cre(unseen_tick, float(i) * 1000.0, le2, 0)
+            fired += int(do)
+        if fired:
+            failures.append(f"WP-9 mute-flap re-nudged {fired}x (must be 0)")
     except Exception as e:
         failures.append(f"WP-9 re-nudge unit checks errored: {e}")
 
