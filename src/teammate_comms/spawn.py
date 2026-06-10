@@ -30,8 +30,6 @@ MARKETPLACE = "coltondyck"
 PLUGIN_SPEC = f"plugin:{PLUGIN_NAME}@{MARKETPLACE}"
 DANGEROUS_LAUNCH_ARGS = f"claude --dangerously-load-development-channels {PLUGIN_SPEC}"
 ALLOWLISTED_LAUNCH_ARGS = f"claude --channels {PLUGIN_SPEC}"
-# Back-compat alias (was the only launch constant pre-0.6.5).
-DEFAULT_LAUNCH_ARGS = DANGEROUS_LAUNCH_ARGS
 
 
 def managed_settings_paths():

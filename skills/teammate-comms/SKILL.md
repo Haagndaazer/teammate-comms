@@ -125,3 +125,6 @@ the resolved root.
 > Power-user shortcut: if `$TEAMMATE_AGENT` (and optionally `$TEAMMATE_TEAM`) is set
 > in the environment, the server auto-registers with it at startup — no explicit
 > `teammate_register` call needed.
+
+> Dashboard identity: the human operator's display name is `teammate_dashboard`'s
+> `human_name` arg, else `$TEAMMATE_HUMAN_NAME`, else `human`.

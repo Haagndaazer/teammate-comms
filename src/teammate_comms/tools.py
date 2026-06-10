@@ -193,7 +193,7 @@ TOOL_DEFINITIONS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "Message id to ack, or \"all\"."},
+                "id": {"type": "string", "description": "Message id to ack, or \"all\". Note: \"all\" with no prior teammate_inbox read this session drains the whole inbox (startup-drain); after a read it clears only what that read showed, preserving messages that arrived since."},
             },
             "required": ["id"],
         },
@@ -261,7 +261,7 @@ TOOL_DEFINITIONS = [
                     "items": {"type": "string"},
                     "description": "Member names — for 'create' (initial members) and 'add'.",
                 },
-                "limit": {"type": "integer", "description": "For 'history': max messages to return (default 50)."},
+                "limit": {"type": "integer", "description": "For 'history': max messages to return (default 50). Applied AFTER the sender/post_type/since filters, so it's the N most-recent MATCHING messages (a narrow filter can still reach far back)."},
                 "sender": {"type": "string", "description": "For 'history': only show messages from this teammate."},
                 "post_type": {"type": "string", "enum": list(_POST_TYPES), "description": "For 'history': only show posts of this type (the decision trail)."},
                 "since": {"type": "string", "description": "For 'history': only show messages with id >= this cursor (e.g. 'everything since I last checked')."},
@@ -387,8 +387,7 @@ def _handle_register(args, ctx):
 
 
 def _clean_message(message):
-    """Return the trimmed message body, or raise CommsError. Sender-explicit sibling
-    of _validate_message (which pulls from an args dict)."""
+    """Return the trimmed message body, or raise CommsError."""
     if not isinstance(message, str) or not message.strip():
         raise CommsError("'message' is required and must be a non-empty string.")
     return message.strip()
@@ -423,15 +422,6 @@ def _parse_mentions(content, members):
             seen.add(name)
             out.append(name)
     return out
-
-
-def _validate_message(args):
-    """Return the trimmed message body, or raise CommsError."""
-    return _clean_message(args.get("message"))
-
-
-def _validate_priority(args):
-    return _clean_priority(args.get("priority", "normal"))
 
 
 def send_dm(root, team, sender, to, message, priority="normal", post_type=None, reply_to=None):

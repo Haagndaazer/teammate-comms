@@ -2,3 +2,14 @@
 # bash fails on CRLF line endings, and this repo may be checked out on Windows
 # (where core.autocrlf=true would otherwise convert it).
 * text=auto eol=lf
+
+# Defense-in-depth for the vibe-cognition journal: no journal commit should ever land
+# on a WP branch (the manager flushes it to main via a worktree), but if one slips in,
+# a union merge appends both sides' lines instead of conflicting — the file is
+# append-only NDJSON, so union is always a safe superset. `-text` treats it as BINARY
+# (no eol filtering): the global `* text=auto eol=lf` would otherwise store the journal
+# LF while the live file is CRLF (Python text-mode appends), so a clean-filter checkout
+# would shrink the live file one byte per line under the running server's byte-based
+# replay offset (and warn on every flush). Binary → content-equal == byte-equal, killing
+# that whole class and making the union driver byte-deterministic.
+.cognition/*.jsonl merge=union -text

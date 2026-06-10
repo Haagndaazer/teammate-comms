@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SessionStart hook — pre-build the (zero-dep) venv so the MCP server can launch
-# with `uv run --no-sync` without ever blocking the stdio handshake, and remind
-# the user to set TEAMMATE_AGENT if it is missing.
+# with `uv run --no-sync` without ever blocking the stdio handshake. (Identity is
+# established at runtime via teammate_register, so an unset TEAMMATE_AGENT is the
+# normal case and needs no warning — see the script tail.)
 #
 # Unlike vibe-cognition this does NOT write a per-project .mcp.json: teammate-comms
 # declares its MCP server inline in plugin.json.

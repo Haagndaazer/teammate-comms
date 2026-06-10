@@ -5,7 +5,7 @@
 > **Pure-stdlib** Python (zero runtime dependencies), shipped as a marketplace plugin.
 
 This document began as a pre-build blueprint; it has been **reconciled to the
-as-built implementation (v0.3.1)**. Where a design decision reversed during the
+as-built implementation (v0.7.1)**. Where a design decision reversed during the
 build, an *“Originally planned … shipped … because …”* note preserves the lineage —
 the rationale is the valuable part, even when the choice flipped.
 
@@ -53,7 +53,8 @@ teammate-comms/
 │   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
 ├── hooks/
 │   ├── hooks.json
-│   └── session-start.sh        # builds the venv before the server spawns
+│   ├── session-start.sh        # builds the venv before the server spawns
+│   └── reinject-instructions.sh # re-injects the standing instructions after a compact
 ├── skills/teammate-comms/SKILL.md
 ├── tests/test_handshake.py     # end-to-end server test (handshake + tools + channel)
 ├── README.md
@@ -100,7 +101,7 @@ the plugin is self-contained and does not write into a project's `.mcp.json`.
 ```json
 {
   "name": "teammate-comms",
-  "version": "0.3.1",
+  "version": "0.7.1",
   "description": "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances.",
   "author": { "name": "ColtonDyck" },
   "license": "MIT",
@@ -280,7 +281,7 @@ namespacing carves out subsets.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **12 tools:**
+long-lived server. **13 tools:**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -360,6 +361,8 @@ inbox — but **no `pid`/`channel`**, so it's never a wakeable channel and never
 register-time collision guard). Agents see the human in `teammate_list`/`teammate_profile`
 marked `🧑 (operator)` with a `presence` (online/away) instead of `channel`, and can
 `teammate_send` to them / invite them to groups by flat name like any teammate. The
+human's display name is the `human_name` arg, else **`$TEAMMATE_HUMAN_NAME`**, else
+`human`. The
 console posts **as the human** by calling the **sender-explicit cores** `send_dm` /
 `send_group` (extracted from `_handle_send` / `_send_to_group`; the tool handlers are now
 thin wrappers), so a human message wakes live agents through the existing file-driven
@@ -386,10 +389,11 @@ watcher with **no `channel.py` change**.
   `agent in mentions` and adds a 🔔 line to its wake (content-only, no per-member records,
   no count change).
 - **Mute:** `muted_groups` on the member's agent record (the watcher already reads that
-  record, cached on the 5s heartbeat). The watcher's `_audible` filter drops muted-group
-  messages from the wake/count but keeps them in the inbox; `known_ids` still tracks the
-  full unread set so an unmute never retro-nudges. A 1:1 DM (no `group` key) can never be
-  muted.
+  record, cached on the 5s heartbeat). The watcher drops muted-group messages from the
+  wake/count via an inline set-difference (`(unread_ids - muted_ids) - known_ids - last_seen`
+  in channel.py — there is no separate `_audible` helper) but keeps them in the inbox;
+  `known_ids` still absorbs the muted ids so an unmute never retro-nudges. A 1:1 DM (no
+  `group` key) can never be muted.
 - **Read receipts:** read-only inference — `group_read_positions` reads each member's
   `_read.json` for the max acked group-message id (no write path, no ack change). Surfaced
   via `teammate_group reads` + dashboard ticks. An ack/seen upper bound, groups-only.
@@ -436,7 +440,10 @@ cores **tee** every message into one append-only **NDJSON** log
 `kind` ∈ `dm`/`group`). NDJSON append (O(1), one line) avoids the O(n²) full-rewrite and
 whole-team lock serialization a JSON array would impose. The tee is **last and
 best-effort** (a short never-raise lock; disabled by `TEAMMATE_TRANSCRIPT=0`) so
-observability never precedes or delays the authoritative delivery write. **Privacy note:**
+observability never precedes or delays the authoritative delivery write. `TEAMMATE_TRANSCRIPT=0`
+gates **only this firehose** — `reactions.jsonl` and `deletions.jsonl` are always written
+(they're features, not observability), and with the firehose off a reaction (DM or group
+post) can't resolve its `target_from` so its author-wake is skipped. **Privacy note:**
 this durably records previously-ephemeral agent↔agent DMs under the (global-by-default)
 comms root — intended for the operator overseeing their own agents, opt-out via the env
 flag. Reads are window-bounded (`read_transcript(limit=200)`) so a large log never floods
@@ -518,6 +525,12 @@ README's "Trusting the channel" section; `spawn.py` auto-detects this file for r
 3. README written (install / dev flow / restart-after-first-sync note).
 4. Marketplace consolidated into `colton-claude-plugins` (§4b).
 5. Profile fields (0.2.0 → 0.3.1) + global-default comms root (0.3.0).
+6. Group chat via `#sigil` fan-out + typed posts + @mentions + mute + read receipts (0.4.x–0.5).
+7. `teammate_dashboard` web console + human-as-teammate + NDJSON observability transcript (0.5.0).
+8. Reactions (author-wake) + `teammate_reincarnate` + managed-settings channel auto-detect (0.6.x).
+9. `teammate_delete` (message tombstones + offline-teammate removal) + deletions sub-stream (0.7.0).
+10. Missed-event hardening (0.7.1): poll-cursor forward pagination, reaction-wake high-water
+    cursor, durable (blocking) reaction/deletion appends — see §7/§8.
 
 **Remaining:**
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.
