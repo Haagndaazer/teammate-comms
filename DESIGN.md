@@ -530,31 +530,46 @@ gates **only this firehose** — `reactions.jsonl` and `deletions.jsonl` are alw
 post) can't resolve its `target_from` so its author-wake is skipped. **Privacy note:**
 this durably records previously-ephemeral agent↔agent DMs under the (global-by-default)
 comms root — intended for the operator overseeing their own agents, opt-out via the env
-flag. Reads are window-bounded (`read_transcript(limit=200)`) so a large log never floods
-the browser. **Cursor pagination (v0.7.1):** the dashboard poll passes `oldest_first=bool(cursor)`
-— a fresh load takes the newest tail (unchanged), but once walking a cursor the reader keeps
-the **oldest** window and the poll advances the cursor only to the last *returned* id, so a
-burst larger than the window pages out across polls instead of being sliced off and skipped
-(the cut also swallows any same-id collision group at the boundary, so the cursor can't
-stall). The reactions/deletions sub-streams thread the same `oldest_first` policy. (Audit C-2 — a fresh
+flag. Reads are window-bounded (`read_jsonl_tail(200)` on a fresh load) so a large log never floods
+the browser. **Records BYTE cursor (P3).** The dashboard's records stream is paged by a **byte
+offset**, not an id: the opaque poll cursor is `"<offset>|<generation>"` (a byte position + a
+crc32 of the file's first line). A fresh load takes the newest tail and mints the cursor at ~EOF
+via a **stat-then-tail** order — the offset is the size captured *before* the tail, so it is `≤`
+the tail's size; a record appended between the two observations is shown by the tail *and*
+re-streamed next poll, where the browser's id-dedup folds the repeat (the reverse order would
+drop it). A cursored poll then reads **only the bytes appended since** that offset (one bounded
+read vs the old O(file) `since` scan), advancing the offset by **raw newline geometry** so it
+always lands on a `\n` boundary; a partial trailing line is left for the next poll (torn-tail
+safe), and a burst larger than `limit` pages out across polls. **Validity / transparent re-tail:**
+if the offset exceeds the file size (truncation/recreation-smaller) or the first-line
+`generation` no longer matches (recreation), the byte position is meaningless, so the reader
+**re-tails** (newest `limit`) and re-mints — transparently, since the browser's `seen` id-set
+dedups any re-served record (no reload signal, no frontend change). **Generation contract (for
+WP-10 rotation):** `generation` changes iff the bytes of the first line (byte 0 .. first `\n`)
+change — append-stable (byte 0 never moves on the append-only log), recreation-sensitive; a
+future WP-10 NDJSON **rotation** MUST bump the generation explicitly (it replaces byte 0) rather
+than rely on the crc, and the one out-of-contract hole — a recreated file whose first line is
+byte-identical *and* whose size ≥ the old offset — is unreachable in practice (it needs the same
+first message down to its microsecond-timestamp id). The **reactions/deletions** sub-streams keep
+their **id**-based `oldest_first` pagination — a different cursor family with NO shared reset
+semantics (a transcript recreation re-tails records but does not reset those streams). (Audit C-2 — a fresh
 deletions load replaying only the newest `limit` events, so a very old deletion rendered
 undeleted — is **fixed in v0.7.1** by deletions compaction: the fresh load unions a target-keyed
 `deletions_set.json` baseline with the full live jsonl. See the deletions-compaction bullet in §8.)
 
-> **Known firehose limit — out-of-order tee (audit N-1, accepted).** A message's `id` is
-> stamped at *send* (before the inbox lock) and is **load-bearing** — it's the inbox-record
-> id, the ack id, and the react/delete resolution key — so it CANNOT be re-stamped under the
+> **Out-of-order tee (audit N-1) — FIXED in P3 by the byte cursor.** A message's `id` is
+> stamped at *send* (before the inbox lock) and is **load-bearing** — it's the inbox-record id,
+> the ack id, and the react/delete resolution key — so it CANNOT be re-stamped under the
 > transcript lock the way reactions/deletions were (WP-1 CR-1); moving it would desync the
-> transcript id from the ack/react identity. Two concurrent sends can therefore tee
-> out-of-order (`[T2, T1]`); if a record is teed *after* the dashboard cursor already advanced
-> past its id, that record never appears in the **firehose** (the message is still delivered,
-> acked, reacted, and deletion-resolvable — only the observability view skips it). Accepted
-> under the best-effort-observability stance. The real fix is a **file-offset/byte cursor** for
-> the transcript stream (immune to id order), which must be co-designed with WP-7's NDJSON
-> rotation (a byte offset is invalidated by rotation) — deferred there, not bodged here.
-> **Audit C-1 is deferred to the same WP-7 work:** `react()`/`resolve_message` scanning a
-> "bounded recent tail" gives no real speedup while `read_transcript` parses the whole file to
-> build its window — the genuine fix is the same seek-from-tail read C-2 needs.
+> transcript id from the ack/react identity. Two concurrent sends can therefore tee out-of-order
+> (`[T2, T1]`). The old **id** cursor (`id >= since`) skipped a record teed *after* the cursor
+> had advanced past its id: it never appeared in the **firehose** (the message was still
+> delivered, acked, reacted, and deletion-resolvable — only the observability view lost it). The
+> **byte cursor makes id order irrelevant**: a late tee still lands at **EOF** (`open "a"`), so
+> byte-streaming emits it — it then renders in **arrival order** in the feed. **Shown late beats
+> never shown.** **Audit C-1** (`react()`/`resolve_message` scanning a bounded recent tail) is
+> likewise resolved in P1's `read_jsonl_tail` `_scan_transcript_for_id`; NDJSON **rotation**
+> itself stays deferred to **WP-10**, with the generation contract above written to receive it.
 
 **Profile fields (0.2.0; `project` added 0.3.0).** Stored as plain keys on the agent
 registry record via `write_agent_record`'s field-level merge — additive,

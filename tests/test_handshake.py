@@ -1866,6 +1866,180 @@ def main():
     except Exception as e:
         failures.append(f"WP-7 P2 deletions-compaction unit checks errored: {e}")
 
+    # ── WP-7 P3 (firehose/N-1) — transcript BYTE cursor: read_transcript_after streams only the
+    #    bytes appended since the last poll (no O(file) re-scan), with offset|generation validity
+    #    and a transparent re-tail on recreation. BYTE-EXACT new_offset is the load-bearing detail. ──
+    try:
+        import http.client as _hc3
+        from urllib.parse import quote as _q3
+
+        from teammate_comms import comms as _cp3
+        from teammate_comms import dashboard as _dash3
+
+        _td = tempfile.mkdtemp(prefix="tc-wp7-p3-")
+        _tp = os.path.join(_td, "transcript.jsonl")
+
+        def _wb3(data, mode="wb"):
+            with open(_tp, mode) as _f:
+                _f.write(data)
+
+        # (1) missing file → reset, empty.
+        _r = _cp3.read_transcript_after(os.path.join(_td, "nope.jsonl"), 0, "", 200)
+        if _r != ([], 0, "", True):
+            failures.append(f"P3 missing file: {_r}")
+
+        # (2) BYTE-EXACT new_offset under \n + CRLF + blank + garbage + multibyte (the centerpiece).
+        _img = (b'{"id":"a","m":"x"}' + b"\n"
+                + '{"id":"b","m":"café→"}'.encode("utf-8") + b"\r\n"   # multibyte body + CRLF
+                + b"\n"                                                          # blank line
+                + b"not json at all" + b"\n"                                     # garbage line
+                + b'{"id":"c","m":"y"}' + b"\n")
+        _wb3(_img)
+        # First read with the fresh sentinel ("") forces a transparent RE-TAIL (not an increment).
+        recs, noff, ngen, rst = _cp3.read_transcript_after(_tp, 0, "", 200)
+        if not rst:
+            failures.append("P3 empty-gen first read did not reset (re-tail)")
+        if [r.get("id") for r in recs] != ["a", "b", "c"]:
+            failures.append(f"P3 re-tail dropped/added records (blank/garbage skip?): {[r.get('id') for r in recs]}")
+        if noff != len(_img):
+            failures.append(f"P3 re-tail offset != file size: {noff} vs {len(_img)}")
+        # Valid INCREMENT from 0 with the correct generation → byte-exact advance to EOF.
+        _gen = ngen
+        recs2, noff2, ngen2, rst2 = _cp3.read_transcript_after(_tp, 0, _gen, 200)
+        if rst2 or [r.get("id") for r in recs2] != ["a", "b", "c"] or ngen2 != _gen:
+            failures.append(f"P3 valid increment wrong: reset={rst2} ids={[r.get('id') for r in recs2]}")
+        if noff2 != len(_img):
+            failures.append(f"P3 BYTE-EXACT new_offset != raw byte length: {noff2} vs {len(_img)}")
+        if recs2[1].get("m") != "café→":
+            failures.append(f"P3 multibyte body corrupted: {recs2[1].get('m')!r}")
+
+        # (3) no new bytes (offset==size) → [] and offset unchanged (the cheap steady-state path).
+        _r3 = _cp3.read_transcript_after(_tp, len(_img), _gen, 200)
+        if _r3 != ([], len(_img), _gen, False):
+            failures.append(f"P3 no-new-bytes not a clean no-op: {_r3}")
+
+        # (4) TORN tail: a complete line + a partial (no \n). Only the complete one is consumed;
+        #     offset stops BEFORE the partial; completing the partial yields it on the next read.
+        _comp = b'{"id":"d","m":"z"}'
+        _wb3(_comp + b"\n" + b'{"id":"e","m":"incompl', mode="ab")
+        recs4, noff4, _, _ = _cp3.read_transcript_after(_tp, len(_img), _gen, 200)
+        if [r.get("id") for r in recs4] != ["d"]:
+            failures.append(f"P3 torn-tail consumed a partial line: {[r.get('id') for r in recs4]}")
+        if noff4 != len(_img) + len(_comp) + 1:
+            failures.append(f"P3 torn-tail offset crossed the partial: {noff4} vs {len(_img)+len(_comp)+1}")
+        _wb3(b'ete"}\n', mode="ab")                                    # complete the partial line
+        recs4b, _, _, _ = _cp3.read_transcript_after(_tp, noff4, _gen, 200)
+        if [r.get("id") for r in recs4b] != ["e"]:
+            failures.append(f"P3 completed line not returned next read: {[r.get('id') for r in recs4b]}")
+
+        # (4b) divergence-free: a RESET (re-tail, gen="") and a from-zero INCREMENT return the SAME
+        #      records (blank/garbage skipping must agree, or the re-tail dedup would leak/double-count).
+        _reset_ids = [r.get("id") for r in _cp3.read_transcript_after(_tp, 0, "", 200)[0]]
+        _incr_ids = [r.get("id") for r in _cp3.read_transcript_after(_tp, 0, _gen, 200)[0]]
+        if _reset_ids != _incr_ids:
+            failures.append(f"P3 reset vs increment record divergence: {_reset_ids} != {_incr_ids}")
+
+        # (5) offset > size → reset; (6) generation mismatch → reset; (6b) NEGATIVE offset (a
+        #     hand-crafted cursor) must re-tail cleanly, never wedge the stream on seek().
+        if not _cp3.read_transcript_after(_tp, 10**9, _gen, 200)[3]:
+            failures.append("P3 offset>size did not reset")
+        if not _cp3.read_transcript_after(_tp, 5, "deadbeef", 200)[3]:
+            failures.append("P3 generation mismatch did not reset")
+        _neg = _cp3.read_transcript_after(_tp, -5, _gen, 200)
+        if not _neg[3] or _neg[1] < 0:
+            failures.append(f"P3 negative offset did not reset (livelock risk): {_neg[:1]} reset={_neg[3]}")
+
+        # (6c) N-1 FIX: a record teed OUT OF ID ORDER (a lower id appended AFTER a higher one) is
+        #      byte-streamed in FILE order — the old id cursor (id>=since) would have skipped it.
+        _ooo = b'{"id":"2026-01-01T00:00:05.000000","m":"late-high"}\n' \
+               b'{"id":"2026-01-01T00:00:01.000000","m":"earlier-low"}\n'   # lower id appended LAST
+        _wb3(_ooo)
+        _ogen = _cp3._transcript_generation(_tp, len(_ooo))
+        _oids = [r.get("id") for r in _cp3.read_transcript_after(_tp, 0, _ogen, 200)[0]]
+        if _oids != ["2026-01-01T00:00:05.000000", "2026-01-01T00:00:01.000000"]:
+            failures.append(f"P3 N-1: out-of-order tee not byte-streamed in file order: {_oids}")
+
+        # (7) burst > limit: 10 lines, limit=3 → first 3 records, offset BYTE-EXACT at the 3rd \n;
+        #     the rest page out next call (A-1 parity) with byte-exact continuity across the page.
+        _lines = [('{"id":"n%d"}' % i).encode("utf-8") for i in range(10)]
+        _bimg = b"".join(l + b"\n" for l in _lines)
+        _wb3(_bimg)
+        _bgen = _cp3._transcript_generation(_tp, len(_bimg))
+        recb, noffb, _, _ = _cp3.read_transcript_after(_tp, 0, _bgen, 3)
+        _exp_off = sum(len(_lines[i]) + 1 for i in range(3))          # bytes through the 3rd \n
+        if [r.get("id") for r in recb] != ["n0", "n1", "n2"] or noffb != _exp_off:
+            failures.append(f"P3 burst cap page1 wrong: ids={[r.get('id') for r in recb]} off={noffb} vs {_exp_off}")
+        recb2, _, _, _ = _cp3.read_transcript_after(_tp, noffb, _bgen, 3)
+        if [r.get("id") for r in recb2] != ["n3", "n4", "n5"]:
+            failures.append(f"P3 burst cap page2 (paging continuity) wrong: {[r.get('id') for r in recb2]}")
+
+        # (7b) burst cap with INTERLEAVED blank/garbage at the boundary: the cap counts RECORDS, the
+        #      offset counts RAW bytes — junk between the limit-th record and the next is left for
+        #      page 2 (offset stops at the limit-th record's \n), and page 2 resumes byte-continuous.
+        _jimg = (b'{"id":"j0"}\n' + b'{"id":"j1"}\n' + b"\n" + b"junk\n"   # 2 recs, then blank+garbage
+                 + b'{"id":"j2"}\n' + b'{"id":"j3"}\n')
+        _wb3(_jimg)
+        _jgen = _cp3._transcript_generation(_tp, len(_jimg))
+        recj, noffj, _, _ = _cp3.read_transcript_after(_tp, 0, _jgen, 2)        # cap after j1
+        _jexp = len(b'{"id":"j0"}\n') + len(b'{"id":"j1"}\n')                   # stops at j1's \n, junk deferred
+        if [r.get("id") for r in recj] != ["j0", "j1"] or noffj != _jexp:
+            failures.append(f"P3 burst+junk page1 wrong: ids={[r.get('id') for r in recj]} off={noffj} vs {_jexp}")
+        recj2, _, _, _ = _cp3.read_transcript_after(_tp, noffj, _jgen, 2)       # page 2 skips the junk
+        if [r.get("id") for r in recj2] != ["j2", "j3"]:
+            failures.append(f"P3 burst+junk page2 did not skip interleaved junk: {[r.get('id') for r in recj2]}")
+
+        # (8) transcript_tail_and_cursor: stat-then-tail mint — offset == file size, gen set, full tail.
+        _wb3(_bimg)                                                    # re-establish a known 10-line image
+        _trecs, _toff, _tgen = _cp3.transcript_tail_and_cursor(_tp, 200)
+        if _toff != len(_bimg) or _tgen != _bgen or [r.get("id") for r in _trecs] != [f"n{i}" for i in range(10)]:
+            failures.append(f"P3 tail_and_cursor mint wrong: off={_toff} gen={_tgen}")
+
+        # (9) real loopback _api_poll: fresh mints a byte cursor; append → cursored returns ONLY the
+        #     new record + advances; caught-up → empty; recreate (new first line) → reset re-tails.
+        proot3 = tempfile.mkdtemp(prefix="tc-wp7-p3api-")
+        _tf3 = _cp3.get_transcript_file(proot3, None)
+        _tf3.parent.mkdir(parents=True, exist_ok=True)
+        with open(_tf3, "w", encoding="utf-8") as _f:                 # write the firehose bytes directly
+            for i in range(2):
+                _f.write(json.dumps({"id": f"r{i}", "from": "a", "message": f"m{i}", "kind": "dm"}) + "\n")
+        _dres3 = _dash3.start_dashboard(proot3, None, "Operator", port=0, open_browser=False)
+        _dport3, _dtok3 = _dres3["port"], _dash3._STATE.token
+        try:
+            def _poll3(cur):
+                c = _hc3.HTTPConnection("127.0.0.1", _dport3, timeout=5)
+                c.putrequest("GET", f"/api/poll?cursor={_q3(cur)}&rcursor=&dcursor=",
+                             skip_host=True, skip_accept_encoding=True)
+                c.putheader("Host", "127.0.0.1")
+                c.putheader("X-Dashboard-Token", _dtok3)
+                c.endheaders()
+                r = c.getresponse()
+                d = json.loads(r.read())
+                c.close()
+                return d
+            _pf3 = _poll3("")                                         # fresh → tail + minted byte cursor
+            if [r.get("id") for r in _pf3.get("records", [])] != ["r0", "r1"]:
+                failures.append(f"P3 _api_poll fresh records wrong: {_pf3.get('records')}")
+            _c3 = _pf3.get("cursor", "")
+            if "|" not in _c3:
+                failures.append(f"P3 _api_poll fresh cursor is not a byte cursor: {_c3!r}")
+            with open(_tf3, "a", encoding="utf-8") as _f:             # one new record appended
+                _f.write(json.dumps({"id": "r2", "from": "a", "message": "m2", "kind": "dm"}) + "\n")
+            _pc3 = _poll3(_c3)
+            if [r.get("id") for r in _pc3.get("records", [])] != ["r2"]:
+                failures.append(f"P3 _api_poll cursored did not stream ONLY the new record: {_pc3.get('records')}")
+            if _pc3.get("cursor") == _c3:
+                failures.append("P3 _api_poll cursored did not advance the byte cursor")
+            if _poll3(_pc3.get("cursor")).get("records"):
+                failures.append("P3 _api_poll caught-up unexpectedly returned records")
+            with open(_tf3, "w", encoding="utf-8") as _f:             # RECREATE with a different first line
+                _f.write(json.dumps({"id": "z0", "from": "b", "message": "new", "kind": "dm"}) + "\n")
+            if [r.get("id") for r in _poll3(_pc3.get("cursor")).get("records", [])] != ["z0"]:
+                failures.append("P3 _api_poll recreation did not reset + re-tail")
+        finally:
+            _dash3.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-7 P3 byte-cursor unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

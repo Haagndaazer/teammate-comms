@@ -39,14 +39,16 @@ from .comms import (
     get_groups_dir,
     group_read_positions,
     is_channel_alive,
+    get_transcript_file,
     read_agent_record,
     read_deletions,
     read_deletions_set,
     read_group_meta,
     read_reactions,
-    read_transcript,
+    read_transcript_after,
     register_human,
     set_human_presence,
+    transcript_tail_and_cursor,
 )
 
 
@@ -241,13 +243,26 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team
-        # oldest_first=bool(cursor): a fresh load (no cursor) takes the newest tail; once
-        # walking a cursor we page OLDEST-first and advance the cursor only to the last
-        # returned id, so a burst larger than `limit` drains across polls instead of being
-        # skipped (audit A-1). All three sub-streams thread the same policy.
-        records = read_transcript(root, team, since=(cursor or None), limit=200,
-                                  oldest_first=bool(cursor))
-        new_cursor = records[-1]["id"] if records else cursor
+        # Records sub-stream — BYTE cursor (P3). UNLIKE the id-based reactions/deletions cursors
+        # below, this cursor is "<offset>|<generation>" (a byte position + a first-line crc) and is
+        # OPAQUE to the browser. The two cursor families do NOT share reset semantics: a transcript
+        # recreation re-tails the records stream (transparently — the id-dedup folds repeats),
+        # while the id-based streams keep their own cursors. A live cursored poll reads only the
+        # bytes appended since last poll (vs the old O(file) `since` scan), and byte-streaming fixes
+        # N-1 too (a late/out-of-order tee lands at EOF, so it's emitted, not skipped — it then
+        # shows in arrival order; shown late beats never shown).
+        _tpath = get_transcript_file(root, team)
+        if cursor:
+            _off_s, _, _gen = cursor.partition("|")   # split on the FIRST "|"; empty RHS ≡ fresh sentinel
+            try:
+                _off = int(_off_s)
+            except ValueError:
+                _off, _gen = 0, ""                    # malformed cursor → force a clean re-tail
+            records, _new_off, _new_gen, _reset = read_transcript_after(_tpath, _off, _gen, limit=200)
+            new_cursor = f"{_new_off}|{_new_gen}"
+        else:
+            records, _off0, _gen0 = transcript_tail_and_cursor(_tpath, limit=200)   # fresh: tail + mint
+            new_cursor = f"{_off0}|{_gen0}"
         # Reaction events sub-stream (own cursor). The frontend folds add/remove into
         # per-message chips client-side. Ambient — never woke anyone.
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500,

@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import time
+import zlib
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -858,6 +859,106 @@ def read_transcript(root, team=None, since=None, limit=200, oldest_first=False):
     except (FileNotFoundError, OSError):
         return []
     return _window(records, limit, oldest_first)
+
+
+# ── Transcript byte cursor (P3, audit firehose/N-1) ─────────────────────────────
+#
+# The dashboard's records stream walks the transcript by a BYTE offset, not an id, so a live
+# cursored poll reads only the bytes appended since last poll (vs the O(file) full scan an id
+# `since` forces). The opaque cursor is "<offset>|<generation>": `offset` is a byte position,
+# `generation` is a crc32 of the file's first line — append-stable (byte 0 never moves on the
+# append-only transcript), changing only on recreation, so a stale offset (truncation/recreation)
+# is detected and the reader transparently re-tails. This ALSO fixes N-1: an out-of-order tee
+# lands at EOF, so byte-streaming emits it where the id cursor (id >= since) skipped it.
+
+GEN_BOUND = 64 * 1024   # bytes scanned for the first-line terminator when computing a generation
+
+
+def _transcript_generation(path, size):
+    """crc32 (as a decimal string) of the transcript's first line — bytes ``0..first \\n`` — or
+    ``""`` when that line isn't yet terminated within ``GEN_BOUND`` (a cold-start torn head, an
+    empty file, or a pathological mega-line). ``""`` is the fresh/unknown sentinel: it ALWAYS
+    forces a re-tail, never a validation against a half-written first line. Append-stable, so an
+    append never changes it; recreation does. ``size`` is the caller's single stat (no re-stat)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(min(size, GEN_BOUND))   # absolute position 0 on a fresh handle
+    except OSError:
+        return ""
+    nl0 = head.find(b"\n")
+    return "" if nl0 == -1 else str(zlib.crc32(head[:nl0]))
+
+
+def transcript_tail_and_cursor(path, limit=200):
+    """Fresh-load tail + the byte cursor to resume live-streaming from ~EOF. Returns
+    ``(records, offset, generation)``.
+
+    Stat-THEN-tail: the offset is the file size captured BEFORE the tail read, so it is ``<=`` the
+    size the tail observed (the transcript only grows). A record appended BETWEEN the two
+    observations is therefore both shown by the tail AND re-streamed by the next cursored poll
+    (the dashboard folds the repeat by id) — never lost (the tail-then-stat order would drop it).
+    The offset sits at ~EOF, so old pre-tail history is not re-streamed: subsequent polls stream
+    only NEW appends, preserving today's 'fresh shows newest N, then live-stream' behavior."""
+    try:
+        offset = os.path.getsize(path)
+    except OSError:
+        return ([], 0, "")                        # no file (e.g. TEAMMATE_TRANSCRIPT=0) → cursor "0|"
+    gen = _transcript_generation(path, offset)
+    return (read_jsonl_tail(path, limit), offset, gen)
+
+
+def read_transcript_after(path, offset, generation, limit=200):
+    """Forward byte-cursor read of the append-only transcript. Returns
+    ``(records, new_offset, new_generation, reset)``.
+
+    ``records`` are the NEW complete records since ``offset`` (oldest-first), capped at ``limit``;
+    ``new_offset``/``new_generation`` form the next cursor. ``reset`` is True when the offset was
+    invalidated (file missing / recreated / truncated) — then ``records`` is instead the newest-
+    ``limit`` TAIL (a transparent re-tail; the dashboard's id-dedup folds any re-served record).
+
+    ONE stat per call (NIT-2); the generation read and the increment read use SEPARATE opens, each
+    with an absolute seek so no file position is ever inherited (NIT-1). BINARY mode (text seek/tell
+    lies under CRLF). ``new_offset`` is advanced by RAW newline geometry — every consumed byte,
+    including blank/garbage lines and each ``\\n``, is counted; it is NEVER reconstructed from the
+    parsed/stripped records (which would desync on the first blank/garbage/CRLF/multibyte line).
+    Offsets always land on a ``\\n``-boundary, so the next seek can't split a line or a codepoint.
+    A partial final line (no ``\\n`` yet) is left UNCONSUMED — torn-tail safe."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ([], 0, "", True)                  # no file → empty re-tail; caller mints "0|"
+    cur_gen = _transcript_generation(path, size)  # open #1 (bounded first-line read)
+    if generation == "" or cur_gen == "" or generation != cur_gen or not (0 <= offset <= size):
+        # fresh/unknown sentinel, empty/torn head, recreation, truncation, OR a malformed
+        # out-of-range offset (a negative offset would raise on seek and wedge the stream — a
+        # hand-crafted cursor must still re-tail cleanly, never livelock) → transparent re-tail.
+        return (read_jsonl_tail(path, limit), size, cur_gen, True)
+    try:
+        with open(path, "rb") as f:               # open #2 — absolute seek, never an inherited pos
+            f.seek(offset)
+            buf = f.read(size - offset)            # bounded by THIS poll's stat (a later append
+    except OSError:                                # is caught next poll, keeping offset math exact)
+        return ([], offset, generation, False)    # transient read error → no progress, retry
+    records = []
+    consumed = 0          # raw bytes consumed since `offset` (drives new_offset)
+    count = 0             # complete RECORDS emitted (drives the limit cap; blank/garbage excluded)
+    start = 0
+    while True:
+        nl = buf.find(b"\n", start)
+        if nl == -1:
+            break                                 # remaining bytes are a partial final line — defer
+        line = buf[start:nl].decode("utf-8", "replace").strip()   # .strip() drops a CRLF's \r + ws
+        if line:
+            try:
+                records.append(json.loads(line))
+                count += 1
+            except (json.JSONDecodeError, ValueError):
+                pass                              # garbage line: skip the record but STILL advance
+        consumed = nl + 1                         # past this line + its \n (blank/garbage included)
+        start = consumed
+        if limit and count >= limit:
+            break                                 # burst cap: the rest pages out next poll (A-1)
+    return (records, offset + consumed, cur_gen, False)
 
 
 # ── Reactions ───────────────────────────────────────────────────────────────────
