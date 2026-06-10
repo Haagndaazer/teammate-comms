@@ -1659,6 +1659,19 @@ def main():
         # sane (a heavy 1000-ack test isn't worth the runtime; the trim is a plain slice).
         if not (isinstance(_t7._READ_CAP, int) and _t7._READ_CAP > 0):
             failures.append("P4: _READ_CAP is not a positive int")
+        # P4 CR (v0.4.2 composition): an id SHOWN on an earlier page must STAY in last_seen when
+        # a later windowed read shows a DIFFERENT page — else it re-counts as unseen and the
+        # watcher would re-nudge a message the agent already read. last_seen is union-with-prune.
+        uroot = tempfile.mkdtemp(prefix="tc-wp7-p4u-")
+        for i in range(5):
+            _t7.send_dm(uroot, None, "alice", "bob", f"u{i}")
+        _uctx = {"identity": _Id7("bob", uroot)}
+        _uids = sorted(m["id"] for m in _c7.read_json_safe(_c7.get_inboxes_dir(uroot, None) / "bob_unread.json"))
+        _t7._handle_inbox({"since": _uids[1]}, _uctx)     # page A: shows ids >= id1 (incl _uids[1])
+        _t7._handle_inbox({"limit": 1}, _uctx)            # page B: shows only the newest id
+        if _uids[1] not in (_uctx["identity"].get_last_seen() or set()):
+            failures.append("P4 CR: an earlier-page id fell out of last_seen on a later windowed "
+                            "read (would re-nudge an already-read message)")
     except Exception as e:
         failures.append(f"WP-7 P4 inbox-windowing unit checks errored: {e}")
 

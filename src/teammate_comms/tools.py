@@ -534,11 +534,19 @@ def _handle_inbox(args, ctx):
     if isinstance(limit, int) and limit > 0 and len(messages) > limit:
         messages = messages[-limit:]                       # most recent N within the filter
 
-    # Record the ids ACTUALLY SHOWN so a later ack("all") only clears those (arrivals after
-    # this read are preserved). CRITICAL with windowing: set_last_seen reflects the SHOWN
-    # subset only — never the full inbox — or ack("all") would drain unshown messages (silent
-    # loss). Count-only reads (above) don't count as a read.
-    ctx["identity"].set_last_seen(m.get("id") for m in messages)
+    # last_seen accumulates every id SHOWN this session (UNION, not replace), pruned to the
+    # CURRENT unread ids. Two contracts ride on this: (1) ack("all") clears only what was
+    # actually shown, so a limited read can't drain unshown messages (silent loss); (2) an id
+    # shown on an EARLIER page must STAY seen when a later windowed read shows a different
+    # page — else it falls out of last_seen while still unread → the watcher re-counts it as
+    # unseen and re-nudges a message the agent already read (the v0.4.2 contract; two
+    # individually-correct changes composing into a regression). Pruning to current-unread lets
+    # acked/removed ids leave naturally (bounded, exactly like the watcher's known_ids). A
+    # count-only read (above) returns before here, so it never counts as a read.
+    _prev_seen = ctx["identity"].get_last_seen() or set()
+    _shown = {m.get("id") for m in messages}
+    _unread_ids = {m.get("id") for m in all_unread}
+    ctx["identity"].set_last_seen((_prev_seen | _shown) & _unread_ids)
 
     if not messages:
         return ("No unread messages." if not (since or limit)
