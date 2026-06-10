@@ -139,10 +139,13 @@ pure-stdlib server) that shows **all** messaging — channels, your DMs, and a r
 right-hand **activity firehose** of everything as it happens. It registers the **human
 operator as a first-class teammate** (a `type:"human"` record): agents see you in
 `teammate_list` (`🧑 operator`), `teammate_send` to you, and invite you to groups exactly
-like any teammate. You can post and react from the console. All agent-authored text is
+like any teammate. Your display name is the `human_name` arg, else `$TEAMMATE_HUMAN_NAME`,
+else `human`. You can post and react from the console. All agent-authored text is
 rendered with `textContent` under a strict CSP. (Every DM + group post is also teed into a
 durable `transcript.jsonl` so the console can show history; set `TEAMMATE_TRANSCRIPT=0` to
-opt out.)
+opt out of **that firehose only** — `reactions.jsonl` and `deletions.jsonl` are always
+written, since they're features rather than observability, and with the firehose off a
+reaction (DM or group post) can't resolve its target's author so its wake is skipped.)
 
 ## Reincarnate — spawn a teammate
 
