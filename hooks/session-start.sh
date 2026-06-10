@@ -8,6 +8,25 @@
 # declares its MCP server inline in plugin.json.
 set -euo pipefail
 
+# This entry is matcherless (fires on every SessionStart source). On a `compact` the venv
+# already exists mid-session, so skip the build — self-filter on the hook's stdin
+# {"source":...}, contract-independently (no reliance on hooks.json matcher syntax, which
+# the audit flagged as unverified). Only read stdin when it's NOT a tty so a manual run can
+# never block on `cat`; an unknown/absent source falls through to the normal build (safe).
+if [ ! -t 0 ]; then
+    HOOK_INPUT="$(cat || true)"
+    if printf '%s' "$HOOK_INPUT" | grep -q '"source"[[:space:]]*:[[:space:]]*"compact"'; then
+        echo '{}'
+        exit 0
+    fi
+fi
+
+# Fail closed but VISIBLE: an unset CLAUDE_PLUGIN_ROOT under `set -u` would otherwise abort
+# at the bare ref below before any JSON is emitted (a silent dead hook). Emit '{}' instead.
+if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+    echo '{}'
+    exit 0
+fi
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
 VENV_DIR="${PLUGIN_ROOT}/.venv"
 STAMP="${VENV_DIR}/.uv-sync-stamp"
@@ -40,9 +59,14 @@ else
 fi
 
 if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
-    UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync --project "${PLUGIN_ROOT}" --no-dev 2>/dev/null || true
-    mkdir -p "${VENV_DIR}"
-    echo "$HASH" > "$STAMP"
+    # Stamp ONLY on a successful sync. A failed sync must NOT write the stamp — else the
+    # half-built venv is recorded as done, the next session's hash matches and SKIPS the sync,
+    # and the server fails to launch with no diagnostic. No stamp → next session retries
+    # (self-healing). The build stays best-effort: a failure here never blocks the handshake.
+    if UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync --project "${PLUGIN_ROOT}" --no-dev 2>/dev/null; then
+        mkdir -p "${VENV_DIR}"
+        echo "$HASH" > "$STAMP"
+    fi
 fi
 
 # Identity is established at runtime via the teammate_register tool, so an unset

@@ -1263,6 +1263,110 @@ def main():
     except Exception as e:
         failures.append(f"WP-9 re-nudge unit checks errored: {e}")
 
+    # ── WP-3 (G-1) — dashboard HTTP layer: start the real loopback server in-process and hit
+    #    every endpoint with stdlib http.client (zero deps). Token/Host guards + status codes
+    #    + response shapes. try/finally shutdown — _STATE is process-global, a leak would
+    #    poison later blocks (and the harness never else-imports dashboard, so the port's free).
+    try:
+        import http.client as _hc
+
+        from teammate_comms import dashboard as _dash
+
+        ddroot = tempfile.mkdtemp(prefix="tc-wp3-dash-")
+        # port=0 → OS-assigned free port. The default 7842 must NOT be used: the server sets
+        # allow_reuse_address, so on Windows the test would bind the SAME port as a real
+        # dashboard already running on 7842 and client requests would race to the wrong server
+        # (a different token → spurious 401/403). An ephemeral port keeps the block hermetic.
+        _dres = _dash.start_dashboard(ddroot, None, "Operator", port=0, open_browser=False)
+        _dport, _dtok = _dres["port"], _dash._STATE.token
+
+        def _dreq(method, path, token=None, host="127.0.0.1", body=None):
+            conn = _hc.HTTPConnection("127.0.0.1", _dport, timeout=5)
+            raw = json.dumps(body).encode("utf-8") if body is not None else None
+            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", host)
+            if token is not None:
+                conn.putheader("X-Dashboard-Token", token)
+            if raw is not None:
+                conn.putheader("Content-Type", "application/json")
+                conn.putheader("Content-Length", str(len(raw)))
+            conn.endheaders(message_body=raw)
+            resp = conn.getresponse()
+            status, data = resp.status, resp.read()
+            conn.close()
+            return status, data
+
+        try:
+            # index: good token → 200 AND the served HTML actually carries the injected token.
+            st, body = _dreq("GET", f"/?token={_dtok}")
+            if st != 200 or _dtok.encode() not in body:
+                failures.append(f"WP-3 GET / (token) -> {st}; token injected into HTML: {_dtok.encode() in body}")
+            if _dreq("GET", "/?token=BAD")[0] != 403:
+                failures.append("WP-3 GET / bad token did not 403")
+            if _dreq("GET", f"/?token={_dtok}", host="evil.com")[0] != 403:
+                failures.append("WP-3 GET / bad Host did not 403")
+            # /api/conversations: token → 200 + keys; no token → 401.
+            st, body = _dreq("GET", "/api/conversations", token=_dtok)
+            conv = json.loads(body) if st == 200 else {}
+            if st != 200 or not all(k in conv for k in ("me", "groups", "roster", "dms")):
+                failures.append(f"WP-3 /api/conversations -> {st} or missing keys")
+            if _dreq("GET", "/api/conversations")[0] != 401:
+                failures.append("WP-3 /api/conversations no-token did not 401")
+            # /api/poll: 200 + all six sub-stream keys (values empty on a fresh root).
+            st, body = _dreq("GET", "/api/poll?cursor=&rcursor=&dcursor=", token=_dtok)
+            poll = json.loads(body) if st == 200 else {}
+            if st != 200 or not all(k in poll for k in
+                                    ("records", "cursor", "reactions", "rcursor", "deletions", "dcursor")):
+                failures.append(f"WP-3 /api/poll -> {st} or missing keys")
+            # /api/send: valid (to a non-self name) → 200 {id}; missing 'to' → 400.
+            st, body = _dreq("POST", "/api/send", token=_dtok, body={"to": "Bob", "message": "hi"})
+            if st != 200 or "id" not in (json.loads(body) if st == 200 else {}):
+                failures.append(f"WP-3 /api/send valid -> {st} or no id")
+            if _dreq("POST", "/api/send", token=_dtok, body={})[0] != 400:
+                failures.append("WP-3 /api/send missing 'to' did not 400")
+            # /api/react: a valid emoji always 200 (records best-effort, no transcript setup);
+            # a bogus emoji → 400 (the whitelist gate).
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "fire"})[0] != 200:
+                failures.append("WP-3 /api/react valid emoji did not 200")
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "bogus"})[0] != 400:
+                failures.append("WP-3 /api/react bogus emoji did not 400")
+            # /api/delete: XOR guard (neither message nor teammate) → 400. "Operator" is
+            # registered so we reach the 400 guard, NOT the 409 no-identity branch.
+            if _dreq("POST", "/api/delete", token=_dtok, body={})[0] != 400:
+                failures.append("WP-3 /api/delete XOR guard did not 400")
+            # unknown path → 404.
+            if _dreq("GET", "/api/bogus", token=_dtok)[0] != 404:
+                failures.append("WP-3 unknown /api path did not 404")
+        finally:
+            _dash.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-3 dashboard HTTP unit checks errored: {e}")
+
+    # ── WP-3 (G-4) — hooks fail-closed-but-VISIBLE: with CLAUDE_PLUGIN_ROOT unset each hook
+    #    must still emit valid '{}' (not die silently under set -u); session-start.sh must
+    #    fast-exit '{}' on a `compact` source (the matcherless double-fire self-filter). Needs
+    #    bash — SKIP (don't fail) where absent so the harness keeps no hard bash dependency. ──
+    try:
+        import shutil as _sh
+        _bash = _sh.which("bash")
+        if _bash:
+            _hooks = REPO / "hooks"
+            _noroot = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+            for _script in ("session-start.sh", "reinject-instructions.sh"):
+                _p = subprocess.run([_bash, str(_hooks / _script)], env=_noroot,
+                                    input=b"", capture_output=True, timeout=30)
+                if _p.returncode != 0 or _p.stdout.decode("utf-8", "replace").strip() != "{}":
+                    failures.append(f"WP-3 hook {_script} (no PLUGIN_ROOT) → rc={_p.returncode} "
+                                    f"out={_p.stdout.decode('utf-8', 'replace').strip()!r}")
+            # source=compact on stdin → fast '{}' (skips the venv build), regardless of env.
+            _pc = subprocess.run([_bash, str(_hooks / "session-start.sh")], env=dict(os.environ),
+                                 input=b'{"source":"compact"}', capture_output=True, timeout=30)
+            if _pc.returncode != 0 or _pc.stdout.decode("utf-8", "replace").strip() != "{}":
+                failures.append(f"WP-3 session-start.sh source=compact did not fast-exit '{{}}': "
+                                f"rc={_pc.returncode}")
+    except Exception as e:
+        failures.append(f"WP-3 hooks unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

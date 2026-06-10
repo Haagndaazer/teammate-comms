@@ -8,6 +8,12 @@
 # hookSpecificOutput JSON, or '{}' on any failure.
 set -euo pipefail
 
+# Fail closed but VISIBLE: an unset CLAUDE_PLUGIN_ROOT under `set -u` would abort at the bare
+# ref below before any JSON is emitted (a silent dead hook); emit '{}' and exit 0 instead.
+if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+    echo '{}'
+    exit 0
+fi
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
 # Use the SAME venv resolution as session-start.sh (${PLUGIN_ROOT}/.venv) so `uv run` reuses
 # the venv the server already launches from — never builds a fresh one mid-compact. Point

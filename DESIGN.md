@@ -56,7 +56,8 @@ teammate-comms/
 │   ├── session-start.sh        # builds the venv before the server spawns
 │   └── reinject-instructions.sh # re-injects the standing instructions after a compact
 ├── skills/teammate-comms/SKILL.md
-├── tests/test_handshake.py     # end-to-end server test (handshake + tools + channel)
+├── tests/test_handshake.py     # end-to-end server test (handshake + tools + channel + dashboard HTTP + hooks)
+├── .github/workflows/ci.yml    # CI: run the harness on ubuntu + windows (added 0.7.x)
 ├── README.md
 └── .gitignore
 ```
@@ -78,6 +79,14 @@ fast, predictable spawn:
   via `${CLAUDE_PLUGIN_ROOT}`) runs `uv sync` against a stamp so the venv exists
   *before* the server is spawned. The hook runs under `bash` (git-bash on Windows).
 - The MCP server is launched with **`uv run --no-sync`** (venv already present).
+- **Hook hardening (0.7.x / WP-3):** both hooks **fail closed but VISIBLE** — an unset
+  `CLAUDE_PLUGIN_ROOT` emits valid `{}` and exits 0 instead of dying silently under
+  `set -u` before any JSON. session-start.sh writes the sync stamp **only on a successful
+  `uv sync`** (a failed sync no longer stamps a half-built venv as done → the next session
+  retries instead of failing silently). Its entry is matcherless (fires on every
+  SessionStart source); rather than rely on unverified `hooks.json` matcher syntax it
+  **self-filters on the stdin `{"source":...}`** and fast-exits `{}` on a `compact` (the
+  venv already exists mid-session) — contract-independent and hermetically tested.
 - **First-session UX:** on a fresh install the hook builds the venv and the server
   connects after a **restart** — identical to vibe-cognition. Documented in the README.
 - A **second SessionStart hook** (`hooks/reinject-instructions.sh`, `matcher:"compact"`)
