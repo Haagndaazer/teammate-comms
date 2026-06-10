@@ -46,7 +46,7 @@ from .comms import (
     read_reactions,
     read_transcript,
     remove_agent,
-    remove_messages_from_inbox,
+    remove_group_messages_from_inbox,
     strip_member_from_groups,
     tombstone_in_group_messages,
     tombstone_in_inbox,
@@ -849,15 +849,18 @@ def _handle_group(args, ctx):
         # Creator-only, OR any member if the creator is no longer a member (orphan).
         if not (agent == creator or (creator not in members and agent in members)):
             raise CommsError(f"Only the creator ({creator}) can delete {sigil}.")
-        # Resolve the group's message ids BEFORE rmtree so we can purge the fan-out
-        # copies that linger in member inboxes. (The old bug: delete removed only the
-        # group dir, leaving those copies + the transcript behind, so a "deleted" group's
-        # messages still showed.) Order: clean inboxes -> rmtree -> emit the deletion
-        # event LAST, so a best-effort partial rmtree can't desync the dashboard.
-        msg_ids = [m.get("id") for m in read_group_messages(root, team, group)
-                   if isinstance(m, dict) and m.get("id")]
+        # Purge the fan-out copies that linger in member inboxes BEFORE the rmtree. (The old
+        # bug: delete removed only the group dir, leaving those copies + the transcript behind,
+        # so a "deleted" group's messages still showed.) Purge by the GROUP PREDICATE
+        # (group == sigil), NOT a pre-snapshot id-set, so a copy that lands between the snapshot
+        # and the purge is still caught (A-5 window-shrink; the residual post-rmtree-recreate
+        # orphan is accepted as eventually-consistent — see remove_group_messages_from_inbox).
+        # Order: clean inboxes -> rmtree -> emit the deletion event LAST, so a best-effort
+        # partial rmtree can't desync the dashboard.
+        msg_count = len([m for m in read_group_messages(root, team, group)
+                         if isinstance(m, dict) and m.get("id")])
         for member in members:
-            remove_messages_from_inbox(root, team, member, msg_ids)
+            remove_group_messages_from_inbox(root, team, member, sigil)
         delete_group(root, team, group)
         # best-effort (block=False): the group dir is already gone, so emitting the event
         # LAST is the recorded v0.7.0 ordering (a partial rmtree can't desync the
@@ -865,7 +868,7 @@ def _handle_group(args, ctx):
         # (re-entry hits "No group"). A fresh dashboard load omits the absent group anyway.
         append_deletion(root, team, {"target": sigil,  # id stamped under the lock inside append_deletion
                                      "kind": "group", "by": agent, "op": "delete"}, block=False)
-        return (f"Deleted group {sigil} (purged {len(msg_ids)} message(s) from "
+        return (f"Deleted group {sigil} (purged ~{msg_count} message(s) from "
                 f"member inboxes).")
 
     if action == "join":

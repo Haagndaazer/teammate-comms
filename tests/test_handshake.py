@@ -1477,6 +1477,144 @@ def main():
     except Exception as e:
         failures.append(f"WP-5 hardening unit checks errored: {e}")
 
+    # ── WP-6 — race + scale: A-7 dead-only atomic steal (exactly-one-winner), A-5 predicate
+    #    purge, N-1 characterization of the accepted out-of-order-tee firehose limit. ──
+    try:
+        import shutil as _sh6
+        import threading as _th6
+
+        from teammate_comms import comms as _c6
+        from teammate_comms import tools as _t6
+        tm6 = None
+        wroot6 = tempfile.mkdtemp(prefix="tc-wp6-")
+
+        import socket as _sock6
+
+        def _mklock(name, pid, host=None):
+            ld = Path(wroot6) / f"{name}.lock"
+            ld.mkdir(parents=True, exist_ok=True)
+            (ld / "pid").write_text(f"{pid}\n{_sock6.gethostname() if host is None else host}")
+            return ld
+
+        # ---- A-7 (a): an ALIVE holder (this very process) is NEVER stolen — file_lock RAISES.
+        _alive = _mklock("alive", os.getpid())
+        try:
+            with _c6.file_lock(Path(wroot6) / "alive", timeout=0.2):
+                failures.append("A-7: stole a lock from an ALIVE holder")
+        except _c6.CommsError:
+            pass
+        if not (_alive / "pid").exists():
+            failures.append("A-7: the alive holder's lock dir was disturbed")
+        _sh6.rmtree(_alive, ignore_errors=True)
+
+        # ---- A-7 (b)+(c): force _pid_alive→False (verified dead) to test the steal path
+        #      deterministically (no real-dead-pid reuse flake).
+        _orig_pa = _c6._pid_alive
+        _c6._pid_alive = lambda pid: False
+        try:
+            _mklock("dead", 99999)
+            try:
+                with _c6.file_lock(Path(wroot6) / "dead", timeout=0.3):
+                    pass                              # acquired by stealing the dead holder
+            except _c6.CommsError:
+                failures.append("A-7: did NOT steal a lock from a verified-dead holder")
+            # exactly-one-winner: 8 concurrent stealers on one dead lock → exactly one claims
+            # (the claim is a `mkdir` of a sibling .claim marker — the same atomic primitive the
+            # lock uses; exactly one of N concurrent mkdirs wins, cross-platform incl. Windows).
+            _two = _mklock("two", 99999)
+            _wins = []
+
+            def _steal():
+                if _c6._claim_if_dead(_two):
+                    _wins.append(1)
+            _ts = [_th6.Thread(target=_steal) for _ in range(8)]
+            for t in _ts:
+                t.start()
+            for t in _ts:
+                t.join()
+            if len(_wins) != 1:
+                failures.append(f"A-7: {len(_wins)} stealers won the atomic claim (must be EXACTLY 1)")
+        finally:
+            _c6._pid_alive = _orig_pa
+            for _p in Path(wroot6).glob("*.claim"):     # clean any leftover claim marker
+                _sh6.rmtree(_p, ignore_errors=True)
+
+        # ---- A-7 (d): UNDETERMINED liveness (_pid_alive→None) must NOT be stolen (absence of a
+        #      death proof is not a death proof — else a tasklist failure re-opens the bug).
+        _c6._pid_alive = lambda pid: None
+        try:
+            _unk = _mklock("unk", 424242)
+            if _c6._claim_if_dead(_unk):
+                failures.append("A-7: stole a lock whose holder liveness is UNDETERMINED (None)")
+        finally:
+            _c6._pid_alive = _orig_pa
+            _sh6.rmtree(Path(wroot6) / "unk.lock", ignore_errors=True)
+
+        # ---- A-7 (e) CR-1: a FRESH .claim marker is respected (not stolen past), but an
+        #      ORPHANED one (older than CLAIM_STALE_SECONDS — a stealer killed mid-claim) is
+        #      reclaimed so a dead holder's lock can't get permanently stuck.
+        _c6._pid_alive = lambda pid: False
+        try:
+            _af = _mklock("aged", 99999)
+            _fresh = Path(str(_af) + ".claim")
+            _fresh.mkdir()
+            if _c6._claim_if_dead(_af):
+                failures.append("A-7 CR-1: stole past a FRESH claim marker")
+            _fresh.rmdir()
+            _ag2 = _mklock("aged2", 99999)
+            _stale = Path(str(_ag2) + ".claim")
+            _stale.mkdir()
+            _old = time.time() - (_c6.CLAIM_STALE_SECONDS + 60)
+            os.utime(_stale, (_old, _old))
+            if not _c6._claim_if_dead(_ag2):
+                failures.append("A-7 CR-1: did NOT reclaim an ORPHANED (aged) claim → lock would stick")
+        finally:
+            _c6._pid_alive = _orig_pa
+            for _p in Path(wroot6).glob("aged*"):
+                _sh6.rmtree(_p, ignore_errors=True)
+
+        # ---- A-7 (f) CR-2: a holder on a DIFFERENT host with a locally-dead pid is NOT stolen
+        #      (host-gated liveness — local _pid_alive can't judge a remote pid; A-7 must not
+        #      relocate cross-host).
+        _c6._pid_alive = lambda pid: False
+        try:
+            _rem = _mklock("remote", 99999, host="some-other-host-xyz")
+            if _c6._claim_if_dead(_rem):
+                failures.append("A-7 CR-2: stole a lock held on a DIFFERENT host (cross-host steal)")
+        finally:
+            _c6._pid_alive = _orig_pa
+            _sh6.rmtree(Path(wroot6) / "remote.lock", ignore_errors=True)
+
+        # ---- A-5: the predicate purge removes a member's group copies (group==sigil) ONLY —
+        #      including a copy injected AFTER an id snapshot (the race-window-shrink) — and
+        #      leaves non-group (DM) messages untouched.
+        _c6.write_group_meta(wroot6, tm6, "g", {"name": "g", "members": ["alice", "bob"],
+                                                "creator": "alice", "createdAt": _c6.now_timestamp()})
+        _t6.send_group(wroot6, tm6, "alice", "#g", "g-msg")
+        _t6.send_dm(wroot6, tm6, "alice", "bob", "dm-msg")
+        _binbox = _c6.get_inboxes_dir(wroot6, tm6) / "bob_unread.json"
+        _bm = _c6.read_json_safe(_binbox)
+        _bm.append({"id": "race-1", "from": "carol", "group": "#g", "message": "raced-in"})
+        _c6.write_json_atomic(_binbox, _bm)             # a copy that "landed" before the purge
+        _c6.remove_group_messages_from_inbox(wroot6, tm6, "bob", "#g")
+        _after = _c6.read_json_safe(_binbox)
+        if any(isinstance(m, dict) and m.get("group") == "#g" for m in _after):
+            failures.append("A-5: predicate purge left a group copy (incl. the raced-in one)")
+        if not any(isinstance(m, dict) and not m.get("group") for m in _after):
+            failures.append("A-5: predicate purge wrongly removed bob's DM")
+
+        # ---- N-1 (characterization of the ACCEPTED firehose limit): a record teed out of order
+        #      (id < the cursor) is excluded by a since=cursor read. Encodes the known behavior
+        #      so the WP-7 byte-cursor implementer knows exactly what they're fixing.
+        _nroot = tempfile.mkdtemp(prefix="tc-wp6-n1-")
+        _c6.append_transcript(_nroot, tm6, {"id": "2026-01-01T00:00:00.000200", "message": "later"})
+        _c6.append_transcript(_nroot, tm6, {"id": "2026-01-01T00:00:00.000100", "message": "raced-earlier"})
+        _seen = [r.get("id") for r in _c6.read_transcript(_nroot, tm6, since="2026-01-01T00:00:00.000200")]
+        if "2026-01-01T00:00:00.000100" in _seen:
+            failures.append("N-1 characterization changed: the out-of-order earlier id is now included")
+    except Exception as e:
+        failures.append(f"WP-6 race+scale unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

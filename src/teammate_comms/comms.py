@@ -287,52 +287,163 @@ def write_json_atomic(filepath, data):
     os.replace(tmp, filepath)
 
 
-@contextmanager
-def file_lock(lock_path, timeout=10):
-    """Cross-platform lock via mkdir (atomic on all OSes). Raises on timeout."""
-    lock_dir = Path(str(lock_path) + ".lock")
-    start = time.time()
-    while True:
-        try:
-            lock_dir.mkdir(parents=False, exist_ok=False)
-            break
-        except FileExistsError:
-            if time.time() - start > timeout:
-                try:
-                    lock_dir.rmdir()
-                except OSError:
-                    pass
-                try:
-                    lock_dir.mkdir(parents=False, exist_ok=False)
-                    break
-                except FileExistsError:
-                    raise CommsError(
-                        f"Could not acquire lock on {lock_path.name} after {timeout}s."
-                    )
-            time.sleep(0.05)
+# A claim marker (see _claim_if_dead) lives microseconds; one older than this is an orphan
+# left by a stealer killed mid-claim, and is reclaimed so a dead holder's lock can't get stuck.
+CLAIM_STALE_SECONDS = 30
+
+
+def _write_lock_pid(lock_dir):
+    """Best-effort: record the holder's pid AND host inside the lock dir, so a contender can
+    tell a DEAD-on-THIS-HOST holder (steal-able) from a slow-but-alive one, OR a holder on a
+    DIFFERENT host (whose pid is meaningless locally — never steal). A failed/absent/foreign
+    write reads back as 'unknown/foreign' → never stolen (fail toward the live holder)."""
     try:
-        yield
+        (lock_dir / "pid").write_text(f"{os.getpid()}\n{socket.gethostname()}")
+    except OSError:
+        pass
+
+
+def _release_lock(lock_dir):
+    """Remove a lock dir we own — the pid file first (the dir is otherwise non-empty)."""
+    try:
+        (lock_dir / "pid").unlink()
+    except OSError:
+        pass
+    try:
+        lock_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _claim_if_dead(lock_dir):
+    """If the lock's holder is VERIFIED dead, atomically claim + remove the stale dir and
+    return True (the caller then re-mkdir's a fresh lock). Return False — never steal — when
+    the holder is alive, UNDETERMINED (``_pid_alive`` → None: absence of proof of death is not
+    proof of death), the pid file is missing/unreadable, OR another contender won the claim.
+
+    The exclusive claim is a ``mkdir`` of a sibling ``<lock>.claim`` marker — the SAME atomic
+    primitive the lock itself uses, so of N concurrent stealers EXACTLY ONE wins the mkdir
+    (the rest get ``FileExistsError`` → don't steal). (A naive rmdir+mkdir would let two
+    stealers both 'win' and re-import the very two-writers race A-7 closes; and an
+    ``os.replace`` rename of the lock DIRECTORY proved non-exclusive under concurrency on
+    Windows — empirically 4/8 stealers 'won' — so mkdir is the reliable choice.) After winning
+    the claim we re-check the stale dir still exists (a slightly-later caller mustn't 'win'
+    a lock an earlier stealer already removed), remove it, then drop the claim marker.
+
+    Liveness is HOST-GATED (mirrors ``is_channel_alive``): ``_pid_alive`` is purely local, so a
+    holder on a DIFFERENT host is never stolen (its pid is meaningless here) — a dead remote
+    holder's lock is recovered only manually, bounded by the timeout raise/drop; strictly safer
+    than stealing a live remote. And the ``.claim`` marker is AGE-GATED: one older than
+    ``CLAIM_STALE_SECONDS`` (a stealer killed mid-claim) is reclaimed, so a dead holder's lock
+    can't get permanently stuck behind a dead claim."""
+    try:
+        lines = (lock_dir / "pid").read_text().splitlines()
+        pid = int(lines[0].strip())
+    except (OSError, ValueError, IndexError):
+        return False                          # missing/unreadable pid → unknown → don't steal
+    host = lines[1].strip() if len(lines) > 1 else ""
+    if host != socket.gethostname():
+        return False                          # holder on a DIFFERENT host → local pid is meaningless
+    if _pid_alive(pid) is not False:
+        return False                          # alive (True) or undetermined (None) → don't steal
+    claim = Path(str(lock_dir) + ".claim")
+    try:
+        claim.mkdir(parents=False, exist_ok=False)   # atomic exclusive — exactly one winner
+    except OSError:
+        # Another stealer holds the claim — normally micro-lived. If it's STALE (a stealer was
+        # killed between mkdir and its finally), reclaim it: rmdir + one retry. Two concurrent
+        # cleaners race the fresh mkdir → exactly one wins (the same exclusive primitive), so a
+        # dead holder's lock can't get permanently stuck behind a dead claim marker.
+        try:
+            stale = (time.time() - claim.stat().st_mtime) > CLAIM_STALE_SECONDS
+        except OSError:
+            return False                      # claim vanished under us → let the caller loop
+        if not stale:
+            return False
+        try:
+            claim.rmdir()
+        except OSError:
+            pass
+        try:
+            claim.mkdir(parents=False, exist_ok=False)
+        except OSError:
+            return False                      # another cleaner won the fresh claim → don't steal
+    try:
+        if not lock_dir.exists():
+            return False                      # already stolen+removed by an earlier winner
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        return True
     finally:
         try:
-            lock_dir.rmdir()
+            claim.rmdir()
         except OSError:
             pass
 
 
 @contextmanager
+def file_lock(lock_path, timeout=10):
+    """Cross-platform lock via mkdir (atomic on all OSes). Raises CommsError on timeout.
+
+    On timeout the lock is STOLEN only from a VERIFIED-DEAD holder (pid recorded in the lock
+    dir; ``_claim_if_dead`` does the atomic claim). A slow-but-alive holder is NEVER stolen
+    from — the contention surfaces as a raise instead (a surfaced error beats two writers
+    clobbering each other; audit A-7). A holder that hasn't written its pid yet is treated as
+    unknown (never stolen), bounded by ``timeout`` (we raise, never wait forever or steal blind)."""
+    lock_dir = Path(str(lock_path) + ".lock")
+    start = time.time()
+    while True:
+        try:
+            lock_dir.mkdir(parents=False, exist_ok=False)
+            _write_lock_pid(lock_dir)
+            break
+        except FileExistsError:
+            if time.time() - start > timeout:
+                if _claim_if_dead(lock_dir):
+                    try:
+                        lock_dir.mkdir(parents=False, exist_ok=False)
+                        _write_lock_pid(lock_dir)
+                        break
+                    except FileExistsError:
+                        start = time.time()       # someone re-acquired post-claim; reset + retry
+                        time.sleep(0.05)
+                        continue
+                raise CommsError(
+                    f"Could not acquire lock on {lock_path.name} after {timeout}s "
+                    f"(holder alive or undetermined — not stolen)."
+                )
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        _release_lock(lock_dir)
+
+
+@contextmanager
 def file_lock_optional(lock_path, timeout=2):
-    """Best-effort lock that never raises. Yields True if acquired, else False."""
+    """Best-effort lock that NEVER raises. Yields True if acquired, else False (caller drops).
+
+    Same dead-holder steal discipline as ``file_lock`` (A-7) — an alive/undetermined holder is
+    never stolen from; here a non-acquire simply yields False instead of raising, preserving
+    the droppable/never-raise contract the transcript/reaction/deletion tees depend on."""
     lock_dir = Path(str(lock_path) + ".lock")
     start = time.time()
     acquired = False
     while True:
         try:
             lock_dir.mkdir(parents=False, exist_ok=False)
+            _write_lock_pid(lock_dir)
             acquired = True
             break
         except FileExistsError:
             if time.time() - start > timeout:
-                break
+                if _claim_if_dead(lock_dir):
+                    try:
+                        lock_dir.mkdir(parents=False, exist_ok=False)
+                        _write_lock_pid(lock_dir)
+                        acquired = True
+                    except FileExistsError:
+                        pass                      # re-acquired by someone else → drop
+                break                             # alive/undetermined/lost → drop (never raise)
             time.sleep(0.05)
         except OSError:
             break
@@ -340,10 +451,7 @@ def file_lock_optional(lock_path, timeout=2):
         yield acquired
     finally:
         if acquired:
-            try:
-                lock_dir.rmdir()
-            except OSError:
-                pass
+            _release_lock(lock_dir)
 
 
 # ── Deletion / tombstone helpers ──────────────────────────────────────────────────
@@ -405,19 +513,24 @@ def tombstone_in_group_messages(root, team, group, msg_id, deleted_by):
     return False
 
 
-def remove_messages_from_inbox(root, team, member, msg_ids):
-    """Hard-remove messages (by id) from a member's inbox (both files) under the unread
-    lock. Used by whole-group delete — the group is gone, so there's no thread to keep."""
-    ids = set(msg_ids)
-    if not ids:
-        return
+def remove_group_messages_from_inbox(root, team, member, sigil):
+    """Hard-remove a member's copies of a group's messages by the GROUP PREDICATE (any record
+    with ``group == sigil``), not a pre-snapshotted id-set — used by whole-group delete.
+
+    The predicate catches a fan-out copy that landed AFTER an id snapshot but before this
+    purge, shrinking the A-5 race window. It is NOT a full fix: a ``send_group`` that passed
+    its meta-exists check before the dir ``rmtree`` but whose fan-out lands AFTER this purge can
+    still orphan an inbox copy — closing that needs cross-store atomicity the v0.7.0 plan
+    rejected. The residual is accepted as eventually-consistent (the dashboard omits the absent
+    group on reload; ``resolve_message``'s group-dir fallback finds nothing). Both inbox files
+    under the unread lock; writes only on change."""
     inboxes_dir = get_inboxes_dir(root, team)
     unread_file = inboxes_dir / f"{member}_unread.json"
     read_file = inboxes_dir / f"{member}_read.json"
     with file_lock(unread_file):
         for f in (unread_file, read_file):
             msgs = read_json_safe(f)
-            kept = [m for m in msgs if not (isinstance(m, dict) and m.get("id") in ids)]
+            kept = [m for m in msgs if not (isinstance(m, dict) and m.get("group") == sigil)]
             if len(kept) != len(msgs):
                 write_json_atomic(f, kept)
 
