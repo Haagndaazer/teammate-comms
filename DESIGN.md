@@ -460,6 +460,12 @@ watcher with **no `channel.py` change**.
   records only, scroll-aware, last-200); reaction chips + a clickable emoji bar
   (`POST /api/react`, reactions sub-stream on `/api/poll`); read-receipt ticks; field
   chips for `post_type`/mentions/`reply_to`.
+- **Compose send-parity (0.7.x / WP-4):** `_api_send` now passes `reply_to` + `post_type`
+  through to the cores (was DM/group `to`+`message`+`priority` only), and the compose row
+  gained the matching write-side affordances: a `↳` reply chip (click a message's `↳` →
+  pending `reply_to`, clearable), a `post_type` select, and an `urgent` toggle. Send/react
+  failures now `alert` the server's reason (B-3) instead of silently swallowing. All new
+  DOM is `textContent`-only (no `innerHTML`), preserving the strict-CSP discipline.
 
 **Observability transcript (added 0.5.0-dev).** To let the console show *all* messaging
 (1:1 DMs were previously ephemeral — only in `_unread.json`, gone after ack), both send

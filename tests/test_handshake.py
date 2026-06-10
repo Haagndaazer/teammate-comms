@@ -1329,6 +1329,34 @@ def main():
                 failures.append(f"WP-3 /api/send valid -> {st} or no id")
             if _dreq("POST", "/api/send", token=_dtok, body={})[0] != 400:
                 failures.append("WP-3 /api/send missing 'to' did not 400")
+            # ── WP-4 (B-1) — _api_send passes post_type/reply_to/priority through to both cores.
+            #    Assert against the RECIPIENT INBOX (authoritative, always written) — NOT
+            #    read_transcript (TEAMMATE_TRANSCRIPT-gated → could pass vacuously). DM + # branches.
+            from teammate_comms import comms as _dc
+            # DM branch: typed + threaded + urgent reach the recipient's stored record.
+            st, body = _dreq("POST", "/api/send", token=_dtok,
+                             body={"to": "Carol", "message": "m1", "post_type": "decision",
+                                   "reply_to": "ref-123", "priority": "urgent"})
+            _mid = json.loads(body).get("id") if st == 200 else None
+            _cinbox = _dc.read_json_safe(_dc.get_inboxes_dir(ddroot, None) / "Carol_unread.json")
+            _crec = next((m for m in _cinbox if m.get("id") == _mid), None) if _mid else None
+            if not (_crec and _crec.get("post_type") == "decision"
+                    and _crec.get("reply_to") == "ref-123" and _crec.get("priority") == "urgent"):
+                failures.append(f"WP-4 DM send did not pass post_type/reply_to/priority through: {_crec}")
+            # Group (#) branch: same pass-through into the group transcript.
+            _dc.write_group_meta(ddroot, None, "g", {"name": "g", "members": ["Operator", "Dave"],
+                                                     "creator": "Operator", "createdAt": _dc.now_timestamp()})
+            st, body = _dreq("POST", "/api/send", token=_dtok,
+                             body={"to": "#g", "message": "gm", "post_type": "blocker", "reply_to": "ref-g"})
+            _gmid = json.loads(body).get("id") if st == 200 else None
+            _grec = next((m for m in _dc.read_group_messages(ddroot, None, "g")
+                          if m.get("id") == _gmid), None) if _gmid else None
+            if not (_grec and _grec.get("post_type") == "blocker" and _grec.get("reply_to") == "ref-g"):
+                failures.append(f"WP-4 group send did not pass post_type/reply_to through: {_grec}")
+            # A bogus post_type is rejected by the core (_clean_post_type → CommsError → 400).
+            if _dreq("POST", "/api/send", token=_dtok,
+                     body={"to": "Carol", "message": "x", "post_type": "bogus"})[0] != 400:
+                failures.append("WP-4 send with bogus post_type did not 400")
             # /api/react: a valid emoji always 200 (records best-effort, no transcript setup);
             # a bogus emoji → 400 (the whitelist gate).
             if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "fire"})[0] != 200:

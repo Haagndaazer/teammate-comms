@@ -75,10 +75,20 @@
   .item .del:hover { opacity: 1; }
   .body.deleted, .fbody.deleted { color: var(--dim); font-style: italic; }
   #composewrap { grid-row: 2; grid-column: 2; border-top: 1px solid var(--line);
-                 background: var(--panel); padding: 12px 22px; display: flex; gap: 10px; }
-  #compose { flex: 1; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+                 background: var(--panel); padding: 12px 22px; display: flex; gap: 10px;
+                 flex-wrap: wrap; align-items: center; }
+  #compose { flex: 1; min-width: 180px; background: var(--panel2); color: var(--fg);
+             border: 1px solid var(--line);
              border-radius: 8px; padding: 9px 12px; font: inherit; resize: none; }
   #compose:disabled { opacity: .5; }
+  #replychip { flex: 0 0 100%; display: flex; gap: 8px; align-items: center;
+               font-size: 12px; opacity: .85; }
+  #replychip[hidden] { display: none; }
+  #replychip .rxclear { cursor: pointer; font-weight: 700; }
+  #ptype, #urgwrap { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+                     border-radius: 8px; padding: 0 8px; font: inherit; font-size: 13px;
+                     display: flex; align-items: center; gap: 5px; cursor: pointer; }
+  #ptype:disabled, #urgwrap.disabled { opacity: .5; cursor: default; }
   #send { background: var(--accent); color: #fff; border: 0; border-radius: 8px;
           padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer; }
   #send:disabled { opacity: .5; cursor: default; }
@@ -99,7 +109,16 @@
   <aside id="sidebar"><h1>teammate-comms</h1><div id="nav"></div></aside>
   <section id="main"><div class="empty">Select a conversation.</div></section>
   <div id="composewrap">
+    <div id="replychip" hidden></div>
     <textarea id="compose" rows="1" placeholder="Message…" disabled></textarea>
+    <select id="ptype" title="Post type (turns the thread into a decision trail)" disabled>
+      <option value="">type…</option>
+      <option value="decision">decision</option>
+      <option value="blocker">blocker</option>
+      <option value="fyi">fyi</option>
+      <option value="chatter">chatter</option>
+    </select>
+    <label id="urgwrap" title="Send as urgent"><input type="checkbox" id="urgent" disabled> urgent</label>
     <button id="send" disabled>Send</button>
   </div>
   <aside id="activity">
@@ -289,9 +308,14 @@ function navItem(id, label, online, sub, removable) {
 
 // ── center pane ──
 function selectConv(id) {
+  clearReplyTo();        // a reply intent is per-conversation — drop it on ANY switch (Slack
+                         // semantics); otherwise a pending reply_to would attach a message id
+                         // from the previous conversation, citing an id that isn't in this thread.
   current = id; ensureConv(id); markRead(id); renderNav(); renderTranscript();
   const c = convs.get(id) || {}; const ok = c.sendable !== false;
   $("#compose").disabled = !ok; $("#send").disabled = !ok;
+  $("#ptype").disabled = !ok; $("#urgent").disabled = !ok;
+  $("#urgwrap").classList.toggle("disabled", !ok);
   $("#compose").placeholder = ok ? ("Message " + (c.label || id) + "…") : "Read-only (you're not a participant)";
   if (ok) $("#compose").focus();
 }
@@ -326,6 +350,9 @@ function renderMsg(rec) {
   if (rec.post_type) head.appendChild(span("tag pt", rec.post_type));
   if (rec.priority === "urgent") head.appendChild(span("tag", "URGENT"));
   if ((rec.mentions || []).includes(ME)) head.appendChild(span("tag mention", "🔔 you"));
+  const reply = el("span", "del"); reply.textContent = "↳"; reply.title = "Reply to this message";
+  reply.addEventListener("click", () => setReplyTo(rec.id));
+  head.appendChild(reply);
   const del = el("span", "del"); del.textContent = "🗑"; del.title = "Delete this message";
   del.addEventListener("click", () => deleteMessage(rec.id));
   head.appendChild(del);
@@ -367,8 +394,15 @@ async function toggleReact(target, emoji) {
   // optimistic local update; the poll reconciles
   applyReactions([{ target, emoji, from: ME, op: mine ? "remove" : "add" }]);
   if (current) renderTranscript();
-  try { await api("/api/react", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target, emoji, remove: !!mine }) }); } catch (e) {}
+  try {
+    await api("/api/react", { method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ target, emoji, remove: !!mine }) });
+  } catch (e) {
+    // revert the optimistic apply, then surface the reason (B-3, N6) — no silent swallow.
+    applyReactions([{ target, emoji, from: ME, op: mine ? "add" : "remove" }]);
+    if (current) renderTranscript();
+    alert("React failed: " + e.message);
+  }
 }
 
 async function deleteMessage(id) {
@@ -414,15 +448,35 @@ function renderFeed(rec) {
 }
 
 // ── compose ──
+let replyTo = null;                                   // pending reply target (a message id)
+function setReplyTo(id) {
+  replyTo = id;
+  const chip = $("#replychip");
+  chip.textContent = "↳ replying to " + id + "  ";
+  const x = span("rxclear", "✕"); x.title = "Cancel reply";
+  x.addEventListener("click", clearReplyTo);
+  chip.appendChild(x);
+  chip.hidden = false;
+  $("#compose").focus();
+}
+function clearReplyTo() { replyTo = null; const c = $("#replychip"); c.hidden = true; c.textContent = ""; }
+
 async function sendMsg() {
   const box = $("#compose"); const text = box.value.trim();
   if (!text || !current) return;
   const c = convs.get(current) || {}; if (c.sendable === false) return;
   const to = current[0] === "#" ? current : current.slice(1);
+  const body = { to, message: text };
+  const pt = $("#ptype").value; if (pt) body.post_type = pt;          // typed post (B-1)
+  if ($("#urgent").checked) body.priority = "urgent";                // urgent (B-2)
+  if (replyTo) body.reply_to = replyTo;                              // thread (B-1)
   box.value = "";
-  try { await api("/api/send", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to, message: text }) }); }
-  catch (e) { box.value = text; }
+  try {
+    await api("/api/send", { method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body) });
+    clearReplyTo();
+    $("#urgent").checked = false;        // reset urgent each send; the type select stays sticky
+  } catch (e) { box.value = text; alert("Send failed: " + e.message); }   // surface + restore (B-3, N6)
 }
 $("#send").addEventListener("click", sendMsg);
 $("#compose").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
