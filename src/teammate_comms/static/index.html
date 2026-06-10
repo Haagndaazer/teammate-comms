@@ -308,12 +308,14 @@ function navItem(id, label, online, sub, removable) {
 
 // ── center pane ──
 function selectConv(id) {
+  clearReplyTo();        // a reply intent is per-conversation — drop it on ANY switch (Slack
+                         // semantics); otherwise a pending reply_to would attach a message id
+                         // from the previous conversation, citing an id that isn't in this thread.
   current = id; ensureConv(id); markRead(id); renderNav(); renderTranscript();
   const c = convs.get(id) || {}; const ok = c.sendable !== false;
   $("#compose").disabled = !ok; $("#send").disabled = !ok;
   $("#ptype").disabled = !ok; $("#urgent").disabled = !ok;
   $("#urgwrap").classList.toggle("disabled", !ok);
-  if (!ok) clearReplyTo();        // leaving a sendable conversation drops any pending reply
   $("#compose").placeholder = ok ? ("Message " + (c.label || id) + "…") : "Read-only (you're not a participant)";
   if (ok) $("#compose").focus();
 }
