@@ -977,6 +977,96 @@ def get_deletions_file(root, team=None):
     return base / "deletions.jsonl"
 
 
+def get_deletions_set_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]deletions_set.json`` — the COMPACTED deleted-set.
+
+    A target-keyed dict ``{target: event}`` holding every deletion that has been folded out of
+    the jsonl tail (see ``_compact_deletions_locked``). It is the durable BASELINE the dashboard
+    unions with the live jsonl on a fresh load so a deleted message can never reappear once its
+    event ages past the jsonl tail (audit C-2). Deduped by target (deletions are monotonic — op
+    is always 'delete', there is no undelete)."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "deletions_set.json"
+
+
+# Compaction thresholds (C-2). ``RETAIN`` events stay in the live jsonl tail; older events fold
+# into the set-file. The byte gate is a CHEAP getsize trip on append — it bounds the live-file
+# SIZE only, it is NOT a correctness input: the dashboard's fresh-load read is the FULL live jsonl
+# unioned with the full set-file, so completeness holds no matter when (or whether) the gate fires.
+DELETIONS_RETAIN = 1000
+DELETIONS_COMPACT_BYTES = 256 * 1024
+
+
+def read_deletions_set(root, team=None):
+    """Return the compacted deleted-set dict ``{target: event}`` (the C-2 baseline).
+
+    Read-only and lock-free (write_json_atomic gives the reader old-or-new, never partial); any
+    miss/corruption/non-dict → ``{}`` so the caller's ``.values()`` is always safe."""
+    v = read_json_readonly(get_deletions_set_file(root, team))
+    return v if isinstance(v, dict) else {}
+
+
+def _compact_deletions_locked(root, team):
+    """Fold all-but-the-newest ``DELETIONS_RETAIN`` deletion events into the target-keyed set-file,
+    then trim the jsonl to that tail. MUST be called with the deletions.jsonl lock already held
+    (so no appender interleaves the read-fold-trim). Best-effort: any failure leaves the jsonl
+    intact (the set write is the durable half; the trim is pure size relief and self-heals next
+    run). Ordering is load-bearing: write the SET FIRST (atomic), THEN trim the jsonl (atomic) —
+    a crash/failure in between leaves the jsonl still holding everything AND the set holding the
+    folded head (idempotent overlap), so a fresh load reads a superset, never a gap. The reverse
+    order could drop tombstones. The mkdir-lock keys off the path STRING (a sibling .lock dir);
+    os.replace swaps the FILE inode only, never the lock dir, so re-reading + replacing the jsonl
+    under its own lock is deadlock-free."""
+    path = get_deletions_file(root, team)
+    all_events = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    all_events.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except (FileNotFoundError, OSError):
+        return
+    if len(all_events) <= DELETIONS_RETAIN:
+        return
+    head, tail = all_events[:-DELETIONS_RETAIN], all_events[-DELETIONS_RETAIN:]
+    folded = read_deletions_set(root, team)
+    for e in head:
+        t = e.get("target")
+        if t:
+            folded[t] = e          # union by target (monotonic; last delete wins, all are deletes)
+    write_json_atomic(get_deletions_set_file(root, team), folded)   # SET FIRST (atomic)
+    tmp = path.with_name(path.name + ".compact.tmp")               # distinct from set-file's .tmp
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in tail:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)      # THEN trim (atomic; a lockless reader sees old-full or new-tail)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()       # orphan cleanup if os.replace raised (e.g. Windows read race)
+        except OSError:
+            pass
+
+
+def _maybe_compact_deletions(root, team):
+    """Cheap getsize gate → compact. FULLY self-contained: never raises (so neither append path
+    can mislabel a successful event append as failed), best-effort. Call only with the lock held."""
+    try:
+        path = get_deletions_file(root, team)
+        if os.path.getsize(path) > DELETIONS_COMPACT_BYTES:
+            _compact_deletions_locked(root, team)
+    except Exception as e:
+        print(f"[teammate-comms] deletions compaction skipped: {e}", file=sys.stderr, flush=True)
+
+
 def append_deletion(root, team, record, block=True, timeout=5):
     """Append one deletion event to the deletions sub-stream.
 
@@ -1007,6 +1097,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
                 record["id"] = now_timestamp()
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
         except Exception as e:
             print(f"[teammate-comms] deletion append skipped: {e}", file=sys.stderr, flush=True)
         return
@@ -1017,6 +1108,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
             record["id"] = now_timestamp()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
     except CommsError:
         raise CommsError(
             f"Deletion not recorded: deletions.jsonl stayed locked for {timeout}s "

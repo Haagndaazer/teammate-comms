@@ -362,6 +362,38 @@ that is otherwise append-only:
   the event (the recorded "emit event LAST so a partial `rmtree` can't desync" ordering), so a
   raised append would be lost permanently on retry — and they self-heal anyway, since a fresh
   load simply omits the absent group/teammate.
+- **Deletions compaction (v0.7.1, C-2).** `deletions.jsonl` is append-only, so a fresh console
+  load used to replay only its newest `limit` (1000) events — past that window an old tombstone
+  was lost and the message **reappeared**. Fix: events older than the newest `DELETIONS_RETAIN`
+  (1000) are folded into a **target-keyed set-file** `deletions_set.json` (`{target: event}`,
+  deduped — deletions are monotonic, there is no undelete). A fresh load now reads the
+  **complete** deleted-set = that baseline **unioned with the ENTIRE live `jsonl`** (a full read,
+  *not* a bounded tail — see the invariant below); both halves fold idempotently by target.
+  - **Compaction (`_compact_deletions_locked`)** runs inline under the appender's already-held
+    lock (a cheap `getsize` gate on each append; both the blocking and best-effort paths), and is
+    **always best-effort — it never fails a delete** (the event append is the durable op;
+    compaction is pure size relief). Ordering is load-bearing: **write the set-file FIRST**
+    (atomic temp+rename), **THEN trim the jsonl** (atomic temp+rename). A crash/failure in between
+    leaves the jsonl still holding everything *and* the set holding the folded head (idempotent
+    overlap) → a fresh load reads a superset, never a gap; the reverse order could drop tombstones.
+    The mkdir-lock keys off the path *string* (a sibling `.lock` dir); `os.replace` swaps the file
+    inode only, so re-reading + atomically replacing the jsonl under its own lock is deadlock-free.
+  - **Completeness invariant (gate-independent).** The live jsonl holds every not-yet-folded
+    event; the set-file holds every folded (older) target; their union is every deletion ever —
+    *no matter when or whether the size-gate fired*. The byte gate (`DELETIONS_COMPACT_BYTES`)
+    therefore only bounds the live-file **size**, it is **not** a correctness input — which is
+    exactly why the fresh-load read must stay a **full** `read_deletions(limit=None)` and must
+    **never** be "optimized" back to the bounded newest-N tail (that would skip an un-folded middle
+    event sitting between the retained tail and the gate).
+  - **Accepted ECs (self-healing).** (1) A **cursored** client (live console mid-poll) does *not*
+    replay the baseline; one that lags **more than `DELETIONS_RETAIN` deletions between two polls**
+    (e.g. a long-suspended browser tab) skips the compacted-away tombstones until its next **full
+    reload**, which recovers them — same class as the firehose/reaction cursors. (2) A group
+    hard-deleted then **recreated with the same name** has its old `kind:"group"` tombstone (target
+    is the group *name* `#x`, not a unique id) replayed on every fresh load, hiding the new group
+    until its first message re-pushes it — pre-existing, now with a wider replay window. (3) Under
+    sustained `file_lock_optional` contention a group/teammate delete may skip both its append and
+    compaction; the jsonl stays correct (full-file fresh read), just larger.
 - **Intentional, documented behaviors:** dashboard reflection requires the firehose
   (`TEAMMATE_TRANSCRIPT=1`); a tombstoned message's reactions persist in MCP reads
   (inbox/history) though the dashboard hides them; reacting to a deleted message still wakes
@@ -498,9 +530,10 @@ the browser. **Cursor pagination (v0.7.1):** the dashboard poll passes `oldest_f
 the **oldest** window and the poll advances the cursor only to the last *returned* id, so a
 burst larger than the window pages out across polls instead of being sliced off and skipped
 (the cut also swallows any same-id collision group at the boundary, so the cursor can't
-stall). The reactions/deletions sub-streams thread the same `oldest_first` policy. (Separate
-known limit, audit C-2 / WP-7: a fresh deletions load only replays the newest `limit` events,
-so a very old deletion past that window can render undeleted until rotation/compaction lands.)
+stall). The reactions/deletions sub-streams thread the same `oldest_first` policy. (Audit C-2 — a fresh
+deletions load replaying only the newest `limit` events, so a very old deletion rendered
+undeleted — is **fixed in v0.7.1** by deletions compaction: the fresh load unions a target-keyed
+`deletions_set.json` baseline with the full live jsonl. See the deletions-compaction bullet in §8.)
 
 > **Known firehose limit — out-of-order tee (audit N-1, accepted).** A message's `id` is
 > stamped at *send* (before the inbox lock) and is **load-bearing** — it's the inbox-record

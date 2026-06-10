@@ -1764,6 +1764,107 @@ def main():
     except Exception as e:
         failures.append(f"WP-7 P1 seek-tail unit checks errored: {e}")
 
+    # ── WP-7 P2 (C-2) — deletions.jsonl compaction: fold tail-evicted events into a target-keyed
+    #    set-file so a FRESH dashboard load (baseline-set UNION the FULL live jsonl) reflects EVERY
+    #    deletion ever — a tombstone can't reappear once it ages past the jsonl tail. ──
+    try:
+        import http.client as _hc2
+        from urllib.parse import quote as _q2
+
+        from teammate_comms import comms as _cp2
+        from teammate_comms import dashboard as _dash2
+
+        _save_retain, _save_bytes = _cp2.DELETIONS_RETAIN, _cp2.DELETIONS_COMPACT_BYTES
+        try:
+            _cp2.DELETIONS_RETAIN = 3          # keep only the newest 3 events in the live jsonl
+            _cp2.DELETIONS_COMPACT_BYTES = 1   # trip the gate on every append (any line > 1 byte)
+            p2root = tempfile.mkdtemp(prefix="tc-wp7-p2-")
+            # 8 message-deletes; RETAIN=3 → the oldest 5 fold into the set-file, jsonl keeps 3.
+            for i in range(8):
+                _cp2.append_deletion(p2root, None,
+                                     {"target": f"msg-{i}", "kind": "message", "by": "op", "op": "delete"})
+            _djsonl = _cp2.get_deletions_file(p2root, None)
+            _dset = _cp2.read_deletions_set(p2root, None)
+            _live_targets = [e["target"] for e in _cp2.read_deletions(p2root, None, limit=None)]
+            # (a) jsonl trimmed to exactly the newest RETAIN (file order); (b) the rest are folded.
+            if _live_targets != ["msg-5", "msg-6", "msg-7"]:
+                failures.append(f"P2 jsonl not trimmed to newest RETAIN: {_live_targets}")
+            if set(_dset) != {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"}:
+                failures.append(f"P2 set-file missing folded targets: {sorted(_dset)}")
+            # (c) COMPLETENESS / C-2 close: baseline UNION full jsonl = ALL 8 incl the oldest.
+            if (set(_dset) | set(_live_targets)) != {f"msg-{i}" for i in range(8)}:
+                failures.append("P2 fresh-load union is not the complete deleted-set")
+            # (d) idempotent: re-compacting (lock held) loses nothing and dups nothing.
+            with _cp2.file_lock(_djsonl, timeout=10):
+                _cp2._compact_deletions_locked(p2root, None)
+            _live2 = [e["target"] for e in _cp2.read_deletions(p2root, None, limit=None)]
+            if len(_live2) != 3 or (set(_cp2.read_deletions_set(p2root, None)) | set(_live2)) != {f"msg-{i}" for i in range(8)}:
+                failures.append(f"P2 re-compaction not idempotent: live={_live2}")
+            # (e) THE GAP CASE — un-compacted oversized steady state (RETAIN < count, gate OFF):
+            #     the fresh read is FULL-FILE, so the oldest is STILL present (the bug a bounded
+            #     newest-1000 tail read would have reintroduced).
+            _cp2.DELETIONS_COMPACT_BYTES = 10**9        # never trip
+            gaproot = tempfile.mkdtemp(prefix="tc-wp7-p2gap-")
+            for i in range(6):                          # 6 > RETAIN(3) but NO compaction fires
+                _cp2.append_deletion(gaproot, None,
+                                     {"target": f"g-{i}", "kind": "message", "by": "op", "op": "delete"})
+            if _cp2.read_deletions_set(gaproot, None) != {}:
+                failures.append("P2 gap-case: compaction fired with the gate disabled")
+            if {e["target"] for e in _cp2.read_deletions(gaproot, None, limit=None)} != {f"g-{i}" for i in range(6)}:
+                failures.append("P2 gap-case: full-file fresh read dropped the oldest un-folded event")
+            _cp2.DELETIONS_COMPACT_BYTES = 1            # re-arm
+            # (f) block=False (whole-group/teammate delete) never raises, records the event, and
+            #     compaction still runs under the optional lock.
+            bfroot = tempfile.mkdtemp(prefix="tc-wp7-p2bf-")
+            for i in range(8):
+                _cp2.append_deletion(bfroot, None,
+                                     {"target": f"grp-{i}", "kind": "group", "by": "op", "op": "delete"},
+                                     block=False)
+            _bf_union = set(_cp2.read_deletions_set(bfroot, None)) | {
+                e["target"] for e in _cp2.read_deletions(bfroot, None, limit=None)}
+            if _bf_union != {f"grp-{i}" for i in range(8)}:
+                failures.append(f"P2 block=False path lost a deletion: {sorted(_bf_union)}")
+            # (g) corrupt set-file → read_deletions_set coerces to {} (no crash; fresh load still works).
+            with open(_cp2.get_deletions_set_file(bfroot, None), "w", encoding="utf-8") as _f:
+                _f.write("{ this is not json")
+            if _cp2.read_deletions_set(bfroot, None) != {}:
+                failures.append("P2 corrupt set-file did not coerce to {}")
+
+            # (h) _api_poll fresh-vs-cursored over a REAL loopback server (ephemeral port) — pins the
+            #     C-2 close AND the documented cursored-lag self-heal. try/finally shutdown.
+            _dres2 = _dash2.start_dashboard(p2root, None, "Operator", port=0, open_browser=False)
+            _dport2, _dtok2 = _dres2["port"], _dash2._STATE.token
+            try:
+                def _poll(dc):
+                    c = _hc2.HTTPConnection("127.0.0.1", _dport2, timeout=5)
+                    c.putrequest("GET", f"/api/poll?cursor=&rcursor=&dcursor={_q2(dc)}",
+                                 skip_host=True, skip_accept_encoding=True)
+                    c.putheader("Host", "127.0.0.1")
+                    c.putheader("X-Dashboard-Token", _dtok2)
+                    c.endheaders()
+                    r = c.getresponse()
+                    d = json.loads(r.read())
+                    c.close()
+                    return d
+                _pf = _poll("")                                     # FRESH load
+                if {e["target"] for e in _pf.get("deletions", [])} != {f"msg-{i}" for i in range(8)}:
+                    failures.append("P2 _api_poll FRESH load did not return the complete deleted-set")
+                # CAUGHT-UP cursored poll: NO baseline (folded msg-0..4 absent); only live tail ids.
+                _pc = {e["target"] for e in _poll(_pf.get("dcursor", "")).get("deletions", [])}
+                if _pc & {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"} or not _pc <= {"msg-5", "msg-6", "msg-7"}:
+                    failures.append(f"P2 cursored poll leaked the baseline or non-tail ids: {sorted(_pc)}")
+                # LAGGED cursor (older than the jsonl floor): skips the folded-away tombstones
+                # (self-heal contract) — they only come back on a full reload (asserted by _pf).
+                _pl = {e["target"] for e in _poll("0000").get("deletions", [])}
+                if _pl & {"msg-0", "msg-1", "msg-2", "msg-3", "msg-4"}:
+                    failures.append(f"P2 lagged cursored unexpectedly replayed folded tombstones: {sorted(_pl)}")
+            finally:
+                _dash2.shutdown_dashboard()
+        finally:
+            _cp2.DELETIONS_RETAIN, _cp2.DELETIONS_COMPACT_BYTES = _save_retain, _save_bytes
+    except Exception as e:
+        failures.append(f"WP-7 P2 deletions-compaction unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

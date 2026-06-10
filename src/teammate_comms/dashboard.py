@@ -40,6 +40,7 @@ from .comms import (
     is_channel_alive,
     read_agent_record,
     read_deletions,
+    read_deletions_set,
     read_group_meta,
     read_reactions,
     read_transcript,
@@ -251,14 +252,25 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500,
                                    oldest_first=bool(rcursor))
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
-        # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set
-        # and re-renders affected messages/groups — the firehose is append-only and
-        # id-keyed, so an in-place tombstone never re-crosses `cursor`. Replayed from the
-        # start on a fresh load so previously-deleted messages render as deleted (after the
-        # 1000-tail window — see audit C-2, full fix is WP-7).
-        deletions = read_deletions(root, team, since=(dcursor or None), limit=1000,
-                                   oldest_first=bool(dcursor))
-        new_dcursor = deletions[-1]["id"] if deletions else dcursor
+        # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set and
+        # re-renders affected messages/groups — the firehose is append-only and id-keyed, so an
+        # in-place tombstone never re-crosses `cursor`.
+        #   FRESH load (no dcursor): the COMPLETE deleted-set = the compacted baseline (set-file)
+        #   UNIONed with the ENTIRE live jsonl. The full jsonl read (limit=None) is DELIBERATE and
+        #   load-bearing for C-2: the bounded newest-N tail would skip any event sitting between
+        #   the retained tail and the compaction gate (not yet folded into the set) — do NOT
+        #   "optimize" this back to a tail read. The jsonl is bounded near DELETIONS_RETAIN by
+        #   compaction, so this stays cheap; the union folds idempotently (keyed by target).
+        #   CURSORED walk: page oldest-first from the cursor (A-1 burst paging), NO baseline.
+        # EC (self-healing): a cursored client that lags > DELETIONS_RETAIN deletions between
+        # polls skips the compacted-away tombstones until its next full reload — see DESIGN.md.
+        if dcursor:
+            deletions = read_deletions(root, team, since=dcursor, limit=1000, oldest_first=True)
+            new_dcursor = deletions[-1]["id"] if deletions else dcursor
+        else:
+            jsonl = read_deletions(root, team, limit=None)   # entire live file (bounded), oldest→newest
+            deletions = list(read_deletions_set(root, team).values()) + jsonl
+            new_dcursor = jsonl[-1]["id"] if jsonl else dcursor   # cursor tracks the JSONL tail only
         return self._json(200, {"records": records, "cursor": new_cursor,
                                 "reactions": reactions, "rcursor": new_rcursor,
                                 "deletions": deletions, "dcursor": new_dcursor})
