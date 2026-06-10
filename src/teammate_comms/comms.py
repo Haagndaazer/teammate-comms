@@ -774,7 +774,13 @@ def read_jsonl_tail(path, n_records, since=None, chunk_size=8192):
     (dropping a Windows ``\\r`` and surrounding whitespace) — reproducing the line readers'
     semantics, so 'newest N' is N PARSEABLE records (blank/garbage lines skipped), NOT N raw
     lines, and the result is byte-identical to ``read_transcript(...)[-N:]``. With ``since``,
-    keeps only records whose id is ``>= since``. Missing/empty file → []."""
+    keeps only records whose id is ``>= since``. Missing/empty file → [].
+
+    Documented divergence (the ONLY behavioral difference from the full text-mode reader): this
+    reader is MORE TOLERANT of undecodable bytes — it decodes with ``errors='replace'`` and skips
+    unparseable lines, where the full reader would RAISE ``UnicodeDecodeError`` on invalid UTF-8.
+    So the 'byte-identical' claim holds for every well-formed log; only a CORRUPT file diverges,
+    and in the better direction (skip, never raise)."""
     if not (n_records and n_records > 0):
         return []
     try:
