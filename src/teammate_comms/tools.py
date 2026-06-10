@@ -72,6 +72,9 @@ _REACTIONS = REACTION_EMOJI
 # well UNDER the dashboard's 1 MB POST-body cap so an over-long message returns this
 # informative error (→ 400) rather than the opaque 413 the transport cap would give.
 MAX_MESSAGE_CHARS = 64 * 1024
+# Cap on _read.json (acked-message history) entries — trimmed to the most recent N on ack so
+# the append-forever log can't grow without bound (audit C-3).
+_READ_CAP = 1000
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -183,11 +186,13 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "teammate_inbox",
-        "description": "Read your own unread messages (or just the unread count).",
+        "description": "Read your own unread messages (or just the unread count). Optional 'since'/'limit' page a large inbox.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "count_only": {"type": "boolean", "description": "If true, return only the unread count."},
+                "since": {"type": "string", "description": "Only show unread messages with id >= this cursor (page forward through a large inbox)."},
+                "limit": {"type": "integer", "description": "Show only the most recent N unread (after any 'since' filter). ack(\"all\") then clears only what was shown."},
             },
         },
     },
@@ -513,20 +518,38 @@ def _handle_inbox(args, ctx):
     agent, team, root = _require_registered(ctx)
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, agent)
-    messages = read_json_safe(inboxes_dir / f"{agent}_unread.json")
+    all_unread = read_json_safe(inboxes_dir / f"{agent}_unread.json")
 
     if args.get("count_only"):
-        return str(len(messages))
+        return str(len(all_unread))
 
-    # Record the ids shown so a later ack("all") only clears what was actually SEEN
-    # (arrivals after this read are preserved). Count-only reads (above) don't count.
+    # Optional windowing (C-3): 'since' (id >= cursor) then 'limit' (the most recent N). For an
+    # unbounded inbox the agent can page rather than pull everything at once.
+    messages = all_unread
+    since = args.get("since")
+    if isinstance(since, str) and since.strip():
+        s = since.strip()
+        messages = [m for m in messages if m.get("id", "") >= s]
+    limit = args.get("limit")
+    if isinstance(limit, int) and limit > 0 and len(messages) > limit:
+        messages = messages[-limit:]                       # most recent N within the filter
+
+    # Record the ids ACTUALLY SHOWN so a later ack("all") only clears those (arrivals after
+    # this read are preserved). CRITICAL with windowing: set_last_seen reflects the SHOWN
+    # subset only — never the full inbox — or ack("all") would drain unshown messages (silent
+    # loss). Count-only reads (above) don't count as a read.
     ctx["identity"].set_last_seen(m.get("id") for m in messages)
 
     if not messages:
-        return "No unread messages."
+        return ("No unread messages." if not (since or limit)
+                else f"No unread messages match the filter ({len(all_unread)} total unread).")
 
     rx_all = aggregate_reactions(read_reactions(root, team))
-    out = [f"=== {len(messages)} unread message(s) for {agent} ==="]
+    header = f"=== {len(messages)} unread message(s) for {agent}"
+    if len(messages) < len(all_unread):
+        header += f" (showing {len(messages)} of {len(all_unread)}; page with since/limit)"
+    header += " ==="
+    out = [header]
     for msg in messages:
         tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
         grp = msg.get("group")
@@ -589,6 +612,12 @@ def _handle_ack(args, ctx):
             unread = [m for m in unread if m.get("id") != msg_id]
             result = f"Acknowledged message {msg_id} from {to_ack.get('from')}."
 
+        # Cap _read.json growth (C-3): it's an append-forever acked-history log. Keep the most
+        # recent _READ_CAP entries — read receipts (group_read_positions reads the max acked id
+        # per member) only ever care about recent positions, so trimming ancient acked history
+        # is safe. Bounds the file the watcher never reads but ack rewrites each time.
+        if len(read) > _READ_CAP:
+            read = read[-_READ_CAP:]
         write_json_atomic(unread_file, unread)
         write_json_atomic(read_file, read)
     return result

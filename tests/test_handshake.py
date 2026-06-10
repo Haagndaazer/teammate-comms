@@ -1615,6 +1615,53 @@ def main():
     except Exception as e:
         failures.append(f"WP-6 race+scale unit checks errored: {e}")
 
+    # ── WP-7 P4 (C-3) — teammate_inbox since/limit windowing; the SILENT-LOSS guard: ack("all")
+    #    after a LIMITED read clears only what was SHOWN, never unshown messages. ──
+    try:
+        from teammate_comms import comms as _c7
+        from teammate_comms import tools as _t7
+
+        class _Id7:
+            def __init__(self, agent, root):
+                self.agent, self.root, self._seen = agent, root, None
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+            def set_last_seen(self, ids):
+                self._seen = set(ids)
+
+            def get_last_seen(self):
+                return self._seen
+        proot7 = tempfile.mkdtemp(prefix="tc-wp7-p4-")
+        for i in range(5):
+            _t7.send_dm(proot7, None, "alice", "bob", f"m{i}")
+        _ctx7 = {"identity": _Id7("bob", proot7)}
+        _binb = _c7.get_inboxes_dir(proot7, None) / "bob_unread.json"
+        # limited read → most recent 2; header notes it; set_last_seen reflects ONLY those 2.
+        _out = _t7._handle_inbox({"limit": 2}, _ctx7)
+        if "showing 2 of 5" not in _out:
+            failures.append(f"P4: limited inbox didn't note 'showing 2 of 5': {_out[:90]!r}")
+        _seen = _ctx7["identity"].get_last_seen()
+        if _seen is None or len(_seen) != 2:
+            failures.append(f"P4: set_last_seen did not reflect ONLY the 2 shown ids ({_seen})")
+        # ack-all now clears ONLY the 2 shown — the other 3 remain unread (NO silent loss).
+        _t7._handle_ack({"id": "all"}, _ctx7)
+        _rem = _c7.read_json_safe(_binb)
+        if len(_rem) != 3:
+            failures.append(f"P4 SILENT-LOSS: ack('all') after limit=2 left {len(_rem)} unread (want 3)")
+        # since filter: only ids >= the cursor (page forward). The 3 remaining are the oldest 3.
+        _ids = sorted(m["id"] for m in _rem)
+        _sout = _t7._handle_inbox({"since": _ids[-1]}, {"identity": _Id7("bob", proot7)})
+        if "1 unread message(s)" not in _sout:
+            failures.append(f"P4 since filter: expected 1 message at/after the newest remaining: {_sout[:90]!r}")
+        # _read.json cap is module-level (_READ_CAP) and trims on ack — assert the constant is
+        # sane (a heavy 1000-ack test isn't worth the runtime; the trim is a plain slice).
+        if not (isinstance(_t7._READ_CAP, int) and _t7._READ_CAP > 0):
+            failures.append("P4: _READ_CAP is not a positive int")
+    except Exception as e:
+        failures.append(f"WP-7 P4 inbox-windowing unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
