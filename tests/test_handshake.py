@@ -2118,6 +2118,40 @@ def main():
     except Exception as e:
         failures.append(f"WP-8 P1 identity-UX unit checks errored: {e}")
 
+    # ── WP-8 P2 (F-3) — inbox reaction display unified on group-history's NAMES form (the inbox
+    #    used to show bare counts '👍 2'; the wake said someone reacted, the inbox couldn't say who). ──
+    try:
+        from teammate_comms import tools as _t83
+
+        class _IdRx:
+            def __init__(self, agent, root):
+                self.agent, self.root, self._seen = agent, root, None
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+            def set_last_seen(self, ids):
+                self._seen = set(ids)
+
+            def get_last_seen(self):
+                return self._seen
+
+        _g = _t83._REACTIONS
+        # (a) the SHARED helper's exact form: reactor names, ', ' within an emoji, '; ' between emojis.
+        if _t83._reaction_summary({"thumbsup": ["alice", "bob"]}) != f"{_g['thumbsup']} alice, bob":
+            failures.append("F-3: single-emoji names form wrong")
+        if _t83._reaction_summary({"thumbsup": ["alice"], "fire": ["bob"]}) != f"{_g['thumbsup']} alice; {_g['fire']} bob":
+            failures.append("F-3: multi-emoji separator form wrong")
+        # (b) end-to-end: the INBOX now renders reactor NAMES (matching history), not a count.
+        f3root = tempfile.mkdtemp(prefix="tc-wp8-f3-")
+        _res = _t83.send_dm(f3root, None, "alice", "bob", "hello")
+        _t83.react(f3root, None, "carol", _res["id"], "thumbsup")
+        _outx = _t83._handle_inbox({}, {"identity": _IdRx("bob", f3root)})
+        if f"reactions: {_g['thumbsup']} carol" not in _outx:
+            failures.append(f"F-3: inbox did not render reactor NAMES: {_outx!r}")
+    except Exception as e:
+        failures.append(f"WP-8 P2 inbox-reaction-names unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

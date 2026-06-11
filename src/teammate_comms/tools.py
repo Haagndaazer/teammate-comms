@@ -85,8 +85,11 @@ _RESOLVE_TAIL = 500
 
 
 def _reaction_summary(reactions_by_emoji):
-    """Render a {emoji: [reactors]} dict as a compact summary line ('👍 2  🔥 1')."""
-    return "  ".join(f"{_REACTIONS.get(e, e)} {len(who)}" for e, who in reactions_by_emoji.items())
+    """Render a {emoji: [reactors]} dict listing the reactor NAMES per emoji
+    ('👍 alice, bob; 🔥 carol') — the single shared form for the inbox AND group history (F-3:
+    the inbox used to show bare counts '👍 2', so a wake said someone reacted but the inbox
+    couldn't say who). Callers wrap it as '    reactions: <this>'."""
+    return "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in reactions_by_emoji.items())
 
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
@@ -579,7 +582,7 @@ def _handle_inbox(args, ctx):
         out.append(str(msg.get("message", "")))
         rx = rx_all.get(msg.get("id"))
         if rx:
-            out.append("    " + _reaction_summary(rx))
+            out.append(f"    reactions: {_reaction_summary(rx)}")   # names, matching group history (F-3)
     return "\n".join(out)
 
 
@@ -1042,8 +1045,7 @@ def _handle_group(args, ctx):
         out.append(str(msg.get("message", "")))
         rx = rx_all.get(msg.get("id"))
         if rx:
-            reactors = "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in rx.items())
-            out.append(f"    reactions: {reactors}")
+            out.append(f"    reactions: {_reaction_summary(rx)}")   # shared helper (F-3)
     return "\n".join(out)
 
 
