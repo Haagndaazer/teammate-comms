@@ -27,9 +27,13 @@ INSTRUCTIONS = (
     "teammate_ack. Reply with teammate_send. You are a full instance: the channel "
     "wakes you, so no polling loop is needed.\n"
     "\n"
-    "Standing rule: update your teammate-comms status as you work (teammate_update) so "
-    "teammates can see what you're doing, which project you're in, and which areas you "
-    "own — via teammate_list / teammate_profile — without interrupting you."
+    "Standing rules:\n"
+    "- Update your teammate-comms status as you work (teammate_update) so teammates can "
+    "see what you're doing, which project you're in, and which areas you own — via "
+    "teammate_list / teammate_profile — without interrupting you.\n"
+    "- Before starting a task, find out who holds authority over the areas you'll touch "
+    "(teammate_list / teammate_profile); if a teammate owns one, coordinate with them via "
+    "teammate_send before you modify it — never overlap another agent's authority unannounced."
 )
 
 # Header so the re-injected (post-compact) block is self-explaining when it sits next to

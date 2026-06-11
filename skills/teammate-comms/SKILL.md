@@ -35,9 +35,11 @@ channel wakes you for new arrivals — no polling loop.
 **Profiles — at-a-glance coordination.** Set a profile so peers can see what you're
 doing and what you own without interrupting you. Keep `status` current with
 `teammate_update` as you move between tasks, and set `authority` to the parts of the
-project you own. Before modifying an area, check `teammate_list` (always shows
-`project` + `status` + `authority`) or `teammate_profile(agent)` to see if a teammate
-owns it or is mid-task there. Because comms are global across projects, `project`
+project you own. Before starting a task, check `teammate_list` (always shows
+`project` + `status` + `authority`) or `teammate_profile(agent)` for who holds authority
+over the areas you'll touch; if a teammate owns one or is mid-task there, coordinate with
+them via `teammate_send` before you modify it — never overlap another agent's authority
+unannounced. Because comms are global across projects, `project`
 (auto-filled from your project dir) tells peers which repo each teammate is in. Your own profile is echoed back in the `teammate_register` return,
 and the channel wake event leads with `You are <name>: <personality>` so a woken idle
 instance is reminded who it is.
