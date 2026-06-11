@@ -2304,8 +2304,13 @@ def main():
             def snapshot(self):
                 return (self.agent, None, self.root, None)
 
+        import socket as _sockD
         droot = tempfile.mkdtemp(prefix="tc-wp8-g5-")
+        # Heartbeat-only CONTRACT pin (G-5 CR): a FRESH heartbeat + a DEAD pid on THIS host. The
+        # doctor must report alive=True (heartbeat-only, pid_check=False) — a regression to the
+        # default pid_check=True would both flip this to False AND spawn a `tasklist` storm.
         _cD.write_agent_record(droot, None, "doc", type="full", channel=True,
+                               host=_sockD.gethostname(), pid=999999,
                                lastHeartbeat=_cD.now_timestamp(), spawned_by="boss")
         _tD.send_dm(droot, None, "x", "doc", "hi")          # creates doc's unread inbox (1)
         _dctx = {"identity": _IdD("doc", droot)}

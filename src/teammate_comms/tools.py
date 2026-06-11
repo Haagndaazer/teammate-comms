@@ -718,7 +718,11 @@ def _doctor_report(root, team):
             if isinstance(r, dict):
                 agents[r.get("name", f.stem)] = {
                     "type": r.get("type"),
-                    "alive": bool(is_channel_alive(r)) if r.get("type") == "full" else None,
+                    # pid_check=False is LOAD-BEARING: the doctor walks EVERY agent, and a
+                    # per-agent pid probe spawns N `tasklist` subprocesses (~5s each on a stale
+                    # same-host record) — the exact storm teammate_list's heartbeat-only liveness
+                    # avoids (c362e41c838f), and this tool is reached for WHEN comms feel slow.
+                    "alive": bool(is_channel_alive(r, pid_check=False)) if r.get("type") == "full" else None,
                     "lastHeartbeat": r.get("lastHeartbeat"),
                 }
     except OSError:
