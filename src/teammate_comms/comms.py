@@ -398,6 +398,15 @@ def _claim_if_dead(lock_dir):
         if rehost != socket.gethostname() or _pid_alive(repid) is not False:
             return False                      # re-acquired (alive) / undetermined / foreign → don't steal
         shutil.rmtree(lock_dir, ignore_errors=True)
+        # True means: claim won + removal ATTEMPTED — NOT "verified gone". The exclusive re-mkdir in
+        # file_lock is the actual arbiter, and a lingered rmtree (a concurrent reader's open handle on
+        # Windows) is DELIBERATELY routed through file_lock's FileExistsError-retry branch, which
+        # resets the clock and recovers. DO NOT "harden" this into a verify-removal
+        # (`if lock_dir.exists(): return False`) without first reading file_lock's raise-on-False
+        # branch: a False there RAISES (no retry), so verify-removal would convert that recoverable
+        # transient into a surfaced CommsError — removing the working recovery this honest-looking
+        # `return True` actually relies on. (The rule-20 "True should bind its reason" itch lives
+        # here as this plaque, not as code: the reason is "attempted under the claim", by design.)
         return True
     finally:
         try:
