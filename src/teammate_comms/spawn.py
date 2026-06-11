@@ -104,13 +104,14 @@ def build_claude_command(prompt, extra_args=None, settings_paths=None):
     return argv
 
 
-def build_child_env(base, agent, project_dir, team=None, comms_dir=None):
+def build_child_env(base, agent, project_dir, team=None, comms_dir=None, spawned_by=None):
     """Build the child env dict for the spawned instance.
 
     Sets ``TEAMMATE_AGENT`` (→ auto-register as that name) and ``CLAUDE_PROJECT_DIR``
     (→ fills the ``project`` field; the server reads the env var, not cwd). Optionally
-    ``TEAMMATE_TEAM`` / ``TEAMMATE_COMMS_DIR``. Raises ``CommsError`` if the two handoff
-    vars aren't set (a real raise, not an ``assert`` — asserts are a no-op under ``-O``).
+    ``TEAMMATE_TEAM`` / ``TEAMMATE_COMMS_DIR``. ``spawned_by`` stamps the provenance breadcrumb
+    (F-5). Raises ``CommsError`` if the two handoff vars aren't set (a real raise, not an
+    ``assert`` — asserts are a no-op under ``-O``).
     """
     env = dict(base)
     env["TEAMMATE_AGENT"] = agent
@@ -119,6 +120,14 @@ def build_child_env(base, agent, project_dir, team=None, comms_dir=None):
         env["TEAMMATE_TEAM"] = team
     if comms_dir:
         env["TEAMMATE_COMMS_DIR"] = str(comms_dir)
+    # Provenance breadcrumb (F-5): stamp WHO spawned this child so its register record knows its
+    # origin. SET (or POP) UNCONDITIONALLY so a stale value can NEVER be inherited from the
+    # parent's own env — a grand-child carries its IMMEDIATE parent, never the grandparent. Same
+    # never-inherit discipline as the reincarnate gate stripped just below (the F-1 lesson).
+    if spawned_by:
+        env["TEAMMATE_SPAWNED_BY"] = spawned_by
+    else:
+        env.pop("TEAMMATE_SPAWNED_BY", None)
     # Strip the reincarnate GATE so a spawned child can't itself re-spawn unless its operator
     # explicitly opts back in (the reincarnate gate is opt-in-default-off by design, F-1). This
     # is the gate ONLY — TEAMMATE_LAUNCH_ARGS is a launch override the child SHOULD inherit so

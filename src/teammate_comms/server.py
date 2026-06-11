@@ -111,6 +111,19 @@ def respond_error(msg_id, code, message):
     send_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
 
 
+def _project_label(proj_dir):
+    """Two-component ``parent/name`` label for ``CLAUDE_PROJECT_DIR`` so two repos that share a
+    basename (e.g. two ``api`` checkouts) are distinguishable in ``teammate_list`` (F-4). Falls
+    back to the bare name when there is no usable parent (a drive root, a UNC share root) rather
+    than emit a leading-slash value. PRE-TRUNCATED to the ``project`` field cap so a deep path can
+    never raise out of ``validate_profile_field`` and BREAK registration — an auto-fill convenience
+    must not be a registration footgun."""
+    p = Path(proj_dir)
+    name, parent = p.name, p.parent.name
+    label = f"{parent}/{name}" if (parent and name) else (name or proj_dir)
+    return label[:PROFILE_FIELDS["project"]]
+
+
 def register_identity(agent, team, comms_dir, profile=None):
     """Establish identity + start watching. Raises CommsError on bad input.
 
@@ -127,8 +140,20 @@ def register_identity(agent, team, comms_dir, profile=None):
     if "project" not in profile:
         proj_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if not _looks_unset(proj_dir):
-            profile["project"] = Path(proj_dir.strip()).name
+            profile["project"] = _project_label(proj_dir.strip())
     profile_fields = {k: validate_profile_field(k, v) for k, v in profile.items()}
+    # Provenance (F-5): a reincarnated child records WHO spawned it. `build_child_env` sets
+    # TEAMMATE_SPAWNED_BY unconditionally (never inherited), so a present value is trustworthy.
+    # This is a registry-RECORD field (NOT a profile field — it's provenance, not self-description);
+    # write_agent_record's field-level merge preserves it across heartbeats, like `type`. Validated
+    # as an agent name; a malformed value is dropped rather than allowed to break registration.
+    spawned_by = os.environ.get("TEAMMATE_SPAWNED_BY")
+    spawned_by = None if _looks_unset(spawned_by) else spawned_by.strip()
+    if spawned_by:
+        try:
+            validate_agent_name(spawned_by)
+        except CommsError:
+            spawned_by = None
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
 
@@ -156,6 +181,7 @@ def register_identity(agent, team, comms_dir, profile=None):
         type="full", channel=True, pid=os.getpid(), host=hostname,
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
         **profile_fields,
+        **({"spawned_by": spawned_by} if spawned_by else {}),
     )
 
     _identity.set(agent, team, root, unread_file)

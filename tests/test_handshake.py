@@ -62,7 +62,7 @@ PERSONALITY = "methodical and dry"
 STATUS_INIT = "booting up"
 STATUS_NEW = "running checks"
 AUTHORITY = "tests/**"
-PROJECT = "MyTestProject"  # basename auto-filled from CLAUDE_PROJECT_DIR
+PROJECT = "MyTestProject"  # auto-filled from CLAUDE_PROJECT_DIR (F-4: as two-component parent/name)
 GROUP = "brainstorm"
 GROUP_SIGIL = "#brainstorm"
 HUMAN = "Operator"  # the human operator registered by teammate_dashboard
@@ -97,6 +97,21 @@ def find_response(rid, timeout=4.0):
                 return ((m.get("result") or {}).get("content") or [{}])[0].get("text", "")
         time.sleep(0.1)
     return ""
+
+
+def wait_until(predicate, timeout=12.0, interval=0.1):
+    """Poll until ``predicate()`` is truthy or ``timeout`` elapses; return its last value (G-3).
+
+    Deadline-polling beats a fixed ``time.sleep`` against the real 5s heartbeat: robust on slow CI
+    (it waits longer when needed) and quicker on fast machines (returns as soon as the signal
+    lands). On timeout it returns the falsy value and the caller proceeds, so a genuinely missing
+    signal still surfaces as the downstream assertion's failure (never a hang)."""
+    deadline = time.time() + timeout
+    val = predicate()
+    while not val and time.time() < deadline:
+        time.sleep(interval)
+        val = predicate()
+    return val
 
 
 def inboxes_dir(root):
@@ -368,9 +383,21 @@ def main():
     append_external_reaction(root, "someones-msg", PEER, "Nancy", "smile", "add")     # not my msg
     append_external_reaction(root, decision_id or "x", AGENT, PEER, "thumbsup", "remove")  # remove
 
-    # Heartbeat cycle (5s): refreshes the watcher's muted cache, processes reaction wakes,
-    # AND confirms type:"full" + a profile field survive the registry merge.
-    time.sleep(5.5)
+    # Heartbeat cycle (5s): processes reaction wakes + confirms type:"full" + a profile field
+    # survive the registry merge. G-3: deadline-poll on the reaction-wake SIGNAL instead of a fixed
+    # 5.5s sleep — the tick that emits the wake is the tick that does the merge, so the wake's
+    # arrival proves both ran; the atomic record write means a post-wake read can't see a torn merge.
+    def _reaction_wake_seen():
+        for _l in list(stdout_lines):
+            try:
+                _m = json.loads(_l)
+            except (ValueError, TypeError):
+                continue
+            if (_m.get("method") == "notifications/claude/channel"
+                    and (_m.get("params") or {}).get("meta", {}).get("kind") == "reaction"):
+                return True
+        return False
+    wait_until(_reaction_wake_seen, timeout=12.0)   # > 2 heartbeats so a slow first tick still lands
     type_after_heartbeat = None
     status_after_heartbeat = None
     if record.exists():
@@ -386,6 +413,10 @@ def main():
                 "params": {"name": "teammate_inbox", "arguments": {}}})   # both present (mute keeps them)
     send(proc, {"jsonrpc": "2.0", "id": 44, "method": "tools/call",
                 "params": {"name": "teammate_group", "arguments": {"action": "unmute", "group": GROUP_SIGIL}}})
+    # Kept as a fixed heartbeat-length sleep (NOT deadline-polled, unlike the reaction wait above):
+    # this waits for the watcher to REFRESH its in-memory muted cache from the record — an INTERNAL
+    # state change with no observable pre-signal (the only proof is the post-unmute wake that
+    # follows, which we can't poll for before it exists). Forcing a poll here would be guesswork.
     time.sleep(5.5)   # heartbeat clears the muted cache
     append_external_message(root, AGENT, PEER, "after-unmute-grp", group=GROUP_SIGIL)  # wakes (count 1, names group)
     time.sleep(1.3)
@@ -417,6 +448,11 @@ def main():
             msgs.append(json.loads(l))
         except (json.JSONDecodeError, ValueError):
             bad_stdout.append(l)
+    # Responses are matched by request id, so the SEND order and the gaps in the id space don't
+    # matter: ids are allocated per logical step, NOT strictly monotonically — some are reserved
+    # for a later cluster (e.g. the group/mute/unmute steps send 43/44/46 then the gated-reincarnate
+    # probe reuses 52) and a few group-history reads (35/36/45) resolve out of numeric order. by_id
+    # makes lookup order-independent; the gaps are intentional, not missing requests.
     by_id = {m.get("id"): m for m in msgs if "id" in m}
     notifications = [m for m in msgs if m.get("method") == "notifications/claude/channel"]
     # MESSAGE wakes only — v0.6.1 reaction wakes carry meta.kind=="reaction" and must NOT
@@ -482,9 +518,10 @@ def main():
     # whoami echoes the profile set at registration
     if STATUS_INIT not in text(6) or ROLE not in text(6):
         failures.append(f"whoami missing profile fields: {text(6)}")
-    # project was auto-filled from CLAUDE_PROJECT_DIR's basename (not passed explicitly)
-    if PROJECT not in text(6):
-        failures.append(f"whoami missing auto-filled project {PROJECT!r}: {text(6)}")
+    # project auto-filled as TWO-COMPONENT parent/name from CLAUDE_PROJECT_DIR (F-4):
+    # "C:/some/path/MyTestProject" -> "path/MyTestProject" (not the bare basename), not passed explicitly
+    if "path/" + PROJECT not in text(6):
+        failures.append(f"whoami project not two-component 'path/{PROJECT}' (F-4): {text(6)}")
 
     # send to peer wrote peer's inbox
     if is_error(7):
@@ -620,9 +657,8 @@ def main():
         failures.append(f"profile status did not survive heartbeat (got {status_after_heartbeat!r})")
 
     # ── dashboard + human-as-teammate + durable observability transcript ──
-    # stdout stayed pure JSON-RPC even after the HTTP server launched (no stray prints)
-    if bad_stdout:
-        failures.append(f"non-JSON-RPC line(s) on stdout (stdout-purity): {bad_stdout[:3]}")
+    # (stdout-purity is reported FIRST in the report section below — a break there cascades into
+    #  many false downstream by_id-miss failures, so it's surfaced as the probable ROOT CAUSE.)
     # teammate_dashboard launched and returned a localhost URL
     if is_error(31) or "http://127.0.0.1:" not in text(31) or "Dashboard" not in text(31):
         failures.append(f"teammate_dashboard did not return a localhost URL: {text(31)}")
@@ -2040,6 +2076,264 @@ def main():
     except Exception as e:
         failures.append(f"WP-7 P3 byte-cursor unit checks errored: {e}")
 
+    # ── WP-8 P1 (F-2/F-4/F-5) — identity/registration UX: unregistered-recipient warnings (warn,
+    #    never error — open membership is intentional); two-component parent/name project; reincarnate
+    #    spawned_by provenance (set unconditionally, never inherited; survives the heartbeat merge). ──
+    try:
+        from teammate_comms import comms as _c8
+        from teammate_comms import server as _s8
+        from teammate_comms import spawn as _sp8
+        from teammate_comms import tools as _t8
+
+        class _Id8:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+        # ---- F-2: unregistered DM recipient → DELIVERED (open membership) + a queued/typo NOTE,
+        #      NOT an error. A registered recipient gets the channel-status branch, no F-2 note.
+        f2root = tempfile.mkdtemp(prefix="tc-wp8-f2-")
+        _ctx8 = {"identity": _Id8("alice", f2root)}
+        _o1 = _t8._handle_send({"to": "ghost", "message": "hi"}, _ctx8)
+        if "no agent record" not in _o1:
+            failures.append(f"F-2: DM to an unregistered name missing the queued NOTE: {_o1!r}")
+        _gi = _c8.read_json_safe(_c8.get_inboxes_dir(f2root, None) / "ghost_unread.json")
+        if not any(m.get("message") == "hi" for m in _gi):      # delivery preserved (open membership)
+            failures.append("F-2: a message to an unregistered name was NOT delivered (should queue)")
+        _c8.write_agent_record(f2root, None, "realbob", type="full", channel=False)
+        if "no agent record" in _t8._handle_send({"to": "realbob", "message": "yo"}, _ctx8):
+            failures.append("F-2: a REGISTERED recipient wrongly got the unregistered NOTE")
+        _o3 = _t8._handle_group({"action": "create", "group": "g8", "members": ["ghost2"]}, _ctx8)
+        if "no agent record" not in _o3 or "Created group" not in _o3:
+            failures.append(f"F-2: group-create unregistered-member NOTE/creation wrong: {_o3!r}")
+
+        # ---- F-4: two-component parent/name; bare-name fallback when there's no parent; deep-path
+        #      truncate-BEFORE-validate so a long path can't raise out of validate and break register.
+        if _s8._project_label("/home/me/api") != "me/api":
+            failures.append(f"F-4: two-component label wrong: {_s8._project_label('/home/me/api')!r}")
+        if _s8._project_label("solo") != "solo":                # no usable parent → bare name, no leading '/'
+            failures.append(f"F-4: bare-name fallback wrong: {_s8._project_label('solo')!r}")
+        _lab = _s8._project_label("/" + "x" * 200 + "/proj")    # parent 200 chars → must truncate
+        if len(_lab) > _c8.PROFILE_FIELDS["project"]:
+            failures.append(f"F-4: deep-path label exceeds the project cap ({len(_lab)})")
+        _c8.validate_profile_field("project", _lab)             # must NOT raise (truncate-before-validate)
+
+        # ---- F-5: spawned_by — set UNCONDITIONALLY in build_child_env, NEVER inherited; stored on
+        #      the register record; SURVIVES a heartbeat merge.
+        if _sp8.build_child_env({}, "child", "/p", spawned_by="parent").get("TEAMMATE_SPAWNED_BY") != "parent":
+            failures.append("F-5: build_child_env did not set TEAMMATE_SPAWNED_BY")
+        _gc = _sp8.build_child_env({"TEAMMATE_SPAWNED_BY": "grandparent"}, "gc", "/p", spawned_by="parent2")
+        if _gc.get("TEAMMATE_SPAWNED_BY") != "parent2":         # grand-child carries its IMMEDIATE parent
+            failures.append(f"F-5: grand-child inherited a stale spawned_by: {_gc.get('TEAMMATE_SPAWNED_BY')!r}")
+        if "TEAMMATE_SPAWNED_BY" in _sp8.build_child_env({"TEAMMATE_SPAWNED_BY": "stale"}, "c", "/p"):
+            failures.append("F-5: a stale spawned_by was inherited when none was passed (never-inherit)")
+        f5root = tempfile.mkdtemp(prefix="tc-wp8-f5-")
+        _pre_id, _pre_reg = _s8._identity.snapshot(), _s8._registered.is_set()
+        _pre_sb = os.environ.get("TEAMMATE_SPAWNED_BY")
+        try:
+            os.environ["TEAMMATE_SPAWNED_BY"] = "lead"
+            _s8.register_identity("childagent", None, f5root)
+            _root5, _ = _c8.resolve_comms_root(f5root)
+            _rec = _c8.read_agent_record(_root5, None, "childagent")
+            if not _rec or _rec.get("spawned_by") != "lead":
+                failures.append(f"F-5: spawned_by not stored on the register record: {_rec}")
+            # heartbeat-style write (channel/lastHeartbeat only) must PRESERVE spawned_by (field merge)
+            _c8.write_agent_record(_root5, None, "childagent", channel=True, lastHeartbeat=_c8.now_timestamp())
+            if _c8.read_agent_record(_root5, None, "childagent").get("spawned_by") != "lead":
+                failures.append("F-5: spawned_by did NOT survive a heartbeat merge")
+        finally:
+            if _pre_sb is None:
+                os.environ.pop("TEAMMATE_SPAWNED_BY", None)
+            else:
+                os.environ["TEAMMATE_SPAWNED_BY"] = _pre_sb
+            _s8._identity.set(*_pre_id)                          # restore global identity
+            _s8._registered.set() if _pre_reg else _s8._registered.clear()
+    except Exception as e:
+        failures.append(f"WP-8 P1 identity-UX unit checks errored: {e}")
+
+    # ── WP-8 P2 (F-3) — inbox reaction display unified on group-history's NAMES form (the inbox
+    #    used to show bare counts '👍 2'; the wake said someone reacted, the inbox couldn't say who). ──
+    try:
+        from teammate_comms import tools as _t83
+
+        class _IdRx:
+            def __init__(self, agent, root):
+                self.agent, self.root, self._seen = agent, root, None
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+            def set_last_seen(self, ids):
+                self._seen = set(ids)
+
+            def get_last_seen(self):
+                return self._seen
+
+        _g = _t83._REACTIONS
+        # (a) the SHARED helper's exact form: reactor names, ', ' within an emoji, '; ' between emojis.
+        if _t83._reaction_summary({"thumbsup": ["alice", "bob"]}) != f"{_g['thumbsup']} alice, bob":
+            failures.append("F-3: single-emoji names form wrong")
+        if _t83._reaction_summary({"thumbsup": ["alice"], "fire": ["bob"]}) != f"{_g['thumbsup']} alice; {_g['fire']} bob":
+            failures.append("F-3: multi-emoji separator form wrong")
+        # (b) end-to-end: the INBOX now renders reactor NAMES (matching history), not a count.
+        f3root = tempfile.mkdtemp(prefix="tc-wp8-f3-")
+        _res = _t83.send_dm(f3root, None, "alice", "bob", "hello")
+        _t83.react(f3root, None, "carol", _res["id"], "thumbsup")
+        _outx = _t83._handle_inbox({}, {"identity": _IdRx("bob", f3root)})
+        if f"reactions: {_g['thumbsup']} carol" not in _outx:
+            failures.append(f"F-3: inbox did not render reactor NAMES: {_outx!r}")
+    except Exception as e:
+        failures.append(f"WP-8 P2 inbox-reaction-names unit checks errored: {e}")
+
+    # ── WP-8 P3 (G-2/G-6) — coverage for branches that have bitten this codebase's failure classes:
+    #    resolve_comms_root fallbacks, _maybe_auto_register (the TEAMMATE_AGENT path the main scenario
+    #    pops), read_json_safe corrupt-reset, group join/leave/members, the spawn launcher SEAM (mocked
+    #    Popen, no real spawn), and the dashboard static asset is actually packaged (G-6). ──
+    try:
+        from teammate_comms import comms as _c9
+        from teammate_comms import server as _s9
+        from teammate_comms import spawn as _sp9
+        from teammate_comms import tools as _t9
+
+        class _Id9:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+        # ---- G-2: resolve_comms_root — all four ordered branches (explicit > env > config > default).
+        _se = {k: os.environ.get(k) for k in ("TEAMMATE_COMMS_DIR", "CLAUDE_CONFIG_DIR")}
+        try:
+            if _c9.resolve_comms_root("/explicit")[1] != "comms_dir arg":
+                failures.append("G-2 resolve_comms_root: explicit comms_dir branch wrong")
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            os.environ["TEAMMATE_COMMS_DIR"] = "/env-comms"
+            if _c9.resolve_comms_root(None)[1] != "TEAMMATE_COMMS_DIR":
+                failures.append("G-2 resolve_comms_root: TEAMMATE_COMMS_DIR branch wrong")
+            os.environ.pop("TEAMMATE_COMMS_DIR", None)
+            os.environ["CLAUDE_CONFIG_DIR"] = "/cfg"
+            if _c9.resolve_comms_root(None)[1] != "CLAUDE_CONFIG_DIR":
+                failures.append("G-2 resolve_comms_root: CLAUDE_CONFIG_DIR branch wrong")
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if _c9.resolve_comms_root(None)[1] != "~/.claude default":
+                failures.append("G-2 resolve_comms_root: default branch wrong")
+        finally:
+            for _k, _v in _se.items():
+                os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
+
+        # ---- G-2: _maybe_auto_register (the TEAMMATE_AGENT env path) — exercised WITH F-4 (project)
+        #      and F-5 (spawned_by), which all flow through register, so the record proves all three.
+        ar_root = tempfile.mkdtemp(prefix="tc-wp8-ar-")
+        _pre_id9, _pre_reg9 = _s9._identity.snapshot(), _s9._registered.is_set()
+        _pre_e9 = {k: os.environ.get(k) for k in
+                   ("TEAMMATE_AGENT", "TEAMMATE_COMMS_DIR", "CLAUDE_PROJECT_DIR", "TEAMMATE_SPAWNED_BY")}
+        try:
+            os.environ.update({"TEAMMATE_AGENT": "autobot", "TEAMMATE_COMMS_DIR": ar_root,
+                               "CLAUDE_PROJECT_DIR": "/work/myrepo", "TEAMMATE_SPAWNED_BY": "boss"})
+            _s9._maybe_auto_register()
+            _r9, _ = _c9.resolve_comms_root(ar_root)
+            _arec = _c9.read_agent_record(_r9, None, "autobot")
+            if not _arec or _arec.get("type") != "full":
+                failures.append(f"G-2 _maybe_auto_register: no full record written: {_arec}")
+            elif _arec.get("project") != "work/myrepo" or _arec.get("spawned_by") != "boss":
+                failures.append(f"G-2 auto-register did not flow F-4/F-5 through: {_arec}")
+        finally:
+            for _k, _v in _pre_e9.items():
+                os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
+            _s9._identity.set(*_pre_id9)
+            _s9._registered.set() if _pre_reg9 else _s9._registered.clear()
+
+        # ---- G-2: read_json_safe resets a CORRUPT file to [] on disk (and returns []).
+        _cf = Path(tempfile.mkdtemp(prefix="tc-wp8-rjs-")) / "corrupt.json"
+        _cf.write_text("{ this is not json", encoding="utf-8")
+        if _c9.read_json_safe(_cf) != [] or json.loads(_cf.read_text(encoding="utf-8")) != []:
+            failures.append("G-2 read_json_safe did not reset a corrupt file to []")
+
+        # ---- G-2: group join / members / leave as MCP-dispatched actions (only create+add were tested).
+        groot = tempfile.mkdtemp(prefix="tc-wp8-grp-")
+        _ag, _bg = {"identity": _Id9("alice", groot)}, {"identity": _Id9("bob", groot)}
+        _t9._handle_group({"action": "create", "group": "team"}, _ag)
+        if "bob" not in _t9._handle_group({"action": "join", "group": "team"}, _bg):
+            failures.append("G-2 group join: bob not in members after join")
+        _mem = _t9._handle_group({"action": "members", "group": "team"}, _ag)
+        if "alice" not in _mem or "bob" not in _mem:
+            failures.append(f"G-2 group members: missing alice/bob: {_mem!r}")
+        _t9._handle_group({"action": "leave", "group": "team"}, _bg)
+        if "bob" in _t9._handle_group({"action": "members", "group": "team"}, _ag):
+            failures.append("G-2 group leave: bob still a member after leave")
+
+        # ---- G-2: spawn launcher SEAM — mock subprocess.Popen so the launcher resolution + argv
+        #      construction run WITHOUT actually spawning a terminal (the only hermetic way to cover
+        #      spawn_in_terminal; the real detached launch stays out of scope, stated in the diff).
+        _real_popen = _sp9.subprocess.Popen
+        _popen_calls = []
+        try:
+            class _FakePopen:
+                def __init__(self, *a, **k):
+                    _popen_calls.append((a, k))
+            _sp9.subprocess.Popen = _FakePopen
+            _argv = ["claude", "-p", "hi"]
+            _launched = _sp9.spawn_in_terminal(_argv, "/tmp", {"X": "1"})
+            if not (_popen_calls and _launched and all(a in _launched for a in _argv)):
+                failures.append(f"G-2 spawn_in_terminal seam: argv not execd by the launcher: {_launched}")
+        finally:
+            _sp9.subprocess.Popen = _real_popen
+
+        # ---- G-6: the dashboard static asset must be PACKAGED (the triple-fallback can otherwise
+        #      serve a placeholder on a packaging mistake — assert via the packaged-resource API).
+        from importlib.resources import files as _ir_files
+        _idx = _ir_files("teammate_comms") / "static" / "index.html"
+        if not (_idx.is_file() and len(_idx.read_text(encoding="utf-8")) > 500):
+            failures.append("G-6: teammate_comms/static/index.html is not packaged (or is a stub)")
+    except Exception as e:
+        failures.append(f"WP-8 P3 coverage/packaging unit checks errored: {e}")
+
+    # ── WP-8 P5 (G-5) — teammate_whoami(verbose=True) doctor section: read-only diagnostics
+    #    (heartbeat freshness — NOT a pid probe; file sizes; unread counts; lock dirs) + spawned_by. ──
+    try:
+        from teammate_comms import comms as _cD
+        from teammate_comms import tools as _tD
+
+        class _IdD:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+        import socket as _sockD
+        droot = tempfile.mkdtemp(prefix="tc-wp8-g5-")
+        # Heartbeat-only CONTRACT pin (G-5 CR): a FRESH heartbeat + a DEAD pid on THIS host. The
+        # doctor must report alive=True (heartbeat-only, pid_check=False) — a regression to the
+        # default pid_check=True would both flip this to False AND spawn a `tasklist` storm.
+        _cD.write_agent_record(droot, None, "doc", type="full", channel=True,
+                               host=_sockD.gethostname(), pid=999999,
+                               lastHeartbeat=_cD.now_timestamp(), spawned_by="boss")
+        _tD.send_dm(droot, None, "x", "doc", "hi")          # creates doc's unread inbox (1)
+        _dctx = {"identity": _IdD("doc", droot)}
+        # plain whoami: NO doctor section, but the F-5 spawned_by breadcrumb IS surfaced.
+        _plain = json.loads(_tD._handle_whoami({}, _dctx))
+        if "doctor" in _plain:
+            failures.append("G-5: plain whoami wrongly included a doctor section")
+        if _plain.get("spawned_by") != "boss":
+            failures.append(f"G-5: whoami did not surface spawned_by: {_plain.get('spawned_by')}")
+        # verbose: a doctor section with the read-only diagnostics keys + correct heartbeat/unread.
+        _doc = json.loads(_tD._handle_whoami({"verbose": True}, _dctx)).get("doctor")
+        if not isinstance(_doc, dict) or not all(k in _doc for k in
+                                                 ("comms_root", "agents", "files", "unread_counts", "lock_dirs")):
+            failures.append(f"G-5: doctor section missing keys: {_doc}")
+        elif _doc["agents"].get("doc", {}).get("alive") is not True or _doc["unread_counts"].get("doc") != 1:
+            failures.append(f"G-5: doctor heartbeat/unread wrong: {_doc.get('agents')} / {_doc.get('unread_counts')}")
+        # unregistered + verbose → a doctor note, no crash.
+        _un = json.loads(_tD._handle_whoami({"verbose": True}, {"identity": _IdD(None, None)}))
+        if _un.get("registered") is not False or "doctor" not in _un:
+            failures.append(f"G-5: unregistered verbose whoami wrong: {_un}")
+    except Exception as e:
+        failures.append(f"WP-8 P5 doctor unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
@@ -2050,6 +2344,13 @@ def main():
         failures.append(f"version drift: pkg={pkg} plugin={plug} pyproject={pyp}")
 
     # ── report ──
+    # G-3: a stdout-purity break makes `by_id` lose entries, cascading into many false downstream
+    # failures (result()/text() return {}/"" for the missing ids). Surface it FIRST as the probable
+    # ROOT CAUSE — do NOT early-exit (every failure stays visible), just re-order so the run isn't
+    # misdiagnosed by an arbitrary cascade symptom.
+    if bad_stdout:
+        failures.insert(0, f"ROOT CAUSE — non-JSON-RPC line(s) on stdout (stdout-purity broke; the "
+                           f"failures below are likely cascades of this): {bad_stdout[:3]}")
     print("=== STDOUT messages ===")
     for m in msgs:
         print(" ", json.dumps(m)[:200])

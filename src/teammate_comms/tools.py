@@ -85,8 +85,11 @@ _RESOLVE_TAIL = 500
 
 
 def _reaction_summary(reactions_by_emoji):
-    """Render a {emoji: [reactors]} dict as a compact summary line ('👍 2  🔥 1')."""
-    return "  ".join(f"{_REACTIONS.get(e, e)} {len(who)}" for e, who in reactions_by_emoji.items())
+    """Render a {emoji: [reactors]} dict listing the reactor NAMES per emoji
+    ('👍 alice, bob; 🔥 carol') — the single shared form for the inbox AND group history (F-3:
+    the inbox used to show bare counts '👍 2', so a wake said someone reacted but the inbox
+    couldn't say who). Callers wrap it as '    reactions: <this>'."""
+    return "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in reactions_by_emoji.items())
 
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
@@ -225,7 +228,16 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_whoami",
         "description": "Report this instance's registration state, identity, comms dir, and your own profile.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {"type": "object", "properties": {
+            "verbose": {
+                "type": "boolean",
+                "description": (
+                    "Also include a read-only `doctor` diagnostics section: comms root, each "
+                    "agent's heartbeat freshness/liveness, sub-stream file sizes, unread counts, "
+                    "and any leftover lock directories. Useful when comms seem stuck."
+                ),
+            },
+        }},
     },
     {
         "name": "teammate_update",
@@ -515,8 +527,10 @@ def _handle_send(args, ctx):
         lines.append(f"{to} is the human operator — they'll see this in their dashboard.")
     else:
         lines.append(
-            f"{to} has no live channel. If they are a spawned subagent, their lead "
-            f"must SendMessage-nudge them to check their inbox."
+            f"NOTE: no teammate named {to!r} is registered (no agent record). The message is "
+            f"queued in their inbox and will be delivered if/when they register under that exact "
+            f"name — a typo'd recipient queues silently. If {to} is a spawned subagent, their "
+            f"lead must SendMessage-nudge them to read it."
         )
     return "\n".join(lines)
 
@@ -577,7 +591,7 @@ def _handle_inbox(args, ctx):
         out.append(str(msg.get("message", "")))
         rx = rx_all.get(msg.get("id"))
         if rx:
-            out.append("    " + _reaction_summary(rx))
+            out.append(f"    reactions: {_reaction_summary(rx)}")   # names, matching group history (F-3)
     return "\n".join(out)
 
 
@@ -689,13 +703,72 @@ def _handle_list(args, ctx):
     return teammates
 
 
+def _doctor_report(root, team):
+    """Read-only diagnostics for teammate_whoami(verbose=True) (G-5): comms layout, per-agent
+    heartbeat FRESHNESS (the same heartbeat-only signal teammate_list uses — NOT a pid probe, which
+    the heartbeat-only liveness decision deliberately avoids), sub-stream file sizes, unread counts,
+    and leftover lock dirs. Best-effort throughout: a vanishing/locked path under a concurrent
+    writer (Windows dir races) is skipped, never raised; nothing is ever stolen or removed."""
+    base = get_inboxes_dir(root, team).parent      # .../TeammateComms[/team]
+    rep = {"comms_root": str(root)}
+    agents = {}
+    try:
+        for f in sorted(get_agents_dir(root, team).glob("*.json")):
+            r = read_json_readonly(f)
+            if isinstance(r, dict):
+                agents[r.get("name", f.stem)] = {
+                    "type": r.get("type"),
+                    # pid_check=False is LOAD-BEARING: the doctor walks EVERY agent, and a
+                    # per-agent pid probe spawns N `tasklist` subprocesses (~5s each on a stale
+                    # same-host record) — the exact storm teammate_list's heartbeat-only liveness
+                    # avoids (c362e41c838f), and this tool is reached for WHEN comms feel slow.
+                    "alive": bool(is_channel_alive(r, pid_check=False)) if r.get("type") == "full" else None,
+                    "lastHeartbeat": r.get("lastHeartbeat"),
+                }
+    except OSError:
+        pass
+    rep["agents"] = agents
+    files = {}
+    for label, fname in (("transcript", "transcript.jsonl"),
+                         ("reactions", "reactions.jsonl"), ("deletions", "deletions.jsonl")):
+        try:
+            files[label] = {"bytes": (base / fname).stat().st_size}
+        except OSError:
+            pass                                   # absent / unreadable → omit
+    rep["files"] = files
+    unread = {}
+    try:
+        for f in sorted(get_inboxes_dir(root, team).glob("*_unread.json")):
+            rec = read_json_readonly(f)
+            unread[f.name.rsplit("_", 1)[0]] = len(rec) if isinstance(rec, list) else None
+    except OSError:
+        pass
+    rep["unread_counts"] = unread
+    locks = []                                     # leftover lock DIRS — enumerate read-only, never steal
+    try:
+        for p in base.rglob("*.lock"):
+            try:
+                if p.is_dir():
+                    locks.append(str(p.relative_to(base)))
+            except OSError:
+                continue                           # vanished mid-enum (Windows) — skip
+    except OSError:
+        pass
+    rep["lock_dirs"] = locks
+    return rep
+
+
 def _handle_whoami(args, ctx):
     agent, team, root, _ = ctx["identity"].snapshot()
+    verbose = bool(args.get("verbose") or args.get("doctor"))
     if agent is None:
-        return json.dumps({
+        out = {
             "registered": False,
             "hint": "Call teammate_register(agent=\"<your-name>\") to establish identity.",
-        }, indent=2)
+        }
+        if verbose:
+            out["doctor"] = {"note": "not registered — no comms root resolved yet."}
+        return json.dumps(out, indent=2)
     record = read_agent_record(root, team, agent) or {}
     info = {
         "registered": True,
@@ -705,6 +778,10 @@ def _handle_whoami(args, ctx):
         "inboxes_dir": str(get_inboxes_dir(root, team)),
         "profile": {field: record.get(field) for field in PROFILE_FIELDS},
     }
+    if record.get("spawned_by"):
+        info["spawned_by"] = record["spawned_by"]  # F-5 provenance breadcrumb, surfaced here
+    if verbose:
+        info["doctor"] = _doctor_report(root, team)   # G-5
     return json.dumps(info, indent=2, ensure_ascii=False)
 
 
@@ -881,8 +958,16 @@ def _handle_group(args, ctx):
                 "name": group, "members": members,
                 "creator": agent, "createdAt": now_timestamp(),
             })
-        return (f"Created group {sigil} with member(s): {', '.join(members)}. "
-                f"Post with teammate_send(to=\"{sigil}\").")
+        out = (f"Created group {sigil} with member(s): {', '.join(members)}. "
+               f"Post with teammate_send(to=\"{sigil}\").")
+        # F-2: open membership is intentional, so an unregistered member is NOT an error — but
+        # warn so a typo'd name doesn't silently join a phantom (it just won't receive posts until
+        # it registers under that exact name).
+        unknown = [m for m in members if m != agent and read_agent_record(root, team, m) is None]
+        if unknown:
+            out += (f"\nNOTE: no agent record yet for {', '.join(unknown)} — they'll receive "
+                    f"posts in their inbox if/when they register under those exact names.")
+        return out
 
     if action == "delete":
         meta = read_group_meta(root, team, group)
@@ -1032,8 +1117,7 @@ def _handle_group(args, ctx):
         out.append(str(msg.get("message", "")))
         rx = rx_all.get(msg.get("id"))
         if rx:
-            reactors = "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in rx.items())
-            out.append(f"    reactions: {reactors}")
+            out.append(f"    reactions: {_reaction_summary(rx)}")   # shared helper (F-3)
     return "\n".join(out)
 
 
@@ -1251,7 +1335,8 @@ def _handle_reincarnate(args, ctx):
 
     from . import spawn
     argv = spawn.build_claude_command(prompt)
-    env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir)
+    env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir,
+                                spawned_by=agent)  # provenance breadcrumb (F-5)
     try:
         spawn.spawn_in_terminal(argv, project_dir, env)
     except FileNotFoundError as e:
@@ -1260,9 +1345,12 @@ def _handle_reincarnate(args, ctx):
         raise CommsError(f"Spawn failed: {e}")
     return (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
-        f"It will auto-register and arm its channel (approve the channel-load prompt in "
-        f"the new window if shown). This confirms LAUNCH, not registration — run "
-        f"teammate_list in a few seconds to see {target} go live."
+        f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "
+        f"within ~10-20s (it will register with spawned_by={agent!r}). If the new window shows a "
+        f"channel-load/trust prompt it won't register until that's approved — and in a headless / "
+        f"no-click context it may never register, which looks identical to success here. Verify "
+        f"with teammate_list: {target} appears once it's live; if it hasn't after ~30s, check the "
+        f"new window."
     )
 
 
