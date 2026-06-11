@@ -99,6 +99,21 @@ def find_response(rid, timeout=4.0):
     return ""
 
 
+def wait_until(predicate, timeout=12.0, interval=0.1):
+    """Poll until ``predicate()`` is truthy or ``timeout`` elapses; return its last value (G-3).
+
+    Deadline-polling beats a fixed ``time.sleep`` against the real 5s heartbeat: robust on slow CI
+    (it waits longer when needed) and quicker on fast machines (returns as soon as the signal
+    lands). On timeout it returns the falsy value and the caller proceeds, so a genuinely missing
+    signal still surfaces as the downstream assertion's failure (never a hang)."""
+    deadline = time.time() + timeout
+    val = predicate()
+    while not val and time.time() < deadline:
+        time.sleep(interval)
+        val = predicate()
+    return val
+
+
 def inboxes_dir(root):
     return Path(root) / "TeammateComms" / TEAM / "inboxes"
 
@@ -368,9 +383,21 @@ def main():
     append_external_reaction(root, "someones-msg", PEER, "Nancy", "smile", "add")     # not my msg
     append_external_reaction(root, decision_id or "x", AGENT, PEER, "thumbsup", "remove")  # remove
 
-    # Heartbeat cycle (5s): refreshes the watcher's muted cache, processes reaction wakes,
-    # AND confirms type:"full" + a profile field survive the registry merge.
-    time.sleep(5.5)
+    # Heartbeat cycle (5s): processes reaction wakes + confirms type:"full" + a profile field
+    # survive the registry merge. G-3: deadline-poll on the reaction-wake SIGNAL instead of a fixed
+    # 5.5s sleep — the tick that emits the wake is the tick that does the merge, so the wake's
+    # arrival proves both ran; the atomic record write means a post-wake read can't see a torn merge.
+    def _reaction_wake_seen():
+        for _l in list(stdout_lines):
+            try:
+                _m = json.loads(_l)
+            except (ValueError, TypeError):
+                continue
+            if (_m.get("method") == "notifications/claude/channel"
+                    and (_m.get("params") or {}).get("meta", {}).get("kind") == "reaction"):
+                return True
+        return False
+    wait_until(_reaction_wake_seen, timeout=12.0)   # > 2 heartbeats so a slow first tick still lands
     type_after_heartbeat = None
     status_after_heartbeat = None
     if record.exists():
@@ -386,6 +413,10 @@ def main():
                 "params": {"name": "teammate_inbox", "arguments": {}}})   # both present (mute keeps them)
     send(proc, {"jsonrpc": "2.0", "id": 44, "method": "tools/call",
                 "params": {"name": "teammate_group", "arguments": {"action": "unmute", "group": GROUP_SIGIL}}})
+    # Kept as a fixed heartbeat-length sleep (NOT deadline-polled, unlike the reaction wait above):
+    # this waits for the watcher to REFRESH its in-memory muted cache from the record — an INTERNAL
+    # state change with no observable pre-signal (the only proof is the post-unmute wake that
+    # follows, which we can't poll for before it exists). Forcing a poll here would be guesswork.
     time.sleep(5.5)   # heartbeat clears the muted cache
     append_external_message(root, AGENT, PEER, "after-unmute-grp", group=GROUP_SIGIL)  # wakes (count 1, names group)
     time.sleep(1.3)
@@ -417,6 +448,11 @@ def main():
             msgs.append(json.loads(l))
         except (json.JSONDecodeError, ValueError):
             bad_stdout.append(l)
+    # Responses are matched by request id, so the SEND order and the gaps in the id space don't
+    # matter: ids are allocated per logical step, NOT strictly monotonically — some are reserved
+    # for a later cluster (e.g. the group/mute/unmute steps send 43/44/46 then the gated-reincarnate
+    # probe reuses 52) and a few group-history reads (35/36/45) resolve out of numeric order. by_id
+    # makes lookup order-independent; the gaps are intentional, not missing requests.
     by_id = {m.get("id"): m for m in msgs if "id" in m}
     notifications = [m for m in msgs if m.get("method") == "notifications/claude/channel"]
     # MESSAGE wakes only — v0.6.1 reaction wakes carry meta.kind=="reaction" and must NOT
@@ -621,9 +657,8 @@ def main():
         failures.append(f"profile status did not survive heartbeat (got {status_after_heartbeat!r})")
 
     # ── dashboard + human-as-teammate + durable observability transcript ──
-    # stdout stayed pure JSON-RPC even after the HTTP server launched (no stray prints)
-    if bad_stdout:
-        failures.append(f"non-JSON-RPC line(s) on stdout (stdout-purity): {bad_stdout[:3]}")
+    # (stdout-purity is reported FIRST in the report section below — a break there cascades into
+    #  many false downstream by_id-miss failures, so it's surfaced as the probable ROOT CAUSE.)
     # teammate_dashboard launched and returned a localhost URL
     if is_error(31) or "http://127.0.0.1:" not in text(31) or "Dashboard" not in text(31):
         failures.append(f"teammate_dashboard did not return a localhost URL: {text(31)}")
@@ -2152,6 +2187,110 @@ def main():
     except Exception as e:
         failures.append(f"WP-8 P2 inbox-reaction-names unit checks errored: {e}")
 
+    # ── WP-8 P3 (G-2/G-6) — coverage for branches that have bitten this codebase's failure classes:
+    #    resolve_comms_root fallbacks, _maybe_auto_register (the TEAMMATE_AGENT path the main scenario
+    #    pops), read_json_safe corrupt-reset, group join/leave/members, the spawn launcher SEAM (mocked
+    #    Popen, no real spawn), and the dashboard static asset is actually packaged (G-6). ──
+    try:
+        from teammate_comms import comms as _c9
+        from teammate_comms import server as _s9
+        from teammate_comms import spawn as _sp9
+        from teammate_comms import tools as _t9
+
+        class _Id9:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+        # ---- G-2: resolve_comms_root — all four ordered branches (explicit > env > config > default).
+        _se = {k: os.environ.get(k) for k in ("TEAMMATE_COMMS_DIR", "CLAUDE_CONFIG_DIR")}
+        try:
+            if _c9.resolve_comms_root("/explicit")[1] != "comms_dir arg":
+                failures.append("G-2 resolve_comms_root: explicit comms_dir branch wrong")
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            os.environ["TEAMMATE_COMMS_DIR"] = "/env-comms"
+            if _c9.resolve_comms_root(None)[1] != "TEAMMATE_COMMS_DIR":
+                failures.append("G-2 resolve_comms_root: TEAMMATE_COMMS_DIR branch wrong")
+            os.environ.pop("TEAMMATE_COMMS_DIR", None)
+            os.environ["CLAUDE_CONFIG_DIR"] = "/cfg"
+            if _c9.resolve_comms_root(None)[1] != "CLAUDE_CONFIG_DIR":
+                failures.append("G-2 resolve_comms_root: CLAUDE_CONFIG_DIR branch wrong")
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if _c9.resolve_comms_root(None)[1] != "~/.claude default":
+                failures.append("G-2 resolve_comms_root: default branch wrong")
+        finally:
+            for _k, _v in _se.items():
+                os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
+
+        # ---- G-2: _maybe_auto_register (the TEAMMATE_AGENT env path) — exercised WITH F-4 (project)
+        #      and F-5 (spawned_by), which all flow through register, so the record proves all three.
+        ar_root = tempfile.mkdtemp(prefix="tc-wp8-ar-")
+        _pre_id9, _pre_reg9 = _s9._identity.snapshot(), _s9._registered.is_set()
+        _pre_e9 = {k: os.environ.get(k) for k in
+                   ("TEAMMATE_AGENT", "TEAMMATE_COMMS_DIR", "CLAUDE_PROJECT_DIR", "TEAMMATE_SPAWNED_BY")}
+        try:
+            os.environ.update({"TEAMMATE_AGENT": "autobot", "TEAMMATE_COMMS_DIR": ar_root,
+                               "CLAUDE_PROJECT_DIR": "/work/myrepo", "TEAMMATE_SPAWNED_BY": "boss"})
+            _s9._maybe_auto_register()
+            _r9, _ = _c9.resolve_comms_root(ar_root)
+            _arec = _c9.read_agent_record(_r9, None, "autobot")
+            if not _arec or _arec.get("type") != "full":
+                failures.append(f"G-2 _maybe_auto_register: no full record written: {_arec}")
+            elif _arec.get("project") != "work/myrepo" or _arec.get("spawned_by") != "boss":
+                failures.append(f"G-2 auto-register did not flow F-4/F-5 through: {_arec}")
+        finally:
+            for _k, _v in _pre_e9.items():
+                os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
+            _s9._identity.set(*_pre_id9)
+            _s9._registered.set() if _pre_reg9 else _s9._registered.clear()
+
+        # ---- G-2: read_json_safe resets a CORRUPT file to [] on disk (and returns []).
+        _cf = Path(tempfile.mkdtemp(prefix="tc-wp8-rjs-")) / "corrupt.json"
+        _cf.write_text("{ this is not json", encoding="utf-8")
+        if _c9.read_json_safe(_cf) != [] or json.loads(_cf.read_text(encoding="utf-8")) != []:
+            failures.append("G-2 read_json_safe did not reset a corrupt file to []")
+
+        # ---- G-2: group join / members / leave as MCP-dispatched actions (only create+add were tested).
+        groot = tempfile.mkdtemp(prefix="tc-wp8-grp-")
+        _ag, _bg = {"identity": _Id9("alice", groot)}, {"identity": _Id9("bob", groot)}
+        _t9._handle_group({"action": "create", "group": "team"}, _ag)
+        if "bob" not in _t9._handle_group({"action": "join", "group": "team"}, _bg):
+            failures.append("G-2 group join: bob not in members after join")
+        _mem = _t9._handle_group({"action": "members", "group": "team"}, _ag)
+        if "alice" not in _mem or "bob" not in _mem:
+            failures.append(f"G-2 group members: missing alice/bob: {_mem!r}")
+        _t9._handle_group({"action": "leave", "group": "team"}, _bg)
+        if "bob" in _t9._handle_group({"action": "members", "group": "team"}, _ag):
+            failures.append("G-2 group leave: bob still a member after leave")
+
+        # ---- G-2: spawn launcher SEAM — mock subprocess.Popen so the launcher resolution + argv
+        #      construction run WITHOUT actually spawning a terminal (the only hermetic way to cover
+        #      spawn_in_terminal; the real detached launch stays out of scope, stated in the diff).
+        _real_popen = _sp9.subprocess.Popen
+        _popen_calls = []
+        try:
+            class _FakePopen:
+                def __init__(self, *a, **k):
+                    _popen_calls.append((a, k))
+            _sp9.subprocess.Popen = _FakePopen
+            _argv = ["claude", "-p", "hi"]
+            _launched = _sp9.spawn_in_terminal(_argv, "/tmp", {"X": "1"})
+            if not (_popen_calls and _launched and all(a in _launched for a in _argv)):
+                failures.append(f"G-2 spawn_in_terminal seam: argv not execd by the launcher: {_launched}")
+        finally:
+            _sp9.subprocess.Popen = _real_popen
+
+        # ---- G-6: the dashboard static asset must be PACKAGED (the triple-fallback can otherwise
+        #      serve a placeholder on a packaging mistake — assert via the packaged-resource API).
+        from importlib.resources import files as _ir_files
+        _idx = _ir_files("teammate_comms") / "static" / "index.html"
+        if not (_idx.is_file() and len(_idx.read_text(encoding="utf-8")) > 500):
+            failures.append("G-6: teammate_comms/static/index.html is not packaged (or is a stub)")
+    except Exception as e:
+        failures.append(f"WP-8 P3 coverage/packaging unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
@@ -2162,6 +2301,13 @@ def main():
         failures.append(f"version drift: pkg={pkg} plugin={plug} pyproject={pyp}")
 
     # ── report ──
+    # G-3: a stdout-purity break makes `by_id` lose entries, cascading into many false downstream
+    # failures (result()/text() return {}/"" for the missing ids). Surface it FIRST as the probable
+    # ROOT CAUSE — do NOT early-exit (every failure stays visible), just re-order so the run isn't
+    # misdiagnosed by an arbitrary cascade symptom.
+    if bad_stdout:
+        failures.insert(0, f"ROOT CAUSE — non-JSON-RPC line(s) on stdout (stdout-purity broke; the "
+                           f"failures below are likely cascades of this): {bad_stdout[:3]}")
     print("=== STDOUT messages ===")
     for m in msgs:
         print(" ", json.dumps(m)[:200])
