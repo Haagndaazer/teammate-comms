@@ -1621,6 +1621,41 @@ def main():
             _c6._pid_alive = _orig_pa
             _sh6.rmtree(Path(wroot6) / "remote.lock", ignore_errors=True)
 
+        # ---- A-7 (g) CR-3 [release-gate]: STALE death-evidence in the steal path. An earlier
+        #      stealer can remove the dead lock and re-acquire a LIVE one BETWEEN our top-of-function
+        #      pid read and our winning the .claim; the post-claim guard must RE-READ + RE-VERIFY the
+        #      pid (not just exists(), which can't tell the live re-acquire from the old dead lock),
+        #      or it rmtrees the live holder's lock = the two-writers A-7 corruption reintroduced by
+        #      the defense. Deterministic: the FIRST _pid_alive call (top read) rewrites the lock's
+        #      pid to THIS live process (simulating the re-acquire) and reports the ORIGINAL pid dead
+        #      so we proceed into the claim; the re-verify then re-reads the now-LIVE pid and must
+        #      DECLINE. Unfixed (exists()-only) code STEALS it — so this fails hard without the fix.
+        _calls = []
+        lock_cr = _mklock("cr3", 99999)
+
+        def _fake_pa(pid):
+            _calls.append(pid)
+            if len(_calls) == 1:                       # top read: an earlier stealer re-acquired LIVE
+                (lock_cr / "pid").write_text(f"{os.getpid()}\n{_sock6.gethostname()}")
+                return False                           # the ORIGINAL dead pid still reads dead → proceed
+            return True if pid == os.getpid() else _orig_pa(pid)   # re-verify sees the LIVE re-acquirer
+        _c6._pid_alive = _fake_pa
+        try:
+            _stole = _c6._claim_if_dead(lock_cr)
+        finally:
+            _c6._pid_alive = _orig_pa
+        if _stole is not False:
+            failures.append("A-7 CR-3: STOLE a lock re-acquired LIVE between top-read and claim (stale evidence)")
+        if len(_calls) < 2:
+            failures.append(f"A-7 CR-3: the post-claim re-verify did NOT run ({len(_calls)} _pid_alive call(s) — fix absent?)")
+        elif _calls[1] != os.getpid():
+            failures.append(f"A-7 CR-3: re-verify did not re-read the fresh (live) pid: {_calls[1]}")
+        if not lock_cr.exists():
+            failures.append("A-7 CR-3: the re-acquired LIVE lock was DESTROYED (two-writers reintroduced)")
+        if Path(str(lock_cr) + ".claim").exists():
+            failures.append("A-7 CR-3: the .claim marker leaked (finally cleanup regressed)")
+        _sh6.rmtree(lock_cr, ignore_errors=True)
+
         # ---- A-5: the predicate purge removes a member's group copies (group==sigil) ONLY —
         #      including a copy injected AFTER an id snapshot (the race-window-shrink) — and
         #      leaves non-group (DM) messages untouched.

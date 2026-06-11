@@ -328,8 +328,13 @@ def _claim_if_dead(lock_dir):
     stealers both 'win' and re-import the very two-writers race A-7 closes; and an
     ``os.replace`` rename of the lock DIRECTORY proved non-exclusive under concurrency on
     Windows — empirically 4/8 stealers 'won' — so mkdir is the reliable choice.) After winning
-    the claim we re-check the stale dir still exists (a slightly-later caller mustn't 'win'
-    a lock an earlier stealer already removed), remove it, then drop the claim marker.
+    the claim we RE-READ + RE-VERIFY the holder pid under the claim (NOT just `exists()`): the
+    top-of-function evidence is stale once we've blocked on the claim, and an earlier stealer may
+    have removed the dead lock and re-acquired a LIVE one — indistinguishable by existence alone —
+    so a stale `exists()` check would rmtree a live holder's lock (the very A-7 two-writers race).
+    The claim's mutual exclusion + the present dead dir (which blocks any re-acquire mkdir) make
+    that re-read trustworthy. Only a still-present, same-host, VERIFIED-dead lock is removed; then
+    the claim marker is dropped.
 
     Liveness is HOST-GATED (mirrors ``is_channel_alive``): ``_pid_alive`` is purely local, so a
     holder on a DIFFERENT host is never stolen (its pid is meaningless here) — a dead remote
@@ -370,8 +375,28 @@ def _claim_if_dead(lock_dir):
         except OSError:
             return False                      # another cleaner won the fresh claim → don't steal
     try:
-        if not lock_dir.exists():
-            return False                      # already stolen+removed by an earlier winner
+        # FRESH evidence under the claim. The pid/host read at the top is now STALE: between that
+        # read and our winning the claim, an EARLIER stealer could have removed the dead lock AND
+        # re-acquired a fresh, LIVE lock (its own pid inside) — and `lock_dir.exists()` alone can't
+        # tell that live lock from the old dead one (existence is identical), so a blind rmtree
+        # would destroy a LIVE holder's lock = the two-writers A-7 corruption this very defense
+        # exists to prevent (ledger #9: never act on expired evidence). The held claim is the mutual
+        # exclusion that makes this re-read trustworthy: while we hold it no other stealer can
+        # remove+re-acquire, and the still-present dead dir makes every acquirer's
+        # mkdir(exist_ok=False) fail — so the pid file is STABLE under us. Re-verify same-host +
+        # VERIFIED-dead. (The SECOND _pid_alive probe is DELIBERATE, not redundant with the top one
+        # — it's the only fresh-evidence check; do not "optimize" it away or the hole reopens.) Any
+        # other outcome (missing/unreadable/changed/alive/undetermined/foreign) → drop, don't steal.
+        try:
+            if not lock_dir.exists():
+                return False                  # already removed by an earlier winner
+            relines = (lock_dir / "pid").read_text().splitlines()
+            repid = int(relines[0].strip())
+            rehost = relines[1].strip() if len(relines) > 1 else ""
+        except (OSError, ValueError, IndexError):
+            return False                      # lock vanished / pid now unreadable → don't steal
+        if rehost != socket.gethostname() or _pid_alive(repid) is not False:
+            return False                      # re-acquired (alive) / undetermined / foreign → don't steal
         shutil.rmtree(lock_dir, ignore_errors=True)
         return True
     finally:
