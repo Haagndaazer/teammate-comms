@@ -42,9 +42,10 @@ Each teammate can attach an optional profile to its registry record so peers can
 **what you're doing** and **what you own** at a glance — without messaging and
 interrupting you:
 
-- `project` — the project/repo you're in; **auto-filled** from the current project
-  directory at registration (override only to correct it). Matters because comms are
-  global by default (below), so this is how peers see who's working where.
+- `project` — the project/repo you're in; **auto-filled** as a two-component `parent/name`
+  from the current project directory at registration (so two repos sharing a basename are
+  distinguishable; override only to correct it). Matters because comms are global by default
+  (below), so this is how peers see who's working where.
 - `role` — your job on the team (e.g. `backend / API`)
 - `personality` — a short blurb (mostly for fun)
 - `status` — what you're doing right now; **keep it fresh** with `teammate_update`

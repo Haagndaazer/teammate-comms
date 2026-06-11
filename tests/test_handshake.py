@@ -62,7 +62,7 @@ PERSONALITY = "methodical and dry"
 STATUS_INIT = "booting up"
 STATUS_NEW = "running checks"
 AUTHORITY = "tests/**"
-PROJECT = "MyTestProject"  # basename auto-filled from CLAUDE_PROJECT_DIR
+PROJECT = "MyTestProject"  # auto-filled from CLAUDE_PROJECT_DIR (F-4: as two-component parent/name)
 GROUP = "brainstorm"
 GROUP_SIGIL = "#brainstorm"
 HUMAN = "Operator"  # the human operator registered by teammate_dashboard
@@ -482,9 +482,10 @@ def main():
     # whoami echoes the profile set at registration
     if STATUS_INIT not in text(6) or ROLE not in text(6):
         failures.append(f"whoami missing profile fields: {text(6)}")
-    # project was auto-filled from CLAUDE_PROJECT_DIR's basename (not passed explicitly)
-    if PROJECT not in text(6):
-        failures.append(f"whoami missing auto-filled project {PROJECT!r}: {text(6)}")
+    # project auto-filled as TWO-COMPONENT parent/name from CLAUDE_PROJECT_DIR (F-4):
+    # "C:/some/path/MyTestProject" -> "path/MyTestProject" (not the bare basename), not passed explicitly
+    if "path/" + PROJECT not in text(6):
+        failures.append(f"whoami project not two-component 'path/{PROJECT}' (F-4): {text(6)}")
 
     # send to peer wrote peer's inbox
     if is_error(7):
@@ -2039,6 +2040,83 @@ def main():
             _dash3.shutdown_dashboard()
     except Exception as e:
         failures.append(f"WP-7 P3 byte-cursor unit checks errored: {e}")
+
+    # ── WP-8 P1 (F-2/F-4/F-5) — identity/registration UX: unregistered-recipient warnings (warn,
+    #    never error — open membership is intentional); two-component parent/name project; reincarnate
+    #    spawned_by provenance (set unconditionally, never inherited; survives the heartbeat merge). ──
+    try:
+        from teammate_comms import comms as _c8
+        from teammate_comms import server as _s8
+        from teammate_comms import spawn as _sp8
+        from teammate_comms import tools as _t8
+
+        class _Id8:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+        # ---- F-2: unregistered DM recipient → DELIVERED (open membership) + a queued/typo NOTE,
+        #      NOT an error. A registered recipient gets the channel-status branch, no F-2 note.
+        f2root = tempfile.mkdtemp(prefix="tc-wp8-f2-")
+        _ctx8 = {"identity": _Id8("alice", f2root)}
+        _o1 = _t8._handle_send({"to": "ghost", "message": "hi"}, _ctx8)
+        if "no agent record" not in _o1:
+            failures.append(f"F-2: DM to an unregistered name missing the queued NOTE: {_o1!r}")
+        _gi = _c8.read_json_safe(_c8.get_inboxes_dir(f2root, None) / "ghost_unread.json")
+        if not any(m.get("message") == "hi" for m in _gi):      # delivery preserved (open membership)
+            failures.append("F-2: a message to an unregistered name was NOT delivered (should queue)")
+        _c8.write_agent_record(f2root, None, "realbob", type="full", channel=False)
+        if "no agent record" in _t8._handle_send({"to": "realbob", "message": "yo"}, _ctx8):
+            failures.append("F-2: a REGISTERED recipient wrongly got the unregistered NOTE")
+        _o3 = _t8._handle_group({"action": "create", "group": "g8", "members": ["ghost2"]}, _ctx8)
+        if "no agent record" not in _o3 or "Created group" not in _o3:
+            failures.append(f"F-2: group-create unregistered-member NOTE/creation wrong: {_o3!r}")
+
+        # ---- F-4: two-component parent/name; bare-name fallback when there's no parent; deep-path
+        #      truncate-BEFORE-validate so a long path can't raise out of validate and break register.
+        if _s8._project_label("/home/me/api") != "me/api":
+            failures.append(f"F-4: two-component label wrong: {_s8._project_label('/home/me/api')!r}")
+        if _s8._project_label("solo") != "solo":                # no usable parent → bare name, no leading '/'
+            failures.append(f"F-4: bare-name fallback wrong: {_s8._project_label('solo')!r}")
+        _lab = _s8._project_label("/" + "x" * 200 + "/proj")    # parent 200 chars → must truncate
+        if len(_lab) > _c8.PROFILE_FIELDS["project"]:
+            failures.append(f"F-4: deep-path label exceeds the project cap ({len(_lab)})")
+        _c8.validate_profile_field("project", _lab)             # must NOT raise (truncate-before-validate)
+
+        # ---- F-5: spawned_by — set UNCONDITIONALLY in build_child_env, NEVER inherited; stored on
+        #      the register record; SURVIVES a heartbeat merge.
+        if _sp8.build_child_env({}, "child", "/p", spawned_by="parent").get("TEAMMATE_SPAWNED_BY") != "parent":
+            failures.append("F-5: build_child_env did not set TEAMMATE_SPAWNED_BY")
+        _gc = _sp8.build_child_env({"TEAMMATE_SPAWNED_BY": "grandparent"}, "gc", "/p", spawned_by="parent2")
+        if _gc.get("TEAMMATE_SPAWNED_BY") != "parent2":         # grand-child carries its IMMEDIATE parent
+            failures.append(f"F-5: grand-child inherited a stale spawned_by: {_gc.get('TEAMMATE_SPAWNED_BY')!r}")
+        if "TEAMMATE_SPAWNED_BY" in _sp8.build_child_env({"TEAMMATE_SPAWNED_BY": "stale"}, "c", "/p"):
+            failures.append("F-5: a stale spawned_by was inherited when none was passed (never-inherit)")
+        f5root = tempfile.mkdtemp(prefix="tc-wp8-f5-")
+        _pre_id, _pre_reg = _s8._identity.snapshot(), _s8._registered.is_set()
+        _pre_sb = os.environ.get("TEAMMATE_SPAWNED_BY")
+        try:
+            os.environ["TEAMMATE_SPAWNED_BY"] = "lead"
+            _s8.register_identity("childagent", None, f5root)
+            _root5, _ = _c8.resolve_comms_root(f5root)
+            _rec = _c8.read_agent_record(_root5, None, "childagent")
+            if not _rec or _rec.get("spawned_by") != "lead":
+                failures.append(f"F-5: spawned_by not stored on the register record: {_rec}")
+            # heartbeat-style write (channel/lastHeartbeat only) must PRESERVE spawned_by (field merge)
+            _c8.write_agent_record(_root5, None, "childagent", channel=True, lastHeartbeat=_c8.now_timestamp())
+            if _c8.read_agent_record(_root5, None, "childagent").get("spawned_by") != "lead":
+                failures.append("F-5: spawned_by did NOT survive a heartbeat merge")
+        finally:
+            if _pre_sb is None:
+                os.environ.pop("TEAMMATE_SPAWNED_BY", None)
+            else:
+                os.environ["TEAMMATE_SPAWNED_BY"] = _pre_sb
+            _s8._identity.set(*_pre_id)                          # restore global identity
+            _s8._registered.set() if _pre_reg else _s8._registered.clear()
+    except Exception as e:
+        failures.append(f"WP-8 P1 identity-UX unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

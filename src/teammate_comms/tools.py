@@ -515,8 +515,10 @@ def _handle_send(args, ctx):
         lines.append(f"{to} is the human operator — they'll see this in their dashboard.")
     else:
         lines.append(
-            f"{to} has no live channel. If they are a spawned subagent, their lead "
-            f"must SendMessage-nudge them to check their inbox."
+            f"NOTE: no teammate named {to!r} is registered (no agent record). The message is "
+            f"queued in their inbox and will be delivered if/when they register under that exact "
+            f"name — a typo'd recipient queues silently. If {to} is a spawned subagent, their "
+            f"lead must SendMessage-nudge them to read it."
         )
     return "\n".join(lines)
 
@@ -881,8 +883,16 @@ def _handle_group(args, ctx):
                 "name": group, "members": members,
                 "creator": agent, "createdAt": now_timestamp(),
             })
-        return (f"Created group {sigil} with member(s): {', '.join(members)}. "
-                f"Post with teammate_send(to=\"{sigil}\").")
+        out = (f"Created group {sigil} with member(s): {', '.join(members)}. "
+               f"Post with teammate_send(to=\"{sigil}\").")
+        # F-2: open membership is intentional, so an unregistered member is NOT an error — but
+        # warn so a typo'd name doesn't silently join a phantom (it just won't receive posts until
+        # it registers under that exact name).
+        unknown = [m for m in members if m != agent and read_agent_record(root, team, m) is None]
+        if unknown:
+            out += (f"\nNOTE: no agent record yet for {', '.join(unknown)} — they'll receive "
+                    f"posts in their inbox if/when they register under those exact names.")
+        return out
 
     if action == "delete":
         meta = read_group_meta(root, team, group)
@@ -1251,7 +1261,8 @@ def _handle_reincarnate(args, ctx):
 
     from . import spawn
     argv = spawn.build_claude_command(prompt)
-    env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir)
+    env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir,
+                                spawned_by=agent)  # provenance breadcrumb (F-5)
     try:
         spawn.spawn_in_terminal(argv, project_dir, env)
     except FileNotFoundError as e:
@@ -1260,9 +1271,12 @@ def _handle_reincarnate(args, ctx):
         raise CommsError(f"Spawn failed: {e}")
     return (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
-        f"It will auto-register and arm its channel (approve the channel-load prompt in "
-        f"the new window if shown). This confirms LAUNCH, not registration — run "
-        f"teammate_list in a few seconds to see {target} go live."
+        f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "
+        f"within ~10-20s (it will register with spawned_by={agent!r}). If the new window shows a "
+        f"channel-load/trust prompt it won't register until that's approved — and in a headless / "
+        f"no-click context it may never register, which looks identical to success here. Verify "
+        f"with teammate_list: {target} appears once it's live; if it hasn't after ~30s, check the "
+        f"new window."
     )
 
 

@@ -503,7 +503,14 @@ watcher with **no `channel.py` change**.
   `wt.exe` primary / `CREATE_NEW_CONSOLE`+`BREAKAWAY_FROM_JOB` fallback; best-effort
   live-name collision guard (refuse only if already live). The dev channel flag stays in
   the default launch args (custom channel, not allowlisted) — overridable via
-  `TEAMMATE_LAUNCH_ARGS`.
+  `TEAMMATE_LAUNCH_ARGS`. **Launch ≠ registration (F-5):** the return states an expected
+  registration window (~10–20s) + a `teammate_list` recheck, and is explicit that a headless
+  trust-prompt-absent child may never register (which would look identical to success). The
+  child's register record carries a `spawned_by` provenance breadcrumb: `build_child_env` sets
+  `TEAMMATE_SPAWNED_BY` to the parent **unconditionally** (never inherited — a grand-child gets
+  its immediate parent, the same never-inherit discipline as the stripped reincarnate gate, F-1),
+  read at register and stored as a registry-record field (not a profile field) that survives the
+  heartbeat merge.
 - **Dashboard upgrades:** dropped the redundant "Direct messages" section (Teammates is
   the DM entry + shows presence); added an "Observed (read-only)" section (agent↔agent
   DMs) directly under Teammates; a right-hand live activity firehose (FIFO, newly-seen
@@ -575,8 +582,11 @@ undeleted — is **fixed in v0.7.1** by deletions compaction: the fresh load uni
 registry record via `write_agent_record`'s field-level merge — additive,
 backward-compatible, and they survive the 5s heartbeat (the test asserts this).
 `validate_profile_field` collapses whitespace/newlines and length-caps per field.
-`project` is auto-filled from `basename($CLAUDE_PROJECT_DIR)` at registration
-(overridable), so peers see who is working where now that comms are global. An agent's
+`project` is auto-filled as a two-component `parent/name` from `$CLAUDE_PROJECT_DIR` at
+registration (F-4 — so two repos sharing a basename like `api` are distinguishable in
+`teammate_list`; falls back to the bare name at a drive/UNC root, and is pre-truncated to the
+field cap so a deep path can never raise out of validation and break registration), overridable,
+so peers see who is working where now that comms are global. An agent's
 own profile is echoed in the `teammate_register` return, and the channel wake event
 leads with `You are <name>: <personality>`, so it stays reminded of who it is across
 waking.
