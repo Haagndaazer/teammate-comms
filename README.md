@@ -23,7 +23,7 @@ tools and pushes `notifications/claude/channel` events.
 | `teammate_inbox` | `count_only?` | Read your unread messages (or count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. `"all"` clears only what you've **seen** (messages that arrived since your last `teammate_inbox` read are kept). |
 | `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. The human operator shows as `🧑 (operator)`. |
-| `teammate_whoami` | — | Registration state, identity, team, comms dir, and your own profile (diagnostics). |
+| `teammate_whoami` | `verbose?` | Registration state, identity, team, comms dir, and your own profile (diagnostics). `verbose:true` adds a read-only **doctor** report — comms root, per-agent heartbeat liveness, sub-stream file sizes, unread counts, and any leftover lock dirs (use it when comms seem stuck). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. `history` reads the shared transcript (filterable into a decision trail); `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's acked up to where. |

@@ -228,7 +228,16 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_whoami",
         "description": "Report this instance's registration state, identity, comms dir, and your own profile.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {"type": "object", "properties": {
+            "verbose": {
+                "type": "boolean",
+                "description": (
+                    "Also include a read-only `doctor` diagnostics section: comms root, each "
+                    "agent's heartbeat freshness/liveness, sub-stream file sizes, unread counts, "
+                    "and any leftover lock directories. Useful when comms seem stuck."
+                ),
+            },
+        }},
     },
     {
         "name": "teammate_update",
@@ -694,13 +703,68 @@ def _handle_list(args, ctx):
     return teammates
 
 
+def _doctor_report(root, team):
+    """Read-only diagnostics for teammate_whoami(verbose=True) (G-5): comms layout, per-agent
+    heartbeat FRESHNESS (the same heartbeat-only signal teammate_list uses — NOT a pid probe, which
+    the heartbeat-only liveness decision deliberately avoids), sub-stream file sizes, unread counts,
+    and leftover lock dirs. Best-effort throughout: a vanishing/locked path under a concurrent
+    writer (Windows dir races) is skipped, never raised; nothing is ever stolen or removed."""
+    base = get_inboxes_dir(root, team).parent      # .../TeammateComms[/team]
+    rep = {"comms_root": str(root)}
+    agents = {}
+    try:
+        for f in sorted(get_agents_dir(root, team).glob("*.json")):
+            r = read_json_readonly(f)
+            if isinstance(r, dict):
+                agents[r.get("name", f.stem)] = {
+                    "type": r.get("type"),
+                    "alive": bool(is_channel_alive(r)) if r.get("type") == "full" else None,
+                    "lastHeartbeat": r.get("lastHeartbeat"),
+                }
+    except OSError:
+        pass
+    rep["agents"] = agents
+    files = {}
+    for label, fname in (("transcript", "transcript.jsonl"),
+                         ("reactions", "reactions.jsonl"), ("deletions", "deletions.jsonl")):
+        try:
+            files[label] = {"bytes": (base / fname).stat().st_size}
+        except OSError:
+            pass                                   # absent / unreadable → omit
+    rep["files"] = files
+    unread = {}
+    try:
+        for f in sorted(get_inboxes_dir(root, team).glob("*_unread.json")):
+            rec = read_json_readonly(f)
+            unread[f.name.rsplit("_", 1)[0]] = len(rec) if isinstance(rec, list) else None
+    except OSError:
+        pass
+    rep["unread_counts"] = unread
+    locks = []                                     # leftover lock DIRS — enumerate read-only, never steal
+    try:
+        for p in base.rglob("*.lock"):
+            try:
+                if p.is_dir():
+                    locks.append(str(p.relative_to(base)))
+            except OSError:
+                continue                           # vanished mid-enum (Windows) — skip
+    except OSError:
+        pass
+    rep["lock_dirs"] = locks
+    return rep
+
+
 def _handle_whoami(args, ctx):
     agent, team, root, _ = ctx["identity"].snapshot()
+    verbose = bool(args.get("verbose") or args.get("doctor"))
     if agent is None:
-        return json.dumps({
+        out = {
             "registered": False,
             "hint": "Call teammate_register(agent=\"<your-name>\") to establish identity.",
-        }, indent=2)
+        }
+        if verbose:
+            out["doctor"] = {"note": "not registered — no comms root resolved yet."}
+        return json.dumps(out, indent=2)
     record = read_agent_record(root, team, agent) or {}
     info = {
         "registered": True,
@@ -710,6 +774,10 @@ def _handle_whoami(args, ctx):
         "inboxes_dir": str(get_inboxes_dir(root, team)),
         "profile": {field: record.get(field) for field in PROFILE_FIELDS},
     }
+    if record.get("spawned_by"):
+        info["spawned_by"] = record["spawned_by"]  # F-5 provenance breadcrumb, surfaced here
+    if verbose:
+        info["doctor"] = _doctor_report(root, team)   # G-5
     return json.dumps(info, indent=2, ensure_ascii=False)
 
 

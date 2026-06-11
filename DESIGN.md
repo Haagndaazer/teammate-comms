@@ -318,7 +318,7 @@ long-lived server. **13 tools:**
 | `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
 | `teammate_ack` | `id` (or `"all"`) | Move a message from unread → read. |
 | `teammate_list` | — | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Humans show `🧑 (operator)` + `presence`. |
-| `teammate_whoami` | — | Resolved identity, team, comms dir, and own profile (diagnostics). |
+| `teammate_whoami` | `verbose?` | Resolved identity, team, comms dir, and own profile (diagnostics). `verbose:true` adds a read-only **doctor** section — comms root, per-agent heartbeat freshness/liveness, sub-stream file sizes, unread counts, leftover lock dirs (G-5). |
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, `sender?`/`post_type?`/`since?`/`reply_to?` (history filters) | Manage group chats (see below) + mute/unmute a group's wakes + `reads` (read receipts). |
@@ -516,7 +516,12 @@ watcher with **no `channel.py` change**.
   DMs) directly under Teammates; a right-hand live activity firehose (FIFO, newly-seen
   records only, scroll-aware, last-200); reaction chips + a clickable emoji bar
   (`POST /api/react`, reactions sub-stream on `/api/poll`); read-receipt ticks; field
-  chips for `post_type`/mentions/`reply_to`.
+  chips for `post_type`/mentions/`reply_to`. **Read receipts refresh on the 5s roster tick, not
+  the 1.5s poll** (so they can lag ~5s): the poll is deliberately **conversation-agnostic** (the
+  server is stateless — it doesn't know which thread the browser has open), so live per-thread
+  receipts would need a new poll parameter + member-gating. That's audit **B-4**, deferred as a
+  documented known-limit — a protocol change isn't worth ~3.5s of freshness on a cosmetic
+  indicator (if real users feel the lag it returns as its own WP with a `&conv=` design).
 - **Compose send-parity (0.7.x / WP-4):** `_api_send` now passes `reply_to` + `post_type`
   through to the cores (was DM/group `to`+`message`+`priority` only), and the compose row
   gained the matching write-side affordances: a `↳` reply chip (click a message's `↳` →
@@ -557,7 +562,13 @@ change — append-stable (byte 0 never moves on the append-only log), recreation
 future WP-10 NDJSON **rotation** MUST bump the generation explicitly (it replaces byte 0) rather
 than rely on the crc, and the one out-of-contract hole — a recreated file whose first line is
 byte-identical *and* whose size ≥ the old offset — is unreachable in practice (it needs the same
-first message down to its microsecond-timestamp id). The **reactions/deletions** sub-streams keep
+first message down to its microsecond-timestamp id). A second, even narrower unreachable window
+(P3 review note): `transcript_tail_and_cursor` stats the size, then reads the first line for the
+generation — a recreation landing *between* those two reads mints offset-from-old + generation-
+from-new; if the new file then grows past the old size the next seek lands mid-line and the
+partial-line discard drops one fragment, self-correcting at the next `\n` boundary. Like the hole
+above it needs an *in-flight* transcript recreation, which nothing in-product does. The
+**reactions/deletions** sub-streams keep
 their **id**-based `oldest_first` pagination — a different cursor family with NO shared reset
 semantics (a transcript recreation re-tails records but does not reset those streams). (Audit C-2 — a fresh
 deletions load replaying only the newest `limit` events, so a very old deletion rendered

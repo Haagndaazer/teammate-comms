@@ -2291,6 +2291,44 @@ def main():
     except Exception as e:
         failures.append(f"WP-8 P3 coverage/packaging unit checks errored: {e}")
 
+    # ── WP-8 P5 (G-5) — teammate_whoami(verbose=True) doctor section: read-only diagnostics
+    #    (heartbeat freshness — NOT a pid probe; file sizes; unread counts; lock dirs) + spawned_by. ──
+    try:
+        from teammate_comms import comms as _cD
+        from teammate_comms import tools as _tD
+
+        class _IdD:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+
+        droot = tempfile.mkdtemp(prefix="tc-wp8-g5-")
+        _cD.write_agent_record(droot, None, "doc", type="full", channel=True,
+                               lastHeartbeat=_cD.now_timestamp(), spawned_by="boss")
+        _tD.send_dm(droot, None, "x", "doc", "hi")          # creates doc's unread inbox (1)
+        _dctx = {"identity": _IdD("doc", droot)}
+        # plain whoami: NO doctor section, but the F-5 spawned_by breadcrumb IS surfaced.
+        _plain = json.loads(_tD._handle_whoami({}, _dctx))
+        if "doctor" in _plain:
+            failures.append("G-5: plain whoami wrongly included a doctor section")
+        if _plain.get("spawned_by") != "boss":
+            failures.append(f"G-5: whoami did not surface spawned_by: {_plain.get('spawned_by')}")
+        # verbose: a doctor section with the read-only diagnostics keys + correct heartbeat/unread.
+        _doc = json.loads(_tD._handle_whoami({"verbose": True}, _dctx)).get("doctor")
+        if not isinstance(_doc, dict) or not all(k in _doc for k in
+                                                 ("comms_root", "agents", "files", "unread_counts", "lock_dirs")):
+            failures.append(f"G-5: doctor section missing keys: {_doc}")
+        elif _doc["agents"].get("doc", {}).get("alive") is not True or _doc["unread_counts"].get("doc") != 1:
+            failures.append(f"G-5: doctor heartbeat/unread wrong: {_doc.get('agents')} / {_doc.get('unread_counts')}")
+        # unregistered + verbose → a doctor note, no crash.
+        _un = json.loads(_tD._handle_whoami({"verbose": True}, {"identity": _IdD(None, None)}))
+        if _un.get("registered") is not False or "doctor" not in _un:
+            failures.append(f"G-5: unregistered verbose whoami wrong: {_un}")
+    except Exception as e:
+        failures.append(f"WP-8 P5 doctor unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
