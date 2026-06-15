@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.8.1
+
+A token-efficiency pass — leaner channel events, leaner tool output, and leaner tool
+schemas — plus a standing rule for authority coordination and CI hardening.
+**No breaking changes** to the tool surface (new optional params `all` / `show_all`
+added; all existing calls behave identically without them).
+
+### Lean channel wakes
+- **Terse wake events.** The `notifications/claude/channel` event is now signal-only:
+  the boilerplate phrases ("You have unread messages", "Check your teammate_inbox")
+  are gone. Typical wake: `"📬 2 new message(s) from alice, #design. Reply to
+  to:'#design' not the sender."` (~10–25 tok vs. the previous ~80–170 tok).
+- **Persona-reminder dropped.** The `"You are <name>: <personality>"` prefix on every
+  wake is gone — the persona is durable in the agent's session context and echoed
+  back at registration; per-wake repetition was redundant token spend.
+- **Re-nudge scoped to DM / urgent / @mention.** Ambient group chatter no longer
+  burns the re-nudge budget. If a group post goes unread but isn't a DM, isn't urgent,
+  and doesn't @mention you, the watcher skips the re-nudge for it specifically — while
+  still advancing the backoff clock so a later DM/mention can still fire.
+
+### Lean surface & outputs
+- **`teammate_list` drops personality.** The per-agent personality block is removed
+  from list output (use `teammate_profile` for full details). Across a team of 26
+  agents this saves ~4,000 chars per call.
+- **`teammate_list` scopes to your project by default.** With global comms, a list
+  of all agents across every project is noisy. The default view now shows only
+  teammates in your project. Human operators and agents with no project set are always
+  shown (they're global). Pass `all=True` to see everyone; a footer notes how many
+  were filtered and warns that cross-project authority owners may be hidden.
+- **`teammate_inbox` suppresses already-seen bodies.** A second read in the same
+  session no longer re-dumps message bodies you already saw — the header line stays
+  (id, sender, group, urgency tags) so the message remains ack-able. A note tells you
+  how many were suppressed. Pass `show_all=True` to re-read full bodies (useful after
+  context compaction).
+- **Trimmed tool-def schemas.** The `personality` field description in
+  `teammate_register` and `teammate_update` shrank from ~950 to ~195 chars (full
+  guidance moved to `SKILL.md`). Net: −1,000 chars per-request tool schema overhead.
+
+### Agent coordination
+- **Authority-coordination standing rule.** `teammate_register` now includes a
+  standing instruction to check `teammate_list` for authority holders before touching
+  an area — and to send a coordination message before modifying anything owned by
+  another teammate. The rule also appears in the `SKILL.md` Profiles section and
+  reaches the channel reinject path so it persists across idle wakes.
+
+### Under the hood
+- CI action pins updated to Node-24 release commits with a force-Node24 trip-wire
+  (`FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`), eliminating the Node-20 deprecation warning
+  that previously appeared on every CI run.
+- A-7 lock-steal contention test de-flaked: the assertion now targets the production
+  property (`file_lock` exclusion — at most one holder and at least one acquirer)
+  rather than a Windows-rmtree-fragile claim count.
+
 ## v0.8.0
 
 A reliability + scale hardening pass over the whole tool, plus dashboard and diagnostics polish —
