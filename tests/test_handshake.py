@@ -19,11 +19,12 @@ primary path). Asserts both halves of the unified server:
       arrival that lands after the read is preserved (v0.4.1)
 
   Profile fields:
-    - teammate_register echoes the profile back (personality reminder at start)
+    - teammate_register echoes the profile back (role + personality shown on register)
     - `project` is auto-filled from CLAUDE_PROJECT_DIR's basename and shows in
       whoami / teammate_list / teammate_profile
     - teammate_update changes status; teammate_list always shows project/status/
-      authority and includes personality; teammate_profile returns the full profile;
+      authority (WP-11b: personality dropped from list, use teammate_profile);
+      teammate_profile returns the full profile;
       a profile field SURVIVES a heartbeat cycle
     - the channel wake names the message source (sender/group); personality never
       appears in wakes (WP-11a dropped the owner-reminder — registration echo suffices)
@@ -432,6 +433,11 @@ def main():
                            "arguments": {"agent": "Echo", "project_dir": str(REPO)}}})
     time.sleep(0.5)
 
+    # WP-11b: teammate_list all=True — smoke test that the param is accepted (no shared-inbox side-effects)
+    send(proc, {"jsonrpc": "2.0", "id": 62, "method": "tools/call",
+                "params": {"name": "teammate_list", "arguments": {"all": True}}})
+    time.sleep(0.5)
+
     proc.stdin.close()
     try:
         proc.wait(timeout=5)
@@ -595,8 +601,9 @@ def main():
         failures.append(f"teammate_list missing project value {PROJECT!r}: {text(17)}")
     if STATUS_NEW not in text(17) or AUTHORITY not in text(17):
         failures.append(f"teammate_list missing updated status/authority values: {text(17)}")
-    if PERSONALITY not in text(17):
-        failures.append(f"teammate_list missing personality: {text(17)}")
+    # WP-11b: personality is dropped from teammate_list output (use teammate_profile for full details)
+    if PERSONALITY in text(17):
+        failures.append(f"WP-11b: teammate_list should not include personality (use teammate_profile): {text(17)}")
     # teammate_profile (self) returns the full profile incl. personality
     for needle in (PROJECT, PERSONALITY, ROLE, STATUS_NEW, AUTHORITY):
         if needle not in text(18):
@@ -813,6 +820,12 @@ def main():
     # gate-off path (no TEAMMATE_REINCARNATE_ENABLED) is isError + spawns nothing
     if not is_error(52) or "disabled" not in text(52):
         failures.append(f"reincarnate gate-off not isError/disabled: {by_id.get(52)}")
+
+    # ── WP-11b — lean surface & outputs ──
+    # teammate_list all=True accepted without error and returns roster
+    if is_error(62) or "Registered teammates" not in text(62):
+        failures.append(f"WP-11b: teammate_list(all=True) failed: {text(62)}")
+
     # spawn.py pure builders (NO real spawn): list-form safety + handoff env + dir validation
     try:
         sys.path.insert(0, str(SRC))
@@ -1361,6 +1374,56 @@ def main():
             failures.append(f"WP-11a _renudge_ids: unseen_ids subset not respected: {_got_sub}")
     except Exception as e:
         failures.append(f"WP-11a _renudge_ids unit checks errored: {e}")
+
+    # ── WP-11b — inbox body suppression (hermetic, isolated temp root — no shared inbox) ──
+    # Tests _handle_inbox's _prev_seen/new_msgs/seen_msgs split directly. A second read in the
+    # same session must suppress already-shown bodies; show_all=True restores them.
+    # Isolated from the channel harness to prevent polluting the timing-sensitive watcher tests.
+    try:
+        from teammate_comms.tools import _handle_inbox as _hi11b
+        from teammate_comms import comms as _c11b
+
+        _b11b_root = tempfile.mkdtemp(prefix="tc-11b-")
+        _b11b_agent = "probe-agent"
+        _b11b_team = None
+
+        _inboxes11b = _c11b.get_inboxes_dir(_b11b_root, _b11b_team)
+        _c11b.ensure_inbox(_inboxes11b, _b11b_agent)
+        _probe_msg = {"id": "probe-msg-1", "from": "probe-peer", "priority": "normal",
+                      "message": "suppression-probe-body"}
+        _c11b.write_json_atomic(_inboxes11b / f"{_b11b_agent}_unread.json", [_probe_msg])
+
+        class _Id11b:
+            def __init__(self):
+                self._ls = None
+            def snapshot(self):
+                return (_b11b_agent, _b11b_team, _b11b_root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        _ctx11b = {"identity": _Id11b()}
+
+        # First read: body must appear (message is new this session)
+        _r1 = _hi11b({}, _ctx11b)
+        if "suppression-probe-body" not in _r1:
+            failures.append(f"WP-11b suppression: first read must show the body: {_r1}")
+
+        # Second read: body must be suppressed (id now in last_seen); note must appear
+        _r2 = _hi11b({}, _ctx11b)
+        if "suppression-probe-body" in _r2:
+            failures.append(f"WP-11b suppression: second read re-dumped already-seen body (should suppress): {_r2}")
+        if "already read this session" not in _r2 and "No new messages" not in _r2:
+            failures.append(f"WP-11b suppression: second read missing suppression note: {_r2}")
+
+        # show_all=True: body must reappear (escape hatch for post-compaction re-read)
+        _r3 = _hi11b({"show_all": True}, _ctx11b)
+        if "suppression-probe-body" not in _r3:
+            failures.append(f"WP-11b suppression show_all=True: body should reappear: {_r3}")
+
+    except Exception as e:
+        failures.append(f"WP-11b inbox suppression unit checks errored: {e}")
 
     # ── WP-3 (G-1) — dashboard HTTP layer: start the real loopback server in-process and hit
     #    every endpoint with stdlib http.client (zero deps). Token/Host guards + status codes

@@ -14,9 +14,9 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** — fans out to every member; `@name` (a member) flags a mention; `post_type` builds a decision trail. |
-| `teammate_inbox` | `count_only?` | Read *your* unread messages (or just the count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. |
+| `teammate_inbox` | `count_only?`, `show_all?` | Read *your* unread messages (or just the count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies of messages already shown this session are suppressed by default — pass `show_all=True` to re-read them (useful after context compaction). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. `"all"` clears only what you've **seen** as of your last `teammate_inbox` read — arrivals since then are kept. |
-| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. The human operator shows as `🧑 (operator)`. |
+| `teammate_list` | `all?` | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`, `role` when set**), plus a **Groups** section. Defaults to your project only — pass `all=True` for a global view (cross-project authority owners are hidden in the default view). The human operator shows as `🧑 (operator)`. Use `teammate_profile` for full details including personality. |
 | `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
@@ -40,14 +40,19 @@ project you own. Before starting a task, check `teammate_list` (always shows
 over the areas you'll touch; if a teammate owns one or is mid-task there, coordinate with
 them via `teammate_send` before you modify it — never overlap another agent's authority
 unannounced. Because comms are global across projects, `project`
-(auto-filled from your project dir) tells peers which repo each teammate is in. Your own profile is echoed back in the `teammate_register` return,
-and the channel wake event leads with `You are <name>: <personality>` so a woken idle
-instance is reminded who it is.
+(auto-filled from your project dir) tells peers which repo each teammate is in. Your own profile is echoed back in the `teammate_register` return.
 
-`personality` is a *persona to inhabit* (write a person — concrete detail, a
-temperament, voice cues — never the job/owned-areas/current-task; those are
-role/authority/status); see the `teammate_register` tool description for the full
-guide. Profile fields are **durable**: re-registering later only re-establishes your
+`personality` is a *persona to genuinely inhabit* — write a **person**, not a property
+list: concrete, lived-in sensory detail over adjectives; a through-line of temperament
+or values; voice cues for how they talk. Pure flavor — it colors tone and conversation,
+never what the agent decides, owns, or how rigorously it works. Mention **none** of its
+job, owned areas, or current task (those are `role`/`authority`/`status`). Durable
+identity: set once, change rarely. The bar to hit: *"Island girl, North Atlantic. Swims
+in water that bites the breath out of her, then grins about it. Always has tea going cold
+somewhere. Reads the shipping forecast like a lullaby. Quiet, dry, fierce about small
+kindnesses."*
+
+Profile fields are **durable**: re-registering later only re-establishes your
 identity and channel — your `role`/`personality`/`authority` persist, so you don't
 re-supply them (refresh the dynamic `status` with `teammate_update`).
 
