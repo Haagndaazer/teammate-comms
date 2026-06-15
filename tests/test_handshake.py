@@ -25,8 +25,8 @@ primary path). Asserts both halves of the unified server:
     - teammate_update changes status; teammate_list always shows project/status/
       authority and includes personality; teammate_profile returns the full profile;
       a profile field SURVIVES a heartbeat cycle
-    - the channel wake names the message source (sender/group); the personality reminder
-      is every ~10 msgs (registration echoes it), NOT every wake
+    - the channel wake names the message source (sender/group); personality never
+      appears in wakes (WP-11a dropped the owner-reminder — registration echo suffices)
 
   Channel half:
     - initialize echoes the id and advertises BOTH experimental['claude/channel']
@@ -550,13 +550,13 @@ def main():
         failures.append("no notifications/claude/channel emitted for new message")
     elif mwakes[0]["params"]["meta"].get("agent") != AGENT:
         failures.append(f"channel notification meta wrong: {mwakes[0]['params']['meta']}")
-    # v0.6.0: the wake names WHERE the message came from (the DM sender), and does NOT
-    # lead with the personality reminder (that's now every ~10 msgs + at registration, not
-    # every wake — registration echo is asserted via text(5) above).
+    # v0.6.0: the wake names WHERE the message came from (the DM sender).
+    # WP-11a: the v0.6 owner-reminder ("You are <name>: <personality>") was dropped —
+    # the persona is durable in the agent's session; PERSONALITY must not appear in any wake.
     elif "tester" not in mwakes[0]["params"].get("content", ""):
         failures.append(f"channel wake did not name the source/sender: {mwakes[0]['params'].get('content')}")
-    elif PERSONALITY in mwakes[0]["params"].get("content", ""):
-        failures.append(f"early wake wrongly included the personality reminder (should be every ~10): {mwakes[0]['params'].get('content')}")
+    elif any(PERSONALITY in n["params"].get("content", "") for n in mwakes):
+        failures.append(f"WP-11a: personality reminder appeared in a wake (should be gone)")
     # v0.4.2: nudge count is the UNSEEN count and is never padded by read-but-unacked
     # messages. Every message in this run is read/acked before the next arrives, so the
     # unseen count at each nudge is exactly 1 — a notification with count>1 would mean a
@@ -1330,6 +1330,37 @@ def main():
             failures.append(f"WP-9 mute-flap re-nudged {fired}x (must be 0)")
     except Exception as e:
         failures.append(f"WP-9 re-nudge unit checks errored: {e}")
+
+    # ── WP-11a — lean wakes: _renudge_ids pure helper determines which unseen messages
+    #    warrant a re-nudge (DM / urgent / @mention). Ambient group chatter is excluded
+    #    so the re-nudge budget isn't wasted on low-priority posts. ──
+    try:
+        from teammate_comms.channel import _renudge_ids as _rni
+        ME11 = "agent11"
+        _dm    = {"id": "id-dm",      "from": "peer"}                              # DM (no group)
+        _grp   = {"id": "id-grp",     "from": "peer", "group": "#team"}            # ambient group
+        _urg   = {"id": "id-urg",     "from": "peer", "group": "#team", "priority": "urgent"}
+        _men   = {"id": "id-men",     "from": "peer", "group": "#team", "mentions": [ME11, "other"]}
+        _men_x = {"id": "id-men-x",   "from": "peer", "group": "#team", "mentions": ["other"]}  # @other, not me
+        _msgs  = [_dm, _grp, _urg, _men, _men_x]
+        _all   = {"id-dm", "id-grp", "id-urg", "id-men", "id-men-x"}
+        _got   = _rni(_msgs, _all, ME11)
+        if "id-dm" not in _got:
+            failures.append("WP-11a _renudge_ids: DM not in renudge set")
+        if "id-urg" not in _got:
+            failures.append("WP-11a _renudge_ids: urgent group post not in renudge set")
+        if "id-men" not in _got:
+            failures.append("WP-11a _renudge_ids: @mentioned group post not in renudge set")
+        if "id-grp" in _got:
+            failures.append("WP-11a _renudge_ids: ambient group chatter wrongly in renudge set")
+        if "id-men-x" in _got:
+            failures.append("WP-11a _renudge_ids: @other-only group post wrongly in renudge set")
+        # subset check: only ids present in unseen_ids pass through
+        _got_sub = _rni(_msgs, {"id-dm"}, ME11)
+        if _got_sub != {"id-dm"}:
+            failures.append(f"WP-11a _renudge_ids: unseen_ids subset not respected: {_got_sub}")
+    except Exception as e:
+        failures.append(f"WP-11a _renudge_ids unit checks errored: {e}")
 
     # ── WP-3 (G-1) — dashboard HTTP layer: start the real loopback server in-process and hit
     #    every endpoint with stdlib http.client (zero deps). Token/Host guards + status codes
