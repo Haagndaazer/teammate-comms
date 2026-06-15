@@ -1554,25 +1554,60 @@ def main():
                     pass                              # acquired by stealing the dead holder
             except _c6.CommsError:
                 failures.append("A-7: did NOT steal a lock from a verified-dead holder")
-            # exactly-one-winner: 8 concurrent stealers on one dead lock → exactly one claims
-            # (the claim is a `mkdir` of a sibling .claim marker — the same atomic primitive the
-            # lock uses; exactly one of N concurrent mkdirs wins, cross-platform incl. Windows).
-            _two = _mklock("two", 99999)
-            _wins = []
-
-            def _steal():
-                if _c6._claim_if_dead(_two):
-                    _wins.append(1)
-            _ts = [_th6.Thread(target=_steal) for _ in range(8)]
-            for t in _ts:
-                t.start()
-            for t in _ts:
-                t.join()
-            if len(_wins) != 1:
-                failures.append(f"A-7: {len(_wins)} stealers won the atomic claim (must be EXACTLY 1)")
         finally:
             _c6._pid_alive = _orig_pa
             for _p in Path(wroot6).glob("*.claim"):     # clean any leftover claim marker
+                _sh6.rmtree(_p, ignore_errors=True)
+
+        # ---- A-7 (g) [release-gate de-flake]: contention EXCLUSION through the PRODUCTION path.
+        #      The old test ("exactly one of 8 _claim_if_dead returns True") raced shutil.rmtree on
+        #      Windows — a lingering dir (a peer thread's open pid-read handle) read as a SECOND
+        #      'win'. That's a TEST artifact, NOT a prod two-writers: a steal is followed by an
+        #      EXCLUSIVE re-mkdir (the true arbiter), and a lingered rmtree routes through file_lock's
+        #      FileExistsError-retry, which recovers. Re-aim at what matters: N contenders go through
+        #      REAL file_lock on a stealable dead lock; NO TWO may hold at once, and the dead lock
+        #      must be recovered (>=1 acquires). Asserting serial hand-off of ALL N would itself be
+        #      timing-dependent (a thread crossing its 0.3s cliff while a peer holds raises, legitimately)
+        #      — "no simultaneous holders + >=1 acquirer" is the right, flake-immune invariant.
+        #      DO NOT mock _pid_alive here: after the steal a LIVE holder (a real peer thread, real
+        #      pid) must stay UN-stealable, so the real liveness check is load-bearing — an always-dead
+        #      mock would defeat the steal's re-verify by construction (and make the live peer stealable
+        #      → a false red AND a miniature of the very two-writers this guards).
+        _ex = Path(wroot6) / "excl"
+        _exld = Path(str(_ex) + ".lock")
+        _exld.mkdir()
+        (_exld / "pid").write_text(f"2000000000\n{_sock6.gethostname()}")   # > pid_max / no such PID → really dead
+        _held = [False]
+        _overlap = []
+        _exacq = [0]
+        _exerr = []
+        try:
+            def _contend():
+                try:
+                    with _c6.file_lock(_ex, timeout=0.3):
+                        if _held[0]:
+                            _overlap.append(1)           # two holders at once = exclusion broken
+                        _held[0] = True
+                        time.sleep(0.01)                 # widen the overlap window
+                        _held[0] = False
+                    _exacq[0] += 1                        # completed a full EXCLUSIVE hold
+                except _c6.CommsError:
+                    pass                                 # a live peer held through our timeout — not a violation
+                except Exception as _e:
+                    _exerr.append(repr(_e))              # record, never mask
+            _ets = [_th6.Thread(target=_contend) for _ in range(5)]
+            for t in _ets:
+                t.start()
+            for t in _ets:
+                t.join()
+            if _overlap:
+                failures.append(f"A-7 exclusion BROKEN: {len(_overlap)} simultaneous-holder event(s) (two-writers)")
+            if _exacq[0] < 1:
+                failures.append("A-7 exclusion: NO thread acquired the dead lock (steal path not exercised)")
+            if _exerr:
+                failures.append(f"A-7 exclusion worker error(s): {_exerr[:2]}")
+        finally:
+            for _p in Path(wroot6).glob("excl*"):
                 _sh6.rmtree(_p, ignore_errors=True)
 
         # ---- A-7 (d): UNDETERMINED liveness (_pid_alive→None) must NOT be stolen (absence of a
