@@ -19,11 +19,12 @@ primary path). Asserts both halves of the unified server:
       arrival that lands after the read is preserved (v0.4.1)
 
   Profile fields:
-    - teammate_register echoes the profile back (personality reminder at start)
+    - teammate_register echoes the profile back (role + personality shown on register)
     - `project` is auto-filled from CLAUDE_PROJECT_DIR's basename and shows in
       whoami / teammate_list / teammate_profile
     - teammate_update changes status; teammate_list always shows project/status/
-      authority and includes personality; teammate_profile returns the full profile;
+      authority (WP-11b: personality dropped from list, use teammate_profile);
+      teammate_profile returns the full profile;
       a profile field SURVIVES a heartbeat cycle
     - the channel wake names the message source (sender/group); personality never
       appears in wakes (WP-11a dropped the owner-reminder — registration echo suffices)
@@ -432,6 +433,18 @@ def main():
                            "arguments": {"agent": "Echo", "project_dir": str(REPO)}}})
     time.sleep(0.5)
 
+    # WP-11b: inbox body suppression — a second read in the same session must not re-dump seen bodies.
+    append_external_message(root, AGENT, PEER, "suppression-probe")
+    time.sleep(0.3)
+    send(proc, {"jsonrpc": "2.0", "id": 60, "method": "tools/call",
+                "params": {"name": "teammate_inbox", "arguments": {}}})          # first read — body shows
+    send(proc, {"jsonrpc": "2.0", "id": 61, "method": "tools/call",
+                "params": {"name": "teammate_inbox", "arguments": {}}})          # second read — body suppressed
+    # WP-11b: teammate_list all=True — smoke test that the param is accepted
+    send(proc, {"jsonrpc": "2.0", "id": 62, "method": "tools/call",
+                "params": {"name": "teammate_list", "arguments": {"all": True}}})
+    time.sleep(0.5)
+
     proc.stdin.close()
     try:
         proc.wait(timeout=5)
@@ -595,8 +608,9 @@ def main():
         failures.append(f"teammate_list missing project value {PROJECT!r}: {text(17)}")
     if STATUS_NEW not in text(17) or AUTHORITY not in text(17):
         failures.append(f"teammate_list missing updated status/authority values: {text(17)}")
-    if PERSONALITY not in text(17):
-        failures.append(f"teammate_list missing personality: {text(17)}")
+    # WP-11b: personality is dropped from teammate_list output (use teammate_profile for full details)
+    if PERSONALITY in text(17):
+        failures.append(f"WP-11b: teammate_list should not include personality (use teammate_profile): {text(17)}")
     # teammate_profile (self) returns the full profile incl. personality
     for needle in (PROJECT, PERSONALITY, ROLE, STATUS_NEW, AUTHORITY):
         if needle not in text(18):
@@ -813,6 +827,19 @@ def main():
     # gate-off path (no TEAMMATE_REINCARNATE_ENABLED) is isError + spawns nothing
     if not is_error(52) or "disabled" not in text(52):
         failures.append(f"reincarnate gate-off not isError/disabled: {by_id.get(52)}")
+
+    # ── WP-11b — lean surface & outputs ──
+    # Inbox body suppression: first read shows the body; second read suppresses it.
+    if is_error(60) or "suppression-probe" not in text(60):
+        failures.append(f"WP-11b: first teammate_inbox didn't show the suppression-probe body: {text(60)}")
+    if "suppression-probe" in text(61):
+        failures.append(f"WP-11b: second teammate_inbox re-dumped an already-seen body (should be suppressed): {text(61)}")
+    if "already read this session" not in text(61) and "No new messages" not in text(61):
+        failures.append(f"WP-11b: second teammate_inbox didn't note suppression: {text(61)}")
+    # teammate_list all=True accepted without error and returns roster
+    if is_error(62) or "Registered teammates" not in text(62):
+        failures.append(f"WP-11b: teammate_list(all=True) failed: {text(62)}")
+
     # spawn.py pure builders (NO real spawn): list-form safety + handoff env + dir validation
     try:
         sys.path.insert(0, str(SRC))

@@ -99,17 +99,9 @@ _PROFILE_DESCRIPTIONS = {
     ),
     "role": "Your job/role on the team (e.g. 'backend / API').",
     "personality": (
-        "Give the agent a bit of human soul: a persona to genuinely inhabit, not a property list. "
-        "Write a PERSON — concrete, lived-in sensory detail over adjectives ('swims in water that "
-        "bites the breath out of her, then grins' beats 'adventurous'); a through-line of temperament "
-        "or values that ties the details together; voice cues for how they talk (deadpan, warm, gruff). "
-        "Pure flavor: it colors tone and conversation, never what the agent decides, owns, or how "
-        "rigorously it works. Mention NONE of its job, owned areas, or current task — those are the "
-        "role/authority/status fields; if you can tell what the agent does from this, rewrite it. "
-        "Durable identity: set once, change rarely (unlike status, which you refresh). The bar to hit: "
-        "'Island girl, North Atlantic. Swims in water that bites the breath out of her, then grins about "
-        "it. Always has tea going cold somewhere. Reads the shipping forecast like a lullaby. Quiet, dry, "
-        "fierce about small kindnesses.'"
+        "A persona to inhabit — concrete sensory detail, temperament, and voice cues. "
+        "Never the agent's job, owned areas, or current task (those are role/authority/status). "
+        "See SKILL.md for full guidance."
     ),
     "status": "What you're doing right now — keep this fresh so teammates can see it at a glance.",
     "authority": "Areas of the project you own (e.g. 'src/auth/**, billing'), so teammates know before modifying them.",
@@ -196,13 +188,14 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "teammate_inbox",
-        "description": "Read your own unread messages (or just the unread count). Optional 'since'/'limit' page a large inbox.",
+        "description": "Read your own unread messages (or just the unread count). Optional 'since'/'limit' page a large inbox. Bodies of messages already shown this session are suppressed by default (pass show_all=True to re-read them).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "count_only": {"type": "boolean", "description": "If true, return only the unread count."},
                 "since": {"type": "string", "description": "Only show unread messages with id >= this cursor (page forward through a large inbox)."},
                 "limit": {"type": "integer", "description": "Show only the most recent N unread (after any 'since' filter). ack(\"all\") then clears only what was shown."},
+                "show_all": {"type": "boolean", "description": "Re-show bodies of messages already read this session (default suppresses them to avoid re-dumping context you've already seen)."},
             },
         },
     },
@@ -222,8 +215,13 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "teammate_list",
-        "description": "List registered teammates with their type and liveness.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "List registered teammates with their type and liveness. Defaults to your project only; pass all=True for a global view.",
+        "inputSchema": {"type": "object", "properties": {
+            "all": {
+                "type": "boolean",
+                "description": "Show teammates from all projects (default shows only your project). Cross-project authority owners are hidden in default view.",
+            },
+        }},
     },
     {
         "name": "teammate_whoami",
@@ -573,13 +571,31 @@ def _handle_inbox(args, ctx):
         return ("No unread messages." if not (since or limit)
                 else f"No unread messages match the filter ({len(all_unread)} total unread).")
 
+    # Body suppression: messages already shown this session don't re-dump their body.
+    # _prev_seen is captured BEFORE set_last_seen above — NEVER-MISS invariant: a message
+    # showing for the first time this call lands in new_msgs and always renders full.
+    # Suppressed messages remain unread — ack("all") and ack(id) still work normally.
+    show_all = bool(args.get("show_all"))
+    new_msgs = [m for m in messages if m.get("id") not in _prev_seen]
+    seen_msgs = [m for m in messages if m.get("id") in _prev_seen]
+
+    if not show_all and not new_msgs:
+        n = len(seen_msgs)
+        if since or limit:
+            return (f"No new messages in this window ({n} already read this session). "
+                    f"Remove since/limit or pass show_all=True to re-read.")
+        return (f"No new messages. {n} unread already read this session. "
+                f"Pass show_all=True to re-read.")
+
+    render_msgs = messages if show_all else new_msgs
+
     rx_all = aggregate_reactions(read_reactions(root, team))
     header = f"=== {len(messages)} unread message(s) for {agent}"
     if len(messages) < len(all_unread):
         header += f" (showing {len(messages)} of {len(all_unread)}; page with since/limit)"
     header += " ==="
     out = [header]
-    for msg in messages:
+    for msg in render_msgs:
         tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
         grp = msg.get("group")
         gtag = f" [👥 group: {grp}]" if grp else ""
@@ -592,6 +608,9 @@ def _handle_inbox(args, ctx):
         rx = rx_all.get(msg.get("id"))
         if rx:
             out.append(f"    reactions: {_reaction_summary(rx)}")   # names, matching group history (F-3)
+    if not show_all and seen_msgs:
+        out.append(f"\n({len(seen_msgs)} message(s) already read this session not re-shown. "
+                   f"Pass show_all=True to re-read.)")
     return "\n".join(out)
 
 
@@ -654,15 +673,30 @@ def _handle_ack(args, ctx):
 
 def _handle_list(args, ctx):
     _agent, team, root = _require_registered(ctx)
+    show_all = bool(args.get("all"))
+    # Project-scoped filter (display-only — routing/delivery is always global).
+    # Stale-project edge case: if the caller updated their working project without
+    # re-registering, my_project may lag behind; pass all=True to see everyone.
+    my_record = read_agent_record(root, team, _agent) or {}
+    my_project = my_record.get("project") or ""
+
     agents_dir = get_agents_dir(root, team)
     if not agents_dir.exists():
         return "No registered teammates yet."
 
     rows = []
+    filtered_count = 0
     for path in sorted(agents_dir.glob("*.json")):
         record = read_agent_record(root, team, path.stem)
         if not isinstance(record, dict):
             continue
+        # Always show self; filter others to the caller's project when both sides are known.
+        # Agents with no project set (human operator, legacy) are never filtered out.
+        if not show_all and path.stem != _agent and my_project:
+            agent_project = record.get("project") or ""
+            if agent_project and agent_project != my_project:
+                filtered_count += 1
+                continue
         kind = record.get("type", "unknown")
         me = " (you)" if path.stem == _agent else ""
         if kind == "human":
@@ -682,10 +716,13 @@ def _handle_list(args, ctx):
         role = record.get("role")
         if role:
             rows.append(f"      role:      {role}")
-        personality = record.get("personality")
-        if personality:
-            rows.append(f"      personality: {personality}")
+        # personality intentionally excluded from list — use teammate_profile for full details
     teammates = "Registered teammates:\n" + "\n".join(rows) if rows else "No registered teammates yet."
+    if filtered_count:
+        teammates += (
+            f"\n\n({filtered_count} teammate(s) in other projects omitted, including any "
+            f"cross-project authority owners — pass all=True to see all.)"
+        )
 
     # Groups section — groups are addressed like teammates (with a '#' prefix).
     group_rows = []
