@@ -485,6 +485,12 @@ def main():
         instr = init.get("result", {}).get("instructions", "")
         if "teammate_register" not in instr or "status as you work" not in instr:
             failures.append(f"initialize instructions missing/incomplete: {instr[:80]!r}")
+        # WP-10: the authority-coordination standing rule reaches the handshake too. Bind its
+        # DISTINCTIVE reason-phrase (who-owns + coordinate-before) — NOT the bare token "authority",
+        # which already appears in the profile-fields list (asserting that would be a tautology).
+        _instr_l = instr.lower()
+        if "authority over the areas" not in _instr_l or "before you modify" not in _instr_l:
+            failures.append(f"initialize instructions missing the authority-coordination rule (WP-10): {instr[:120]!r}")
 
     # tools/list: 13 tools, each with an object inputSchema
     tl = result(2).get("tools")
@@ -1023,6 +1029,9 @@ def main():
             failures.append("server INSTRUCTIONS is not single-sourced from instructions.py")
         if "status as you work" not in _ins.INSTRUCTIONS:
             failures.append("INSTRUCTIONS missing the 'update your status as you work' standing rule")
+        _ins_l = _ins.INSTRUCTIONS.lower()   # WP-10: authority-coordination rule, distinctive phrase
+        if "authority over the areas" not in _ins_l or "before you modify" not in _ins_l:
+            failures.append("INSTRUCTIONS missing the WP-10 authority-coordination standing rule")
         _buf = _io.StringIO()
         with _redirect(_buf):
             _ins.main()
@@ -1032,6 +1041,9 @@ def main():
             failures.append(f"reinject hookEventName wrong: {_hso.get('hookEventName')}")
         if "status as you work" not in _hso.get("additionalContext", ""):
             failures.append("reinject additionalContext missing the standing rule")
+        _ac_l = _hso.get("additionalContext", "").lower()   # WP-10: the reinject path carries it too
+        if "authority over the areas" not in _ac_l or "before you modify" not in _ac_l:
+            failures.append("reinject additionalContext missing the WP-10 authority-coordination rule")
     except Exception as e:
         failures.append(f"instructions/reinject checks errored: {e}")
 
