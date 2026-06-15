@@ -433,14 +433,7 @@ def main():
                            "arguments": {"agent": "Echo", "project_dir": str(REPO)}}})
     time.sleep(0.5)
 
-    # WP-11b: inbox body suppression — a second read in the same session must not re-dump seen bodies.
-    append_external_message(root, AGENT, PEER, "suppression-probe")
-    time.sleep(0.3)
-    send(proc, {"jsonrpc": "2.0", "id": 60, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})          # first read — body shows
-    send(proc, {"jsonrpc": "2.0", "id": 61, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})          # second read — body suppressed
-    # WP-11b: teammate_list all=True — smoke test that the param is accepted
+    # WP-11b: teammate_list all=True — smoke test that the param is accepted (no shared-inbox side-effects)
     send(proc, {"jsonrpc": "2.0", "id": 62, "method": "tools/call",
                 "params": {"name": "teammate_list", "arguments": {"all": True}}})
     time.sleep(0.5)
@@ -829,13 +822,6 @@ def main():
         failures.append(f"reincarnate gate-off not isError/disabled: {by_id.get(52)}")
 
     # ── WP-11b — lean surface & outputs ──
-    # Inbox body suppression: first read shows the body; second read suppresses it.
-    if is_error(60) or "suppression-probe" not in text(60):
-        failures.append(f"WP-11b: first teammate_inbox didn't show the suppression-probe body: {text(60)}")
-    if "suppression-probe" in text(61):
-        failures.append(f"WP-11b: second teammate_inbox re-dumped an already-seen body (should be suppressed): {text(61)}")
-    if "already read this session" not in text(61) and "No new messages" not in text(61):
-        failures.append(f"WP-11b: second teammate_inbox didn't note suppression: {text(61)}")
     # teammate_list all=True accepted without error and returns roster
     if is_error(62) or "Registered teammates" not in text(62):
         failures.append(f"WP-11b: teammate_list(all=True) failed: {text(62)}")
@@ -1388,6 +1374,56 @@ def main():
             failures.append(f"WP-11a _renudge_ids: unseen_ids subset not respected: {_got_sub}")
     except Exception as e:
         failures.append(f"WP-11a _renudge_ids unit checks errored: {e}")
+
+    # ── WP-11b — inbox body suppression (hermetic, isolated temp root — no shared inbox) ──
+    # Tests _handle_inbox's _prev_seen/new_msgs/seen_msgs split directly. A second read in the
+    # same session must suppress already-shown bodies; show_all=True restores them.
+    # Isolated from the channel harness to prevent polluting the timing-sensitive watcher tests.
+    try:
+        from teammate_comms.tools import _handle_inbox as _hi11b
+        from teammate_comms import comms as _c11b
+
+        _b11b_root = tempfile.mkdtemp(prefix="tc-11b-")
+        _b11b_agent = "probe-agent"
+        _b11b_team = None
+
+        _inboxes11b = _c11b.get_inboxes_dir(_b11b_root, _b11b_team)
+        _c11b.ensure_inbox(_inboxes11b, _b11b_agent)
+        _probe_msg = {"id": "probe-msg-1", "from": "probe-peer", "priority": "normal",
+                      "message": "suppression-probe-body"}
+        _c11b.write_json_atomic(_inboxes11b / f"{_b11b_agent}_unread.json", [_probe_msg])
+
+        class _Id11b:
+            def __init__(self):
+                self._ls = None
+            def snapshot(self):
+                return (_b11b_agent, _b11b_team, _b11b_root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        _ctx11b = {"identity": _Id11b()}
+
+        # First read: body must appear (message is new this session)
+        _r1 = _hi11b({}, _ctx11b)
+        if "suppression-probe-body" not in _r1:
+            failures.append(f"WP-11b suppression: first read must show the body: {_r1}")
+
+        # Second read: body must be suppressed (id now in last_seen); note must appear
+        _r2 = _hi11b({}, _ctx11b)
+        if "suppression-probe-body" in _r2:
+            failures.append(f"WP-11b suppression: second read re-dumped already-seen body (should suppress): {_r2}")
+        if "already read this session" not in _r2 and "No new messages" not in _r2:
+            failures.append(f"WP-11b suppression: second read missing suppression note: {_r2}")
+
+        # show_all=True: body must reappear (escape hatch for post-compaction re-read)
+        _r3 = _hi11b({"show_all": True}, _ctx11b)
+        if "suppression-probe-body" not in _r3:
+            failures.append(f"WP-11b suppression show_all=True: body should reappear: {_r3}")
+
+    except Exception as e:
+        failures.append(f"WP-11b inbox suppression unit checks errored: {e}")
 
     # ── WP-3 (G-1) — dashboard HTTP layer: start the real loopback server in-process and hit
     #    every endpoint with stdlib http.client (zero deps). Token/Host guards + status codes
