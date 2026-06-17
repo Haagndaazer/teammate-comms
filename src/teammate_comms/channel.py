@@ -188,22 +188,6 @@ def _wake_payload(messages, unseen_ids, agent):
     return len(unseen_ids), group_targets, mentioned, senders
 
 
-def _renudge_ids(messages, unseen_ids, agent):
-    """Pure: subset of ``unseen_ids`` that warrant a re-nudge — DM / urgent / @mention.
-
-    Ambient group chatter is excluded: the first-nudge already ran; re-nudging for
-    low-priority group traffic wastes tokens. ``compute_reemit`` still receives the full
-    ``unseen_ids`` for clock management so the disarm-on-empty (all-caught-up) invariant
-    holds — this function gates only the EMIT, not the state update.
-    """
-    return {
-        m.get("id") for m in messages
-        if m.get("id") in unseen_ids
-        and (not m.get("group")                       # DM
-             or m.get("priority") == "urgent"         # urgent group post
-             or agent in m.get("mentions", []))        # @mention in group post
-    }
-
 
 def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
     """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
@@ -215,6 +199,7 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     last_hb = 0.0
     known_ids = None  # ids already seeded-at-registration or already nudged; None until seeded
     last_agent = None
+    last_generation = None  # Identity generation at last reset; same-name re-register bumps this
     muted = set()     # cached muted_groups for this agent; refreshed on the heartbeat tick
     known_reaction_ids = None  # previous tick's returned reaction ids; None until first read
     reaction_cursor = None     # high-water mark (max reaction id seen) driving the read window
@@ -222,116 +207,122 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     reemit_attempts = 0        # re-nudge attempts in the current quiet period (capped)
 
     while not stop_evt.is_set():
-        if not (initialized_evt.is_set() and registered_evt.is_set()):
-            stop_evt.wait(POLL_SECONDS)
-            continue
+        try:
+            if not (initialized_evt.is_set() and registered_evt.is_set()):
+                stop_evt.wait(POLL_SECONDS)
+                continue
 
-        agent, team, root, unread_file = identity.snapshot()
-        if agent is None or root is None:
-            stop_evt.wait(POLL_SECONDS)
-            continue
+            agent, team, root, unread_file = identity.snapshot()
+            generation = identity.get_generation()
+            if agent is None or root is None:
+                stop_evt.wait(POLL_SECONDS)
+                continue
 
-        # Identity (re)set: re-seed for the new inbox (Identity.set already cleared
-        # its last_seen, so both reset together). last_hb=0 forces an immediate
-        # heartbeat + muted-cache refresh for the new identity.
-        if agent != last_agent:
-            known_ids = None
-            last_agent = agent
-            muted = set()
-            last_hb = 0.0
-            known_reaction_ids = None
-            reaction_cursor = None
-            last_emit_mono = None
-            reemit_attempts = 0
+            # Identity (re)set: re-seed for the new inbox. Triggers on agent name change OR on a
+            # same-name re-registration (post-compaction), detected via a bumped generation counter.
+            # Identity.set already cleared last_seen on name-change; the watcher reset here purges
+            # known_ids and clocks so stale in-memory state doesn't suppress wakes after re-register.
+            # last_hb=0 forces an immediate heartbeat + muted-cache refresh.
+            if agent != last_agent or generation != last_generation:
+                known_ids = None
+                last_agent = agent
+                last_generation = generation
+                muted = set()
+                last_hb = 0.0
+                known_reaction_ids = None
+                reaction_cursor = None
+                last_emit_mono = None
+                reemit_attempts = 0
 
-        now = time.monotonic()
-        if now - last_hb >= HEARTBEAT_SECONDS:
-            write_agent_record(
-                root, team, agent, timeout=2,
-                channel=True, pid=os.getpid(), host=hostname,
-                lastHeartbeat=now_timestamp(),
-            )
-            last_hb = now
-            # Refresh the muted-groups cache (≤5s staleness for a mute to take effect) so
-            # the per-poll wake filter below never adds a disk read.
-            hb_rec = read_agent_record(root, team, agent) or {}
-            muted = set(hb_rec.get("muted_groups", []))
-            # Reaction wakes (low-volume → only on the 5s heartbeat tick, not every poll):
-            # wake the AUTHOR of a reacted-to message. A high-water cursor drives the read
-            # window forward (since=reaction_cursor, oldest_first once seeded) so a burst
-            # larger than the limit pages across ticks instead of scrolling past a fixed
-            # tail and silently missing a wake (audit A-2). A giant burst drains at
-            # 500/tick (~5s/tick) — bounded delay, never a drop. Decision logic lives in
-            # the pure compute_reaction_wakes (hermetically tested). Seed = no startup wake.
-            reactions = read_reactions(root, team, since=reaction_cursor, limit=500,
-                                       oldest_first=(reaction_cursor is not None))
-            fresh_rx, known_reaction_ids, new_rcursor = compute_reaction_wakes(
-                reactions, known_reaction_ids, agent)
-            if fresh_rx:
-                emit_reaction_event(send_message, agent, fresh_rx)
-                _log_emit("reaction", len(fresh_rx), 0)
-            if new_rcursor is not None:
-                reaction_cursor = new_rcursor
+            now = time.monotonic()
+            if now - last_hb >= HEARTBEAT_SECONDS:
+                write_agent_record(
+                    root, team, agent, timeout=2,
+                    channel=True, pid=os.getpid(), host=hostname,
+                    lastHeartbeat=now_timestamp(),
+                )
+                last_hb = now
+                # Refresh the muted-groups cache (≤5s staleness for a mute to take effect) so
+                # the per-poll wake filter below never adds a disk read.
+                hb_rec = read_agent_record(root, team, agent) or {}
+                muted = set(hb_rec.get("muted_groups", []))
+                # Reaction wakes (low-volume → only on the 5s heartbeat tick, not every poll):
+                # wake the AUTHOR of a reacted-to message. A high-water cursor drives the read
+                # window forward (since=reaction_cursor, oldest_first once seeded) so a burst
+                # larger than the limit pages across ticks instead of scrolling past a fixed
+                # tail and silently missing a wake (audit A-2). A giant burst drains at
+                # 500/tick (~5s/tick) — bounded delay, never a drop. Decision logic lives in
+                # the pure compute_reaction_wakes (hermetically tested). Seed = no startup wake.
+                reactions = read_reactions(root, team, since=reaction_cursor, limit=500,
+                                           oldest_first=(reaction_cursor is not None))
+                fresh_rx, known_reaction_ids, new_rcursor = compute_reaction_wakes(
+                    reactions, known_reaction_ids, agent)
+                if fresh_rx:
+                    emit_reaction_event(send_message, agent, fresh_rx)
+                    _log_emit("reaction", len(fresh_rx), 0)
+                if new_rcursor is not None:
+                    reaction_cursor = new_rcursor
 
-        messages = read_json_readonly(unread_file)
-        if messages is not None:  # None = unreadable mid-write; skip cycle
-            unread_ids = {m.get("id") for m in messages if m.get("id") is not None}
-            # MUTE: ids of unread messages in a muted group. They stay in the inbox (seen
-            # via teammate_inbox) but are excluded from the WAKE (fresh/count/targets). A
-            # record without a 'group' key (a 1:1 DM) can never be muted → never-miss-a-DM.
-            muted_ids = {m.get("id") for m in messages
-                         if m.get("id") is not None and m.get("group") in muted}
-            if known_ids is None:
-                # Seed at first read after registration: messages already present are
-                # drained by the agent's startup teammate_inbox — don't nudge for them.
-                known_ids = set(unread_ids)
-            else:
-                # UNSEEN = (unread - muted) - last_seen — the ONE set both the first-nudge
-                # and the WP-9 re-nudge gate on. A read-but-unacked message (in last_seen)
-                # and any muted-group message are excluded, so neither can ever (re-)nudge:
-                # that shared computation is what keeps the v0.4.2 no-noise contract intact.
-                # Muted ids are still tracked in known_ids below, so an unmute never
-                # retro-nudges.
-                last_seen = identity.get_last_seen() or set()
-                unseen_ids = (unread_ids - muted_ids) - last_seen
-                fresh = unseen_ids - known_ids
-                if fresh:
-                    # A genuinely-new message → first nudge. group_targets name the reply
-                    # target for ANY unseen group message (mixed-batch fix); mentioned/
-                    # senders name the 🔔 and the sources. All from the shared payload.
-                    unseen_count, group_targets, mentioned, senders = _wake_payload(
-                        messages, unseen_ids, agent)
-                    emit_channel_event(send_message, agent, unseen_count,
-                                       groups=group_targets,
-                                       mentioned=mentioned, senders=senders)
-                    _log_emit("fresh", unseen_count, 0)
-                    known_ids |= unread_ids
-                    last_emit_mono = now      # (re)arm the re-nudge backoff for this batch
-                    reemit_attempts = 0
+            messages = read_json_readonly(unread_file)
+            if messages is not None:  # None = unreadable mid-write; skip cycle
+                unread_ids = {m.get("id") for m in messages if m.get("id") is not None}
+                # MUTE: ids of unread messages in a muted group. They stay in the inbox (seen
+                # via teammate_inbox) but are excluded from the WAKE (fresh/count/targets). A
+                # record without a 'group' key (a 1:1 DM) can never be muted → never-miss-a-DM.
+                muted_ids = {m.get("id") for m in messages
+                             if m.get("id") is not None and m.get("group") in muted}
+                if known_ids is None:
+                    # Seed at first read after registration: messages already present are
+                    # drained by the agent's startup teammate_inbox — don't nudge for them.
+                    known_ids = set(unread_ids)
                 else:
-                    # No NEW message, but a dropped channel push may have left the agent
-                    # unaware of still-unseen unread (GH #38736/#61797). Re-nudge with capped
-                    # backoff. compute_reemit also RESETS the clock+attempts when unseen is
-                    # empty (caught up), so an ack/read re-arms the next batch cleanly.
-                    # Clock management uses the FULL unseen_ids so the disarm-on-empty
-                    # invariant holds even when ambient group chatter is in the unseen set.
-                    do_reemit, reemit_attempts, last_emit_mono = compute_reemit(
-                        unseen_ids, now, last_emit_mono, reemit_attempts)
-                    if do_reemit and _renudge_ids(messages, unseen_ids, agent):
-                        # Emit only for DM/urgent/@mention — ambient group chatter exhausts
-                        # the re-nudge budget silently (state still advanced above). The
-                        # payload uses the full unseen set so the agent sees their total
-                        # backlog even when a DM triggered the re-nudge.
+                    # UNSEEN = (unread - muted) - last_seen — the ONE set both the first-nudge
+                    # and the WP-9 re-nudge gate on. A read-but-unacked message (in last_seen)
+                    # and any muted-group message are excluded, so neither can ever (re-)nudge:
+                    # that shared computation is what keeps the v0.4.2 no-noise contract intact.
+                    # Muted ids are still tracked in known_ids below, so an unmute never
+                    # retro-nudges.
+                    last_seen = identity.get_last_seen() or set()
+                    unseen_ids = (unread_ids - muted_ids) - last_seen
+                    fresh = unseen_ids - known_ids
+                    if fresh:
+                        # A genuinely-new message → first nudge. group_targets name the reply
+                        # target for ANY unseen group message (mixed-batch fix); mentioned/
+                        # senders name the 🔔 and the sources. All from the shared payload.
                         unseen_count, group_targets, mentioned, senders = _wake_payload(
                             messages, unseen_ids, agent)
                         emit_channel_event(send_message, agent, unseen_count,
-                                           None, groups=group_targets,
+                                           groups=group_targets,
                                            mentioned=mentioned, senders=senders)
-                        _log_emit("renudge", unseen_count, reemit_attempts)
-                # Absorb muted ids as "known" every cycle (even with no fresh wake) so a
-                # later unmute finds them already-known → no retro-nudge for still-unread
-                # muted messages (safe under-nudge direction).
-                known_ids |= muted_ids
-                known_ids &= unread_ids  # prune acked/removed ids; keeps the set bounded
+                        _log_emit("fresh", unseen_count, 0)
+                        known_ids |= unread_ids
+                        last_emit_mono = now      # (re)arm the re-nudge backoff for this batch
+                        reemit_attempts = 0
+                    else:
+                        # No NEW message, but a dropped channel push may have left the agent
+                        # unaware of still-unseen unread (GH #38736/#61797). Re-nudge with capped
+                        # backoff for ANY still-unseen message (content-agnostic recovery — a
+                        # dropped emit is a dropped emit regardless of message type). compute_reemit
+                        # also RESETS the clock+attempts when unseen is empty (caught up), so an
+                        # ack/read re-arms the next batch cleanly. No-noise contract holds because
+                        # unseen_ids = (unread - muted) - last_seen already excludes read-but-unacked
+                        # and muted, and compute_reemit's first-emit guard is unchanged.
+                        do_reemit, reemit_attempts, last_emit_mono = compute_reemit(
+                            unseen_ids, now, last_emit_mono, reemit_attempts)
+                        if do_reemit:
+                            unseen_count, group_targets, mentioned, senders = _wake_payload(
+                                messages, unseen_ids, agent)
+                            emit_channel_event(send_message, agent, unseen_count,
+                                               groups=group_targets,
+                                               mentioned=mentioned, senders=senders)
+                            _log_emit("renudge", unseen_count, reemit_attempts)
+                    # Absorb muted ids as "known" every cycle (even with no fresh wake) so a
+                    # later unmute finds them already-known → no retro-nudge for still-unread
+                    # muted messages (safe under-nudge direction).
+                    known_ids |= muted_ids
+                    known_ids &= unread_ids  # prune acked/removed ids; keeps the set bounded
 
-        stop_evt.wait(POLL_SECONDS)
+            stop_evt.wait(POLL_SECONDS)
+        except Exception as exc:
+            print(f"[teammate-comms] watcher error (loop continues): {exc}",
+                  file=sys.stderr, flush=True)

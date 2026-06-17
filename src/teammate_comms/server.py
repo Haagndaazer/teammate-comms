@@ -65,11 +65,16 @@ class Identity:
         # last read are preserved). None = never read this session (ack-all then clears
         # everything, preserving startup-drain). Cleared to None on identity change.
         self._last_seen = None
+        # Monotonically incremented on every .set() call. The watcher detects a same-name
+        # re-registration (post-compaction) by comparing generations and resets known_ids,
+        # clocks, and cursors so stale in-memory state doesn't suppress new wakes.
+        self._generation = 0
 
     def set(self, agent, team, root, unread_file):
         with self._lock:
             if agent != self.agent:
                 self._last_seen = None  # new identity → drop the previous one's seen-ids
+            self._generation += 1
             self.agent, self.team, self.root, self.unread_file = agent, team, root, unread_file
 
     def snapshot(self):
@@ -85,6 +90,11 @@ class Identity:
         """Return a copy of the last-seen id set, or None if never read this session."""
         with self._lock:
             return None if self._last_seen is None else set(self._last_seen)
+
+    def get_generation(self):
+        """Return the current generation counter (bumped on every .set() call)."""
+        with self._lock:
+            return self._generation
 
 
 _identity = Identity()

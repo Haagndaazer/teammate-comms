@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.8.2
+
+A comms-stability fix — restores reliable wakes that degraded mid-session since v0.8.1.
+**No tool-surface change.** Re-nudge again covers group posts (≤3 capped terse wakes,
+only while genuinely unread) — reliability over a handful of tokens.
+
+### Fixed
+- **Watcher crash on re-nudge (TypeError).** `emit_channel_event` lost its `personality`
+  positional parameter in WP-11a. The fresh-emit path was updated; the re-nudge path was
+  not and still passed a stray `None,` → `TypeError: got multiple values for argument
+  'groups'`. The watcher loop had no `try/except`, so the first re-nudge of an unacked
+  DM/urgent/@mention killed the daemon thread, heartbeat stopped, agent went offline,
+  and all further wakes ceased. This is why wakes "work at first, then degrade."
+- **Group messages had no dropped-emit recovery.** WP-11a gated re-nudge to
+  DM/urgent/@mention via `_renudge_ids`. Re-nudge exists to recover dropped emits
+  (GH #38736/#61797) — gating out ambient group posts meant a dropped group emit was
+  permanently unrecovered. Re-nudge is now content-agnostic; `_renudge_ids` is deleted.
+- **Same-name re-registration kept stale watcher state.** After a compaction the agent
+  re-registers under the same name, but the watcher only reset on a name-change; stale
+  `known_ids` suppressed new-arrival wakes. Fixed via an `Identity._generation` counter
+  (bumped on every `.set()`) and a `get_generation()` getter; the watcher resets when the
+  generation changes, not just when the name changes.
+- **Defensive hardening.** The watcher loop body is now wrapped in `try/except Exception
+  → stderr + continue` so no future emit bug can silently kill all comms.
+
 ## v0.8.1
 
 A token-efficiency pass — leaner channel events, leaner tool output, and leaner tool
