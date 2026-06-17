@@ -326,3 +326,4 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
         except Exception as exc:
             print(f"[teammate-comms] watcher error (loop continues): {exc}",
                   file=sys.stderr, flush=True)
+            stop_evt.wait(POLL_SECONDS)  # back off at poll cadence; returns immediately on stop
