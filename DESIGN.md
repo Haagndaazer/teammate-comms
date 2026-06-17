@@ -251,27 +251,30 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   group thread (the mixed-batch case). 1:1-only wakes keep the generic text.
 - Heartbeats the agent's registry record every ~5s.
 
-**Wake-reliability contract (honest, v0.7.x / WP-9).** The inbox JSON is the durable source
+**Wake-reliability contract (honest, v0.8.x / WP-9 + WP-12).** The inbox JSON is the durable source
 of truth, but a dropped channel push is **not** auto-recovered: an idle agent never reads its
 inbox unprompted, so "drained on the next `teammate_inbox`" only holds once *something else*
 wakes it. Claude Code is known to drop channel notifications — GH **#38736** (mid-turn
 notifications dropped, not queued, despite the docs) and **#61797** (sporadic silent drops at
 idle), both unresolved — so after one emit the watcher **re-nudges** still-unseen unread with
 capped exponential backoff: if `unseen = (unread − muted) − last_seen` persists, re-emit the
-same wake at 120 s, then 240 s, then 480 s, capped at 3 attempts. Re-nudge gates on the
-**exact same `unseen` set** the first nudge uses, so a read-but-unacked or muted message can
-never re-nudge (the v0.4.2 no-noise contract, preserved verbatim). Crucially the backoff
-clock is **armed only by a real fresh emit** — when `unseen` empties (caught up) the clock is
-**disarmed** (not re-stamped), so a batch that was never first-nudged (a message that arrived
-while its group was muted and is later unmuted, or the registration seed window) stays
-permanently re-nudge-silent until a genuinely new message re-arms via the fresh path — closing
-the retro-nudge-after-unmute hole. (Accepted edge, consistent with fresh-wake semantics: if
-the clock IS armed and a muted message is unmuted *into* a still-unseen batch, the re-nudge
-count includes it — the same "count reflects all unseen" rule a fresh wake uses.) Every emit
-(fresh / re-nudge / reaction) logs one greppable stderr line
-(`[teammate-comms] wake-emit kind=… unseen=… attempt=…`) so server-emitted can be told from
-client-dropped for an upstream bug report. `compute_reemit` is a pure, hermetically-tested
-decision; a still-lost wake after the cap is no worse than the prior one-and-done behavior.
+same wake at 120 s, then 240 s, then 480 s, capped at 3 attempts. Re-nudge is
+**content-agnostic** — a dropped emit is a dropped emit regardless of message type (DM, group,
+urgent, @mention). Re-nudge gates on the **exact same `unseen` set** the first nudge uses, so
+a read-but-unacked or muted message can never re-nudge (the v0.4.2 no-noise contract, preserved
+verbatim). Crucially the backoff clock is **armed only by a real fresh emit** — when `unseen`
+empties (caught up) the clock is **disarmed** (not re-stamped), so a batch that was never
+first-nudged (a message that arrived while its group was muted and is later unmuted, or the
+registration seed window) stays permanently re-nudge-silent until a genuinely new message
+re-arms via the fresh path — closing the retro-nudge-after-unmute hole. (Accepted edge,
+consistent with fresh-wake semantics: if the clock IS armed and a muted message is unmuted
+*into* a still-unseen batch, the re-nudge count includes it — the same "count reflects all
+unseen" rule a fresh wake uses.) Every emit (fresh / re-nudge / reaction) logs one greppable
+stderr line (`[teammate-comms] wake-emit kind=… unseen=… attempt=…`) so server-emitted can be
+told from client-dropped for an upstream bug report. `compute_reemit` is a pure,
+hermetically-tested decision; a still-lost wake after the cap is no worse than the prior
+one-and-done behavior. The watcher loop body is wrapped in `try/except Exception → stderr +
+continue` so no future emit bug can silently kill the daemon thread.
 
 ---
 

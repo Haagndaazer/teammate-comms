@@ -1344,37 +1344,6 @@ def main():
     except Exception as e:
         failures.append(f"WP-9 re-nudge unit checks errored: {e}")
 
-    # ── WP-11a — lean wakes: _renudge_ids pure helper determines which unseen messages
-    #    warrant a re-nudge (DM / urgent / @mention). Ambient group chatter is excluded
-    #    so the re-nudge budget isn't wasted on low-priority posts. ──
-    try:
-        from teammate_comms.channel import _renudge_ids as _rni
-        ME11 = "agent11"
-        _dm    = {"id": "id-dm",      "from": "peer"}                              # DM (no group)
-        _grp   = {"id": "id-grp",     "from": "peer", "group": "#team"}            # ambient group
-        _urg   = {"id": "id-urg",     "from": "peer", "group": "#team", "priority": "urgent"}
-        _men   = {"id": "id-men",     "from": "peer", "group": "#team", "mentions": [ME11, "other"]}
-        _men_x = {"id": "id-men-x",   "from": "peer", "group": "#team", "mentions": ["other"]}  # @other, not me
-        _msgs  = [_dm, _grp, _urg, _men, _men_x]
-        _all   = {"id-dm", "id-grp", "id-urg", "id-men", "id-men-x"}
-        _got   = _rni(_msgs, _all, ME11)
-        if "id-dm" not in _got:
-            failures.append("WP-11a _renudge_ids: DM not in renudge set")
-        if "id-urg" not in _got:
-            failures.append("WP-11a _renudge_ids: urgent group post not in renudge set")
-        if "id-men" not in _got:
-            failures.append("WP-11a _renudge_ids: @mentioned group post not in renudge set")
-        if "id-grp" in _got:
-            failures.append("WP-11a _renudge_ids: ambient group chatter wrongly in renudge set")
-        if "id-men-x" in _got:
-            failures.append("WP-11a _renudge_ids: @other-only group post wrongly in renudge set")
-        # subset check: only ids present in unseen_ids pass through
-        _got_sub = _rni(_msgs, {"id-dm"}, ME11)
-        if _got_sub != {"id-dm"}:
-            failures.append(f"WP-11a _renudge_ids: unseen_ids subset not respected: {_got_sub}")
-    except Exception as e:
-        failures.append(f"WP-11a _renudge_ids unit checks errored: {e}")
-
     # ── WP-11b — inbox body suppression (hermetic, isolated temp root — no shared inbox) ──
     # Tests _handle_inbox's _prev_seen/new_msgs/seen_msgs split directly. A second read in the
     # same session must suppress already-shown bodies; show_all=True restores them.
@@ -1424,6 +1393,272 @@ def main():
 
     except Exception as e:
         failures.append(f"WP-11b inbox suppression unit checks errored: {e}")
+
+    # ── WP-12 — live-watcher re-nudge + re-register-reset (the regression guards that were
+    #    missing from WP-11a and let the watcher-crash bug ship green). Drive run_watcher on a
+    #    daemon thread with a fake send_message; monkeypatch REEMIT_BASE_SECONDS small; use
+    #    deadline-polling (not fixed sleeps); own temp root per block (hermetic). ──
+    try:
+        import threading as _th12
+        from teammate_comms import channel as _ch12
+        from teammate_comms import comms as _c12
+
+        _TINY_BASE = 0.05  # 50 ms → re-nudge fires in <200 ms even on a loaded CI runner
+
+        def _wait_until12(cond, timeout=5.0, interval=0.05):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if cond():
+                    return True
+                time.sleep(interval)
+            return False
+
+        # ── WP-12 (a): group re-nudge recovers — watcher must still be alive after the re-nudge
+        #    (pre-fix it dies on the TypeError from the stray positional None). ──
+        try:
+            _wroot12a = tempfile.mkdtemp(prefix="tc-wp12a-")
+            _agent12a = "wp12a-agent"
+            _inboxes12a = _c12.get_inboxes_dir(_wroot12a, None)
+            _c12.ensure_inbox(_inboxes12a, _agent12a)
+            _unread12a = _inboxes12a / f"{_agent12a}_unread.json"
+
+            _emits12a = []
+
+            def _send12a(obj):
+                m = obj.get("method", "")
+                if m == "notifications/claude/channel":
+                    _emits12a.append(obj)
+
+            # Generation-aware mock identity
+            class _Id12a:
+                def __init__(self):
+                    self._lock = _th12.Lock()
+                    self._gen = 0
+                    self._ls = None
+                def set(self, agent, team, root, uf):
+                    with self._lock:
+                        self._gen += 1
+                        self._agent, self._team, self._root, self._uf = agent, team, root, uf
+                def snapshot(self):
+                    with self._lock:
+                        return (self._agent, self._team, self._root, self._uf)
+                def get_generation(self):
+                    with self._lock:
+                        return self._gen
+                def get_last_seen(self):
+                    with self._lock:
+                        return self._ls
+                def set_last_seen(self, v):
+                    with self._lock:
+                        self._ls = v
+
+            _id12a = _Id12a()
+            _id12a.set(_agent12a, None, _wroot12a, _unread12a)
+
+            _init12a = _th12.Event()
+            _reg12a = _th12.Event()
+            _stop12a = _th12.Event()
+            _init12a.set()
+            _reg12a.set()
+
+            _orig_base = _ch12.REEMIT_BASE_SECONDS
+            _ch12.REEMIT_BASE_SECONDS = _TINY_BASE
+            try:
+                _wt12a = _th12.Thread(
+                    target=_ch12.run_watcher,
+                    args=(_send12a, _id12a, _init12a, _reg12a, _stop12a),
+                    daemon=True,
+                )
+                _wt12a.start()
+                time.sleep(1.0)  # let the watcher seed known_ids on the empty inbox
+
+                # Inject a group message into the inbox
+                _gmsg = {"id": "g-msg-12a", "from": "peer", "group": "#team",
+                         "message": "group-content"}
+                _c12.write_json_atomic(_unread12a, [_gmsg])
+
+                # Wait for fresh emit
+                if not _wait_until12(lambda: len(_emits12a) >= 1, timeout=5.0):
+                    failures.append("WP-12a: no fresh emit for group message within 5s")
+                else:
+                    # Don't ack — wait for re-nudge (backoff = TINY_BASE)
+                    if not _wait_until12(lambda: len(_emits12a) >= 2,
+                                         timeout=_TINY_BASE * 20 + 3.0):
+                        failures.append("WP-12a: no re-nudge emit for group message (watcher may have crashed)")
+                    else:
+                        # Watcher must still be alive after the re-nudge (pre-fix it dies on TypeError)
+                        if not _wt12a.is_alive():
+                            failures.append("WP-12a: watcher thread DIED after re-nudge (TypeError crash not fixed)")
+                        # Re-nudge emit must name the group target ("to:'#team'")
+                        _renudge_content = _emits12a[1].get("params", {}).get("content", "")
+                        if "to:'#team'" not in _renudge_content:
+                            failures.append(f"WP-12a: re-nudge emit did not name group target: {_renudge_content!r}")
+                        # Cap check: ≤ 1 + REEMIT_MAX_ATTEMPTS total emits
+                        _max_exp = 1 + _ch12.REEMIT_MAX_ATTEMPTS
+                        if len(_emits12a) > _max_exp + 1:  # +1 grace for timing overlap
+                            failures.append(f"WP-12a: too many emits ({len(_emits12a)} > cap {_max_exp})")
+            finally:
+                _stop12a.set()
+                _ch12.REEMIT_BASE_SECONDS = _orig_base
+                _wt12a.join(timeout=2.0)
+        except Exception as _e12a:
+            failures.append(f"WP-12a live-watcher group-renudge errored: {_e12a}")
+
+        # ── WP-12 (b): no-noise live guard — a read message must not re-nudge. ──
+        try:
+            _wroot12b = tempfile.mkdtemp(prefix="tc-wp12b-")
+            _agent12b = "wp12b-agent"
+            _inboxes12b = _c12.get_inboxes_dir(_wroot12b, None)
+            _c12.ensure_inbox(_inboxes12b, _agent12b)
+            _unread12b = _inboxes12b / f"{_agent12b}_unread.json"
+
+            _emits12b = []
+
+            def _send12b(obj):
+                if obj.get("method") == "notifications/claude/channel":
+                    _emits12b.append(obj)
+
+            class _Id12b:
+                def __init__(self):
+                    self._lock = _th12.Lock()
+                    self._gen = 1
+                    self._ls = None
+                def snapshot(self):
+                    return (_agent12b, None, _wroot12b, _unread12b)
+                def get_generation(self):
+                    with self._lock:
+                        return self._gen
+                def get_last_seen(self):
+                    with self._lock:
+                        return self._ls
+                def set_last_seen(self, v):
+                    with self._lock:
+                        self._ls = v
+
+            _id12b = _Id12b()
+            _init12b = _th12.Event()
+            _reg12b = _th12.Event()
+            _stop12b = _th12.Event()
+            _init12b.set()
+            _reg12b.set()
+
+            _orig_base2 = _ch12.REEMIT_BASE_SECONDS
+            _ch12.REEMIT_BASE_SECONDS = _TINY_BASE
+            try:
+                _wt12b = _th12.Thread(
+                    target=_ch12.run_watcher,
+                    args=(_send12b, _id12b, _init12b, _reg12b, _stop12b),
+                    daemon=True,
+                )
+                _wt12b.start()
+                time.sleep(1.0)  # let the watcher seed known_ids on the empty inbox
+
+                _dmsg = {"id": "dm-12b", "from": "peer", "message": "dm-content"}
+                _c12.write_json_atomic(_unread12b, [_dmsg])
+
+                # Wait for fresh emit
+                if not _wait_until12(lambda: len(_emits12b) >= 1, timeout=5.0):
+                    failures.append("WP-12b no-noise: no fresh DM emit")
+                else:
+                    # Mark as read (set_last_seen with the message id)
+                    _id12b.set_last_seen({"dm-12b"})
+                    # Wait well past the re-nudge window — no second emit should arrive
+                    time.sleep(_TINY_BASE * 6)
+                    if len(_emits12b) > 1:
+                        failures.append(f"WP-12b no-noise: re-nudged a read message ({len(_emits12b)} emits)")
+            finally:
+                _stop12b.set()
+                _ch12.REEMIT_BASE_SECONDS = _orig_base2
+                _wt12b.join(timeout=2.0)
+        except Exception as _e12b:
+            failures.append(f"WP-12b no-noise live guard errored: {_e12b}")
+
+        # ── WP-12 (c): re-registration reset — same-name re-register bumps generation, watcher
+        #    resets known_ids; pre-existing message absorbed at re-seed does NOT nudge; a new
+        #    arrival after re-seed DOES nudge. ──
+        try:
+            _wroot12c = tempfile.mkdtemp(prefix="tc-wp12c-")
+            _agent12c = "wp12c-agent"
+            _inboxes12c = _c12.get_inboxes_dir(_wroot12c, None)
+            _c12.ensure_inbox(_inboxes12c, _agent12c)
+            _unread12c = _inboxes12c / f"{_agent12c}_unread.json"
+
+            # Pre-seed inbox with a message BEFORE watcher starts
+            _old_msg = {"id": "old-12c", "from": "peer", "message": "pre-existing"}
+            _c12.write_json_atomic(_unread12c, [_old_msg])
+
+            _emits12c = []
+
+            def _send12c(obj):
+                if obj.get("method") == "notifications/claude/channel":
+                    _emits12c.append(obj)
+
+            class _Id12c:
+                def __init__(self):
+                    self._lock = _th12.Lock()
+                    self._gen = 1
+                    self._ls = None
+                def snapshot(self):
+                    with self._lock:
+                        return (_agent12c, None, _wroot12c, _unread12c)
+                def get_generation(self):
+                    with self._lock:
+                        return self._gen
+                def bump(self):
+                    with self._lock:
+                        self._gen += 1
+                def get_last_seen(self):
+                    with self._lock:
+                        return self._ls
+                def set_last_seen(self, v):
+                    with self._lock:
+                        self._ls = v
+
+            _id12c = _Id12c()
+            _init12c = _th12.Event()
+            _reg12c = _th12.Event()
+            _stop12c = _th12.Event()
+            _init12c.set()
+            _reg12c.set()
+
+            _orig_base3 = _ch12.REEMIT_BASE_SECONDS
+            _ch12.REEMIT_BASE_SECONDS = _TINY_BASE
+            try:
+                _wt12c = _th12.Thread(
+                    target=_ch12.run_watcher,
+                    args=(_send12c, _id12c, _init12c, _reg12c, _stop12c),
+                    daemon=True,
+                )
+                _wt12c.start()
+
+                # Let watcher seed (old_msg absorbed into known_ids — no emit)
+                time.sleep(1.0)
+                if _emits12c:
+                    failures.append(f"WP-12c: pre-existing message caused a spurious emit at seed ({_emits12c})")
+
+                # Simulate same-name re-register: bump generation (old_msg still in inbox)
+                _id12c.bump()
+
+                # Wait for the watcher to detect the new generation and re-seed — still no emit
+                # Needs ≥2 poll cycles: one to detect + reset, one to re-seed.
+                time.sleep(1.2)
+                if _emits12c:
+                    failures.append(f"WP-12c: re-seed after re-register caused spurious emit ({_emits12c})")
+
+                # Now inject a NEW message — must trigger a fresh nudge
+                _new_msg = {"id": "new-12c", "from": "peer", "message": "new-after-rereg"}
+                _c12.write_json_atomic(_unread12c, [_old_msg, _new_msg])
+                if not _wait_until12(lambda: len(_emits12c) >= 1, timeout=5.0):
+                    failures.append("WP-12c: no fresh nudge for new message after re-register reset")
+            finally:
+                _stop12c.set()
+                _ch12.REEMIT_BASE_SECONDS = _orig_base3
+                _wt12c.join(timeout=2.0)
+        except Exception as _e12c:
+            failures.append(f"WP-12c re-register-reset errored: {_e12c}")
+
+    except Exception as e:
+        failures.append(f"WP-12 live-watcher unit checks errored: {e}")
 
     # ── WP-3 (G-1) — dashboard HTTP layer: start the real loopback server in-process and hit
     #    every endpoint with stdlib http.client (zero deps). Token/Host guards + status codes
