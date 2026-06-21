@@ -21,6 +21,8 @@ import traceback
 from .comms import (
     DELETED_MARKER,
     PROFILE_FIELDS,
+    PROJECT_FIELDS,
+    PROJECT_STATUS,
     REACTION_EMOJI,
     CommsError,
     aggregate_reactions,
@@ -38,6 +40,7 @@ from .comms import (
     get_transcript_file,
     group_read_positions,
     is_channel_alive,
+    list_project_records,
     now_timestamp,
     read_agent_record,
     read_group_messages,
@@ -45,10 +48,12 @@ from .comms import (
     read_json_readonly,
     read_json_safe,
     read_jsonl_tail,
+    read_project_record,
     read_reactions,
     read_transcript,
     remove_agent,
     remove_group_messages_from_inbox,
+    remove_project_record,
     strip_member_from_groups,
     tombstone_in_group_messages,
     tombstone_in_inbox,
@@ -56,9 +61,12 @@ from .comms import (
     validate_group_name,
     validate_profile_field,
     validate_project_dir,
+    validate_project_field,
+    validate_project_key,
     write_agent_record,
     write_group_meta,
     write_json_atomic,
+    write_project_record,
 )
 
 _PRIORITIES = ("normal", "urgent")
@@ -126,6 +134,37 @@ def _profile_schema_properties():
 def _collect_profile_args(args):
     """Return {field: raw value} for any profile field present in args (unvalidated)."""
     return {name: args[name] for name in PROFILE_FIELDS if name in args}
+
+
+_PROJECT_DESCRIPTIONS = {
+    "summary":     "One-liner shown in list_projects — keep terse.",
+    "description": "Short paragraph describing the project.",
+    "tech_stack":  "Primary languages/frameworks, comma-separated.",
+    "repo_url":    "Optional remote URL.",
+    "name":        "Human-friendly display name (defaults to the key if omitted).",
+    "status":      "Project status.",
+    "path":        "Local filesystem path (auto-filled from $CLAUDE_PROJECT_DIR when omitted).",
+    "key":         "Project key (defaults to your normalized project label).",
+}
+
+
+def _project_schema_properties():
+    """inputSchema 'properties' for project profile fields."""
+    props = {
+        name: {
+            "type": "string",
+            "description": f"{_PROJECT_DESCRIPTIONS[name]} Max {PROJECT_FIELDS[name]} chars, single line.",
+        }
+        for name in PROJECT_FIELDS
+    }
+    props["status"] = {
+        "type": "string",
+        "enum": list(PROJECT_STATUS),
+        "description": _PROJECT_DESCRIPTIONS["status"],
+    }
+    props["path"] = {"type": "string", "description": _PROJECT_DESCRIPTIONS["path"]}
+    props["key"] = {"type": "string", "description": _PROJECT_DESCRIPTIONS["key"]}
+    return props
 
 TOOL_DEFINITIONS = [
     {
@@ -383,6 +422,53 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "message": {"type": "string", "description": "Id of the message to delete (tombstone). Mutually exclusive with 'teammate'."},
                 "teammate": {"type": "string", "description": "Name of the OFFLINE teammate to remove. Mutually exclusive with 'message'."},
+            },
+        },
+    },
+    {
+        "name": "project_register",
+        "description": (
+            "Define/update the profile for a project. By convention only register or edit "
+            "the project matching your own working directory, unless the user asks you to "
+            "document another."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _project_schema_properties(),
+        },
+    },
+    {
+        "name": "list_projects",
+        "description": (
+            "List all registered project profiles. Returns exactly three things per "
+            "project: display name, live teammate roster, and summary. Use project_profile "
+            "for full details."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "project_profile",
+        "description": (
+            "Read full details for a project profile including its live teammate roster "
+            "(agent name, role, status, liveness). Omit 'key' to read your own project's profile."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Project key (defaults to your project)."},
+            },
+        },
+    },
+    {
+        "name": "project_delete",
+        "description": (
+            "Remove a project profile. By convention only delete the profile for your own "
+            "project, unless the user asks otherwise."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Project key to delete (defaults to your project)."},
             },
         },
     },
@@ -1411,6 +1497,213 @@ def _handle_dashboard(args, ctx):
     )
 
 
+def _resolve_caller_project_key(agent, team, root):
+    """Return the normalized project key for the calling agent, or raise CommsError."""
+    record = read_agent_record(root, team, agent)
+    raw = record.get("project") if isinstance(record, dict) else None
+    if not raw:
+        raise CommsError(
+            "No project key: pass 'key' explicitly or register with a project field set."
+        )
+    return validate_project_key(raw)
+
+
+def _derive_project_roster(root, team, project_key):
+    """Scan all agent records; return those whose normalized project == project_key, humans excluded."""
+    agents_dir = get_agents_dir(root, team)
+    roster = []
+    if not agents_dir.exists():
+        return roster
+    for path in sorted(agents_dir.glob("*.json")):
+        rec = read_agent_record(root, team, path.stem)
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "human":
+            continue
+        raw_proj = rec.get("project") or ""
+        try:
+            agent_key = validate_project_key(raw_proj)
+        except CommsError:
+            continue
+        if agent_key == project_key:
+            roster.append(rec)
+    return roster
+
+
+def _handle_project_register(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    raw_key = args.get("key")
+    if raw_key is not None:
+        key = validate_project_key(raw_key)
+    else:
+        key = _resolve_caller_project_key(agent, team, root)
+
+    validated = {}
+    for fname in PROJECT_FIELDS:
+        if fname in args:
+            validated[fname] = validate_project_field(fname, args[fname])
+    if "status" in args:
+        validated["status"] = validate_project_field("status", args["status"])
+
+    # path: uncapped, whitespace-collapse only; auto-fill from env if omitted and record has none
+    path_val = args.get("path")
+    if path_val is not None:
+        if not isinstance(path_val, str):
+            raise CommsError("'path' must be a string.")
+        validated["path"] = " ".join(path_val.split())  # whitespace-collapse only, no cap
+    else:
+        existing = read_project_record(root, team, key)
+        if not (existing and existing.get("path")):
+            env_path = os.environ.get("CLAUDE_PROJECT_DIR", "")
+            if env_path.strip():
+                validated["path"] = " ".join(env_path.strip().split())
+
+    record = write_project_record(
+        root, team, key, created_by=agent, updated_by=agent, **validated
+    )
+    display_name = record.get("name") or key
+    verb = "Registered" if record.get("created_at") == record.get("updated_at") else "Updated"
+    return (
+        f"{verb} project profile for {key!r} (display name: {display_name!r}).\n"
+        f"Use project_profile to read full details; list_projects to see all projects."
+    )
+
+
+def _handle_list_projects(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    records = list_project_records(root, team)
+
+    # Collect all agent project labels (normalized) — for undocumented + near-miss detection
+    agents_dir = get_agents_dir(root, team)
+    agent_labels = []  # list of (agent_name, raw_project, normalized_key_or_None)
+    if agents_dir.exists():
+        for path in sorted(agents_dir.glob("*.json")):
+            rec = read_agent_record(root, team, path.stem)
+            if not isinstance(rec, dict) or rec.get("type") == "human":
+                continue
+            raw = rec.get("project") or ""
+            if not raw:
+                continue
+            try:
+                norm = validate_project_key(raw)
+            except CommsError:
+                norm = None
+            agent_labels.append((path.stem, raw, norm))
+
+    registered_keys = {r["key"] for r in records if r.get("key")}
+
+    if not records:
+        out = ["No registered project profiles yet."]
+    else:
+        out = []
+        for rec in records:
+            key = rec["key"]
+            display_name = rec.get("name") or key
+            summary = rec.get("summary") or "(no summary)"
+            roster = _derive_project_roster(root, team, key)
+            roster_names = [r.get("name") or r.get("agent") or "?" for r in roster
+                            if isinstance(r, dict)]
+            members_str = ", ".join(roster_names) if roster_names else "(none)"
+            out.append(f"  {display_name} [{key}]")
+            out.append(f"    teammates: {members_str}")
+            out.append(f"    summary:   {summary}")
+
+    # Aggregate: undocumented project labels (agents carry a label with no profile)
+    undocumented = sorted({norm for _, _, norm in agent_labels
+                           if norm and norm not in registered_keys})
+    # Near-miss: agents whose raw project differs from the stored key but normalizes to it
+    near_misses = []
+    for aname, raw, norm in agent_labels:
+        if norm and norm in registered_keys and raw != norm:
+            near_misses.append(f"    {aname}: stored as {raw!r}, normalizes to {norm!r}")
+    # Unparseable: agents whose project label contains forbidden chars — cannot be grouped
+    unparseable = [(aname, raw) for aname, raw, norm in agent_labels if norm is None]
+
+    if records:
+        header = f"Registered projects ({len(records)}):\n" + "\n".join(out)
+    else:
+        header = out[0]
+
+    aggregate = []
+    if undocumented:
+        aggregate.append(
+            "Undocumented project labels (agents active, no profile yet):\n"
+            + "\n".join(f"  {k}" for k in undocumented)
+        )
+    if near_misses:
+        aggregate.append(
+            "Near-miss agents (project field differs from canonical key — will still "
+            "group correctly after normalization):\n" + "\n".join(near_misses)
+        )
+    if unparseable:
+        aggregate.append(
+            "Agents with an unparseable project label (cannot be grouped):\n"
+            + "\n".join(f"  {aname}: {raw!r}" for aname, raw in unparseable)
+        )
+
+    if aggregate:
+        return header + "\n\n" + "\n\n".join(aggregate)
+    return header
+
+
+def _handle_project_profile(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    raw_key = args.get("key")
+    if raw_key is not None:
+        key = validate_project_key(raw_key)
+    else:
+        key = _resolve_caller_project_key(agent, team, root)
+
+    record = read_project_record(root, team, key)
+    if record is None:
+        raise CommsError(
+            f"No project profile for {key!r}. "
+            f"Create one with project_register(key={key!r})."
+        )
+
+    roster = _derive_project_roster(root, team, key)
+    lines = [f"Project: {record.get('name') or key}  [{key}]",
+             f"  status:      {record.get('status') or 'active'}"]
+    for fname in PROJECT_FIELDS:
+        if fname == "name":
+            continue
+        val = record.get(fname)
+        if val:
+            lines.append(f"  {fname + ':':<13}{val}")
+    if record.get("path"):
+        lines.append(f"  path:        {record['path']}")
+    lines.append(f"  created_by:  {record.get('created_by') or '(unknown)'}")
+    lines.append(f"  created_at:  {record.get('created_at') or '(unknown)'}")
+    lines.append(f"  updated_by:  {record.get('updated_by') or '(unknown)'}")
+    lines.append(f"  updated_at:  {record.get('updated_at') or '(unknown)'}")
+    if not roster:
+        lines.append("  teammates:   (none)")
+    else:
+        lines.append(f"  teammates ({len(roster)}):")
+        for rec in roster:
+            name = rec.get("name") or "?"
+            live = is_channel_alive(rec, pid_check=False)
+            role = rec.get("role") or "(no role)"
+            status = rec.get("status") or "(no status)"
+            lines.append(f"    - {name}: {'live' if live else 'offline'}, {role}, {status}")
+    return "\n".join(lines)
+
+
+def _handle_project_delete(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    raw_key = args.get("key")
+    if raw_key is not None:
+        key = validate_project_key(raw_key)
+    else:
+        key = _resolve_caller_project_key(agent, team, root)
+
+    record = read_project_record(root, team, key)
+    if record is None:
+        raise CommsError(f"No project profile for {key!r}.")
+    remove_project_record(root, team, key)
+    return f"Deleted project profile for {key!r}."
+
+
 _HANDLERS = {
     "teammate_register": _handle_register,
     "teammate_send": _handle_send,
@@ -1425,6 +1718,10 @@ _HANDLERS = {
     "teammate_reincarnate": _handle_reincarnate,
     "teammate_dashboard": _handle_dashboard,
     "teammate_delete": _handle_delete,
+    "project_register": _handle_project_register,
+    "list_projects": _handle_list_projects,
+    "project_profile": _handle_project_profile,
+    "project_delete": _handle_project_delete,
 }
 
 

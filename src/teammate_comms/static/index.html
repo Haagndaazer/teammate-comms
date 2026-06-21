@@ -249,6 +249,7 @@ async function loadConversations() {
     }
   }
   window.__roster = d.roster || [];
+  window.__projects = d.projects || {};
   renderNav();
 }
 
@@ -273,7 +274,11 @@ function renderNav() {
   const projOrder = [...byProject.keys()].sort((a, b) =>
     a === "(no project)" ? 1 : b === "(no project)" ? -1 : a.localeCompare(b));
   for (const p of projOrder) {
-    ts.appendChild(span("subhead", p));
+    const projMeta = (window.__projects || {})[p];
+    const subLabel = projMeta
+      ? p + (projMeta.summary ? " — " + projMeta.summary : "") + (projMeta.status && projMeta.status !== "active" ? " [" + projMeta.status + "]" : "")
+      : p;
+    ts.appendChild(span("subhead", subLabel));
     for (const r of byProject.get(p)) {
       const sub = r.agent === ME ? "(you)" : (r.type === "human" ? "🧑" : "");
       // removable: real offline-eligible teammates only — not you, not the human operator

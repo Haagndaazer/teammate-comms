@@ -312,7 +312,7 @@ namespacing carves out subsets.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **13 tools:**
+long-lived server. **17 tools (13 original + 4 project-profile tools added v0.9.0):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -329,6 +329,10 @@ long-lived server. **13 tools:**
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one (XOR, enforced in the handler) | Delete a message (**tombstone**) or remove an **offline** teammate (see below). |
+| `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile (merge-upsert under blocking lock). `key` defaults to caller's normalized `project` label. `path` auto-fills from `$CLAUDE_PROJECT_DIR` on first create. |
+| `list_projects` | — | Concise directory: display name + live roster + summary per project. Trailing aggregate: undocumented project labels + near-miss agents. |
+| `project_profile` | `key?` | Full project detail: all fields, provenance, live roster (liveness per member). |
+| `project_delete` | `key?` | Remove a project profile file. |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
 
@@ -687,7 +691,44 @@ README's "Trusting the channel" section; `spawn.py` auto-detects this file for r
 
 ---
 
-## 12. Status & follow-ups
+## 12. Project profiles (v0.9.0, WP-13)
+
+**Goal:** first-class project entities layered on the existing free-text `project` agent
+field — let a teammate discover *which projects exist*, *who is on each*, and *what
+each does* without having to piece it together from scattered profiles.
+
+**Data model:**
+- Profiles stored as `TeammateComms/<team?>/projects/<slug>.json` (one file per project).
+- Stored fields: `summary` (80), `description` (600), `tech_stack` (400), `repo_url` (200),
+  `name` (100) + `status` enum (`active`/`paused`/`archived`) + `path` (uncapped,
+  whitespace-collapsed) + provenance (`created_by/at`, `updated_by/at`). Slug is
+  `urllib.parse.quote(normalized_key, safe="")` — injective because `%` is forbidden in keys.
+- **Membership is derived, never stored.** Roster = agents whose normalized `project`
+  matches the profile key, excluding `type=="human"`. O(N) scan on `list_projects` and
+  `project_profile` — same complexity as `teammate_list`, noted in §12 as a known trade-off.
+
+**Key normalization (`validate_project_key`):** the load-bearing correctness fix. Normalizes
+`\` → `/`, lowercases, collapses repeated `/`, strips leading/trailing `/`, rejects `%` (slug
+injectivity) and other filesystem-unsafe chars. Applied at roster-derivation time AND in the
+dashboard `_api_conversations` payload — so all comparison paths use the same normalized form
+and the cross-OS split cannot re-emerge at any layer.
+
+**Lock discipline:** `write_project_record` uses `file_lock` (BLOCKING), not
+`file_lock_optional`. Two simultaneous first-creates serialize; neither silently clobbers the
+other. Mirrors `append_reaction` (reactions are a feature, not observability — a drop is
+permanent feature-data loss). `file_lock_optional` stays for heartbeats only.
+
+**Dashboard:** `_api_conversations` normalizes each roster entry's `project` to the canonical
+key (None on failure, never raw string — a raw-string fallback would re-split the sidebar).
+Returns a `projects` dict keyed by normalized key; `renderNav` enriches existing `byProject`
+subheads with the profile `summary`/`status`. No second grouping structure.
+
+**Known trade-off:** `list_projects` scans all agent files (O(N)). Acceptable at current scale
+(matches `teammate_list`). An index could be added as a follow-up if agent count grows.
+
+---
+
+## 13. Status & follow-ups
 
 **Done:**
 1. Scaffolded, implemented, and tested (`tests/test_handshake.py` drives the server
@@ -702,7 +743,11 @@ README's "Trusting the channel" section; `spawn.py` auto-detects this file for r
 9. `teammate_delete` (message tombstones + offline-teammate removal) + deletions sub-stream (0.7.0).
 10. Missed-event hardening (0.7.1): poll-cursor forward pagination, reaction-wake high-water
     cursor, durable (blocking) reaction/deletion appends — see §7/§8.
+11. Lean wakes + lean surface + authority coordination rule (0.8.1 WP-11).
+12. Watcher crash + group recovery + same-name re-register compaction reset (0.8.2 WP-12).
+13. Project profiles + cross-OS roster fix + 4 new tools (0.9.0 WP-13).
 
 **Remaining:**
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.
+- (Optional) project roster index if agent count grows large.
 - (Optional) CLI-parity scripts, if ever wanted.

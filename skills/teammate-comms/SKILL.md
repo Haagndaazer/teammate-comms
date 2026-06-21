@@ -25,6 +25,27 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers). Gated by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration — verify via `teammate_list`. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (the group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive, so citations still resolve. Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry record + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. Deletions reflect live in the dashboard. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) + register the human operator as a first-class teammate. |
+| `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile. `key` defaults to your own normalized project label. **By convention: only register/edit the profile for your own project directory** unless the user asks you to document another. Merge-upsert — omit a field to leave it unchanged; pass `""` to clear it. `path` auto-fills from `$CLAUDE_PROJECT_DIR` on first register. |
+| `list_projects` | — | List all registered project profiles: display name + live teammate roster + summary per project. Use `project_profile` for full details. Also surfaces undocumented project labels (agents active with no profile) and near-miss agents (raw field differs from canonical key). |
+| `project_profile` | `key?` | Full detail for one project — all stored fields, provenance (created_by/at, updated_by/at), and the live-derived teammate roster with liveness. `key` defaults to your project. |
+| `project_delete` | `key?` | Remove a project profile. By convention only delete your own project's profile unless the user asks otherwise. |
+
+**Project profiles — team-level metadata.** Beyond per-agent `project` labels, first-class
+project profiles let teammates discover *which projects exist*, *who works on each*, and
+*what each does* — without that information scattered across individual profiles.
+
+- Use `project_register` to define a profile for your project (summary, description,
+  tech_stack, repo_url, display name, status). Run once; update with the same call
+  (merge-upsert). **Convention: only register/edit your own project's profile** unless the
+  user asks otherwise.
+- `list_projects` gives the team a concise directory: name + current members + summary.
+  Undocumented projects (agents active with no profile) and near-miss agents (misfiled raw
+  field) surface in a trailing aggregate so gaps are visible.
+- `project_profile` gives full detail on one project including provenance.
+- `project_delete` removes a profile (advisory — no hard gate).
+- **Key normalization is automatic.** `$CLAUDE_PROJECT_DIR` auto-fills as `parent/name`.
+  Backslashes (Windows) and forward slashes (Unix) normalize to the same key, so all
+  agents on the same project land in the same roster regardless of OS.
 
 **Startup protocol:** as soon as the session begins, call
 `teammate_register(agent: "<your-name>")` (the human/lead tells you your name) —

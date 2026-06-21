@@ -5,7 +5,7 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 13 tools (register + 12), each with a valid object inputSchema
+    - tools/list returns 17 tools (register + 16), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
     - teammate_register (with a profile) establishes identity; teammate_whoami flips
       to registered and echoes the profile
@@ -498,13 +498,14 @@ def main():
         if "authority over the areas" not in _instr_l or "before you modify" not in _instr_l:
             failures.append(f"initialize instructions missing the authority-coordination rule (WP-10): {instr[:120]!r}")
 
-    # tools/list: 13 tools, each with an object inputSchema
+    # tools/list: 17 tools (13 original + 4 project-profile tools), each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_ack", "teammate_list", "teammate_whoami",
                       "teammate_update", "teammate_profile", "teammate_group",
                       "teammate_react", "teammate_reincarnate", "teammate_dashboard",
-                      "teammate_delete"}
+                      "teammate_delete",
+                      "project_register", "list_projects", "project_profile", "project_delete"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:

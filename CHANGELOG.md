@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.9.0
+
+First-class **project profiles** layered on the existing per-agent `project` field.
+Adds 4 new tools (13 → 17 total) and fixes a silent cross-OS roster split.
+
+### Added
+- **`project_register`** — create or update a project profile (summary, description,
+  tech_stack, repo_url, name, status, path). Merge-upsert under a blocking lock so
+  concurrent first-creates serialize cleanly. `path` auto-fills from
+  `$CLAUDE_PROJECT_DIR` on first register if not supplied.
+- **`list_projects`** — concise global view: display name + live teammate roster +
+  summary per project. Trailing aggregate surfaces undocumented project labels and
+  near-miss agents (raw project field differs from canonical key but normalizes to it).
+- **`project_profile`** — full detail for one project: all stored fields, provenance
+  (created_by/at, updated_by/at), and the live-derived teammate roster with liveness.
+- **`project_delete`** — remove a project profile by key.
+- **`validate_project_key`** — normalizes `\` → `/`, lowercases, collapses `//`, strips
+  leading/trailing slashes, rejects unsafe chars (`%` included to keep slug encoding
+  injective). Fixes a silent cross-OS roster split: Windows `Projects\Foo` and Unix
+  `projects/foo` now converge to the same key and the same roster.
+- **Dashboard enrichment** — `GET /api/conversations` normalizes each roster entry's
+  `project` field (so the JS `byProject` sidebar grouping is OS-agnostic) and includes
+  a `projects` dict keyed by normalized project key; `renderNav` enriches project
+  subheads with the profile summary and status.
+
+### Fixed
+- **Silent cross-OS roster split.** Agents registering from Windows (`CLAUDE_PROJECT_DIR`
+  uses backslashes) and Unix (forward slashes) previously landed in different roster
+  buckets. `validate_project_key` normalization (applied at roster-derivation time and
+  in the dashboard payload) unifies them without any agent-side change.
+
 ## v0.8.2
 
 A comms-stability fix — restores reliable wakes that degraded mid-session since v0.8.1.

@@ -40,6 +40,7 @@ from .comms import (
     group_read_positions,
     is_channel_alive,
     get_transcript_file,
+    list_project_records,
     read_agent_record,
     read_deletions,
     read_deletions_set,
@@ -49,6 +50,7 @@ from .comms import (
     register_human,
     set_human_presence,
     transcript_tail_and_cursor,
+    validate_project_key,
 )
 
 
@@ -219,9 +221,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 kind = rec.get("type", "unknown")
                 online = (rec.get("presence") == "online") if kind == "human" \
                     else is_channel_alive(rec, pid_check=False)
+                raw_proj = rec.get("project")
+                # Normalize project for cross-OS/case group convergence (AC-2). On failure
+                # (forbidden chars or empty), use None so the agent shows as ungrouped rather
+                # than forming a false split group — a raw-string fallback would break AC-2
+                # when two agents spell the same project differently across OSes.
+                if raw_proj:
+                    try:
+                        norm_proj = validate_project_key(raw_proj)
+                    except CommsError:
+                        norm_proj = None
+                else:
+                    norm_proj = None
                 roster.append({
                     "agent": p.stem, "type": kind, "online": bool(online),
-                    "project": rec.get("project"), "role": rec.get("role"),
+                    "project": norm_proj, "role": rec.get("role"),
                     "status": rec.get("status"),
                 })
                 if p.stem != me:
@@ -239,7 +253,20 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 groups.append({"id": "#" + gp.name, "name": gp.name,
                                "members": members, "reads": reads})
         dms = [{"id": "@" + peer, "peer": peer} for peer in peers]
-        return self._json(200, {"me": me, "groups": groups, "roster": roster, "dms": dms})
+        # Project profiles keyed by normalized project key — enriches the existing byProject
+        # client-side grouping in renderNav (no separate grouping structure added, AC-7).
+        projects = {}
+        for pr in list_project_records(root, team):
+            k = pr.get("key")
+            if k:
+                projects[k] = {
+                    "name": pr.get("name") or k,
+                    "summary": pr.get("summary") or "",
+                    "status": pr.get("status") or "active",
+                }
+        return self._json(200, {
+            "me": me, "groups": groups, "roster": roster, "dms": dms, "projects": projects,
+        })
 
     def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team

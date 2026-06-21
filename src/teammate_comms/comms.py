@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import zlib
 from contextlib import contextmanager
 from datetime import datetime
@@ -44,6 +45,17 @@ PROFILE_FIELDS = {
     "status": 200,
     "authority": 500,
 }
+
+# Project profile fields mapped to max length. `path` and `status` are handled separately
+# (path: uncapped, whitespace-collapsed only; status: enum, not free-text).
+PROJECT_FIELDS = {
+    "summary":     80,
+    "description": 600,
+    "tech_stack":  400,
+    "repo_url":    200,
+    "name":        100,
+}
+PROJECT_STATUS = ("active", "paused", "archived")
 
 
 class CommsError(Exception):
@@ -110,6 +122,73 @@ def validate_project_dir(path):
     if not p.is_dir():
         raise CommsError(f"project_dir is not a directory: {p}")
     return p
+
+
+_PROJECT_KEY_FORBIDDEN = re.compile(r'[:\*\?"<>|%\x00-\x1f]')
+
+
+def validate_project_key(value):
+    """Normalize a project key; raise CommsError on bad input.
+
+    Normalization order (each step feeds into the next):
+    1. Trim + collapse internal whitespace.
+    2. Replace ``\\`` → ``/`` (Windows auto-fill uses backslashes).
+    3. Lower-case fold (``Projects/Foo`` == ``projects/foo``).
+    4. Strip leading/trailing slashes; collapse repeated ``/``.
+    5. Reject forbidden chars: ``:``, ``*``, ``?``, ``"``, ``<``, ``>``, ``|``, ``%``
+       (``%`` is forbidden so ``urllib.parse.quote`` slug encoding stays injective —
+       see ``project_key_to_slug``), and ASCII control chars.
+    6. Length-cap at 100.
+
+    The resulting key is the canonical stored form. ``project_key_to_slug`` encodes it
+    as a safe flat filename with no path separators (``/`` → ``%2F``); because ``%`` is
+    forbidden in keys, no two distinct keys can produce the same slug.
+    """
+    if not isinstance(value, str):
+        raise CommsError("Project key must be a string.")
+    collapsed = " ".join(value.split())
+    normalized = collapsed.replace("\\", "/").lower()
+    normalized = normalized.strip("/")
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+    if _PROJECT_KEY_FORBIDDEN.search(normalized):
+        raise CommsError(
+            f"Project key contains forbidden characters (: * ? \" < > | % or control chars): {value!r}"
+        )
+    if not normalized:
+        raise CommsError("Project key must not be empty after normalization.")
+    if len(normalized) > 100:
+        raise CommsError(
+            f"Project key exceeds 100 characters after normalization ({len(normalized)} chars)."
+        )
+    return normalized
+
+
+def validate_project_field(name, value):
+    """Normalize one project profile field; raise CommsError on bad input.
+
+    ``status`` is validated against ``PROJECT_STATUS`` (enum, not free-text).
+    ``path`` is NOT in ``PROJECT_FIELDS`` — callers handle it directly (uncapped,
+    whitespace-collapse only). All other fields follow the same single-line,
+    length-capped pattern as ``validate_profile_field``.
+    """
+    if name == "status":
+        if value not in PROJECT_STATUS:
+            raise CommsError(
+                f"'status' must be one of {list(PROJECT_STATUS)}, got {value!r}."
+            )
+        return value
+    if name not in PROJECT_FIELDS:
+        raise CommsError(
+            f"Unknown project field {name!r}. Valid fields: {sorted(PROJECT_FIELDS)} + status, path."
+        )
+    if not isinstance(value, str):
+        raise CommsError(f"Project field {name!r} must be a string, got {type(value).__name__}.")
+    collapsed = " ".join(value.split())
+    max_len = PROJECT_FIELDS[name]
+    if len(collapsed) > max_len:
+        raise CommsError(f"Project field {name!r} exceeds {max_len} characters.")
+    return collapsed
 
 
 def validate_group_name(name):
@@ -198,6 +277,104 @@ def get_groups_dir(root, team=None):
 def get_group_dir(root, team, group):
     """``<groups>/<group>/`` (group is the clean, sigil-stripped name)."""
     return get_groups_dir(root, team) / group
+
+
+def get_projects_dir(root, team=None):
+    """``<root>/TeammateComms/[<team>/]projects`` — one JSON file per project profile."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "projects"
+
+
+def project_key_to_slug(key):
+    """Encode a normalized project key as a safe flat filename (no path separators).
+
+    Uses percent-encoding (``urllib.parse.quote``) with ``safe=""`` so ``/`` becomes
+    ``%2F`` and the result is a valid single-component filename on all OSes. Injective
+    over normalized keys because ``%`` is forbidden by ``validate_project_key``, so no
+    two distinct keys can produce the same slug.
+    """
+    return urllib.parse.quote(key, safe="")
+
+
+def read_project_record(root, team, key):
+    """Read a project profile by normalized key, or None if absent/unreadable."""
+    path = get_projects_dir(root, team) / f"{project_key_to_slug(key)}.json"
+    rec = read_json_readonly(path)
+    return rec if isinstance(rec, dict) else None
+
+
+def list_project_records(root, team):
+    """Read all project profiles from the projects/ dir. Returns a list of dicts."""
+    pdir = get_projects_dir(root, team)
+    if not pdir.exists():
+        return []
+    out = []
+    for path in sorted(pdir.glob("*.json")):
+        rec = read_json_readonly(path)
+        if isinstance(rec, dict) and rec.get("key"):
+            out.append(rec)
+    return out
+
+
+def remove_project_record(root, team, key):
+    """Remove a project profile file. Best-effort, never raises."""
+    path = get_projects_dir(root, team) / f"{project_key_to_slug(key)}.json"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def write_project_record(root, team, key, timeout=10, **fields):
+    """Merge-upsert a project profile under a BLOCKING lock.
+
+    Uses ``file_lock`` (never ``file_lock_optional``) so two simultaneous first-creates
+    for the same key serialize — neither silently clobbers the other. Raises
+    ``CommsError`` on lock failure (the caller retries).
+
+    Merge rules: an omitted field is unchanged; an explicit ``""`` value clears the
+    field from the record; any other value overwrites. ``created_by``/``created_at`` are
+    stamped on the first create only and never overwritten. ``updated_by``/``updated_at``
+    are always stamped from the SAME ``now_timestamp()`` call — on a first create
+    ``created_at == updated_at``, which lets callers detect a fresh registration.
+    ``status`` is exempt from the ``""``-clears contract: the enum rejects ``""`` before
+    the clear path, and "active" is always a meaningful default with nothing to clear to.
+    """
+    pdir = get_projects_dir(root, team)
+    pdir.mkdir(parents=True, exist_ok=True)
+    record_path = pdir / f"{project_key_to_slug(key)}.json"
+    created_by = fields.pop("created_by", None)
+    updated_by = fields.pop("updated_by", None)
+    _lock_acquired = False
+    try:
+        with file_lock(record_path, timeout=timeout):
+            _lock_acquired = True
+            record = read_json_readonly(record_path)
+            ts = now_timestamp()
+            if not isinstance(record, dict):
+                record = {
+                    "key": key,
+                    "created_by": created_by,
+                    "created_at": ts,
+                }
+            for fname, fval in fields.items():
+                if fval == "":
+                    record.pop(fname, None)
+                elif fval is not None:
+                    record[fname] = fval
+            record["updated_by"] = updated_by
+            record["updated_at"] = ts
+            write_json_atomic(record_path, record)
+            return record
+    except CommsError:
+        if not _lock_acquired:
+            raise CommsError(
+                f"Project {key!r} stayed locked for {timeout}s (concurrent write contention). "
+                f"Retry the call."
+            )
+        raise
 
 
 def read_group_meta(root, team, group):
