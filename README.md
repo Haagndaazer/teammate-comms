@@ -31,6 +31,10 @@ tools and pushes `notifications/claude/channel` events.
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED` (default off); confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) and register the human operator as a first-class teammate. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive (citations still resolve). Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. |
+| `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile. `key` defaults to your normalized project label. By convention: only register your own project's profile unless asked. |
+| `list_projects` | — | List all registered project profiles: display name + live teammate roster + summary. Trailing aggregate shows undocumented project labels and near-miss agents. |
+| `project_profile` | `key?` | Full detail for one project: all fields, provenance, live roster with liveness. `key` defaults to your project. |
+| `project_delete` | `key?` | Remove a project profile. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -68,6 +72,30 @@ The `teammate_register` tool description carries the full writing guide. Profile
 fields are durable: **re-registering only re-establishes identity + channel and
 preserves your existing `role`/`personality`/`authority`** — pass a field only to
 change it (refresh the dynamic `status` with `teammate_update`).
+
+## Project profiles
+
+Beyond per-agent `project` labels, **project profiles** give the team a canonical record for
+each project — what it does, who's on it, its tech stack, and its status:
+
+```
+project_register(summary: "Auth service", tech_stack: "Python, FastAPI", status: "active")
+list_projects()          # → name + live roster + summary for every registered project
+project_profile()        # → full detail + live teammate roster with liveness
+```
+
+The roster is **derived live** (never stored) — any agent whose normalized `project` label
+matches the profile key appears automatically. **Cross-OS convergence is built in:**
+Windows-native agents register with backslash paths (`Projects\Foo`); Unix agents use slashes
+(`projects/foo`). Both normalize to the same key, so they land in the same roster without any
+manual correction.
+
+`list_projects` also surfaces undocumented project labels (agents active with no profile) and
+near-miss agents (raw field differs from the canonical key but would normalize to it) — so
+gaps are visible.
+
+By convention: only `project_register` / `project_delete` for **your own** project's profile
+unless the user asks you to document another.
 
 ## Group chat
 
