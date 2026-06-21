@@ -155,13 +155,6 @@ def test_write_project_record_merge():
         )
         check(rec.get("key") == "org/proj", "key not stored in record")
         check(rec.get("summary") == "initial", "summary not stored on create")
-        check(
-            rec.get("created_at") == rec.get("updated_at"),
-            "tautology[verb-bug]: created_at != updated_at on first create — "
-            "two separate now_timestamp() calls produce different microsecond values; "
-            "the 'Registered' branch in _handle_project_register is unreachable and "
-            "project_register always reports 'Updated' even for a fresh create"
-        )
 
         # Update by a different agent — created_by must not change
         rec2 = write_project_record(root, None, "org/proj",
@@ -184,6 +177,30 @@ def test_write_project_record_merge():
             "tautology[AC-1]: summary='' did not clear the field — stale one-liner persists "
             "in list_projects after an agent intentionally removes the summary"
         )
+
+    # Verb-bug tautology: inject a stepped clock so the two-call bug is deterministic.
+    # Under the fix (one now_timestamp() call): both fields get "t0" → equal → passes.
+    # Under reverted code (two calls): created_at="t0", updated_at="t1" → differ → reliably
+    # fails regardless of machine speed.  The server "Registered"/"Updated" assertions in
+    # run_server_tests are a green-smoke check only, not this tautology guard.
+    import teammate_comms.comms as _comms
+    _orig_ts = _comms.now_timestamp
+    _seq = iter([f"t{i}" for i in range(100)])
+    _comms.now_timestamp = lambda: next(_seq)
+    try:
+        with tempfile.TemporaryDirectory() as tmp2:
+            rec_inj = write_project_record(
+                Path(tmp2), None, "verb/x",
+                created_by="a", updated_by="a", summary="s",
+            )
+            check(
+                rec_inj.get("created_at") == rec_inj.get("updated_at"),
+                "tautology[verb-bug]: created_at != updated_at on create — "
+                "write_project_record called now_timestamp() twice; reverted code "
+                "yields t0 != t1 (deterministic under injected stepped clock)"
+            )
+    finally:
+        _comms.now_timestamp = _orig_ts
 
 
 # ── AC-4: concurrent creates — no field loss, blocking lock ──────────────
@@ -575,7 +592,9 @@ def run_server_tests():
                 "list_project_records reads stale file; projects dir not cleaned up"
             )
 
-            # Fix-1: verb — first project_register says "Registered", update says "Updated"
+            # Fix-1: verb smoke check — "Registered" / "Updated" text on first/second call.
+            # NOTE: this is NOT the tautology guard for the verb bug — see the clock-injection
+            # test in test_write_project_record_merge for the deterministic revert-proof.
             text, err = call(17, "project_register",
                              {"key": "verb/test", "summary": "verb check"})
             check(
