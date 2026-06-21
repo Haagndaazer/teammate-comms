@@ -155,6 +155,13 @@ def test_write_project_record_merge():
         )
         check(rec.get("key") == "org/proj", "key not stored in record")
         check(rec.get("summary") == "initial", "summary not stored on create")
+        check(
+            rec.get("created_at") == rec.get("updated_at"),
+            "tautology[verb-bug]: created_at != updated_at on first create — "
+            "two separate now_timestamp() calls produce different microsecond values; "
+            "the 'Registered' branch in _handle_project_register is unreachable and "
+            "project_register always reports 'Updated' even for a fresh create"
+        )
 
         # Update by a different agent — created_by must not change
         rec2 = write_project_record(root, None, "org/proj",
@@ -566,6 +573,35 @@ def run_server_tests():
                 "temp/del" not in text,
                 "tautology[AC-6]: deleted project 'temp/del' still appears in list_projects — "
                 "list_project_records reads stale file; projects dir not cleaned up"
+            )
+
+            # Fix-1: verb — first project_register says "Registered", update says "Updated"
+            text, err = call(17, "project_register",
+                             {"key": "verb/test", "summary": "verb check"})
+            check(
+                not err and "Registered" in text,
+                f"tautology[verb-bug]: first project_register does not say 'Registered' — "
+                f"two separate now_timestamp() calls differ by microseconds so "
+                f"created_at != updated_at always; 'Registered' branch is unreachable: {text}"
+            )
+            text, err = call(18, "project_register",
+                             {"key": "verb/test", "summary": "updated summary"})
+            check(
+                not err and "Updated" in text,
+                f"tautology[verb-bug]: second project_register does not say 'Updated': {text}"
+            )
+
+            # Fix-2: unparseable bucket — agent with forbidden-char project must be surfaced
+            text, err = call(19, "teammate_register",
+                             {"agent": "badproj-agent", "team": TEAM, "project": "bad:proj"})
+            check(not err, f"register badproj-agent failed: {text}")
+            text, err = call(20, "list_projects", {})
+            check(not err, f"list_projects after badproj-agent failed: {text}")
+            check(
+                "bad:proj" in text or "badproj-agent" in text or "unparseable" in text.lower(),
+                "tautology[fix-2]: agent with forbidden-char project ('bad:proj') absent from "
+                "list_projects — silently dropped instead of surfaced in the unparseable bucket; "
+                "WP §6.2 requires misfiled agents to be visible, not invisible"
             )
 
         finally:

@@ -275,9 +275,9 @@ function renderNav() {
     a === "(no project)" ? 1 : b === "(no project)" ? -1 : a.localeCompare(b));
   for (const p of projOrder) {
     const projMeta = (window.__projects || {})[p];
-    const subLabel = projMeta && projMeta.summary
-      ? p + " — " + projMeta.summary
-      : (projMeta && projMeta.status && projMeta.status !== "active" ? p + " [" + projMeta.status + "]" : p);
+    const subLabel = projMeta
+      ? p + (projMeta.summary ? " — " + projMeta.summary : "") + (projMeta.status && projMeta.status !== "active" ? " [" + projMeta.status + "]" : "")
+      : p;
     ts.appendChild(span("subhead", subLabel));
     for (const r of byProject.get(p)) {
       const sub = r.agent === ME ? "(you)" : (r.type === "human" ? "🧑" : "");

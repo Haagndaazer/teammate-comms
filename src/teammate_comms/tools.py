@@ -1616,6 +1616,8 @@ def _handle_list_projects(args, ctx):
     for aname, raw, norm in agent_labels:
         if norm and norm in registered_keys and raw != norm:
             near_misses.append(f"    {aname}: stored as {raw!r}, normalizes to {norm!r}")
+    # Unparseable: agents whose project label contains forbidden chars — cannot be grouped
+    unparseable = [(aname, raw) for aname, raw, norm in agent_labels if norm is None]
 
     if records:
         header = f"Registered projects ({len(records)}):\n" + "\n".join(out)
@@ -1632,6 +1634,11 @@ def _handle_list_projects(args, ctx):
         aggregate.append(
             "Near-miss agents (project field differs from canonical key — will still "
             "group correctly after normalization):\n" + "\n".join(near_misses)
+        )
+    if unparseable:
+        aggregate.append(
+            "Agents with an unparseable project label (cannot be grouped):\n"
+            + "\n".join(f"  {aname}: {raw!r}" for aname, raw in unparseable)
         )
 
     if aggregate:

@@ -337,21 +337,27 @@ def write_project_record(root, team, key, timeout=10, **fields):
     Merge rules: an omitted field is unchanged; an explicit ``""`` value clears the
     field from the record; any other value overwrites. ``created_by``/``created_at`` are
     stamped on the first create only and never overwritten. ``updated_by``/``updated_at``
-    are always stamped.
+    are always stamped from the SAME ``now_timestamp()`` call — on a first create
+    ``created_at == updated_at``, which lets callers detect a fresh registration.
+    ``status`` is exempt from the ``""``-clears contract: the enum rejects ``""`` before
+    the clear path, and "active" is always a meaningful default with nothing to clear to.
     """
     pdir = get_projects_dir(root, team)
     pdir.mkdir(parents=True, exist_ok=True)
     record_path = pdir / f"{project_key_to_slug(key)}.json"
     created_by = fields.pop("created_by", None)
     updated_by = fields.pop("updated_by", None)
+    _lock_acquired = False
     try:
         with file_lock(record_path, timeout=timeout):
+            _lock_acquired = True
             record = read_json_readonly(record_path)
+            ts = now_timestamp()
             if not isinstance(record, dict):
                 record = {
                     "key": key,
                     "created_by": created_by,
-                    "created_at": now_timestamp(),
+                    "created_at": ts,
                 }
             for fname, fval in fields.items():
                 if fval == "":
@@ -359,14 +365,16 @@ def write_project_record(root, team, key, timeout=10, **fields):
                 elif fval is not None:
                     record[fname] = fval
             record["updated_by"] = updated_by
-            record["updated_at"] = now_timestamp()
+            record["updated_at"] = ts
             write_json_atomic(record_path, record)
             return record
     except CommsError:
-        raise CommsError(
-            f"Project {key!r} stayed locked for {timeout}s (concurrent write contention). "
-            f"Retry the call."
-        )
+        if not _lock_acquired:
+            raise CommsError(
+                f"Project {key!r} stayed locked for {timeout}s (concurrent write contention). "
+                f"Retry the call."
+            )
+        raise
 
 
 def read_group_meta(root, team, group):
