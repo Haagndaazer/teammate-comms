@@ -472,6 +472,39 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "name": "teammate_set_avatar",
+        "description": (
+            "Set or clear a profile avatar image for a registered teammate. "
+            "Requires Pillow (install teammate-comms[images]). "
+            "Provide 'path' (local filesystem path to an image) OR 'image_base64' (base64-encoded bytes). "
+            "Supported formats: PNG, JPEG, GIF, WEBP, and any format Pillow can open. "
+            "Images are automatically resized to 256×256, centred on a black canvas. "
+            "Pass clear=true to remove an existing avatar. "
+            "On success the ASCII preview strip is returned so you can confirm the result."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Name of the agent whose avatar to set. Defaults to yourself.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Filesystem path to the source image (PNG, JPEG, etc.).",
+                },
+                "image_base64": {
+                    "type": "string",
+                    "description": "Base64-encoded image bytes (alternative to path).",
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "Remove the avatar instead of setting one (default false).",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -922,7 +955,7 @@ def _handle_update(args, ctx):
     return f"Profile updated: {parts}."
 
 
-def _format_profile(record, name, is_self=False):
+def _format_profile(record, name, is_self=False, root=None, team=None):
     """Render an agent record as a readable profile block (identity + profile fields)."""
     kind = record.get("type", "unknown")
     me = " (you)" if is_self else ""
@@ -935,6 +968,13 @@ def _format_profile(record, name, is_self=False):
     for field in PROFILE_FIELDS:
         value = record.get(field)
         lines.append(f"  {field + ':':<13}{value if value else '(not set)'}")
+    avatar_meta = record.get("avatar")
+    if isinstance(avatar_meta, dict) and root is not None:
+        from . import avatars as _avatars_mod
+        strip = _avatars_mod.read_avatar_strip(root, team, name, fmt="txt")
+        if strip:
+            lines.append(f"  {'avatar:':<13}[hash: {avatar_meta.get('hash', '?')}]")
+            lines.append(strip)
     return "\n".join(lines)
 
 
@@ -948,7 +988,29 @@ def _handle_profile(args, ctx):
     record = read_agent_record(root, team, target)
     if not record:
         raise CommsError(f"No registered teammate named {target!r}.")
-    return _format_profile(record, target, is_self=(target == agent))
+    return _format_profile(record, target, is_self=(target == agent), root=root, team=team)
+
+
+def _handle_set_avatar(args, ctx):
+    agent, team, root = _require_registered(ctx)
+    target = args.get("agent")
+    if target is not None:
+        validate_agent_name(target)
+    else:
+        target = agent
+    clear = bool(args.get("clear", False))
+    path = args.get("path")
+    image_base64 = args.get("image_base64")
+    from . import avatars as _avatars_mod
+    ascii_strip = _avatars_mod.ingest_avatar(
+        root, team, target,
+        path=path,
+        image_base64=image_base64,
+        clear=clear,
+    )
+    if clear:
+        return f"Avatar cleared for {target!r}."
+    return f"Avatar set for {target!r}.\n{ascii_strip}"
 
 
 # ── Group chat ────────────────────────────────────────────────────────────────
@@ -1722,6 +1784,7 @@ _HANDLERS = {
     "list_projects": _handle_list_projects,
     "project_profile": _handle_project_profile,
     "project_delete": _handle_project_delete,
+    "teammate_set_avatar": _handle_set_avatar,
 }
 
 
