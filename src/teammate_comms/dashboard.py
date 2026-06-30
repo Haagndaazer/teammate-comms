@@ -36,6 +36,7 @@ from .comms import (
     CommsError,
     _window,   # collision-safe burst-paging window, shared with the read_* helpers
     get_agents_dir,
+    get_avatars_dir,
     get_groups_dir,
     group_read_positions,
     is_channel_alive,
@@ -50,6 +51,7 @@ from .comms import (
     register_human,
     set_human_presence,
     transcript_tail_and_cursor,
+    validate_agent_name,
     validate_project_key,
 )
 
@@ -162,6 +164,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     return self._json(403, {"error": "missing or invalid token"})
                 token_js = json.dumps(self.server.token)
                 return self._html(_load_index().replace('"%TOKEN%"', token_js))
+            if path == "/avatar":
+                return self._api_avatar(
+                    qs.get("name", [None])[0] or "",
+                    qs.get("token", [None])[0],
+                )
             if path.startswith("/api/"):
                 if not self._token_ok(self.headers.get("X-Dashboard-Token")):
                     return self._json(401, {"error": "missing or invalid token"})
@@ -209,6 +216,32 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 pass
 
     # ── REST endpoints ──
+    def _api_avatar(self, name, token_param):
+        """Serve a pre-rendered avatar PNG by agent name (token via query string)."""
+        import hashlib
+        if not self._token_ok(token_param):
+            return self._json(401, {"error": "missing or invalid token"})
+        # Validate name BEFORE building any path — block traversal (422 on fail).
+        try:
+            validate_agent_name(name)
+        except CommsError:
+            return self._json(422, {"error": "invalid agent name"})
+        png_path = get_avatars_dir(self.server.root, self.server.team) / f"{name}.png"
+        try:
+            data = png_path.read_bytes()
+        except FileNotFoundError:
+            return self._json(404, {"error": "no avatar for this agent"})
+        except OSError:
+            return self._json(500, {"error": "could not read avatar"})
+        etag = '"' + hashlib.sha256(data).hexdigest()[:12] + '"'
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _api_conversations(self):
         root, team, me = self.server.root, self.server.team, self.server.human_name
         roster, peers = [], []
@@ -233,10 +266,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                         norm_proj = None
                 else:
                     norm_proj = None
+                avatar_meta = rec.get("avatar")
                 roster.append({
                     "agent": p.stem, "type": kind, "online": bool(online),
                     "project": norm_proj, "role": rec.get("role"),
                     "status": rec.get("status"),
+                    "avatar": avatar_meta.get("hash") if isinstance(avatar_meta, dict) else None,
                 })
                 if p.stem != me:
                     peers.append(p.stem)

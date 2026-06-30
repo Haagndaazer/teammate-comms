@@ -646,9 +646,9 @@ def test_version_sync():
     m2 = re.search(r'^version\s*=\s*"([^"]+)"', pyp_text, re.MULTILINE)
     pyp = m2.group(1) if m2 else None
     check(
-        pkg == plug == pyp == "0.9.0",
+        pkg == plug == pyp == "0.10.0",
         f"tautology[version-sync]: version drift — pkg={pkg}, plugin={plug}, pyproject={pyp}; "
-        "all three must be 0.9.0 for v0.9.0 release"
+        "all three must be 0.10.0 for v0.10.0 release"
     )
 
 

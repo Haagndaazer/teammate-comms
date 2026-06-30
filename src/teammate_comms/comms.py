@@ -266,6 +266,14 @@ def get_agents_dir(root, team=None):
     return base / "agents"
 
 
+def get_avatars_dir(root, team=None):
+    """``<root>/TeammateComms/[<team>/]avatars`` — pre-rendered avatar sidecars per agent."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "avatars"
+
+
 def get_groups_dir(root, team=None):
     """``<root>/TeammateComms/[<team>/]groups`` — one subdir per group."""
     base = Path(root) / "TeammateComms"
@@ -463,6 +471,15 @@ def write_json_atomic(filepath, data):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, filepath)
+
+
+def write_bytes_atomic(path, data):
+    """Write binary data via a temp file + os.replace (atomic on the same volume)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
 
 # A claim marker (see _claim_if_dead) lives microseconds; one older than this is an orphan

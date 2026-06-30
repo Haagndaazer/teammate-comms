@@ -1,6 +1,6 @@
 [project]
 name = "teammate-comms"
-version = "0.9.0"
+version = "0.10.0"
 description = "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances."
 authors = [{ name = "ColtonDyck" }]
 license = { text = "MIT" }
@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 # the MCP spawn instant and avoids a dependency tree blocking the stdio handshake).
 dependencies = []
 keywords = ["mcp", "channel", "agent", "messaging"]
+
+[project.optional-dependencies]
+images = ["Pillow>=10"]
 
 [project.scripts]
 teammate-comms = "teammate_comms.server:main"

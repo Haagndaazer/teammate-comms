@@ -265,7 +265,66 @@ def _maybe_auto_register():
         log(f"auto-register from $TEAMMATE_AGENT skipped: {e}")
 
 
+def _avatar_subcommand(argv):
+    """Print a cached avatar strip to stdout.  No Pillow, no network.
+
+    Usage: teammate-comms avatar --name <Name> [--format ansi|ascii]
+           teammate-comms avatar --self   [--format ansi|ascii]
+
+    If --self doesn't resolve (e.g. no stdin JSON or missing agent key), prints
+    nothing and exits 0 so the statusline degrades gracefully to blank.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="teammate-comms avatar",
+        description="Print a cached avatar strip to stdout.",
+        add_help=False,
+    )
+    parser.add_argument("--name", default=None)
+    parser.add_argument("--self", dest="self_", action="store_true")
+    parser.add_argument("--format", dest="fmt", choices=("ansi", "ascii"), default="ansi")
+    try:
+        parsed = parser.parse_args(argv)
+    except SystemExit:
+        return
+
+    name = None
+    if parsed.name:
+        name = parsed.name.strip() or None
+    elif parsed.self_:
+        try:
+            import json as _json
+            raw = sys.stdin.read()
+            if raw:
+                data = _json.loads(raw)
+                name = (data.get("agent") or "").strip() or None
+        except Exception:
+            pass
+
+    if not name:
+        return  # print nothing, exit 0 — statusline degrades to blank
+
+    root, _ = resolve_comms_root(None)
+    team = os.environ.get("TEAMMATE_TEAM") or None
+    if team and not team.strip():
+        team = None
+
+    from .comms import get_avatars_dir
+    ext = "ansi" if parsed.fmt == "ansi" else "txt"
+    sidecar = get_avatars_dir(root, team) / f"{name}.{ext}"
+    try:
+        content = sidecar.read_text(encoding="utf-8")
+    except OSError:
+        return  # no avatar for this agent; print nothing, exit 0
+
+    print(content)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "avatar":
+        _avatar_subcommand(sys.argv[2:])
+        return
+
     ctx = {"identity": _identity, "register": register_identity}
 
     watcher = threading.Thread(

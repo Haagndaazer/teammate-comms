@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.10.0
+
+Optional **profile avatar images** for teammates. Pre-rendered at ingest time so the
+dashboard and statusline CLI pay zero render cost. Adds 1 new tool (17 → 18 total).
+Pillow is an optional extra (`pip install teammate-comms[images]`) — the hot path
+stays zero-dependency.
+
+### Added
+- **`teammate_set_avatar`** — ingest, resize, and pre-render an avatar for any registered
+  agent. Accepts a local filesystem `path` or `image_base64`. Images are normalised to
+  256 × 256 RGB on a black canvas (non-square images are fitted and padded). Pass
+  `clear=true` to remove an existing avatar. Returns the ASCII preview strip on success.
+- **`avatars.py`** — new module: `ingest_avatar` (lazy Pillow import), `read_avatar_strip`
+  (pure stdlib, zero render cost). Pre-renders three sidecars per agent under
+  `TeammateComms/[team/]avatars/`: `<name>.png` (256 × 256 RGB), `<name>.ansi`
+  (xterm-256 half-block, 8 × 8 cells), `<name>.txt` (mono ASCII, 8 × 8).
+- **`comms.get_avatars_dir`** — team-scoped helper mirroring `get_agents_dir`.
+- **`comms.write_bytes_atomic`** — binary counterpart to `write_json_atomic`
+  (temp file + `os.replace`; used for PNG/ANSI/ASCII sidecars).
+- **`GET /avatar`** — dashboard route serving the pre-rendered PNG by agent name.
+  Token via query string (img tags can't set headers), `validate_agent_name` before path
+  construction (422 on fail), `Content-Length` + `ETag` for HTTP/1.1 keep-alive.
+- **`teammate-comms avatar`** subcommand — reads and prints a cached ANSI or ASCII strip
+  to stdout. No Pillow, no network. Suitable for statusline integration:
+  `teammate-comms avatar --name <Name>` or `--self` (reads agent from stdin JSON).
+- **`teammate_profile`** enrichment — ASCII strip appended to the profile block when an
+  avatar is present.
+- **Dashboard** — `GET /api/conversations` roster rows include `avatar` (hash or null);
+  `navItem` renders `<img class="avatar">` when a hash is present (online/offline
+  conveyed via opacity); CSP relaxed from `img-src 'none'` to `img-src 'self'`.
+
+### Changed
+- `pyproject.toml` gains `[project.optional-dependencies] images = ["Pillow>=10"]`.
+  Core `dependencies = []` is unchanged.
+
 ## v0.9.0
 
 First-class **project profiles** layered on the existing per-agent `project` field.
