@@ -400,6 +400,30 @@ def test_ac6_statusline_cli():
         check(result2.stdout.strip() == "",
               "AC-6 [tautology: avatar subcommand for unknown agent must print nothing]")
 
+        # Traversal guard: --name with ".." must degrade to blank/exit-0, NOT leak out-of-tree files.
+        # Place a sentinel at the path the traversal would reach WITHOUT the guard:
+        # get_avatars_dir(root)/".." resolves to root/"TeammateComms", so we write there.
+        sentinel_content = "SENTINEL_SHOULD_NOT_LEAK"
+        sentinel_ansi = root / "TeammateComms" / "sentinel_secret.ansi"
+        sentinel_ansi.parent.mkdir(parents=True, exist_ok=True)
+        sentinel_ansi.write_text(sentinel_content, encoding="utf-8")
+
+        result3 = subprocess.run(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, {str(SRC)!r}); "
+             "from teammate_comms.server import _avatar_subcommand; "
+             "_avatar_subcommand(['--name', '../sentinel_secret', '--format', 'ansi'])"],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        check(result3.returncode == 0,
+              "AC-6 [tautology: traversal --name must exit 0 (not crash)]")
+        check(sentinel_content not in result3.stdout,
+              "AC-6 [tautology: traversal --name must NOT leak out-of-tree sidecar content — "
+              "unguarded code would print the sentinel via path traversal]")
+        check(result3.stdout.strip() == "",
+              "AC-6 [tautology: traversal --name must print nothing — "
+              "validate_agent_name guard must fire before any path is constructed]")
+
 
 # ── AC-7: tautology guard — tests are enumerated in docstrings above ─────────
 # Each check() call above includes the specific reverted-code failure in its message.

@@ -304,6 +304,12 @@ def _avatar_subcommand(argv):
     if not name:
         return  # print nothing, exit 0 — statusline degrades to blank
 
+    # Validate name before constructing any path — block traversal (mirrors dashboard.py:_api_avatar).
+    try:
+        validate_agent_name(name)
+    except CommsError:
+        return  # degrade to blank/exit-0, consistent with other miss paths
+
     root, _ = resolve_comms_root(None)
     team = os.environ.get("TEAMMATE_TEAM") or None
     if team and not team.strip():
@@ -314,8 +320,8 @@ def _avatar_subcommand(argv):
     sidecar = get_avatars_dir(root, team) / f"{name}.{ext}"
     try:
         content = sidecar.read_text(encoding="utf-8")
-    except OSError:
-        return  # no avatar for this agent; print nothing, exit 0
+    except (OSError, UnicodeDecodeError):
+        return  # no avatar / tampered sidecar; print nothing, exit 0
 
     print(content)
 
