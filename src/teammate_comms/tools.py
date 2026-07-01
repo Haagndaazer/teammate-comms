@@ -655,7 +655,7 @@ def _handle_send(args, ctx):
 def _sender_summary(msgs):
     counts = {}
     for m in msgs:
-        s = m.get("from", "?")
+        s = m.get("from") or "?"
         counts[s] = counts.get(s, 0) + 1
     return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
 

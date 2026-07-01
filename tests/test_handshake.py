@@ -2839,11 +2839,15 @@ def main():
 
         # ── T5 — show_all=True re-dumps suppressed bodies across the session boundary ──
         _ctx15["identity"] = _Id15(_b15_agent, _t1_root)   # fresh session, seen_file has all three
-        _s5 = _hi15({"show_all": True}, _ctx15)
+        _s5_sup = _hi15({}, _ctx15)   # without show_all: prior-session bodies must be suppressed
+        if "body-alpha" in _s5_sup or "body-beta" in _s5_sup or "body-new" in _s5_sup:
+            failures.append(f"WP-15 T5: without show_all, prior-session bodies leaked through: {_s5_sup[:120]!r}")
+        _s5 = _hi15({"show_all": True}, _ctx15)   # with show_all: all bodies re-dump in same session
         if "body-alpha" not in _s5 or "body-beta" not in _s5 or "body-new" not in _s5:
             failures.append(f"WP-15 T5: show_all=True did not re-dump all suppressed bodies: {_s5[:120]!r}")
 
         # ── T6 — watcher no-noise: after cross-session read, last_seen set → no re-nudge ──
+        # guards that set_last_seen fires even on an all-suppressed read (no early-return path skips it)
         _t6_seen = _ctx15["identity"].get_last_seen() or set()
         if not {"wp15-a", "wp15-b", "wp15-c"} <= _t6_seen:
             failures.append(f"WP-15 T6: last_seen after cross-session read missing ids: {_t6_seen}")
@@ -2853,6 +2857,7 @@ def main():
             failures.append(f"WP-15 T6: watcher would re-nudge already-read message ids: {_t6_unseen}")
 
         # ── T7 — count_only is inert: no seen_file created by a count-only call ──
+        # guards write placement: seen_file write must be AFTER the count_only early-return
         _t7_root = tempfile.mkdtemp(prefix="tc-15-t7-")
         _t7_ix = _c15.get_inboxes_dir(_t7_root, None)
         _c15.ensure_inbox(_t7_ix, _b15_agent)
