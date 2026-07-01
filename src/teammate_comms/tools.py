@@ -227,14 +227,14 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "teammate_inbox",
-        "description": "Read your own unread messages (or just the unread count). Optional 'since'/'limit' page a large inbox. Bodies of messages already shown this session are suppressed by default (pass show_all=True to re-read them).",
+        "description": "Read your own unread messages (or just the unread count). Optional 'since'/'limit' page a large inbox. Bodies of messages already shown are suppressed by default (durable across sessions — pass show_all=True to re-read them).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "count_only": {"type": "boolean", "description": "If true, return only the unread count."},
                 "since": {"type": "string", "description": "Only show unread messages with id >= this cursor (page forward through a large inbox)."},
                 "limit": {"type": "integer", "description": "Show only the most recent N unread (after any 'since' filter). ack(\"all\") then clears only what was shown."},
-                "show_all": {"type": "boolean", "description": "Re-show bodies of messages already read this session (default suppresses them to avoid re-dumping context you've already seen)."},
+                "show_all": {"type": "boolean", "description": "Re-show bodies of messages already delivered (default suppresses them, durable across sessions, to avoid re-dumping context)."},
             },
         },
     },
@@ -652,14 +652,28 @@ def _handle_send(args, ctx):
     return "\n".join(lines)
 
 
+def _sender_summary(msgs):
+    counts = {}
+    for m in msgs:
+        s = m.get("from") or "?"
+        counts[s] = counts.get(s, 0) + 1
+    return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
+
+
 def _handle_inbox(args, ctx):
     agent, team, root = _require_registered(ctx)
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, agent)
     all_unread = read_json_safe(inboxes_dir / f"{agent}_unread.json")
+    seen_file = inboxes_dir / f"{agent}_seen.json"
 
     if args.get("count_only"):
         return str(len(all_unread))
+
+    # Prune persisted seen-set to current unread immediately — stale ids (acked/removed) can
+    # never resurrect, and there is no window between session start and the first read.
+    _unread_ids = {m.get("id") for m in all_unread}
+    persisted = set(read_json_safe(seen_file)) & _unread_ids
 
     # Optional windowing (C-3): 'since' (id >= cursor) then 'limit' (the most recent N). For an
     # unbounded inbox the agent can page rather than pull everything at once.
@@ -681,10 +695,10 @@ def _handle_inbox(args, ctx):
     # individually-correct changes composing into a regression). Pruning to current-unread lets
     # acked/removed ids leave naturally (bounded, exactly like the watcher's known_ids). A
     # count-only read (above) returns before here, so it never counts as a read.
-    _prev_seen = ctx["identity"].get_last_seen() or set()
+    _prev_seen = (ctx["identity"].get_last_seen() or set()) | persisted
     _shown = {m.get("id") for m in messages}
-    _unread_ids = {m.get("id") for m in all_unread}
     ctx["identity"].set_last_seen((_prev_seen | _shown) & _unread_ids)
+    write_json_atomic(seen_file, sorted((persisted | _shown) & _unread_ids))
 
     if not messages:
         return ("No unread messages." if not (since or limit)
@@ -700,10 +714,11 @@ def _handle_inbox(args, ctx):
 
     if not show_all and not new_msgs:
         n = len(seen_msgs)
+        _sfrom = _sender_summary(seen_msgs)
         if since or limit:
-            return (f"No new messages in this window ({n} already read this session). "
+            return (f"No new messages in this window ({n} already delivered — from: {_sfrom}). "
                     f"Remove since/limit or pass show_all=True to re-read.")
-        return (f"No new messages. {n} unread already read this session. "
+        return (f"No new messages. {n} message(s) already delivered (from: {_sfrom}). "
                 f"Pass show_all=True to re-read.")
 
     render_msgs = messages if show_all else new_msgs
@@ -728,7 +743,8 @@ def _handle_inbox(args, ctx):
         if rx:
             out.append(f"    reactions: {_reaction_summary(rx)}")   # names, matching group history (F-3)
     if not show_all and seen_msgs:
-        out.append(f"\n({len(seen_msgs)} message(s) already read this session not re-shown. "
+        _sfrom = _sender_summary(seen_msgs)
+        out.append(f"\n({len(seen_msgs)} message(s) already delivered (from: {_sfrom}) — not re-shown. "
                    f"Pass show_all=True to re-read.)")
     return "\n".join(out)
 

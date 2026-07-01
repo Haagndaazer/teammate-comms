@@ -238,6 +238,17 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   a nudge. Missed-nudge-safe: a genuinely new message has a fresh id in neither set, so
   it always nudges. (Replaced the earlier integer `baseline` count, which re-nudged on
   every count rise and counted read-but-unacked messages — the v0.4.1-test noise.)
+- **Body suppression + cross-session seen-file (WP-11b / WP-15):** `teammate_inbox`
+  suppresses re-dumping message bodies already shown to the agent. The suppression set
+  has two layers: (1) `Identity._last_seen` — an in-memory set of ids shown in the
+  current session; (2) `{agent}_seen.json` in the inboxes dir — a persisted set that
+  survives restarts. On every non-count read, `_handle_inbox` loads and prunes the
+  on-disk set (intersected with current unread — stale ids drop immediately), unions it
+  with `_last_seen`, and writes back the updated set. `Identity._last_seen` remains
+  `None` until the first inbox read each session; this `None` sentinel is consumed by
+  `ack("all")` startup-drain (drains the whole inbox when never-read-this-session) and
+  the watcher's unseen filter. **Do not persist `_last_seen` itself** — only the
+  separate `seen_file` is persisted, so the sentinel semantics are preserved intact.
 - Emits `notifications/claude/channel` with `meta = {count, agent}` and content that
   references the MCP tools. If the agent has a `personality` set, the content **leads
   with `You are <name>: <personality>`** so a woken idle instance is reminded who it
@@ -746,6 +757,8 @@ subheads with the profile `summary`/`status`. No second grouping structure.
 11. Lean wakes + lean surface + authority coordination rule (0.8.1 WP-11).
 12. Watcher crash + group recovery + same-name re-register compaction reset (0.8.2 WP-12).
 13. Project profiles + cross-OS roster fix + 4 new tools (0.9.0 WP-13).
+14. Teammate profile avatar images + statusline subcommand + zero-dep preserved (0.10.0 WP-14).
+15. Durable cross-session inbox body-suppression via `{agent}_seen.json` (0.11.0 WP-15).
 
 **Remaining:**
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.11.0
+
+**Durable cross-session inbox body-suppression.** `teammate_inbox` now persists the
+set of message bodies it has shown to a `{agent}_seen.json` file alongside the inbox.
+On a new session (server restart / re-register), the startup drain no longer re-dumps
+full bodies for messages already read in a prior session — suppression survives the
+restart. `ack("all")` with no prior read still drains the whole inbox (the
+`last_seen=None` sentinel is unchanged). The suppression count-line now names the
+senders (`"3 already delivered (from: Alice×2, Bob)"`) so a context-wiped agent can
+triage who to `show_all` without dumping everything. Default-on, zero new deps.
+
+### Changed
+- **`teammate_inbox` body-suppression is now durable across sessions.** A per-agent
+  `{agent}_seen.json` in the inboxes directory persists the shown-set. On the first
+  inbox read of a new session, bodies for prior-session messages are suppressed using
+  this file; brand-new arrivals (NEVER-MISS) always render full. The file is pruned
+  to the current unread set on every load — stale ids (acked/removed) can never
+  resurrect. `show_all=True` still re-dumps all bodies.
+- **Suppression count-line includes sender names.** All three suppression messages
+  (`all-suppressed`, `windowed all-suppressed`, partial footer) now render
+  `"N message(s) already delivered (from: Alice×2, Bob)"` instead of the bare
+  `"already read this session"` phrasing — accurate for cross-session suppression
+  and useful as a post-compaction triage hint.
+
 ## v0.10.0
 
 Optional **profile avatar images** for teammates. Pre-rendered at ingest time so the
@@ -120,11 +144,11 @@ added; all existing calls behave identically without them).
   teammates in your project. Human operators and agents with no project set are always
   shown (they're global). Pass `all=True` to see everyone; a footer notes how many
   were filtered and warns that cross-project authority owners may be hidden.
-- **`teammate_inbox` suppresses already-seen bodies.** A second read in the same
-  session no longer re-dumps message bodies you already saw — the header line stays
-  (id, sender, group, urgency tags) so the message remains ack-able. A note tells you
-  how many were suppressed. Pass `show_all=True` to re-read full bodies (useful after
-  context compaction).
+- **`teammate_inbox` suppresses already-seen bodies.** A second read no longer
+  re-dumps message bodies you already saw — the header line stays (id, sender, group,
+  urgency tags) so the message remains ack-able. A note tells you how many were
+  suppressed. Pass `show_all=True` to re-read full bodies. (Suppression was
+  in-session only in WP-11b; v0.11.0 makes it durable across sessions.)
 - **Trimmed tool-def schemas.** The `personality` field description in
   `teammate_register` and `teammate_update` shrank from ~950 to ~195 chars (full
   guidance moved to `SKILL.md`). Net: −1,000 chars per-request tool schema overhead.

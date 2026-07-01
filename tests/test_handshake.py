@@ -1385,7 +1385,7 @@ def main():
         _r2 = _hi11b({}, _ctx11b)
         if "suppression-probe-body" in _r2:
             failures.append(f"WP-11b suppression: second read re-dumped already-seen body (should suppress): {_r2}")
-        if "already read this session" not in _r2 and "No new messages" not in _r2:
+        if "already delivered" not in _r2 and "No new messages" not in _r2:
             failures.append(f"WP-11b suppression: second read missing suppression note: {_r2}")
 
         # show_all=True: body must reappear (escape hatch for post-compaction re-read)
@@ -2746,6 +2746,151 @@ def main():
             failures.append(f"G-5: unregistered verbose whoami wrong: {_un}")
     except Exception as e:
         failures.append(f"WP-8 P5 doctor unit checks errored: {e}")
+
+    # ── WP-15 — durable cross-session inbox body-suppression ──
+    # Tests that {agent}_seen.json persists body suppression across simulated new sessions.
+    # Hermetic, isolated temp root per sub-test.  A new session is simulated by resetting
+    # identity.last_seen to None (the "never read this session" sentinel) while leaving the
+    # on-disk seen_file intact — exactly what a real server restart does.
+    try:
+        from teammate_comms.tools import _handle_inbox as _hi15
+        from teammate_comms.tools import _handle_ack as _ha15
+        from teammate_comms import comms as _c15
+
+        _b15_agent = "probe15"
+
+        class _Id15:
+            def __init__(self, agent, root, team=None):
+                self._agent, self._root, self._team = agent, root, team
+                self._ls = None
+            def snapshot(self):
+                return (self._agent, self._team, self._root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        # ── T1 — cross-session suppression ──
+        _t1_root = tempfile.mkdtemp(prefix="tc-15-t1-")
+        _t1_ix = _c15.get_inboxes_dir(_t1_root, None)
+        _c15.ensure_inbox(_t1_ix, _b15_agent)
+        _msg_a = {"id": "wp15-a", "from": "alice", "priority": "normal", "message": "body-alpha"}
+        _msg_b = {"id": "wp15-b", "from": "bob",   "priority": "normal", "message": "body-beta"}
+        _c15.write_json_atomic(_t1_ix / f"{_b15_agent}_unread.json", [_msg_a, _msg_b])
+        _ctx15 = {"identity": _Id15(_b15_agent, _t1_root)}
+        # Session 1: first read — both bodies appear, seen_file is written.
+        _s1 = _hi15({}, _ctx15)
+        if "body-alpha" not in _s1 or "body-beta" not in _s1:
+            failures.append(f"WP-15 T1: first read must show both bodies: {_s1[:120]!r}")
+        # Session 2: fresh Identity (last_seen=None by construction) + same inboxes dir.
+        # seen_file persists at {agent}_seen.json — suppression must come from it alone.
+        _ctx15["identity"] = _Id15(_b15_agent, _t1_root)
+        _s2 = _hi15({}, _ctx15)
+        if "body-alpha" in _s2 or "body-beta" in _s2:
+            failures.append(f"WP-15 T1: cross-session re-read re-dumped suppressed bodies: {_s2[:120]!r}")
+        if "already delivered" not in _s2 and "No new messages" not in _s2:
+            failures.append(f"WP-15 T1: count line absent from suppressed output: {_s2[:120]!r}")
+        if "this session" in _s2:
+            failures.append(f"WP-15 T1: count line still claims 'this session' for prior-session msg: {_s2[:120]!r}")
+
+        # ── T2 — NEVER-MISS holds (new arrival after new-session reset renders full) ──
+        _msg_c = {"id": "wp15-c", "from": "carol", "priority": "normal", "message": "body-new"}
+        _c15.write_json_atomic(_t1_ix / f"{_b15_agent}_unread.json", [_msg_a, _msg_b, _msg_c])
+        _ctx15["identity"] = _Id15(_b15_agent, _t1_root)
+        _s3 = _hi15({}, _ctx15)
+        if "body-new" not in _s3:
+            failures.append(f"WP-15 T2: NEVER-MISS failed — new body absent after new session: {_s3[:120]!r}")
+        if "body-alpha" in _s3 or "body-beta" in _s3:
+            failures.append(f"WP-15 T2: prior-session bodies leaked in same read as NEVER-MISS: {_s3[:120]!r}")
+
+        # ── T3 — ack("all") startup-drain drains BOTH msg-old and msg-new ──
+        # The sentinel is last_seen=None, NOT persisted seen_file — so both messages are drained.
+        _t3_root = tempfile.mkdtemp(prefix="tc-15-t3-")
+        _t3_ix = _c15.get_inboxes_dir(_t3_root, None)
+        _c15.ensure_inbox(_t3_ix, _b15_agent)
+        _mo = {"id": "t3-old", "from": "alice", "priority": "normal", "message": "old-body"}
+        _mn = {"id": "t3-new", "from": "bob",   "priority": "normal", "message": "new-body"}
+        _c15.write_json_atomic(_t3_ix / f"{_b15_agent}_unread.json", [_mo, _mn])
+        _c15.write_json_atomic(_t3_ix / f"{_b15_agent}_seen.json", ["t3-old"])  # only old pre-seeded
+        _ctx15t3 = {"identity": _Id15(_b15_agent, _t3_root)}
+        _ack_r = _ha15({"id": "all"}, _ctx15t3)
+        if "Acknowledged all 2" not in _ack_r:
+            failures.append(f"WP-15 T3: startup ack-all drained wrong count (want 2 incl. msg-new): {_ack_r!r}")
+        _t3_left = _c15.read_json_safe(_t3_ix / f"{_b15_agent}_unread.json")
+        if _t3_left:
+            failures.append(f"WP-15 T3: inbox not empty after startup ack-all: {_t3_left}")
+
+        # ── T4 — load-time prune: stale id absent from output AND from seen_file after read ──
+        _t4_root = tempfile.mkdtemp(prefix="tc-15-t4-")
+        _t4_ix = _c15.get_inboxes_dir(_t4_root, None)
+        _c15.ensure_inbox(_t4_ix, _b15_agent)
+        _ml = {"id": "t4-live", "from": "alice", "priority": "normal", "message": "live-body"}
+        _c15.write_json_atomic(_t4_ix / f"{_b15_agent}_unread.json", [_ml])
+        _c15.write_json_atomic(_t4_ix / f"{_b15_agent}_seen.json", ["stale-ghost", "t4-live"])
+        _ctx15t4 = {"identity": _Id15(_b15_agent, _t4_root)}
+        _s4 = _hi15({}, _ctx15t4)
+        if "stale-ghost" in _s4:
+            failures.append(f"WP-15 T4: stale id resurrected in inbox output: {_s4[:120]!r}")
+        _t4_sf = _c15.read_json_safe(_t4_ix / f"{_b15_agent}_seen.json")
+        if "stale-ghost" in _t4_sf:
+            failures.append(f"WP-15 T4: stale id NOT pruned from seen_file after read: {_t4_sf}")
+        if "live-body" in _s4:   # t4-live was in prior seen_file → suppressed
+            failures.append(f"WP-15 T4: prior-session body leaked through after load-time prune: {_s4[:120]!r}")
+
+        # ── T5 — show_all=True re-dumps suppressed bodies across the session boundary ──
+        _ctx15["identity"] = _Id15(_b15_agent, _t1_root)   # fresh session, seen_file has all three
+        _s5_sup = _hi15({}, _ctx15)   # without show_all: prior-session bodies must be suppressed
+        if "body-alpha" in _s5_sup or "body-beta" in _s5_sup or "body-new" in _s5_sup:
+            failures.append(f"WP-15 T5: without show_all, prior-session bodies leaked through: {_s5_sup[:120]!r}")
+        _s5 = _hi15({"show_all": True}, _ctx15)   # with show_all: all bodies re-dump in same session
+        if "body-alpha" not in _s5 or "body-beta" not in _s5 or "body-new" not in _s5:
+            failures.append(f"WP-15 T5: show_all=True did not re-dump all suppressed bodies: {_s5[:120]!r}")
+
+        # ── T6 — watcher no-noise: after cross-session read, last_seen set → no re-nudge ──
+        # guards that set_last_seen fires even on an all-suppressed read (no early-return path skips it)
+        _t6_seen = _ctx15["identity"].get_last_seen() or set()
+        if not {"wp15-a", "wp15-b", "wp15-c"} <= _t6_seen:
+            failures.append(f"WP-15 T6: last_seen after cross-session read missing ids: {_t6_seen}")
+        _t6_unread = {m.get("id") for m in _c15.read_json_safe(_t1_ix / f"{_b15_agent}_unread.json")}
+        _t6_unseen = _t6_unread - _t6_seen
+        if _t6_unseen:
+            failures.append(f"WP-15 T6: watcher would re-nudge already-read message ids: {_t6_unseen}")
+
+        # ── T7 — count_only is inert: no seen_file created by a count-only call ──
+        # guards write placement: seen_file write must be AFTER the count_only early-return
+        _t7_root = tempfile.mkdtemp(prefix="tc-15-t7-")
+        _t7_ix = _c15.get_inboxes_dir(_t7_root, None)
+        _c15.ensure_inbox(_t7_ix, _b15_agent)
+        _c15.write_json_atomic(_t7_ix / f"{_b15_agent}_unread.json",
+                               [{"id": "t7-1", "from": "x", "priority": "normal", "message": "t7body"}])
+        _ctx15t7 = {"identity": _Id15(_b15_agent, _t7_root)}
+        _hi15({"count_only": True}, _ctx15t7)
+        if (_t7_ix / f"{_b15_agent}_seen.json").exists():
+            failures.append("WP-15 T7: count_only created seen_file (must be inert)")
+
+        # ── T8 — windowed cross-session: window A suppressed, window B renders full ──
+        _t8_root = tempfile.mkdtemp(prefix="tc-15-t8-")
+        _t8_ix = _c15.get_inboxes_dir(_t8_root, None)
+        _c15.ensure_inbox(_t8_ix, _b15_agent)
+        _w1 = {"id": "t8-w1", "from": "alice", "priority": "normal", "message": "win-one-body"}
+        _w2 = {"id": "t8-w2", "from": "bob",   "priority": "normal", "message": "win-two-body"}
+        _w3 = {"id": "t8-w3", "from": "carol", "priority": "normal", "message": "win-thr-body"}
+        _c15.write_json_atomic(_t8_ix / f"{_b15_agent}_unread.json", [_w1, _w2, _w3])
+        _ctx15t8 = {"identity": _Id15(_b15_agent, _t8_root)}
+        # Session 1: read window A = only w3 (since >= "t8-w3").
+        _sa = _hi15({"since": "t8-w3"}, _ctx15t8)
+        if "win-thr-body" not in _sa:
+            failures.append(f"WP-15 T8 session-1: window A did not render w3 body: {_sa[:80]!r}")
+        # Session 2: fresh Identity; read window B = newest 2 (w2+w3). w3 suppressed, w2 full.
+        _ctx15t8["identity"] = _Id15(_b15_agent, _t8_root)
+        _sb = _hi15({"limit": 2}, _ctx15t8)
+        if "win-thr-body" in _sb:
+            failures.append(f"WP-15 T8: window-A id (w3) not suppressed in session-2 read: {_sb[:80]!r}")
+        if "win-two-body" not in _sb:
+            failures.append(f"WP-15 T8: window-B new id (w2) wrongly suppressed: {_sb[:80]!r}")
+
+    except Exception as e:
+        failures.append(f"WP-15 cross-session suppression unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
