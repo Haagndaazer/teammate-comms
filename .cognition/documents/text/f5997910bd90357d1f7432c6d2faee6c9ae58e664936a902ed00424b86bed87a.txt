@@ -1,0 +1,47 @@
+Fable Audit Stage 1 (2026-07-01), teammate-comms, yardstick = third-party adopters installing from marketplace with zero context. 8 Sonnet auditors (server core, comms.py storage, tools.py, channel+spawn, dashboard+avatars, hooks/packaging/CI, tests, docs accuracy). Full text: docs/260701-fable-audit-systems.md. Findings (id, severity, title):
+S1 critical bug: non-dict JSON-RPC message kills server — handle() unguarded (server.py:223-252, 346-354); sibling paths (dispatch WP-5, watcher WP-12) hardened, envelope missed.
+S2 high blindspot: register name-collision only logged to stderr; tool returns unconditional success (server.py:180-187, 216-220). Found independently by two auditors.
+S3 medium: protocolVersion echoed not negotiated (server.py:227-237).
+S4 medium: $TEAMMATE_AGENT auto-register failure silent (server.py:255-265) — reincarnate child looks alive, never registers.
+S5 low: notification-vs-request inconsistent (id:null frames possible).
+S6 low: "no polling loop needed" instruction overstates — deliberate, validated (097c03396bd4).
+C1 high bug: teammate_inbox reads unread.json with destructive read_json_safe, unlocked (tools.py:667 vs channel.py:266) — contradicts AUDIT-v0.7.0 "verified solid"; risk of silent inbox wipe on synced/network filesystems (OneDrive ~/.claude).
+C2 high bug: unbounded full-scan of global reactions.jsonl on every inbox/group-history call (tools.py:726, 1310) — WP-7 fixed the pattern elsewhere, missed hottest sites.
+C3 med-high: append_group_message rewrites whole history per message (comms.py:401-420), never compacted.
+C4 med-high: naive local-time message ids vs documented cross-host mode (comms.py:33-35 vs DESIGN.md:670-676) — clock skew silently skips messages past cursors.
+C5 medium: global flat namespace, offline collision unguarded (deliberate root ef4af8135c03, unrevisited).
+C6 medium: transcript/reactions no compaction (C-2 deferral).
+T1 high bug: teammate_set_avatar can target any teammate — no caller check (tools.py:1010-1029).
+T2 medium: unread.json uncapped (C-3 half-fix; _read.json capped, unread not).
+T3 medium: authorization model inconsistent — self-only vs global vs convention-only, undocumented.
+W1 high: reincarnate hardcodes coltondyck marketplace (spawn.py:30-34); forks silently broken, failure looks like success (DEVNULL child stdio).
+W2 high: TEAMMATE_REINCARNATE_ENABLED defeated by setx/profile persistence (incident c1fa517c047d, never code-fixed).
+W3 medium: re-nudge cap 3 attempts (~14min) — lone message under sustained drops silent forever (deliberate WP-9, residual).
+W4 medium: watcher snapshot()/get_generation() two-lock TOCTOU (channel.py:215-216).
+W5 medium: spawned children never reaped — POSIX zombies (spawn.py:141-183).
+W6 medium: TEAMMATE_LAUNCH_ARGS parsed shlex posix=True on Windows — backslash paths corrupted (spawn.py:94-98).
+W7 low-med: heartbeat write failure return ignored (channel.py:239-243).
+D1 high: two dashboards defaulting to "human" merge into one identity (tools.py:1565, comms.py:896-914).
+D2 medium: avatar sidecars never GC'd on removal; /avatar serves without registration check.
+D3 medium: image_base64 fully decoded before 50MB cap (avatars.py:166-180); no stdin message-size cap.
+D4 medium: dashboard poll/roster failures swallowed — silent UI freeze on stale token (index.html:505-529).
+D5 verified clean: WP-14 path traversal fixed, XSS clean, CSRF defused.
+P1 critical: missing uv = cryptic MCP-spawn failure disconnected from hook warning (plugin.json:9-14, session-start.sh:47-50).
+P2 high: avatars dead OOB — Pillow extra never installed (uv sync --no-dev), error text prescribes impossible pip fix; README silent.
+P3 medium: missing Git Bash cascades to undiagnosable first-run failure (hooks.json:9,19).
+P4 high: no macOS CI leg despite darwin-specific code (ci.yml:26, spawn.py:42-51).
+P5 medium: AUDIT G-4 marked MERGED but reinject-instructions.sh has no self-filter/test.
+Q1 critical: CI runs 1 of 3 test suites — WP-13/WP-14 suites never invoked (ci.yml:41-42); manager gate compensates internally only (c074742c6570).
+Q2 high: test_wp13 hardcodes C:/cctmp — cannot run on any other machine (test_wp13_projects.py:411).
+Q3 high: version-sync guards stale at "0.10.0" literals — the drift-check drifted (test_wp13:649, test_wp14:441).
+Q4 medium: avatars.py error paths untested.
+Q5 medium: concurrency tests thread-based only, never true multi-process.
+X1 high: 18th tool teammate_set_avatar missing from README/SKILL/DESIGN tool tables.
+X2 high: show_all/body-suppression (current release headline) absent from README.
+X3 high: teammate_list project-scoping default undocumented in README/DESIGN.
+X4 high: SKILL.md still states superseded pre-WP-9 wake guarantee (SKILL.md:106-116 vs DESIGN.md:265-288) — SKILL.md is the surface agents actually load.
+X5 medium: DESIGN.md version framing re-drifted to v0.7.1 (shipped 0.11.0) — recurring failure (AUDIT E-2/WP-2).
+X6 medium: WP-14/WP-15 no DESIGN sections; avatars.py absent from layout.
+X7 low: no git tags for releases.
+X8 low: untracked root WP/BACKLOG docs without disclaimers.
+Root-cause themes: (1) first-contact path never walked on a clean machine (P1,P3,P2,W1); (2) diagnostics go to stderr/nowhere, not the conversation (S2,S4,W7,D1,D4); (3) hardening call-site-driven not pattern-driven (S1,C1,C2,T2,P5); (4) verification record drifts from reality (C1 "verified solid" false, Q3, P5); (5) CI protects one-third of product (Q1-Q3,P4); (6) docs update asymmetrically — SKILL vs README/DESIGN swapped staleness (X1-X6); (7) one-team-era scale/trust assumptions load-bearing and undocumented (C3-C6,T1,T3,C5,D1). 28 potential tasks filed under epic 291c795d20af.

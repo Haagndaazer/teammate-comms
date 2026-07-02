@@ -1,0 +1,43 @@
+# WP-14 — Teammate profile images (avatars)
+
+Manager: Silvie · Implementer: Svetlana · Status: Peer-reviewed + revised (v2), Colton gave go 2026-06-29.
+Branch: feat/wp14-teammate-avatars (off origin/main @ 4a1e4a7, v0.9.0). Version target: 0.10.0.
+
+## 1. Goal
+Let a teammate OPTIONALLY attach a small profile image. Renders in the dashboard roster next to the agent; discoverable by a Claude Code statusline as a tiny terminal-rendered thumbnail (ANSI color half-blocks, monochrome ASCII fallback). Ingestion forgiving: any image forced to 256x256, aspect preserved, black-padded if non-square. Default-off; absence changes nothing.
+
+## 2. Load-bearing constraint
+MCP server is deliberately zero-dependency pure stdlib (dependencies=[] — instant spawn, no dep tree blocking stdio handshake). No image lib on the hot path. Ingestion needs Pillow -> optional extra, lazy-imported in the set-avatar handler only. Everything downstream of ingest is dependency-free because ingest pre-renders+caches every consumer artifact (PNG, ANSI strip, ASCII strip). Core: separate heavy ingest path from light serve path, cache at ingest.
+
+## 3. Locked decisions
+1. Image bytes NOT in agent JSON — bytes in team-scoped avatars/ dir; record holds only hash+timestamp. 2. Pillow optional, lazy in set-avatar; missing -> clear CommsError. 3. Pre-render 3 sidecars at ingest (PNG, ANSI, ASCII). 4. Input is a filesystem path (optional image_base64 fallback). 5. Default-off.
+
+## 4. Data model
+New team-scoped avatars/ dir (mirror get_agents_dir). <name>.png 256x256 RGB black-padded; <name>.ansi 256-color half-block; <name>.txt mono ASCII. get_avatars_dir helper. Agent record gains avatar={"hash":sha256-12,"updated_at":iso} via write_agent_record merge (NOT a PROFILE_FIELDS entry). Hash = cache-buster + presence flag.
+
+## 5. Ingestion (only Pillow-touching code) — avatars.py ingest_avatar(root,team,name,*,path,image_base64)
+(1) Lazy import PIL; ImportError->CommsError. (2) 50MB byte cap before decode; set Image.MAX_IMAGE_PIXELS (raises at decode not open); CPU-bomb under pixel cap accepted v1 risk (note DESIGN.md). (3) RGB, scale longest side 256 aspect-preserved, paste centered on 256x256 black canvas, PNG. (4) ANSI strip U+2580 fg=top/bg=bottom, QUANTIZE to xterm 256-color NOT truecolor. (5) ASCII strip luminance ramp. (6) hash then write_agent_record(avatar=...); False->CommsError. (7) clear: update record FIRST then delete sidecars. write_bytes_atomic helper (write_json_atomic is text-mode). Two-level lazy import: PIL only inside ingest_avatar; avatars imported lazily inside _handle_set_avatar, never module top.
+
+## 6. Tools
+6.1 teammate_set_avatar NEW: path or image_base64; clear bool; returns confirmation+ASCII preview; separate from teammate_update. 6.2 teammate_profile ENRICH: append ASCII .txt strip ONLY (never .ansi — raw escapes are model-context noise). No fetch-bytes tool.
+
+## 7. Dashboard
+7.1 GET /avatar?name=&token=&v=<hash> (token in query, not /api/, img can't set headers): reads avatars/<name>.png, Content-Type image/png, Content-Length, ETag, Cache-Control, 404 absent. validate_agent_name BEFORE building path; 422 on fail. Add to do_GET table. 7.2 _api_conversations include avatar hash/null per row. 7.3 navItem render <img class=avatar> when hash present else dot; online/offline via ring/opacity. CSP img-src 'none'->'self'.
+
+## 8. Statusline — CONFIRMED feasible
+Multi-line supported; 256-color (not truecolor); Unicode blocks render; stdin agent+project_dir, COLUMNS width, 300ms debounce. New avatar subcommand at top of server.main() on argv[1]=='avatar' before MCP loop; reads cached .ansi/.txt, no Pillow/no network; honors COLUMNS/--cols truncate; --format ascii fallback. --name <RegisteredName> reliable; --self best-effort (stdin agent match, prints nothing+exit 0 if unresolved); project_dir NOT used to disambiguate. Ship example settings.json snippet.
+
+## 9. Known-intentional — do NOT fix
+Zero deps on hot path; bytes never in JSON; avatar not PROFILE_FIELDS; status dot stays; token via query; file_lock_optional heartbeats stay (avatar writes use write_agent_record merge).
+
+## 10. Sequencing — RESOLVED
+WP-13 shipped v0.9.0; WP-14 off origin/main, version 0.10.0.
+
+## 11. Docs/version
+0.9.0->0.10.0 in __init__.py:3, plugin.json:3, pyproject.toml:3. Add [project.optional-dependencies] images=["Pillow>=10"]. CHANGELOG, SKILL.md, DESIGN.md, README.md.
+
+## 12. Acceptance criteria (gate)
+1. square png->256x256 + avatar.hash; clear removes 3 sidecars+key. 2. wide(512x128)+tall(128x512)->256x256 centered BLACK pad, aspect preserved. 3. zero-dep: spawn works Pillow-absent; only set_avatar raises clear CommsError (simulate ImportError). 4. /avatar correct Content-Type/ETag; bad/no token 401/403; unknown 404; traversal rejected. 5. _api_conversations hash; navItem img/dot; CSP same-origin only. 6. statusline CLI prints strip, no Pillow, no network. 7. tautology guard: each test fails on reverted code with specific reason. 8. full suite green; fix+proof same commit.
+
+## 13. Out of scope v1
+Animated/non-PNG; avatar history; cropping UI; serving beyond loopback dashboard+CLI; identity verification.

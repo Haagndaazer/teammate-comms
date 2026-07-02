@@ -1,0 +1,23 @@
+# WP-15 — Durable cross-session inbox body-suppression
+
+Manager: Silvie (planner, does not implement). Implementer: Svetlana. Branch: feat/wp15-cross-session-suppression. Target v0.11.0. Source task 156f27bb476a. Research discovery 9fb4d08007ed.
+
+PROBLEM: teammate_inbox body-suppression (WP-11b) prevents re-dumping a read-but-unacked message body WITHIN a session, but the seen-set lives only in Identity._last_seen (in-memory, server.py:67), lost on every new session/server restart/re-register. So on the first teammate_inbox of a new session the startup drain re-dumps the full body of every lingering read-but-unacked message. Agents routinely leave messages unacked across long agentic runs and compactions (Colton-confirmed), so this is the common path.
+
+FIX (Approach A): add a per-agent persisted shown-set {agent}_seen.json in the inboxes dir, consulted ONLY for body suppression in _handle_inbox. Do NOT persist Identity._last_seen itself (load-bearing sentinel for ack-all startup-drain at tools.py:755-758 and the watcher unseen filter at channel.py:285-286). Steps: (0) seen_file = get_inboxes_dir/f'{agent}_seen.json'; read_json_safe returns [] if missing. (1) load+prune AFTER count_only early return (tools.py:661): persisted = set(read_json_safe(seen_file)) & _unread_ids, pruned at load time. (2) suppression set _prev_seen = in-mem last_seen ∪ persisted, used only for new_msgs/seen_msgs split (tools.py:698-699); brand-new id in neither → renders full (NEVER-MISS). (3) set_last_seen line unchanged but semantics shift (now absorbs prior-session ids) — intentional. (4) persist immediately after set_last_seen (tools.py:687), before any early return: write_json_atomic(seen_file, sorted((persisted ∪ _shown) & _unread_ids)). (5) reword count-line copy at tools.py:704,706,731 (all say 'this session', all false cross-session); include sender names for post-compaction triage.
+
+CONCURRENCY: write_json_atomic prevents torn writes; lock-free read-modify-write can lose an update on simultaneous same-agent reads — tolerated (body re-shows at most once more), no lock added.
+
+ACCEPTANCE TESTS (tests/test_handshake.py, assert the reason): T1 cross-session suppression (bodies absent, count-line present, no 'this session' substring); T2 NEVER-MISS (new arrival renders full); T3 ack-all startup-drain regression guard — inbox MUST contain msg-old AND msg-new (fresh, not in prior seen), assert drain==full size==2 (fails vacuously if only prior-session msgs); T4 load-time prune asserts on-disk seen_file content; T5 show_all re-dumps; T6 watcher no-noise; T7 count_only inert (no seen_file touch); T8 windowed cross-session (window A suppressed, window B full — proves set not cursor). Plus standing bar: Windows green, stdlib-only zero deps, docs same WP.
+
+KNOWN-INTENTIONAL (do not fix): Identity._last_seen=None sentinel; set_last_seen stays; read-receipts ack-based (group_read_positions reads _read.json comms.py:929, do not wire seen_file in); do NOT copy _read.json _READ_CAP tail-trim to seen_file.
+
+POST-COMPACTION: durable suppression means a context-wiped agent sees only count-line; mitigation = name senders in count-line; show_all recovers bodies. Deliberate Colton-endorsed tradeoff.
+
+DOCS: README, SKILL.md, CHANGELOG (suppression now durable); DESIGN.md (seen_file layer + last_seen stays sentinel); teammate_inbox schema wording tools.py:230,237.
+
+MIRROR-PATTERN: copy write_json_atomic/read_json_safe from _read.json path but NOT the _READ_CAP tail-cap (seen-set pruned by intersection with unread, never by recency).
+
+REJECTED: full auto-ack-on-read as default — changes read-receipt timing + removes leave-unacked affordance + larger protocol surface; deferred to its own WP if honest unread-counts become a felt need.
+
+GATE: Silvie diff-review + Colton go; sign-off names exact commit SHA; merge is that SHA.
