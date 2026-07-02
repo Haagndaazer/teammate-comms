@@ -48,6 +48,15 @@
 - AC-4: no-Pillow run of wp14 suite still exits 0 (new tests skip or run per their needs).
 - AC-5: full harness green (three suites) on Windows.
 
+## Addendum (from the WP-19 gate, 2026-07-02)
+
+- **Port isolation (observed flake):** two concurrent runs of `test_wp14_avatars.py` on one
+  machine cross-talk — AC-4/AC-5 bind the fixed 7842+ port range, and a client can reach the
+  OTHER process's dashboard (401 with the wrong token). Fix in this WP: the dashboard-binding
+  tests pass port=0-style isolation (start_dashboard's scan accepts a preferred port — pick a
+  RANDOMIZED high base per process, e.g. 20000+pid%20000, so concurrent suites never share a
+  range). Same change in test_handshake.py's dashboard block if it hardcodes the range.
+
 ## Known-intentional — do NOT "fix"
 
 - 50MB cap value, MAX_IMAGE_PIXELS=50M, 256×256 canvas — test them, don't change them.

@@ -47,6 +47,13 @@
    comms root can be consumed from Windows even when the writer is on Linux — cross-OS is the
    whole point). Error text says why ("reserved device name on Windows").
 
+## Addendum (from the WP-19 gate, 2026-07-02)
+
+- WP-19's D1 dashboard warning fires on ANY host mismatch in the existing human record —
+  including a long-dead dashboard's stale host. Once presenceAt exists (item 1), gate that
+  warning on presence-freshness: warn only when the existing record shows FRESH presence
+  from a different host/pid (a dead dashboard's record is a silent takeover, which is fine).
+
 ## Acceptance criteria
 
 - AC-1 (B1): fresh `presenceAt` → human shows online in list/profile/conversations; aged
