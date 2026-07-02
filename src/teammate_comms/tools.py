@@ -39,6 +39,7 @@ from .comms import (
     get_groups_dir,
     get_inboxes_dir,
     get_transcript_file,
+    group_read_has_unseen_acks,
     group_read_positions,
     human_presence_online,
     is_channel_alive,
@@ -87,6 +88,10 @@ MAX_MESSAGE_CHARS = 64 * 1024
 # Cap on _read.json (acked-message history) entries — trimmed to the most recent N on ack so
 # the append-forever log can't grow without bound (audit C-3).
 _READ_CAP = 1000
+# Cap on a live {agent}_unread.json — the file every sender appends to and the watcher polls
+# twice a second (audit T2). Data-preserving, NOT a drop: overflow moves to _read.json (see
+# _cap_unread) so the union of unread+read is always the complete set of sent messages.
+_UNREAD_CAP = 1000
 # react()/resolve_message() resolve a target id from the transcript newest-first. The target is
 # almost always recent, so scan the last _RESOLVE_TAIL records first (read only the file's tail,
 # C-1) and only full-scan the whole stream if that window is saturated and missed (an older
@@ -619,6 +624,7 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     with file_lock(unread_file):
         messages = read_json_safe(unread_file)
         messages.append(record)
+        messages = _cap_unread(messages, inboxes_dir / f"{to}_read.json")  # T2
         write_json_atomic(unread_file, messages)
 
     to_record = read_agent_record(root, team, to)
@@ -767,6 +773,29 @@ def _handle_inbox(args, ctx):
     return "\n".join(out)
 
 
+def _cap_unread(unread, read_file):
+    """T2: if ``unread`` exceeds ``_UNREAD_CAP`` after an append, move the OLDEST overflow
+    records into ``read_file`` tagged ``acked_unseen`` (never actually read — same M5
+    semantics; a hard drop would be message loss, which the audit's own rubric calls
+    critical) AND ``capped`` (distinguishes cap-overflow from ack("all")'s startup-drain in
+    forensics). Caller must hold the SAME lock that guards ``read_file`` (the established
+    tombstone/ack pattern — this reads-modifies-writes it). Returns the (possibly trimmed)
+    unread list; the caller writes it back. Strictly-greater gate: exactly AT the cap never
+    triggers a move.
+    """
+    if len(unread) <= _UNREAD_CAP:
+        return unread
+    overflow_count = len(unread) - _UNREAD_CAP
+    overflow, kept = unread[:overflow_count], unread[overflow_count:]
+    tagged_overflow = [dict(m, acked_unseen=True, capped=True) for m in overflow]
+    read = read_json_safe(read_file)
+    read.extend(tagged_overflow)
+    if len(read) > _READ_CAP:
+        read = read[-_READ_CAP:]
+    write_json_atomic(read_file, read)
+    return kept
+
+
 def _handle_ack(args, ctx):
     agent, team, root = _require_registered(ctx)
     msg_id = args.get("id")
@@ -790,6 +819,11 @@ def _handle_ack(args, ctx):
             if last_seen is None:
                 # Never read this session → clear everything (startup-drain behavior).
                 acked, unread = unread, []
+                # M5: tag each drained record — it was never actually SEEN (drained cold, not
+                # read), so group_read_positions must not infer "caught up" from it (a false
+                # read-receipt via the startup-drain path). Seen-then-acked records (the else
+                # branch below) stay untagged — receipts on that path are unchanged.
+                acked = [dict(m, acked_unseen=True) for m in acked]
                 result = f"Acknowledged all {len(acked)} message(s)."
             else:
                 # Only ack messages the agent has actually SEEN; preserve arrivals that
@@ -1145,6 +1179,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
             with file_lock(unread_file):
                 msgs = read_json_safe(unread_file)
                 msgs.append(record)
+                msgs = _cap_unread(msgs, inboxes_dir / f"{member}_read.json")  # T2
                 write_json_atomic(unread_file, msgs)
             delivered.append(member)
             rec = read_agent_record(root, team, member)
@@ -1344,6 +1379,8 @@ def _handle_group(args, ctx):
         lines = [f"{sigil} read positions (furthest-acked group message per member):"]
         for m in members:
             lines.append(f"  - {m}: {positions.get(m) or '(none acked)'}")
+        if group_read_has_unseen_acks(root, team, group, members):
+            lines.append("(startup-drained messages are not counted as read)")
         return "\n".join(lines)
 
     # action == "history"

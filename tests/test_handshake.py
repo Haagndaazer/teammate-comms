@@ -701,8 +701,9 @@ def main():
     agent_txt = agent_unread.read_text(encoding="utf-8") if agent_unread.exists() else ""
     if "group hello" in agent_txt:
         failures.append("group send echoed to the sender's own inbox (should skip sender)")
-    # transcript recorded the message
-    transcript = groups_dir(root) / GROUP / "messages.json"
+    # transcript recorded the message — WP-25 C3: the append path is now messages.jsonl
+    # (NDJSON, O(1) append), not the legacy full-array messages.json.
+    transcript = groups_dir(root) / GROUP / "messages.jsonl"
     if not transcript.exists() or "group hello" not in transcript.read_text(encoding="utf-8"):
         failures.append(f"group transcript missing message at {transcript}")
     # history returns it
@@ -4097,6 +4098,145 @@ def main():
                 os.environ["TEAMMATE_TEAM"] = _prev_team24c
     except Exception as e:
         failures.append(f"WP-24 AC-3/AC-4 unit checks errored: {e}")
+
+    # ── WP-25 AC-1 (M5) — acked_unseen tag: cold-start drain doesn't inflate read positions ──
+    # Tautology: current main reports the drained id as the position.
+    try:
+        from teammate_comms import tools as _t25a
+        from teammate_comms import comms as _c25a
+
+        _t25a_root = tempfile.mkdtemp(prefix="tc-25-ac1-")
+        _grp25a = "g25a"
+        _sender25a, _member25a = "sender25a", "member25a"
+        _c25a.write_group_meta(_t25a_root, None, _grp25a,
+                               {"name": _grp25a, "members": [_sender25a, _member25a],
+                                "creator": _sender25a, "createdAt": _c25a.now_timestamp()})
+        _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "first message")
+
+        class _Id25a:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+                self._ls = None
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        _ctx25a = {"identity": _Id25a(_member25a, _t25a_root)}
+        _t25a._handle_ack({"id": "all"}, _ctx25a)  # cold-start drain (last_seen is None)
+
+        _positions25a = _c25a.group_read_positions(_t25a_root, None, _grp25a,
+                                                    [_sender25a, _member25a])
+        if _positions25a.get(_member25a) is not None:
+            failures.append(f"WP-25 AC-1 [tautology: a cold-start-drained (never-seen) message "
+                             f"must NOT advance the read position — got "
+                             f"{_positions25a.get(_member25a)!r}, want None]")
+
+        # A seen-then-acked message still advances the position (receipts unchanged there).
+        _mid25a = _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "second message")["id"]
+        _ctx25a["identity"].set_last_seen({_mid25a})  # simulate a real teammate_inbox read
+        _t25a._handle_ack({"id": "all"}, _ctx25a)
+        _positions25a2 = _c25a.group_read_positions(_t25a_root, None, _grp25a,
+                                                     [_sender25a, _member25a])
+        if _positions25a2.get(_member25a) != _mid25a:
+            failures.append(f"WP-25 AC-1: a seen-then-acked message should still advance the "
+                             f"position: {_positions25a2.get(_member25a)!r} != {_mid25a!r}")
+    except Exception as e:
+        failures.append(f"WP-25 AC-1 unit checks errored: {e}")
+
+    # ── WP-25 AC-2/AC-3 (T2) — unread cap: data-preserving overflow move, strict boundary ──
+    try:
+        from teammate_comms import tools as _t25b
+        from teammate_comms import comms as _c25b
+
+        _t25b_root = tempfile.mkdtemp(prefix="tc-25-ac2-")
+        _to25b = "capprobe25b"
+        _c25b.ensure_inbox(_c25b.get_inboxes_dir(_t25b_root, None), _to25b)
+
+        for i in range(_t25b._UNREAD_CAP):  # AC-3 boundary: exactly the cap — no move yet.
+            _t25b.send_dm(_t25b_root, None, "sender25b", _to25b, f"msg-{i}")
+        _unread_at_cap = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_unread.json")
+        if len(_unread_at_cap) != _t25b._UNREAD_CAP:
+            failures.append(f"WP-25 AC-3: unread should hold exactly the cap "
+                             f"({_t25b._UNREAD_CAP}) before overflow: {len(_unread_at_cap)}")
+        _read_at_cap = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_read.json")
+        if _read_at_cap:
+            failures.append(f"WP-25 AC-3: no move should happen exactly AT the cap: {_read_at_cap}")
+
+        # AC-2: the (cap+1)th message triggers a move — oldest lands in _read.json, both tags.
+        _t25b.send_dm(_t25b_root, None, "sender25b", _to25b, "overflow-msg")
+        _unread25b = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_unread.json")
+        _read25b = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_read.json")
+        if len(_unread25b) != _t25b._UNREAD_CAP:
+            failures.append(f"WP-25 AC-2: unread should still hold exactly the cap after "
+                             f"overflow: {len(_unread25b)}")
+        if len(_read25b) != 1:
+            failures.append(f"WP-25 AC-2: exactly one overflow record should move to "
+                             f"_read.json: {len(_read25b)}")
+        elif not (_read25b[0].get("acked_unseen") and _read25b[0].get("capped")):
+            failures.append(f"WP-25 AC-2: overflow record missing acked_unseen/capped tags: {_read25b[0]}")
+        elif _read25b[0].get("message") != "msg-0":
+            failures.append(f"WP-25 AC-2: the OLDEST record should be the one moved, got "
+                             f"{_read25b[0].get('message')!r}")
+        _all_ids25b = {m.get("id") for m in _unread25b} | {m.get("id") for m in _read25b}
+        if len(_all_ids25b) != _t25b._UNREAD_CAP + 1:
+            failures.append(f"WP-25 AC-2: union of unread+read should be all sent messages "
+                             f"({_t25b._UNREAD_CAP + 1}): got {len(_all_ids25b)}")
+    except Exception as e:
+        failures.append(f"WP-25 AC-2/AC-3 unit checks errored: {e}")
+
+    # ── WP-25 AC-4/AC-5 (C3) — group NDJSON: O(1) append, legacy+jsonl read-back, either-store tombstone ──
+    try:
+        from teammate_comms import comms as _c25c
+
+        _t25c_root = tempfile.mkdtemp(prefix="tc-25-ac4-")
+        _grp25c = "g25c"
+        _gdir25c = _c25c.get_group_dir(_t25c_root, None, _grp25c)
+        _gdir25c.mkdir(parents=True, exist_ok=True)
+
+        _c25c.append_group_message(_t25c_root, None, _grp25c, {"id": "c25c-1", "from": "a", "message": "one"})
+        if not (_gdir25c / "messages.jsonl").exists():
+            failures.append("WP-25 AC-4: messages.jsonl was not created by append_group_message")
+        if (_gdir25c / "messages.json").exists():
+            failures.append("WP-25 AC-4: append_group_message should NOT create the legacy messages.json")
+
+        # A legacy array + new jsonl lines read back in order (legacy first — strictly older).
+        _c25c.write_json_atomic(_gdir25c / "messages.json",
+                               [{"id": "c25c-0", "from": "a", "message": "legacy"}])
+        _c25c.append_group_message(_t25c_root, None, _grp25c, {"id": "c25c-2", "from": "a", "message": "two"})
+        _all25c = _c25c.read_group_messages(_t25c_root, None, _grp25c)
+        _ids25c = [m.get("id") for m in _all25c]
+        if _ids25c != ["c25c-0", "c25c-1", "c25c-2"]:
+            failures.append(f"WP-25 AC-4: legacy+jsonl read-back order wrong: {_ids25c}")
+
+        # Tombstone by id hits records in EITHER store.
+        _c25c.tombstone_in_group_messages(_t25c_root, None, _grp25c, "c25c-0", "a")  # legacy
+        _c25c.tombstone_in_group_messages(_t25c_root, None, _grp25c, "c25c-1", "a")  # jsonl
+        _after25c = _c25c.read_group_messages(_t25c_root, None, _grp25c)
+        _tomb25c = {m.get("id"): m.get("deleted") for m in _after25c}
+        if not (_tomb25c.get("c25c-0") and _tomb25c.get("c25c-1")):
+            failures.append(f"WP-25 AC-4: tombstone did not hit both stores: {_tomb25c}")
+        if _tomb25c.get("c25c-2"):
+            failures.append("WP-25 AC-4: tombstone wrongly hit an untouched record")
+
+        # AC-5: sequential appends under lock contention all produce intact lines (no torn write).
+        _t25d_root = tempfile.mkdtemp(prefix="tc-25-ac5-")
+        _grp25d = "g25d"
+        _c25c.get_group_dir(_t25d_root, None, _grp25d).mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            _c25c.append_group_message(_t25d_root, None, _grp25d,
+                                       {"id": f"c25d-{i}", "from": "a", "message": f"m{i}"})
+        _lines25d = _c25c.read_group_messages(_t25d_root, None, _grp25d)
+        if len(_lines25d) != 5 or [m.get("id") for m in _lines25d] != [f"c25d-{i}" for i in range(5)]:
+            failures.append(f"WP-25 AC-5: sequential appends produced wrong/missing lines: {_lines25d}")
+    except Exception as e:
+        failures.append(f"WP-25 AC-4/AC-5 unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

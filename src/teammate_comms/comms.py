@@ -463,26 +463,62 @@ def write_group_meta(root, team, group, meta):
     write_json_atomic(group_dir / "meta.json", meta)
 
 
-def read_group_messages(root, team, group):
-    """Read a group's transcript (``messages.json``) non-destructively; [] if absent.
+def _read_jsonl_records(path):
+    """Read a JSONL file into a list of records; [] if absent. A malformed line is skipped
+    (never raises) — matches ``read_json_readonly``'s never-mistake-a-partial-write-for-
+    corruption stance, extended to a line-oriented format."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except (FileNotFoundError, OSError):
+        pass
+    return out
 
-    Uses ``read_json_readonly`` (NOT read_json_safe) so a concurrent partial write is
-    never mistaken for corruption and the shared transcript is never reset to []. A
-    None (unreadable mid-write) is surfaced as [] to the caller for display.
+
+def _write_jsonl_records(path, records):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def read_group_messages(root, team, group):
+    """Read a group's transcript non-destructively; [] if absent (C3).
+
+    Reads BOTH stores, legacy-first (strictly older, so ordering is preserved): the full-array
+    ``messages.json`` (via ``read_json_readonly`` — a concurrent partial write is never
+    mistaken for corruption and reset) plus the newer NDJSON ``messages.jsonl`` (one record per
+    line, appended in O(1) instead of a read-modify-rewrite of the whole file on every post).
+    No migration: legacy files are read indefinitely, never rewritten to jsonl.
     """
-    msgs = read_json_readonly(get_group_dir(root, team, group) / "messages.json")
-    return msgs if isinstance(msgs, list) else []
+    group_dir = get_group_dir(root, team, group)
+    legacy = read_json_readonly(group_dir / "messages.json")
+    out = list(legacy) if isinstance(legacy, list) else []
+    out.extend(_read_jsonl_records(group_dir / "messages.jsonl"))
+    return out
 
 
 def append_group_message(root, team, group, record, timeout=10):
-    """Append one record to a group's transcript under a lock (atomic write)."""
+    """Append one record to a group's transcript (C3): O(1) NDJSON append, not a full
+    read-modify-rewrite. Locked under ``messages.json``'s lock PATH (kept as-is, even though
+    the write now targets ``messages.jsonl``) so a writer of either store still serializes
+    against the other — same lock, two stores."""
     group_dir = get_group_dir(root, team, group)
     group_dir.mkdir(parents=True, exist_ok=True)
-    messages_file = group_dir / "messages.json"
+    messages_file = group_dir / "messages.json"  # lock path only
+    jsonl_path = group_dir / "messages.jsonl"
     with file_lock(messages_file, timeout=timeout):
-        messages = read_group_messages(root, team, group)
-        messages.append(record)
-        write_json_atomic(messages_file, messages)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def delete_group(root, team, group):
@@ -797,14 +833,23 @@ def tombstone_in_inbox(root, team, member, msg_id, deleted_by):
 
 
 def tombstone_in_group_messages(root, team, group, msg_id, deleted_by):
-    """Tombstone a message (by id) in ``groups/<group>/messages.json`` under its lock."""
-    messages_file = get_group_dir(root, team, group) / "messages.json"
+    """Tombstone a message (by id) in EITHER store — legacy ``messages.json`` or the newer
+    ``messages.jsonl`` (C3) — under ``messages.json``'s lock. Tombstones are rare, so rewriting
+    the whole jsonl file here (O(n)) is fine; the O(1) append path is only for normal posts."""
+    group_dir = get_group_dir(root, team, group)
+    messages_file = group_dir / "messages.json"
+    jsonl_path = group_dir / "messages.jsonl"
     with file_lock(messages_file):
-        messages = read_group_messages(root, team, group)
-        if _apply_tombstone(messages, msg_id, deleted_by):
-            write_json_atomic(messages_file, messages)
-            return True
-    return False
+        found = False
+        legacy = read_json_readonly(messages_file)
+        if isinstance(legacy, list) and _apply_tombstone(legacy, msg_id, deleted_by):
+            write_json_atomic(messages_file, legacy)
+            found = True
+        jsonl_records = _read_jsonl_records(jsonl_path)
+        if jsonl_records and _apply_tombstone(jsonl_records, msg_id, deleted_by):
+            _write_jsonl_records(jsonl_path, jsonl_records)
+            found = True
+        return found
 
 
 def remove_group_messages_from_inbox(root, team, member, sigil):
@@ -1089,6 +1134,11 @@ def group_read_positions(root, team, group, members):
     change). For each member, returns the max id among their read messages tagged with
     this group's sigil — an ack/seen upper bound (gaps possible), groups-only. Returns
     ``{member: id_or_None}``; reads are non-destructive.
+
+    M5: records tagged ``acked_unseen`` (drained by ack("all")'s cold-start path, or moved by
+    the T2 unread cap — neither was ever actually SEEN) are EXCLUDED from the max-id inference
+    — counting them would be a false read-receipt. See ``group_read_has_unseen_acks`` for the
+    companion "some positions used tagged records" signal.
     """
     sigil = group if str(group).startswith("#") else f"#{group}"
     inboxes_dir = get_inboxes_dir(root, team)
@@ -1096,9 +1146,24 @@ def group_read_positions(root, team, group, members):
     for member in members:
         msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
         ids = [m.get("id") for m in msgs
-               if isinstance(m, dict) and m.get("group") == sigil and m.get("id")]
+               if isinstance(m, dict) and m.get("group") == sigil and m.get("id")
+               and not m.get("acked_unseen")]
         positions[member] = max(ids) if ids else None
     return positions
+
+
+def group_read_has_unseen_acks(root, team, group, members):
+    """True if ANY member's ``_read.json`` holds an ``acked_unseen`` record for this group
+    (M5) — drives the ``reads`` action's footnote ("startup-drained messages are not counted
+    as read")."""
+    sigil = group if str(group).startswith("#") else f"#{group}"
+    inboxes_dir = get_inboxes_dir(root, team)
+    for member in members:
+        msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
+        if any(isinstance(m, dict) and m.get("group") == sigil and m.get("acked_unseen")
+               for m in msgs):
+            return True
+    return False
 
 
 def get_transcript_file(root, team=None):
