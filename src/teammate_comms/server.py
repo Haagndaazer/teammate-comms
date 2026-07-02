@@ -252,20 +252,20 @@ def register_identity(agent, team, comms_dir, profile=None):
                     f"{existing_project!r} — you inherit its inbox and transcript attribution.\n"
                 )
 
-    write_agent_record(
+    effective = write_agent_record(
         root, team, agent, timeout=5, bump_epoch=True,
         type="full", channel=True, pid=os.getpid(), host=hostname,
         instance_id=my_instance_id,
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
         **profile_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),
-    )
-
-    # Read the just-written record ONCE — reused for both the epoch stamp (TOCTOU tie-break,
-    # WP-19: fed to the watcher's flap-kill so it can tell "my own registration, heartbeat-
-    # stomped by a race" from "a genuinely later registration") and the profile echo below.
-    # Nothing else can have changed the record yet: this call is single-threaded up to here.
-    effective = read_agent_record(root, team, agent) or {}
+    ) or {}
+    # Take the epoch straight off THIS call's return (WP-19 gate CR) — NEVER from a
+    # subsequent read-back. A read-back is unlocked: between our write and the read, a
+    # COMPETITOR'S register can land (epoch N+1), and our read-back would then return N+1 —
+    # both instances would store N+1 as "my epoch" and the TOCTOU tie-break would have BOTH
+    # sides re-claim forever, exactly the flap the tie-break exists to kill. The return value
+    # is race-free by construction (computed under the same lock as the write).
     _identity.set(agent, team, root, unread_file)
     _identity.set_epoch(effective.get("epoch"))
     _registered.set()

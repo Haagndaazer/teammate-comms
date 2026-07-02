@@ -764,17 +764,48 @@ def remove_group_messages_from_inbox(root, team, member, sigil):
                 write_json_atomic(f, kept)
 
 
-def remove_agent(root, team, name):
-    """Hard-delete an agent's registry record + inbox files (best-effort, never raises)."""
+def remove_agent(root, team, name, timeout=2):
+    """Locked, VERIFIED hard-delete of an agent's registry record + inbox files (audit I3).
+
+    Returns the list of file paths that could NOT be removed (empty = full success) instead of
+    swallowing every OSError — the old best-effort unlink let a Windows sharing violation
+    (e.g. a concurrent heartbeat write) silently no-op the deletion while the caller reported
+    unconditional success. The registry record is unlinked under its own ``file_lock`` (so a
+    concurrent writer can never be mid-write when we check); the two inbox files share the
+    unread file's lock, same as ``tombstone_in_inbox``. A short ``timeout`` (not the 10s
+    default) keeps a genuinely-contended delete from hanging — a real delete should acquire
+    near-instantly; a held lock past that IS the reportable failure.
+    """
     agents_dir = get_agents_dir(root, team)
     inboxes_dir = get_inboxes_dir(root, team)
-    for path in (agents_dir / f"{name}.json",
-                 inboxes_dir / f"{name}_unread.json",
-                 inboxes_dir / f"{name}_read.json"):
+    record_path = agents_dir / f"{name}.json"
+    unread_file = inboxes_dir / f"{name}_unread.json"
+    read_file = inboxes_dir / f"{name}_read.json"
+    failed = []
+
+    def _unlink(path):
         try:
             path.unlink()
+        except FileNotFoundError:
+            pass  # already gone — not a failure, the goal (absent) is already met
         except OSError:
-            pass  # already gone / locked — best-effort, matches the codebase style
+            failed.append(str(path))
+
+    try:
+        with file_lock(record_path, timeout=timeout):
+            _unlink(record_path)
+    except CommsError:
+        failed.append(str(record_path))  # lock contended past timeout — reported, not swallowed
+
+    try:
+        with file_lock(unread_file, timeout=timeout):
+            _unlink(unread_file)
+            _unlink(read_file)
+    except CommsError:
+        failed.append(str(unread_file))
+        failed.append(str(read_file))
+
+    return failed
 
 
 def strip_member_from_groups(root, team, name):
@@ -803,7 +834,12 @@ def write_agent_record(root, team, name, timeout=5, bump_epoch=False, **fields):
 
     Only provided keys are overwritten; existing keys are preserved, so the
     register-owned ``type`` and the channel-owned ``pid``/``channel``/
-    ``lastHeartbeat`` coexist. Returns True if written.
+    ``lastHeartbeat`` coexist. Returns the MERGED RECORD DICT just written (never empty — it
+    always carries at least ``name``, so it's truthy) on success, or False on failure. Every
+    caller does a plain truthiness check (``if not write_agent_record(...)``), so this is a
+    drop-in-compatible upgrade — but a caller that needs a freshly-written field's value (e.g.
+    an atomically-computed epoch) can now read it straight off the return, with NO separate
+    read-back needed (a read-back is a fresh race window: see ``bump_epoch`` below).
 
     Hardening: if the record file *exists* but currently reads as None (a
     concurrent mid-write), skip this write instead of clobbering ``type``.
@@ -811,7 +847,10 @@ def write_agent_record(root, team, name, timeout=5, bump_epoch=False, **fields):
     ``bump_epoch=True`` (WP-19, register-time only) computes ``fields["epoch"]`` from the
     CURRENT on-disk record's epoch (previous + 1, absent → 1) under THIS SAME lock/read — the
     only race-free way to hand out a monotonic epoch when two callers might register the same
-    name at once (any literal ``epoch`` passed in ``fields`` is overridden).
+    name at once (any literal ``epoch`` passed in ``fields`` is overridden). A caller MUST take
+    its own epoch from this call's RETURN VALUE, never from a subsequent read-back — a
+    read-back is unlocked and can observe a LATER competing register's epoch instead of its
+    own (the exact flap this WP's epoch tie-break exists to kill; gate finding on WP-19).
     """
     agents_dir = get_agents_dir(root, team)
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -830,7 +869,7 @@ def write_agent_record(root, team, name, timeout=5, bump_epoch=False, **fields):
         record["name"] = name
         record.update(fields)
         write_json_atomic(record_path, record)
-        return True
+        return record
 
 
 def read_agent_record(root, team, name):

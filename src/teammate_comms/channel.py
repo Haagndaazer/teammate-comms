@@ -291,11 +291,21 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 my_instance_id = identity.get_instance_id()
                 my_epoch = identity.get_epoch()
                 if compute_heartbeat_permit(hb_rec, my_instance_id, my_epoch, datetime.now()):
+                    # I4: stamp type="full" — truthful, since run_watcher only ever runs for a
+                    # registered full instance — so a delete-then-heartbeat resurrection carries
+                    # a real type instead of a type-less ghost. MANDATORY guard: never stomp an
+                    # existing type="human" record (the same read above already has it) — this
+                    # composes with the flap-kill's foreign-instance skip above, which already
+                    # covers a foreign AGENT; a human record has no instance_id at all, so it
+                    # would otherwise sail through compute_heartbeat_permit's "nothing foreign to
+                    # detect" branch and get overwritten here.
+                    type_field = {} if hb_rec.get("type") == "human" else {"type": "full"}
                     write_agent_record(
                         root, team, agent, timeout=2,
                         channel=True, pid=os.getpid(), host=hostname,
                         instance_id=my_instance_id,
                         lastHeartbeat=now_timestamp(),
+                        **type_field,
                     )
                     demoted = False
                 elif not demoted:

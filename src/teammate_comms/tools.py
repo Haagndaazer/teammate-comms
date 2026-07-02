@@ -1510,14 +1510,26 @@ def remove_teammate(root, team, caller, name, is_operator=False):
             f"the record."
         )
     removed_from = strip_member_from_groups(root, team, name)
-    remove_agent(root, team, name)
+    failed_paths = remove_agent(root, team, name)
+    extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
+             if removed_from else "")
+    record_path = str(get_agents_dir(root, team) / f"{name}.json")
+    if record_path in failed_paths:
+        # The registry record itself is still there — the teammate ISN'T actually gone, so
+        # the deletion event must NOT be appended (emit-event-LAST is the natural early return
+        # here: no event means a fresh dashboard/history load never claims a removal that
+        # didn't happen). Report the partial failure honestly instead of "Removed ...".
+        return (f"Partially removed teammate {name}: registry record could not be deleted "
+                f"(locked by another process) — {len(failed_paths)} file(s) failed. Retry "
+                f"teammate_delete to finish: {', '.join(failed_paths)}.{extra}")
     # best-effort (block=False): the record is already unlinked, so a blocking raise here
     # would lose the event permanently on retry (re-entry hits "No teammate named …"). A
     # fresh dashboard load omits the absent teammate; emit-event-LAST stays consistent.
     append_deletion(root, team, {"target": "@" + name,  # id stamped under the lock inside append_deletion
                                  "kind": "teammate", "by": caller, "op": "delete"}, block=False)
-    extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
-             if removed_from else "")
+    if failed_paths:
+        return (f"Removed teammate {name} (registry) but {len(failed_paths)} file(s) were "
+                f"locked — retry teammate_delete to finish: {', '.join(failed_paths)}.{extra}")
     return f"Removed teammate {name} (registry + inbox).{extra}"
 
 
@@ -1555,6 +1567,14 @@ def _handle_reincarnate(args, ctx):
     # WARNS, server.py): refuse only if the name is already a LIVE channel. Reincarnating
     # an OFFLINE name is the whole point.
     existing = read_agent_record(root, team, target)
+    # I2: the human guard MUST come before the is_channel_alive check below — register_human
+    # never sets `channel`, so is_channel_alive(existing) is always False for a human record
+    # and the live-check is structurally blind to it. Without this, reincarnating the
+    # operator's name spawns a child whose auto-register merge-writes type=full over the
+    # human record (WP-19 blocks the CHILD's own auto-register from completing that; this
+    # blocks the SPAWN itself — defense at both ends).
+    if existing and existing.get("type") == "human":
+        raise CommsError(f"{target!r} is the human operator — not reincarnate-able.")
     if existing and is_channel_alive(existing):
         raise CommsError(
             f"{target!r} is already live (pid={existing.get('pid')}, "

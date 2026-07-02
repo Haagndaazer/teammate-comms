@@ -3104,6 +3104,26 @@ def main():
     except Exception as e:
         failures.append(f"WP-19 AC-1 unit checks errored: {e}")
 
+    # ── WP-19 gate CR — write_agent_record(bump_epoch=True) hands out DISTINCT epochs from its
+    # OWN RETURN VALUE, never from a separate read-back (a read-back would race a competitor's
+    # register and could return THEIR epoch — see comms.write_agent_record's docstring). Two
+    # bump_epoch writes to the same name must return epochs N+1 and N+2, strictly increasing.
+    try:
+        from teammate_comms.comms import write_agent_record as _warcr19
+
+        _tcr19_root = tempfile.mkdtemp(prefix="tc-19-epoch-cr-")
+        _rcr19a = _warcr19(_tcr19_root, None, "epochprobe19", timeout=5, bump_epoch=True, type="full")
+        _rcr19b = _warcr19(_tcr19_root, None, "epochprobe19", timeout=5, bump_epoch=True, type="full")
+        if not (isinstance(_rcr19a, dict) and isinstance(_rcr19b, dict)):
+            failures.append(f"WP-19 gate CR: write_agent_record must return the merged record "
+                             f"dict, not True/False: {_rcr19a!r}, {_rcr19b!r}")
+        elif not (_rcr19a.get("epoch") == 1 and _rcr19b.get("epoch") == 2):
+            failures.append(f"WP-19 gate CR: two bump_epoch writes should return epochs 1 then "
+                             f"2 from their RETURN VALUES: {_rcr19a.get('epoch')!r}, "
+                             f"{_rcr19b.get('epoch')!r}")
+    except Exception as e:
+        failures.append(f"WP-19 gate CR unit check errored: {e}")
+
     # ── WP-19 AC-2 (flap kill) + TOCTOU tie-break — compute_heartbeat_permit pure-function tests ──
     # No real sleeps: timestamps are injected (Silvie gate addendum (d)).
     try:
@@ -3220,6 +3240,179 @@ def main():
         _dash19.shutdown_dashboard()
     except Exception as e:
         failures.append(f"WP-19 D1 unit check errored: {e}")
+
+    # ── WP-20 AC-1/AC-2 (I3) — locked, verified teammate deletion (tautology on current main) ──
+    try:
+        from teammate_comms import tools as _tools20
+        from teammate_comms import comms as _c20
+        from teammate_comms.comms import (
+            file_lock as _flock20,
+            write_agent_record as _war20,
+            read_agent_record as _rar20,
+            read_deletions as _rd20,
+            get_agents_dir as _gad20,
+        )
+
+        _t20_root = tempfile.mkdtemp(prefix="tc-20-ac1-")
+        _victim20 = "victim20"
+        _war20(_t20_root, None, _victim20, type="full", channel=False, pid=1,
+               host="wherever", instance_id="v-instance", epoch=1)
+        _c20.ensure_inbox(_c20.get_inboxes_dir(_t20_root, None), _victim20)
+        _record_path20 = _gad20(_t20_root, None) / f"{_victim20}.json"
+
+        # Hold the record's lock (simulates a concurrent writer) and attempt removal.
+        with _flock20(_record_path20):
+            _msg20a = _tools20.remove_teammate(_t20_root, None, "caller20", _victim20)
+        if "Removed teammate" in _msg20a and "locked" not in _msg20a.lower():
+            failures.append(f"WP-20 AC-1/AC-2 [tautology: removal under a held lock must NOT "
+                             f"report unconditional success — reverted code silently no-ops "
+                             f"the unlink and reports success anyway]: {_msg20a}")
+        if "locked" not in _msg20a.lower():
+            failures.append(f"WP-20 AC-1: partial-failure text missing: {_msg20a}")
+        _events20a = _rd20(_t20_root, None)
+        if any(e.get("target") == "@" + _victim20 for e in _events20a):
+            failures.append("WP-20 AC-1: deletion event appended despite the registry record "
+                             "surviving (teammate isn't actually gone)")
+        if not _rar20(_t20_root, None, _victim20):
+            failures.append("WP-20 AC-1: registry record was removed despite the held lock "
+                             "(the lock did not actually protect it)")
+
+        # Release + retry: clean success + event appended.
+        _msg20b = _tools20.remove_teammate(_t20_root, None, "caller20", _victim20)
+        if "Removed teammate" not in _msg20b or "locked" in _msg20b.lower():
+            failures.append(f"WP-20 AC-1: retry after lock release should cleanly succeed: {_msg20b}")
+        _events20b = _rd20(_t20_root, None)
+        if not any(e.get("target") == "@" + _victim20 for e in _events20b):
+            failures.append("WP-20 AC-1: deletion event missing after a clean successful removal")
+        if _rar20(_t20_root, None, _victim20):
+            failures.append("WP-20 AC-1: registry record still present after a clean removal")
+    except Exception as e:
+        failures.append(f"WP-20 AC-1/AC-2 unit checks errored: {e}")
+
+    # ── WP-20 AC-3/AC-4 (I4) — heartbeat-shaped write stamps type=full; never stomps type=human ──
+    try:
+        from teammate_comms import channel as _ch20
+        from teammate_comms.comms import (
+            write_agent_record as _war20b,
+            read_agent_record as _rar20b,
+            get_inboxes_dir as _gid20b,
+            ensure_inbox as _ei20b,
+        )
+
+        class _Id20:
+            def __init__(self, agent, root, unread_file):
+                self._agent, self._team, self._root, self._uf = agent, None, root, unread_file
+            def snapshot(self):
+                return (self._agent, self._team, self._root, self._uf)
+            def get_generation(self):
+                return 1
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, v):
+                pass
+            def get_instance_id(self):
+                return "ghost-instance-20"
+            def get_epoch(self):
+                return 1
+
+        # AC-3: simulate the delete-then-heartbeat ghost. A registered agent's record is gone
+        # (simulating I3's remove_teammate); its still-running watcher's very first heartbeat
+        # tick (last_hb starts at 0.0 → fires immediately) must re-create the record WITH
+        # type=full, not a type-less ghost.
+        _t20c_root = tempfile.mkdtemp(prefix="tc-20-ac3-")
+        _ghost20 = "ghost20"
+        _ix20c = _gid20b(_t20c_root, None)
+        _ei20b(_ix20c, _ghost20)
+        _id20 = _Id20(_ghost20, _t20c_root, _ix20c / f"{_ghost20}_unread.json")
+        _init20, _reg20, _stop20 = threading.Event(), threading.Event(), threading.Event()
+        _init20.set(); _reg20.set()
+        _wt20 = threading.Thread(target=_ch20.run_watcher,
+                                  args=(lambda obj: None, _id20, _init20, _reg20, _stop20),
+                                  daemon=True)
+        _wt20.start()
+        try:
+            _ok20 = wait_until(
+                lambda: (_rar20b(_t20c_root, None, _ghost20) or {}).get("type") == "full",
+                timeout=3.0)
+            if not _ok20:
+                failures.append(f"WP-20 AC-3: watcher heartbeat did not re-create a type=full "
+                                 f"record: {_rar20b(_t20c_root, None, _ghost20)!r}")
+        finally:
+            _stop20.set()
+            _wt20.join(timeout=2)
+
+        # AC-4: a type=human record must KEEP type=human after a heartbeat-shaped write for the
+        # SAME name (unreachable via WP-19's register-time guard in practice, but the guard
+        # inside the watcher must hold on its own).
+        _t20d_root = tempfile.mkdtemp(prefix="tc-20-ac4-")
+        _human20 = "human20"
+        _ix20d = _gid20b(_t20d_root, None)
+        _ei20b(_ix20d, _human20)
+        _war20b(_t20d_root, None, _human20, type="human", host="somewhere", presence="online")
+        _id20h = _Id20(_human20, _t20d_root, _ix20d / f"{_human20}_unread.json")
+        _init20h, _reg20h, _stop20h = threading.Event(), threading.Event(), threading.Event()
+        _init20h.set(); _reg20h.set()
+        _wt20h = threading.Thread(target=_ch20.run_watcher,
+                                   args=(lambda obj: None, _id20h, _init20h, _reg20h, _stop20h),
+                                   daemon=True)
+        _wt20h.start()
+        try:
+            wait_until(lambda: (_rar20b(_t20d_root, None, _human20) or {}).get("channel") is True,
+                       timeout=3.0)  # let at least one heartbeat tick land
+            _rec20h = _rar20b(_t20d_root, None, _human20) or {}
+            if _rec20h.get("type") != "human":
+                failures.append(f"WP-20 AC-4: heartbeat-shaped write stomped a human record's "
+                                 f"type: {_rec20h!r}")
+        finally:
+            _stop20h.set()
+            _wt20h.join(timeout=2)
+    except Exception as e:
+        failures.append(f"WP-20 AC-3/AC-4 unit checks errored: {e}")
+
+    # ── WP-20 AC-5 (I2) — reincarnate refuses a human-typed target; gate-off still checks first ──
+    try:
+        from teammate_comms.tools import _handle_reincarnate as _hr20e, CommsError as _CE20e
+        from teammate_comms.comms import write_agent_record as _war20e
+
+        _t20e_root = tempfile.mkdtemp(prefix="tc-20-ac5-")
+        _human20e = "human20e"
+        _war20e(_t20e_root, None, _human20e, type="human", host="wherever", presence="away")
+
+        class _Id20e:
+            def snapshot(self):
+                return ("caller20e", None, _t20e_root, None)
+        _ctx20e = {"identity": _Id20e()}
+
+        _prev_gate20e = os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+        try:
+            # Gate-off path must short-circuit FIRST — before the human-record read.
+            try:
+                _hr20e({"agent": _human20e, "project_dir": str(REPO)}, _ctx20e)
+                failures.append("WP-20 AC-5: reincarnate should raise when gated off")
+            except _CE20e as _ge20e:
+                if "disabled" not in str(_ge20e):
+                    failures.append(f"WP-20 AC-5: gate-off error text wrong: {_ge20e}")
+
+            # Gate enabled + human target → must raise, naming the operator. Tautology: on
+            # current main is_channel_alive(existing) is always False for a human record
+            # (register_human never sets `channel`) — the live-check is blind, so this would
+            # otherwise sail through and spawn a child.
+            os.environ["TEAMMATE_REINCARNATE_ENABLED"] = "1"
+            try:
+                _hr20e({"agent": _human20e, "project_dir": str(REPO)}, _ctx20e)
+                failures.append("WP-20 AC-5 [tautology: reincarnate must raise for a type=human "
+                                 "target — reverted code's live-check can't see it and would "
+                                 "spawn a child over the operator's identity]")
+            except _CE20e as _e20e:
+                if _human20e not in str(_e20e):
+                    failures.append(f"WP-20 AC-5: reincarnate-human error must name the operator: {_e20e}")
+        finally:
+            if _prev_gate20e is None:
+                os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+            else:
+                os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _prev_gate20e
+    except Exception as e:
+        failures.append(f"WP-20 AC-5 unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
