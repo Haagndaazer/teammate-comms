@@ -84,6 +84,12 @@ def send(proc, obj):
     proc.stdin.flush()
 
 
+def send_raw(proc, raw_line):
+    """Write a raw line to stdin verbatim — for frames that aren't a JSON object (WP-16 AC-1)."""
+    proc.stdin.write((raw_line + "\n").encode("utf-8"))
+    proc.stdin.flush()
+
+
 def find_response(rid, timeout=4.0):
     """Poll stdout_lines mid-run for a response with the given id (so a later request can
     reference a dynamic message id)."""
@@ -438,6 +444,26 @@ def main():
                 "params": {"name": "teammate_list", "arguments": {"all": True}}})
     time.sleep(0.5)
 
+    # ── WP-16: envelope guard + version negotiation + notification discipline ──
+    # AC-1: malformed non-dict frames (null, a bare scalar, a JSON-RPC batch array — batching
+    # is unsupported here) must not kill the server; a subsequent request (id 64) still answers.
+    # ids 63/64/65 are free (out-of-sequence ids are fine; by_id is order-independent).
+    send_raw(proc, "null")
+    send_raw(proc, '"scalar"')
+    send_raw(proc, json.dumps([{"jsonrpc": "2.0", "id": 63, "method": "ping"}]))
+    time.sleep(0.4)
+    send(proc, {"jsonrpc": "2.0", "id": 64, "method": "ping"})
+    time.sleep(0.4)
+    # AC-2: a mid-session re-initialize with a bogus protocolVersion must be answered with OUR
+    # version (non-echo) — the FIRST initialize (id 1) can't prove this since the harness sent
+    # the same version we'd answer regardless.
+    send(proc, {"jsonrpc": "2.0", "id": 65, "method": "initialize",
+                "params": {"protocolVersion": "1999-01-01", "capabilities": {}}})
+    time.sleep(0.4)
+    # AC-3: a notification-form ping (no id) must produce NO response frame.
+    send(proc, {"jsonrpc": "2.0", "method": "ping"})
+    time.sleep(0.4)
+
     proc.stdin.close()
     try:
         proc.wait(timeout=5)
@@ -497,6 +523,23 @@ def main():
         _instr_l = instr.lower()
         if "authority over the areas" not in _instr_l or "before you modify" not in _instr_l:
             failures.append(f"initialize instructions missing the authority-coordination rule (WP-10): {instr[:120]!r}")
+
+    # WP-16 AC-1: a malformed non-dict frame (null / bare scalar / batch array) must not kill
+    # the server — assert the SPECIFIC reason (a -32600 frame emitted, id 64 still answered),
+    # not just "something didn't throw" (a dead server would silently fail both checks below).
+    bad_frame_errors = [m for m in msgs if m.get("id") is None and (m.get("error") or {}).get("code") == -32600]
+    if not bad_frame_errors:
+        failures.append("no -32600 error frame emitted for a malformed non-dict request (WP-16 AC-1)")
+    if by_id.get(64, {}).get("result") != {}:
+        failures.append(f"ping (id 64) after malformed frames unanswered — server likely died (WP-16 AC-1): {by_id.get(64)}")
+    # WP-16 AC-2: mid-session re-initialize with a bogus protocolVersion answers with OUR
+    # version, proving non-echo (the id-1 initialize alone can't prove this).
+    if by_id.get(65, {}).get("result", {}).get("protocolVersion") != "2025-06-18":
+        failures.append(f"re-initialize (id 65) did not answer with our protocol version (WP-16 AC-2): {by_id.get(65)}")
+    # WP-16 AC-3: a notification-form ping (no id) produces NO response frame. -32600 error
+    # frames legitimately carry id null — only exclude those, don't over-assert.
+    if any("id" in m and m["id"] is None and "result" in m for m in msgs):
+        failures.append("notification-form ping produced a response frame (WP-16 AC-3, should be silent)")
 
     # tools/list: 18 tools (13 original + 4 project-profile tools + 1 avatar tool), each with an object inputSchema
     tl = result(2).get("tools")
@@ -2891,6 +2934,33 @@ def main():
 
     except Exception as e:
         failures.append(f"WP-15 cross-session suppression unit checks errored: {e}")
+
+    # ── WP-16 AC-4 — handle_safely: a dispatch crash is answered -32603, the loop survives ──
+    try:
+        from teammate_comms import server as _srv16
+        sent16 = []
+        _orig_send16 = _srv16.send_message
+        _orig_dispatch16 = _srv16.tools_mod.dispatch
+        _srv16.send_message = lambda obj: sent16.append(obj)
+
+        def _boom16(name, arguments, ctx):
+            raise RuntimeError("WP-16 AC-4 induced crash")
+
+        _srv16.tools_mod.dispatch = _boom16
+        try:
+            _srv16.handle_safely(
+                {"jsonrpc": "2.0", "id": 9016, "method": "tools/call",
+                 "params": {"name": "whatever", "arguments": {}}},
+                {"identity": None, "register": None},
+            )
+        finally:
+            _srv16.tools_mod.dispatch = _orig_dispatch16
+            _srv16.send_message = _orig_send16
+        crash_resp = next((m for m in sent16 if m.get("id") == 9016), None)
+        if not crash_resp or (crash_resp.get("error") or {}).get("code") != -32603:
+            failures.append(f"WP-16 AC-4: handler crash not answered -32603: {sent16}")
+    except Exception as e:
+        failures.append(f"WP-16 AC-4 unit check errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

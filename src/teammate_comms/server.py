@@ -19,6 +19,7 @@ import os
 import socket
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 from . import __version__, channel
@@ -41,6 +42,10 @@ from .comms import (
 )
 
 SERVER_NAME = "teammate-comms"
+# The MCP revision WE implement — always answered as-is, never an echo of the client's
+# requested protocolVersion (a client requesting an unsupported version must be told the
+# truth, not a false compatibility claim).
+PROTOCOL_VERSION = "2025-06-18"
 
 # INSTRUCTIONS lives in instructions.py (single source of truth) so the compact-matched
 # SessionStart hook (hooks/reinject-instructions.sh) can re-emit the exact same text.
@@ -225,31 +230,52 @@ def handle(msg, ctx):
     msg_id = msg.get("id")  # echoed verbatim (preserves int/str type)
 
     if method == "initialize":
-        params = msg.get("params") or {}
-        respond(msg_id, {
-            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+        result = {
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
                 "experimental": {"claude/channel": {}},
                 "tools": {},
             },
             "serverInfo": {"name": SERVER_NAME, "version": __version__},
             "instructions": INSTRUCTIONS,
-        })
+        }
+        if msg_id is not None:
+            respond(msg_id, result)
     elif method == "notifications/initialized":
         _initialized.set()  # gate one of two: watcher also needs registration
     elif method == "ping":
-        respond(msg_id, {})
+        if msg_id is not None:
+            respond(msg_id, {})
     elif method == "tools/list":
-        respond(msg_id, {"tools": tools_mod.TOOL_DEFINITIONS})
+        if msg_id is not None:
+            respond(msg_id, {"tools": tools_mod.TOOL_DEFINITIONS})
     elif method == "tools/call":
+        # A notification-form call (no id) is still EXECUTED — only the response is skipped.
         params = msg.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
         text, is_error = tools_mod.dispatch(name, arguments, ctx)
-        respond(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
+        if msg_id is not None:
+            respond(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
     elif msg_id is not None:
         respond_error(msg_id, -32601, f"Method not found: {method}")
     # Unknown notifications (no id): ignore.
+
+
+def handle_safely(msg, ctx):
+    """Wrap ``handle`` so one bad request can't kill the main loop (S1). A crash mid-dispatch is
+    logged to stderr (never stdout — would corrupt the JSON-RPC stream) and, if the request had
+    an id, best-effort answered with -32603 so the caller isn't left hanging forever."""
+    try:
+        handle(msg, ctx)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        msg_id = msg.get("id")
+        if msg_id is not None:
+            try:
+                respond_error(msg_id, -32603, "Internal error")
+            except Exception:
+                pass
 
 
 def _maybe_auto_register():
@@ -351,7 +377,13 @@ def main():
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            handle(msg, ctx)
+            if not isinstance(msg, dict):
+                # A syntactically-valid but non-object frame (bare scalar, null, or a
+                # spec-legal JSON-RPC batch array — batching is unsupported here) — a
+                # single -32600 with id null per JSON-RPC 2.0, never a crash.
+                respond_error(None, -32600, "Invalid Request: expected a JSON object")
+                continue
+            handle_safely(msg, ctx)
     finally:
         _stop.set()
         agent, team, root, _ = _identity.snapshot()
