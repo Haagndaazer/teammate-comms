@@ -33,12 +33,14 @@ from .comms import (
     delete_group,
     ensure_inbox,
     file_lock,
+    find_group_case_variant,
     get_agents_dir,
     get_group_dir,
     get_groups_dir,
     get_inboxes_dir,
     get_transcript_file,
     group_read_positions,
+    human_presence_online,
     is_channel_alive,
     list_project_records,
     now_timestamp,
@@ -869,9 +871,10 @@ def _handle_list(args, ctx):
         me = " (you)" if path.stem == _agent else ""
         if kind == "human":
             # A human has no channel — show their dashboard presence instead, marked
-            # distinctly so agents KNOW it's the operator (not just another agent).
-            rows.append(f"  - {path.stem}{me}: type=human 🧑 (operator), "
-                        f"presence={record.get('presence', 'away')}")
+            # distinctly so agents KNOW it's the operator (not just another agent). Verified
+            # fresh (human_presence_online), not the flat flag — a killed terminal ages out.
+            _presence = "online" if human_presence_online(record) else "away"
+            rows.append(f"  - {path.stem}{me}: type=human 🧑 (operator), presence={_presence}")
         else:
             # Heartbeat-freshness only (no per-agent liveness subprocess).
             live = is_channel_alive(record, pid_check=False)
@@ -1010,7 +1013,8 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     me = " (you)" if is_self else ""
     lines = [f"Profile: {name}{me}", f"  {'type:':<13}{kind}"]
     if kind == "human":
-        lines.append(f"  {'presence:':<13}{record.get('presence', 'away')} (human operator)")
+        _presence = "online" if human_presence_online(record) else "away"
+        lines.append(f"  {'presence:':<13}{_presence} (human operator)")
     else:
         live = is_channel_alive(record, pid_check=False)
         lines.append(f"  {'channel:':<13}{'live' if live else 'offline'}")
@@ -1184,6 +1188,14 @@ def _handle_group(args, ctx):
             validate_agent_name(m)
             if m not in members:
                 members.append(m)
+        # G2: case-variant collision check at CREATE only — open membership means member
+        # NAMES stay free-form addresses, not identities, so this doesn't extend there.
+        existing_group_variant = find_group_case_variant(root, team, group)
+        if existing_group_variant:
+            raise CommsError(
+                f"A group is already registered as '#{existing_group_variant}' — create with "
+                f"that exact spelling, or pick a distinct name."
+            )
         get_group_dir(root, team, group).mkdir(parents=True, exist_ok=True)  # so the .lock dir can be made
         with file_lock(_group_meta_file(root, team, group)):
             if read_group_meta(root, team, group) is not None:

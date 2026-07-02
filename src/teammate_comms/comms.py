@@ -71,6 +71,67 @@ def now_timestamp():
     return datetime.now().strftime(TIMESTAMP_FMT)
 
 
+# Windows reserved device names (G5) — checked on EVERY OS, not just Windows: a shared comms
+# root can be read/written from Windows regardless of which OS created a given name, so a name
+# that's fine on Linux but reserved on Windows must be rejected everywhere up front rather than
+# failing opaquely later at file/lock creation on whichever host happens to touch it.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _check_reserved_name(value, label):
+    """Raise CommsError if ``value``'s FIRST dot-segment, lower-cased, is a Windows reserved
+    device name (con/prn/aux/nul/com1-9/lpt1-9) — e.g. "con" and "con.helper" are rejected,
+    "console" and "con-bot" are fine (G5)."""
+    first_segment = value.split(".", 1)[0].lower()
+    if first_segment in _WINDOWS_RESERVED_NAMES:
+        raise CommsError(
+            f"{label} {value!r} is a reserved device name on Windows ({first_segment!r}) — "
+            f"pick a different name."
+        )
+
+
+def find_case_variant(root, team, name):
+    """Return the exact spelling of an EXISTING agent/human record whose name matches
+    ``name`` case-insensitively but differs in case, or None (G2).
+
+    A shared comms root behaves differently by OS: Windows's case-insensitive filesystem
+    would silently MERGE "Bob" and "bob" into one record, while Linux's case-sensitive
+    filesystem SPLITS them into two shadow identities that never see each other — same root,
+    opposite failure modes, neither detected. Rejecting the collision at register time (the
+    caller raises using the returned spelling) means the retry self-corrects instead.
+    """
+    agents_dir = get_agents_dir(root, team)
+    if not agents_dir.exists():
+        return None
+    lname = name.lower()
+    for path in agents_dir.glob("*.json"):
+        existing = path.stem
+        if existing != name and existing.lower() == lname:
+            return existing
+    return None
+
+
+def find_group_case_variant(root, team, group):
+    """Return the exact spelling of an EXISTING group whose name matches ``group``
+    case-insensitively but differs in case, or None (G2 — checked at group CREATE only; open
+    membership means member names stay free-form addresses, not identities)."""
+    groups_dir = get_groups_dir(root, team)
+    if not groups_dir.exists():
+        return None
+    lname = group.lower()
+    for path in groups_dir.iterdir():
+        if not path.is_dir():
+            continue
+        existing = path.name
+        if existing != group and existing.lower() == lname:
+            return existing
+    return None
+
+
 def validate_agent_name(name):
     """Validate an agent name; raise CommsError on anything unsafe.
 
@@ -82,6 +143,7 @@ def validate_agent_name(name):
             f"Invalid agent name {name!r}. Use alphanumerics, hyphens, "
             f"underscores, and dots only (no path separators)."
         )
+    _check_reserved_name(name, "Agent name")
 
 
 def validate_profile_field(name, value):
@@ -161,6 +223,8 @@ def validate_project_key(value):
         raise CommsError(
             f"Project key exceeds 100 characters after normalization ({len(normalized)} chars)."
         )
+    for segment in normalized.split("/"):
+        _check_reserved_name(segment, "Project key segment")  # G5, per "/"-component
     return normalized
 
 
@@ -207,6 +271,7 @@ def validate_group_name(name):
             f"Invalid group name {name!r}. Use alphanumerics, hyphens, underscores, "
             f"and dots only (an optional leading '#' is allowed)."
         )
+    _check_reserved_name(clean, "Group name")
     return clean
 
 
@@ -951,24 +1016,69 @@ def is_channel_alive(record, staleness=HEARTBEAT_STALENESS_SECONDS, pid_check=Tr
 # is_channel_alive). The human is reachable by flat name like any other teammate.
 
 
+# Presence counts as "online" only while presenceAt is within this many seconds of now (B1).
+# Back-compat: a record with NO presenceAt key (pre-WP-21) trusts the flat `presence` flag as-is
+# — see human_presence_online.
+PRESENCE_STALENESS_SECONDS = 60
+
+
+def human_presence_online(record, staleness=PRESENCE_STALENESS_SECONDS):
+    """True if a human record should render as online (B1: a flat presence flag, set once at
+    dashboard start and only ever flipped by a GRACEFUL shutdown, stays "online" forever if the
+    terminal is killed). ``presence == "online"`` counts only while ``presenceAt`` is fresh.
+
+    Back-compat (mandatory): a record with NO ``presenceAt`` key trusts the flag as-is — a
+    pre-WP-21 record must not flip to "away" the moment this ships.
+    """
+    if not record or record.get("presence") != "online":
+        return False
+    presence_at = record.get("presenceAt")
+    if not presence_at:
+        return True  # back-compat: no presenceAt yet — trust the flag
+    return heartbeat_fresh(presence_at, datetime.now(), staleness)
+
+
 def register_human(root, team, name):
     """Register a human operator as a teammate record (type="human") with an inbox.
 
     Additive over write_agent_record's field-merge: no pid, no channel — so the
     human is never a wakeable channel and never collides with a live agent of the
     same name. Idempotent (re-register just refreshes presence/host).
+
+    G2: raises if an existing record's name matches ``name`` case-insensitively but differs
+    in case — an exact re-register is unaffected (idempotent).
     """
     validate_agent_name(name)
+    existing_variant = find_case_variant(root, team, name)
+    if existing_variant:
+        raise CommsError(
+            f"A teammate is already registered as {existing_variant!r} — register with that "
+            f"exact spelling, or pick a distinct name."
+        )
     ensure_inbox(get_inboxes_dir(root, team), name)
     write_agent_record(
         root, team, name,
         type="human", host=socket.gethostname(),
         startedAt=now_timestamp(), presence="online",
+        # B1: presenceAt + dashboard_pid let presence be verified as fresh (human_presence_online)
+        # instead of trusted as a flat flag forever, and let shutdown's clobber guard (below)
+        # identify which dashboard process actually owns this "online" stamp.
+        presenceAt=now_timestamp(), dashboard_pid=os.getpid(),
     )
 
 
-def set_human_presence(root, team, name, state):
-    """Merge a presence marker ("online"/"away") into a human's record. Best-effort."""
+def set_human_presence(root, team, name, state, owner_pid=None):
+    """Merge a presence marker ("online"/"away") into a human's record. Best-effort.
+
+    ``owner_pid`` (B1 clobber guard): when given, the write is SKIPPED unless the record's
+    CURRENT ``dashboard_pid`` matches it — read-before-write, same best-effort discipline
+    ``write_agent_record`` already has. Without this, a SECOND dashboard's shutdown could mark
+    the FIRST (still-live) operator away just because they share a human name.
+    """
+    if owner_pid is not None:
+        record = read_agent_record(root, team, name)
+        if not record or record.get("dashboard_pid") != owner_pid:
+            return
     write_agent_record(root, team, name, presence=state)
 
 

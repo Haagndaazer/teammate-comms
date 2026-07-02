@@ -23,6 +23,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -40,9 +41,11 @@ from .comms import (
     get_avatars_dir,
     get_groups_dir,
     group_read_positions,
+    human_presence_online,
     is_channel_alive,
     get_transcript_file,
     list_project_records,
+    now_timestamp,
     read_agent_record,
     read_deletions,
     read_deletions_set,
@@ -54,6 +57,7 @@ from .comms import (
     transcript_tail_and_cursor,
     validate_agent_name,
     validate_project_key,
+    write_agent_record,
 )
 
 
@@ -104,6 +108,9 @@ class _DashboardServer(ThreadingHTTPServer):
         self.root = root
         self.team = team
         self.human_name = human_name
+        # B1: monotonic time of the last presenceAt write, throttling refreshes to >=15s apart
+        # (the browser polls every ~1.5s — without this we'd write on every single poll).
+        self.last_presence_refresh = 0.0
 
     def handle_error(self, request, client_address):  # never dump to stdout
         _log(f"request error from {client_address}")
@@ -253,7 +260,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(rec, dict):
                     continue
                 kind = rec.get("type", "unknown")
-                online = (rec.get("presence") == "online") if kind == "human" \
+                online = human_presence_online(rec) if kind == "human" \
                     else is_channel_alive(rec, pid_check=False)
                 raw_proj = rec.get("project")
                 # Normalize project for cross-OS/case group convergence (AC-2). On failure
@@ -304,8 +311,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "me": me, "groups": groups, "roster": roster, "dms": dms, "projects": projects,
         })
 
+    def _maybe_refresh_presence(self):
+        """Refresh presenceAt (B1) on a live poll, throttled to >=15s between writes — the
+        browser polls every ~1.5s, so this is ~1 write per 10 polls, not one per poll."""
+        server = self.server
+        now = time.monotonic()
+        if now - server.last_presence_refresh < 15:
+            return
+        server.last_presence_refresh = now
+        if server.human_name:
+            write_agent_record(server.root, server.team, server.human_name,
+                               presenceAt=now_timestamp())
+
     def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team
+        self._maybe_refresh_presence()
         # Records sub-stream — BYTE cursor (P3). UNLIKE the id-based reactions/deletions cursors
         # below, this cursor is "<offset>|<generation>" (a byte position + a first-line crc) and is
         # OPAQUE to the browser. The two cursor families do NOT share reset semantics: a transcript
@@ -479,12 +499,15 @@ def start_dashboard(root, team, human_name, port=7842, open_browser=True):
                 raise CommsError(f"Could not bind a dashboard port on 127.0.0.1: {last_err}")
             # WP-19 D1 (dashboard half): if a human record under this name already exists on a
             # DIFFERENT host, register_human below silently overwrites its host (two operators
-            # merging into one identity) — surface it before that happens. Presence
-            # staleness/clobber proper is WP-21; here we only warn at start_dashboard time.
+            # merging into one identity) — surface it before that happens. WP-21 addendum: gate
+            # on presence-FRESHNESS, not bare host mismatch — a long-dead dashboard's stale host
+            # is a silent takeover (fine, that's the whole point of presence staleness); only a
+            # FRESH different-host/pid record is a real live collision worth warning about.
             existing_human = read_agent_record(root, team, human_name)
             warning = None
             if (existing_human and existing_human.get("host")
-                    and existing_human.get("host") != socket.gethostname()):
+                    and existing_human.get("host") != socket.gethostname()
+                    and human_presence_online(existing_human)):
                 warning = (f"⚠️ another dashboard may already be registered as {human_name!r} "
                            f"from host {existing_human.get('host')!r} — pass human_name to "
                            f"distinguish operators.")
@@ -518,7 +541,9 @@ def shutdown_dashboard():
         return
     if human_name and root is not None:
         try:
-            set_human_presence(root, team, human_name, "away")
+            # B1 clobber guard: only mark away if the record's dashboard_pid is still OURS —
+            # a second dashboard's shutdown can't mark the first (still-live) operator away.
+            set_human_presence(root, team, human_name, "away", owner_pid=os.getpid())
         except Exception as e:
             _log(f"presence-away failed: {e}")
     try:

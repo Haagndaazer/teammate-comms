@@ -32,6 +32,7 @@ from .comms import (
     CommsError,
     _looks_unset,
     ensure_inbox,
+    find_case_variant,
     get_inboxes_dir,
     heartbeat_fresh,
     is_channel_alive,
@@ -207,6 +208,16 @@ def register_identity(agent, team, comms_dir, profile=None):
             f"Cannot register as {agent!r}: that name belongs to the human operator "
             f"(type=human, registered via teammate_dashboard). An agent may not claim "
             f"the operator's identity — register under a distinct name."
+        )
+    # G2: reject a case-variant collision (an EXACT re-register of the same spelling is
+    # untouched — find_case_variant excludes it). A shared comms root behaves differently by
+    # OS otherwise: Windows merges "Bob"/"bob" into one record, Linux splits them into shadow
+    # identities that never see each other.
+    case_variant = find_case_variant(root, team, agent)
+    if case_variant:
+        raise CommsError(
+            f"A teammate is already registered as {case_variant!r} — register with that "
+            f"exact spelling, or pick a distinct name."
         )
 
     inboxes_dir = get_inboxes_dir(root, team)

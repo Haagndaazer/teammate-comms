@@ -3225,21 +3225,41 @@ def main():
     except Exception as e:
         failures.append(f"WP-19 AC-4 unit checks errored: {e}")
 
-    # ── WP-19 D1 (dashboard half) — collision warning when a human record exists on another host ──
+    # ── WP-19/WP-21 D1 (dashboard half) — collision warning ONLY for a FRESH foreign host ──
+    # WP-21 gate addendum tightened this: a host mismatch alone is not enough — a long-dead
+    # dashboard's stale host is a silent (fine) takeover; only FRESH presence from a different
+    # host should warn.
     try:
         from teammate_comms import dashboard as _dash19
-        from teammate_comms.comms import write_agent_record as _war19e, now_timestamp as _nt19e
+        from teammate_comms.comms import (
+            write_agent_record as _war19e,
+            now_timestamp as _nt19e,
+            TIMESTAMP_FMT as _TSFMT19d1,
+        )
 
+        # Fresh + different host → warns.
         _t19e_root = tempfile.mkdtemp(prefix="tc-19-d1-")
         _human19e = "Operator19d1"
         _war19e(_t19e_root, None, _human19e, type="human", host="some-other-machine",
-                startedAt=_nt19e(), presence="away")
+                startedAt=_nt19e(), presence="online", presenceAt=_nt19e(), dashboard_pid=424242)
         _info19e = _dash19.start_dashboard(_t19e_root, None, _human19e, port=0, open_browser=False)
         if "some-other-machine" not in (_info19e.get("warning") or ""):
-            failures.append(f"WP-19 D1: dashboard collision warning missing/wrong: {_info19e}")
+            failures.append(f"WP-19/21 D1: fresh foreign-host record should warn: {_info19e}")
+        _dash19.shutdown_dashboard()
+
+        # Stale + different host → silent (a dead dashboard's stale host is a fine takeover).
+        _t19f_root = tempfile.mkdtemp(prefix="tc-19-d1-stale-")
+        _human19f = "Operator19d1stale"
+        _stale_hb19f = (datetime.now() - timedelta(seconds=120)).strftime(_TSFMT19d1)
+        _war19e(_t19f_root, None, _human19f, type="human", host="some-other-machine",
+                startedAt=_stale_hb19f, presence="online", presenceAt=_stale_hb19f,
+                dashboard_pid=424242)
+        _info19f = _dash19.start_dashboard(_t19f_root, None, _human19f, port=0, open_browser=False)
+        if _info19f.get("warning"):
+            failures.append(f"WP-19/21 D1: stale foreign-host record should NOT warn: {_info19f}")
         _dash19.shutdown_dashboard()
     except Exception as e:
-        failures.append(f"WP-19 D1 unit check errored: {e}")
+        failures.append(f"WP-19/21 D1 unit check errored: {e}")
 
     # ── WP-20 AC-1/AC-2 (I3) — locked, verified teammate deletion (tautology on current main) ──
     try:
@@ -3413,6 +3433,114 @@ def main():
                 os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _prev_gate20e
     except Exception as e:
         failures.append(f"WP-20 AC-5 unit checks errored: {e}")
+
+    # ── WP-21 AC-1 (B1) — human_presence_online: fresh/aged presenceAt, back-compat no-presenceAt ──
+    try:
+        from teammate_comms.comms import human_presence_online as _hpo21, TIMESTAMP_FMT as _TSFMT21
+
+        _now21 = datetime.now()
+        _fresh21 = {"presence": "online", "presenceAt": _now21.strftime(_TSFMT21)}
+        if not _hpo21(_fresh21):
+            failures.append("WP-21 AC-1: fresh presenceAt should read online")
+
+        _aged21 = {"presence": "online",
+                   "presenceAt": (_now21 - timedelta(seconds=90)).strftime(_TSFMT21)}
+        if _hpo21(_aged21):
+            failures.append("WP-21 AC-1: aged (>60s) presenceAt should read away")
+
+        _legacy21 = {"presence": "online"}  # no presenceAt key at all — back-compat
+        if not _hpo21(_legacy21):
+            failures.append("WP-21 AC-1: back-compat — presence=online with NO presenceAt "
+                             "key must still read online")
+    except Exception as e:
+        failures.append(f"WP-21 AC-1 unit checks errored: {e}")
+
+    # ── WP-21 AC-2 (B1) — shutdown clobber guard: only OUR dashboard_pid can mark away ──
+    try:
+        from teammate_comms.comms import (
+            write_agent_record as _war21b, read_agent_record as _rar21b,
+            set_human_presence as _shp21b,
+        )
+        _t21b_root = tempfile.mkdtemp(prefix="tc-21-ac2-")
+        _human21b = "human21ac2"
+        _war21b(_t21b_root, None, _human21b, type="human", presence="online", dashboard_pid=111)
+        # Foreign pid attempt → untouched.
+        _shp21b(_t21b_root, None, _human21b, "away", owner_pid=222)
+        if (_rar21b(_t21b_root, None, _human21b) or {}).get("presence") != "online":
+            failures.append("WP-21 AC-2: a FOREIGN dashboard_pid marked presence away (clobber)")
+        # Our pid → away.
+        _shp21b(_t21b_root, None, _human21b, "away", owner_pid=111)
+        if (_rar21b(_t21b_root, None, _human21b) or {}).get("presence") != "away":
+            failures.append("WP-21 AC-2: matching dashboard_pid failed to mark presence away")
+    except Exception as e:
+        failures.append(f"WP-21 AC-2 unit checks errored: {e}")
+
+    # ── WP-21 AC-3 (G2) — case-variant collision rejected at register; exact re-register OK ──
+    # Tautology: this MUST fail against current main (register silently proceeds).
+    try:
+        from teammate_comms import server as _srv21c
+        from teammate_comms.comms import CommsError as _CE21c
+
+        _t21c_root = tempfile.mkdtemp(prefix="tc-21-ac3-")
+        _srv21c.register_identity("Bob21", None, _t21c_root, {})
+        try:
+            _srv21c.register_identity("bob21", None, _t21c_root, {})
+            failures.append("WP-21 AC-3 [tautology: register must reject a case-variant "
+                             "collision — reverted code silently proceeds, letting Windows "
+                             "merge/Linux split the identity]")
+        except _CE21c as _e21c:
+            if "Bob21" not in str(_e21c):
+                failures.append(f"WP-21 AC-3: case-collision error must name the existing "
+                                 f"spelling: {_e21c}")
+        # Exact re-register of the SAME spelling stays idempotent.
+        try:
+            _srv21c.register_identity("Bob21", None, _t21c_root, {})
+        except Exception as _e21c2:
+            failures.append(f"WP-21 AC-3: exact re-register of the same spelling should "
+                             f"succeed: {_e21c2}")
+    except Exception as e:
+        failures.append(f"WP-21 AC-3 unit checks errored: {e}")
+
+    # ── WP-21 AC-4 (G5) — Windows reserved device names rejected; near-misses accepted ──
+    try:
+        from teammate_comms.comms import (
+            validate_agent_name as _van21, validate_group_name as _vgn21,
+            validate_project_key as _vpk21, CommsError as _CE21d,
+        )
+        _rejected21 = ["con", "NUL", "com3", "con.helper"]
+        _accepted21 = ["console", "con-bot", "lpt10"]
+        for _n21 in _rejected21:
+            for _label21, _fn21 in (("agent", _van21), ("group", _vgn21)):
+                try:
+                    _fn21(_n21)
+                    failures.append(f"WP-21 AC-4: {_label21} validator accepted reserved name {_n21!r}")
+                except _CE21d:
+                    pass
+            try:
+                _vpk21(_n21)
+                failures.append(f"WP-21 AC-4: project key validator accepted reserved name {_n21!r}")
+            except _CE21d:
+                pass
+            try:
+                _vpk21(f"parent/{_n21}")
+                failures.append(f"WP-21 AC-4: project key validator accepted reserved SEGMENT {_n21!r}")
+            except _CE21d:
+                pass
+        for _n21 in _accepted21:
+            try:
+                _van21(_n21)
+            except _CE21d as _e21d:
+                failures.append(f"WP-21 AC-4: agent validator wrongly rejected {_n21!r}: {_e21d}")
+            try:
+                _vgn21(_n21)
+            except _CE21d as _e21d:
+                failures.append(f"WP-21 AC-4: group validator wrongly rejected {_n21!r}: {_e21d}")
+            try:
+                _vpk21(_n21)
+            except _CE21d as _e21d:
+                failures.append(f"WP-21 AC-4: project key validator wrongly rejected {_n21!r}: {_e21d}")
+    except Exception as e:
+        failures.append(f"WP-21 AC-4 unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
