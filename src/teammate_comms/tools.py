@@ -44,6 +44,7 @@ from .comms import (
     human_presence_online,
     is_channel_alive,
     list_project_records,
+    new_message_id,
     now_timestamp,
     read_agent_record,
     read_group_messages,
@@ -616,7 +617,7 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     ensure_inbox(inboxes_dir, to)
     unread_file = inboxes_dir / f"{to}_unread.json"
 
-    record = {"id": now_timestamp(), "from": sender, "priority": priority, "message": content}
+    record = {"id": new_message_id(), "from": sender, "priority": priority, "message": content}
     if pt:
         record["post_type"] = pt  # additive: flows to inbox + NDJSON transcript
     if isinstance(reply_to, str) and reply_to.strip():
@@ -1151,7 +1152,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
                 meta["members"] = members
                 write_group_meta(root, team, group, meta)
 
-    record = {"id": now_timestamp(), "from": sender, "group": sigil,
+    record = {"id": new_message_id(), "from": sender, "group": sigil,
               "priority": priority, "message": content}
     if pt:
         record["post_type"] = pt  # additive: flows to inbox + group transcript + NDJSON
@@ -1459,18 +1460,26 @@ def react(root, team, reactor, target, emoji, remove=False):
     """Core: append a reaction add/remove event as ``reactor`` (sender-explicit so the
     dashboard reacts AS the human).
 
-    Stamps ``target_from`` (the reacted-to message's author, resolved from the durable
-    transcript) so the watcher can wake ONLY that author. If the author can't be resolved
-    (target not in the transcript, or TEAMMATE_TRANSCRIPT=0) the reaction still records but
-    won't wake anyone.
+    Stamps ``target_from`` (the reacted-to message's author) so the watcher can wake ONLY
+    that author, resolved via ``resolve_message()``'s 3-tier fallback (transcript tail→full,
+    group files, inboxes) — the SAME resolution ``delete_message`` already uses (M4: react
+    used to resolve transcript-only, so TEAMMATE_TRANSCRIPT=0 or a rotated-away id silently
+    dropped the wake while delete on the same id worked via its 3-tier fallback).
+
+    A clean miss now raises (N8: reacting to a nonexistent id used to return a success
+    string) — matching ack/delete's error idiom. Reacting to a TOMBSTONED message still
+    works and still wakes the author (S4, known-intentional: a tombstone keeps the id + from,
+    it doesn't erase them).
     """
     if not isinstance(target, str) or not target.strip():
         raise CommsError("'to_message' is required (the id of the message to react to).")
     if emoji not in _REACTIONS:
         raise CommsError(f"'emoji' must be one of {list(_REACTIONS)}.")
     target = target.strip()
-    _hit = _scan_transcript_for_id(root, team, target)  # tail-first; full-scan fallback (C-1)
-    target_from = _hit.get("from") if _hit else None
+    resolved = resolve_message(root, team, target)
+    if resolved is None:
+        raise CommsError(f"No message with id {target!r} found.")
+    target_from = resolved.get("from")
     # id is stamped inside append_reaction under the lock (file order == id order — see its
     # docstring); we read it back off `record` for the return value.
     record = {"target": target, "from": reactor,

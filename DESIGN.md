@@ -316,6 +316,19 @@ inbox names must be unique across all projects (two repos each registering `lead
 collide on one inbox — the server's same-name collision warning still applies); team
 namespacing carves out subsets.
 
+**Message-id format & cross-host ordering (WP-26, B3/C4).** `new_message_id()` mints
+`now_timestamp() + "." + <disambiguator>`, where the disambiguator is the writer's pid
+plus a per-process monotonic counter (both hex). A bare microsecond timestamp collides:
+two writers stamping the same microsecond otherwise produce two records sharing one id,
+which the dashboard's global per-id dedup silently drops one of, and every id-keyed
+consumer (ack, react, delete, cursors) becomes ambiguous about which record it means.
+The disambiguator guarantees **uniqueness**, not global cross-host **order**: ids order
+by each writer's own local clock, so cross-host ordering is only as good as clock sync
+between hosts (NTP-synced hosts are the supported envelope) — the skew itself is
+unfixable client-side. Old bare ids and new suffixed ids coexist forever (no migration):
+lexical comparison handles the mix, since a bare timestamp is always a strict string
+prefix of its own suffixed extension and therefore sorts before it.
+
 ---
 
 ## 9. MCP tools

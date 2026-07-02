@@ -13,6 +13,7 @@ changes for the plugin/MCP-server context:
    a tool error, never tear down the whole process.
 """
 
+import itertools
 import json
 import os
 import re
@@ -69,6 +70,38 @@ class CommsError(Exception):
 def now_timestamp():
     """Current naive-local timestamp in the shared format."""
     return datetime.now().strftime(TIMESTAMP_FMT)
+
+
+# Per-process monotonic counter feeding new_message_id's disambiguator (B3).
+_id_counter = itertools.count()
+
+
+def new_message_id():
+    """Generate a message id: ``now_timestamp() + "." + <disambiguator>`` (B3).
+
+    Bare microsecond timestamps collide: two writers (or two calls in the SAME process
+    within one microsecond — exactly the scenario ``_window``'s docstring dismisses as
+    already handled) stamping the same value produce two records sharing ONE id. The
+    dashboard's global per-id dedup then silently drops one of them, and every id-keyed
+    consumer (ack, react, delete, cursors) becomes ambiguous about which record it means.
+
+    The disambiguator is ``pid + a per-process monotonic counter`` (both hex, compact):
+    pid alone isn't enough (same-process same-microsecond IS the collision above); a bare
+    counter alone isn't enough across process restarts (could repeat from zero). Hostname
+    is deliberately NOT included (too long for a per-message id) — a pid+timestamp collision
+    across two DIFFERENT hosts within the same microsecond is an accepted residual risk (see
+    the C4 note in DESIGN §storage: this disambiguator guarantees UNIQUENESS, not global
+    cross-host ORDER — ids order by each writer's local clock, and cross-host ordering is
+    only as good as clock sync between hosts).
+
+    Lexical ordering is preserved for a mixed old/new id population: for two ids sharing the
+    SAME timestamp prefix, the suffixed one sorts textually AFTER the bare (unsuffixed)
+    timestamp of that same value — a strict string prefix always sorts as "less than" its
+    own extension. Every comparison in this codebase is ``>=``/``max`` on strings, so this
+    holds everywhere without a migration: old bare ids and new suffixed ids coexist forever,
+    do not rewrite stored ids to "fix" this.
+    """
+    return f"{now_timestamp()}.{os.getpid():x}{next(_id_counter):x}"
 
 
 # Windows reserved device names (G5) — checked on EVERY OS, not just Windows: a shared comms
@@ -1462,7 +1495,7 @@ def append_reaction(root, team, record, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
-            record["id"] = now_timestamp()
+            record["id"] = new_message_id()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except CommsError:
@@ -1656,7 +1689,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
             with file_lock_optional(path, timeout=2) as acquired:
                 if not acquired:
                     return
-                record["id"] = now_timestamp()
+                record["id"] = new_message_id()
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
@@ -1667,7 +1700,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
-            record["id"] = now_timestamp()
+            record["id"] = new_message_id()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)

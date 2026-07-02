@@ -1847,12 +1847,16 @@ def main():
             if _dreq("POST", "/api/send", token=_dtok,
                      body={"to": "Carol", "message": "x", "post_type": "bogus"})[0] != 400:
                 failures.append("WP-4 send with bogus post_type did not 400")
-            # /api/react: a valid emoji always 200 (records best-effort, no transcript setup);
-            # a bogus emoji → 400 (the whitelist gate).
-            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "fire"})[0] != 200:
-                failures.append("WP-3 /api/react valid emoji did not 200")
-            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "bogus"})[0] != 400:
+            # /api/react: a valid emoji on a RESOLVABLE target (the group post above) → 200;
+            # a bogus emoji → 400 (the whitelist gate). WP-26 N8: reacting to an unresolvable
+            # target ("x", no transcript/group/inbox record anywhere) now 400s too — it used
+            # to silently 200 (a reaction to nothing), matching ack/delete's not-found idiom.
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": _gmid, "emoji": "fire"})[0] != 200:
+                failures.append("WP-3 /api/react valid emoji on a resolvable target did not 200")
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": _gmid, "emoji": "bogus"})[0] != 400:
                 failures.append("WP-3 /api/react bogus emoji did not 400")
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "fire"})[0] != 400:
+                failures.append("WP-26 N8: /api/react on an unresolvable target should now 400")
             # /api/delete: XOR guard (neither message nor teammate) → 400. "Operator" is
             # registered so we reach the 400 guard, NOT the 409 no-identity branch.
             if _dreq("POST", "/api/delete", token=_dtok, body={})[0] != 400:
@@ -4237,6 +4241,111 @@ def main():
             failures.append(f"WP-25 AC-5: sequential appends produced wrong/missing lines: {_lines25d}")
     except Exception as e:
         failures.append(f"WP-25 AC-4/AC-5 unit checks errored: {e}")
+
+    # ── WP-26 AC-1 (B3) — 1000 minted ids unique + non-decreasing; end-to-end id consistency ──
+    try:
+        from teammate_comms.comms import new_message_id as _nmi26a
+
+        _ids26a = [_nmi26a() for _ in range(1000)]
+        if len(set(_ids26a)) != 1000:
+            failures.append(f"WP-26 AC-1: 1000 minted ids were not all unique "
+                             f"({len(set(_ids26a))} distinct)")
+        if _ids26a != sorted(_ids26a):
+            failures.append("WP-26 AC-1: minted ids were not lexically non-decreasing")
+
+        # End-to-end: a DM's id flows consistently through inbox -> react -> resolution.
+        from teammate_comms import tools as _t26a
+        from teammate_comms import comms as _c26a
+
+        class _Id26a:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, v):
+                pass
+
+        _t26a_root = tempfile.mkdtemp(prefix="tc-26-ac1-")
+        _dm26a = _t26a.send_dm(_t26a_root, None, "alice26a", "bob26a", "hello")
+        _mid26a = _dm26a["id"]
+        _inbox_text26a = _t26a._handle_inbox({}, {"identity": _Id26a("bob26a", _t26a_root)})
+        if _mid26a not in _inbox_text26a:
+            failures.append(f"WP-26 AC-1: DM's minted id not shown verbatim in the recipient's "
+                             f"inbox: {_mid26a!r} not in {_inbox_text26a[:200]!r}")
+        _rx26a = _t26a.react(_t26a_root, None, "carol26a", _mid26a, "fire")
+        if _rx26a.get("target") != _mid26a or _rx26a.get("target_from") != "alice26a":
+            failures.append(f"WP-26 AC-1: reaction did not carry the DM's exact id/author through: {_rx26a}")
+    except Exception as e:
+        failures.append(f"WP-26 AC-1 unit checks errored: {e}")
+
+    # ── WP-26 AC-2 (B3) — same frozen now_timestamp() still produces distinct ids ──
+    # Tautology: identical ids on current main (bare now_timestamp(), no disambiguator).
+    try:
+        from teammate_comms import tools as _t26b
+        from teammate_comms import comms as _c26b
+
+        _t26b_root = tempfile.mkdtemp(prefix="tc-26-ac2-")
+        _real_nt26b = _c26b.now_timestamp
+        try:
+            _c26b.now_timestamp = lambda: "2026-01-01T00:00:00.000000"  # frozen clock
+            _r1_26b = _t26b.send_dm(_t26b_root, None, "s26b", "to26b-1", "one")
+            _r2_26b = _t26b.send_dm(_t26b_root, None, "s26b", "to26b-2", "two")
+            if _r1_26b["id"] == _r2_26b["id"]:
+                failures.append(f"WP-26 AC-2 [tautology: two send_dm calls under the SAME frozen "
+                                 f"clock produced the SAME id — the disambiguator isn't wired in]: "
+                                 f"{_r1_26b['id']!r}")
+        finally:
+            _c26b.now_timestamp = _real_nt26b
+    except Exception as e:
+        failures.append(f"WP-26 AC-2 unit check errored: {e}")
+
+    # ── WP-26 AC-3 (M4) — TEAMMATE_TRANSCRIPT=0: react resolves target_from via group-file fallback ──
+    # Tautology: current main (transcript-only resolution) records no target_from here.
+    try:
+        from teammate_comms import tools as _t26c
+        from teammate_comms import comms as _c26c
+
+        _prev_tr26c = os.environ.get("TEAMMATE_TRANSCRIPT")
+        try:
+            os.environ["TEAMMATE_TRANSCRIPT"] = "0"
+            _t26c_root = tempfile.mkdtemp(prefix="tc-26-ac3-")
+            _grp26c = "g26c"
+            _c26c.write_group_meta(_t26c_root, None, _grp26c,
+                                   {"name": _grp26c, "members": ["author26c", "reactor26c"],
+                                    "creator": "author26c", "createdAt": _c26c.now_timestamp()})
+            _gmid26c = _t26c.send_group(_t26c_root, None, "author26c", f"#{_grp26c}", "group post")["id"]
+            _transcript26c = _c26c.get_transcript_file(_t26c_root, None)
+            if _transcript26c.exists() and _transcript26c.read_text(encoding="utf-8").strip():
+                failures.append("WP-26 AC-3 setup: transcript should be empty with TEAMMATE_TRANSCRIPT=0")
+            _rx26c = _t26c.react(_t26c_root, None, "reactor26c", _gmid26c, "fire")
+            if _rx26c.get("target_from") != "author26c":
+                failures.append(f"WP-26 AC-3 [tautology: react must resolve target_from via the "
+                                 f"group-file fallback when the transcript is disabled]: {_rx26c}")
+        finally:
+            if _prev_tr26c is None:
+                os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+            else:
+                os.environ["TEAMMATE_TRANSCRIPT"] = _prev_tr26c
+    except Exception as e:
+        failures.append(f"WP-26 AC-3 unit check errored: {e}")
+
+    # ── WP-26 AC-4 (N8) — reacting to a nonexistent id raises, naming the id ──
+    try:
+        from teammate_comms import tools as _t26d
+        from teammate_comms.comms import CommsError as _CE26d
+
+        _t26d_root = tempfile.mkdtemp(prefix="tc-26-ac4-")
+        try:
+            _t26d.react(_t26d_root, None, "reactor26d", "totally-bogus-id", "fire")
+            failures.append("WP-26 AC-4 [tautology: reacting to a nonexistent id must raise — "
+                             "reverted code returns a success string]")
+        except _CE26d as _e26d:
+            if "totally-bogus-id" not in str(_e26d):
+                failures.append(f"WP-26 AC-4: error text must name the id: {_e26d}")
+    except Exception as e:
+        failures.append(f"WP-26 AC-4 unit check errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
