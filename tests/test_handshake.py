@@ -51,6 +51,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -584,6 +585,10 @@ def main():
     # register return echoes the profile back (personality reminder at session start)
     if PERSONALITY not in text(5) or ROLE not in text(5):
         failures.append(f"teammate_register did not echo profile: {text(5)}")
+    # WP-19 AC-5: the normal single-owner register path must stay silent — no collision warning.
+    if "WARNING" in text(5):
+        failures.append(f"WP-19 AC-5: normal single-owner register wrongly printed a "
+                         f"collision warning: {text(5)}")
     if '"registered": true' not in text(6).lower() or AGENT not in text(6):
         failures.append(f"whoami after register wrong: {text(6)}")
     # whoami echoes the profile set at registration
@@ -1510,6 +1515,10 @@ def main():
                 def set_last_seen(self, v):
                     with self._lock:
                         self._ls = v
+                def get_instance_id(self):  # WP-19: run_watcher's heartbeat branch needs this
+                    return "test-instance-id"
+                def get_epoch(self):
+                    return 1
 
             _id12a = _Id12a()
             _id12a.set(_agent12a, None, _wroot12a, _unread12a)
@@ -1593,6 +1602,10 @@ def main():
                 def set_last_seen(self, v):
                     with self._lock:
                         self._ls = v
+                def get_instance_id(self):  # WP-19: run_watcher's heartbeat branch needs this
+                    return "test-instance-id"
+                def get_epoch(self):
+                    return 1
 
             _id12b = _Id12b()
             _init12b = _th12.Event()
@@ -1672,6 +1685,10 @@ def main():
                 def set_last_seen(self, v):
                     with self._lock:
                         self._ls = v
+                def get_instance_id(self):  # WP-19: run_watcher's heartbeat branch needs this
+                    return "test-instance-id"
+                def get_epoch(self):
+                    return 1
 
             _id12c = _Id12c()
             _init12c = _th12.Event()
@@ -3057,6 +3074,152 @@ def main():
             failures.append(f"WP-17 AC-4: unbounded read_reactions(root, team) call(s) remain in tools.py: {len(_unbounded17)}")
     except Exception as e:
         failures.append(f"WP-17 AC-4 unit check errored: {e}")
+
+    # ── WP-19 AC-1 — instance_id/epoch stamped at register; re-register bumps epoch, keeps profile ──
+    try:
+        from teammate_comms import server as _srv19
+        from teammate_comms.comms import read_agent_record as _rar19
+
+        _t19_root = tempfile.mkdtemp(prefix="tc-19-ac1-")
+        _name19 = "probe19ac1"
+        _srv19.register_identity(_name19, None, _t19_root,
+                                  {"role": "tester19", "personality": "curt-and-dry"})
+        _rec19a = _rar19(_t19_root, None, _name19) or {}
+        _iid19 = _rec19a.get("instance_id")
+        if not (isinstance(_iid19, str) and len(_iid19) == 32):
+            failures.append(f"WP-19 AC-1: instance_id missing/malformed after register: {_iid19!r}")
+        if _rec19a.get("epoch") != 1:
+            failures.append(f"WP-19 AC-1: first register epoch should be 1, got {_rec19a.get('epoch')!r}")
+
+        # Re-register same name: epoch bumps, profile fields (not re-passed) are PRESERVED.
+        _srv19.register_identity(_name19, None, _t19_root, {})
+        _rec19b = _rar19(_t19_root, None, _name19) or {}
+        if _rec19b.get("epoch") != 2:
+            failures.append(f"WP-19 AC-1: re-register should bump epoch to 2, got {_rec19b.get('epoch')!r}")
+        if _rec19b.get("instance_id") != _iid19:
+            failures.append(f"WP-19 AC-1: instance_id changed across re-register in the SAME "
+                             f"process: {_iid19!r} -> {_rec19b.get('instance_id')!r}")
+        if _rec19b.get("role") != "tester19" or _rec19b.get("personality") != "curt-and-dry":
+            failures.append(f"WP-19 AC-1: re-register lost the prior profile: {_rec19b!r}")
+    except Exception as e:
+        failures.append(f"WP-19 AC-1 unit checks errored: {e}")
+
+    # ── WP-19 AC-2 (flap kill) + TOCTOU tie-break — compute_heartbeat_permit pure-function tests ──
+    # No real sleeps: timestamps are injected (Silvie gate addendum (d)).
+    try:
+        from teammate_comms import channel as _ch19
+        from teammate_comms.comms import TIMESTAMP_FMT as _TSFMT19
+
+        _now19 = datetime(2026, 1, 1, 12, 0, 0)
+        _my_id19, _my_epoch19 = "mine", 5
+
+        # (b) no record / instance_id-absent record (all pre-WP-19 legacy records) → permit.
+        if not _ch19.compute_heartbeat_permit(None, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2(b): no record should permit the write")
+        if not _ch19.compute_heartbeat_permit({}, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2(b): instance_id-absent record should permit the write")
+
+        # AC-2: foreign + FRESH (right now) → SKIP (demoted).
+        _foreign_fresh19 = {"instance_id": "other", "epoch": 99,
+                            "lastHeartbeat": _now19.strftime(_TSFMT19)}
+        if _ch19.compute_heartbeat_permit(_foreign_fresh19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2: foreign+fresh record should SKIP the write (demoted)")
+
+        # AC-2: foreign + STALE (>30s old) → PERMIT (legitimate re-claim of a dead process).
+        _stale_hb19 = (_now19 - timedelta(seconds=31)).strftime(_TSFMT19)
+        _foreign_stale19 = {"instance_id": "other", "epoch": 99, "lastHeartbeat": _stale_hb19}
+        if not _ch19.compute_heartbeat_permit(_foreign_stale19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2: foreign+stale record should PERMIT the write (re-claim)")
+
+        # TOCTOU tie-break: foreign instance_id but epoch matches MINE → I was heartbeat-stomped
+        # by a race, not superseded by a real registration → re-claim (write).
+        _stomped19 = {"instance_id": "stomper", "epoch": _my_epoch19,
+                      "lastHeartbeat": _now19.strftime(_TSFMT19)}
+        if not _ch19.compute_heartbeat_permit(_stomped19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 TOCTOU: foreign+fresh but epoch==mine should re-claim (write)")
+
+        # A genuinely later registration (foreign instance_id, a DIFFERENT epoch, fresh) → skip.
+        _other19 = {"instance_id": "other", "epoch": _my_epoch19 + 1,
+                    "lastHeartbeat": _now19.strftime(_TSFMT19)}
+        if _ch19.compute_heartbeat_permit(_other19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 TOCTOU: foreign+fresh with a DIFFERENT epoch should skip "
+                             "(a genuinely later claimant)")
+    except Exception as e:
+        failures.append(f"WP-19 AC-2/TOCTOU unit checks errored: {e}")
+
+    # ── WP-19 AC-3 (S2) — register warning names a live foreign claimant's host/pid ──
+    try:
+        from teammate_comms import server as _srv19b
+        from teammate_comms.comms import write_agent_record as _war19, now_timestamp as _nt19
+
+        _t19c_root = tempfile.mkdtemp(prefix="tc-19-ac3-")
+        _name19c = "probe19ac3"
+        _war19(_t19c_root, None, _name19c, type="full", channel=True,
+               pid=999999, host="some-other-host", instance_id="foreign-instance",
+               epoch=1, lastHeartbeat=_nt19())
+        _msg19c = _srv19b.register_identity(_name19c, None, _t19c_root, {})
+        if "WARNING" not in _msg19c or "some-other-host" not in _msg19c or "999999" not in _msg19c:
+            failures.append(f"WP-19 AC-3: register did not warn naming the foreign host/pid: {_msg19c[:200]!r}")
+
+        # (c) self must never warn: re-registering the SAME identity (own instance_id, fresh)
+        # in the SAME process must be silent — twice, to prove it holds on the second call too.
+        _name19c2 = "probe19ac3-self"
+        _msg19c2 = _srv19b.register_identity(_name19c2, None, _t19c_root, {})
+        if "WARNING" in _msg19c2:
+            failures.append(f"WP-19 AC-3(c): first register wrongly warned: {_msg19c2[:200]!r}")
+        _msg19c3 = _srv19b.register_identity(_name19c2, None, _t19c_root, {})
+        if "WARNING" in _msg19c3:
+            failures.append(f"WP-19 AC-3(c): own re-register wrongly warned (same instance_id): {_msg19c3[:200]!r}")
+
+        # (c) a STALE foreign record must not warn either (dead claimant, not live).
+        _name19c4 = "probe19ac3-stale"
+        _stale_hb19c = (datetime.now() - timedelta(seconds=60)).strftime(_TSFMT19)
+        _war19(_t19c_root, None, _name19c4, type="full", channel=True,
+               pid=999998, host="another-host", instance_id="foreign-instance-2",
+               epoch=1, lastHeartbeat=_stale_hb19c)
+        _msg19c4 = _srv19b.register_identity(_name19c4, None, _t19c_root, {})
+        if "WARNING" in _msg19c4:
+            failures.append(f"WP-19 AC-3(c): stale foreign record wrongly warned: {_msg19c4[:200]!r}")
+    except Exception as e:
+        failures.append(f"WP-19 AC-3 unit checks errored: {e}")
+
+    # ── WP-19 AC-4 — human guard: registering over a type=human record raises CommsError ──
+    # Tautology: this MUST fail against current main (register currently succeeds silently).
+    try:
+        from teammate_comms import server as _srv19d
+        from teammate_comms.comms import register_human as _rh19, CommsError as _CE19
+
+        _t19d_root = tempfile.mkdtemp(prefix="tc-19-ac4-")
+        _human19 = "Operator19"
+        _rh19(_t19d_root, None, _human19)
+        try:
+            _srv19d.register_identity(_human19, None, _t19d_root, {})
+            failures.append("WP-19 AC-4 [tautology: register_identity must raise CommsError over "
+                             "a type=human record — reverted code lets this silently succeed]")
+        except _CE19 as _e19d:
+            if _human19 not in str(_e19d):
+                failures.append(f"WP-19 AC-4: human-guard error text must name the human: {_e19d}")
+        except Exception as _e19d2:
+            failures.append(f"WP-19 AC-4: wrong exception type ({type(_e19d2).__name__}), "
+                             f"want CommsError: {_e19d2}")
+    except Exception as e:
+        failures.append(f"WP-19 AC-4 unit checks errored: {e}")
+
+    # ── WP-19 D1 (dashboard half) — collision warning when a human record exists on another host ──
+    try:
+        from teammate_comms import dashboard as _dash19
+        from teammate_comms.comms import write_agent_record as _war19e, now_timestamp as _nt19e
+
+        _t19e_root = tempfile.mkdtemp(prefix="tc-19-d1-")
+        _human19e = "Operator19d1"
+        _war19e(_t19e_root, None, _human19e, type="human", host="some-other-machine",
+                startedAt=_nt19e(), presence="away")
+        _info19e = _dash19.start_dashboard(_t19e_root, None, _human19e, port=0, open_browser=False)
+        if "some-other-machine" not in (_info19e.get("warning") or ""):
+            failures.append(f"WP-19 D1: dashboard collision warning missing/wrong: {_info19e}")
+        _dash19.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-19 D1 unit check errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

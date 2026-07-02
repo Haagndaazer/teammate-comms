@@ -30,9 +30,12 @@ import os
 import socket
 import sys
 import time
+from datetime import datetime
 
 from .comms import (
+    HEARTBEAT_STALENESS_SECONDS,
     REACTION_EMOJI,
+    heartbeat_fresh,
     now_timestamp,
     read_agent_record,
     read_json_readonly,
@@ -174,6 +177,47 @@ def compute_reemit(unseen_ids, now_mono, last_emit_mono, attempts):
     return (False, attempts, last_emit_mono)
 
 
+def compute_heartbeat_permit(record, my_instance_id, my_epoch, now):
+    """Pure flap-kill decision for one heartbeat tick (no I/O — hermetically testable, I1).
+
+    Ownership model: OWNERSHIP TRANSFERS ONLY AT REGISTER (register_identity writes
+    instance_id + epoch=prev+1); a heartbeat never steals a fresh record outright — it only
+    decides whether to keep writing in between registrations. ``record`` is the CURRENT
+    on-disk agent record, read fresh this same tick; ``my_epoch`` is the epoch THIS instance
+    minted at its own last register (stored on Identity, not recomputed here).
+
+    Returns True (permit the write) when:
+      * no record, or its instance_id is absent/ours — nothing foreign to detect (also covers
+        every legacy pre-WP-19 record, which never had an instance_id to begin with); or
+      * the foreign instance_id's heartbeat has gone STALE (not within
+        ``HEARTBEAT_STALENESS_SECONDS`` of ``now``) — a legitimate re-claim of a dead process's
+        record; never wait forever for a winner that crashed; or
+      * TOCTOU tie-break: the record's epoch equals ``my_epoch``. A window exists where MY
+        heartbeat reads the record before a COMPETITOR's register lands, and an unguarded
+        write would then stamp MY instance_id back OVER their fresh registration (the
+        field-merge keeps THEIR epoch, since heartbeats never write epoch — so the record's
+        epoch stays theirs even if instance_id gets clobbered). If the on-disk epoch still
+        matches what I minted at MY OWN register, no one has re-registered since I did — a
+        foreign instance_id here can only be a heartbeat-write STOMP from that race, not a
+        legitimate new registration, so I re-claim. The stomper reads foreign+fresh (with a
+        DIFFERENT epoch — theirs) next tick and demotes. Converges to most-recent-REGISTER
+        within 2 ticks, deterministically.
+
+    False (skip this tick's write) only for a foreign, FRESH, tie-break-losing record — i.e. a
+    genuinely different, currently-live claimant registered after we did.
+    """
+    if not record:
+        return True
+    foreign_id = record.get("instance_id")
+    if not foreign_id or foreign_id == my_instance_id:
+        return True
+    if not heartbeat_fresh(record.get("lastHeartbeat"), now, HEARTBEAT_STALENESS_SECONDS):
+        return True  # foreign but stale — legitimate re-claim of a dead process's record
+    if record.get("epoch") == my_epoch:
+        return True  # TOCTOU tie-break: this is MY registration, heartbeat-stomped by a race
+    return False
+
+
 def _wake_payload(messages, unseen_ids, agent):
     """Pure: the wake's at-a-glance context for ``unseen_ids`` → ``(count, group_targets,
     mentioned, senders)``. Shared by the fresh-nudge and re-nudge paths so a re-nudge is
@@ -205,6 +249,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     reaction_cursor = None     # high-water mark (max reaction id seen) driving the read window
     last_emit_mono = None      # monotonic time of the last wake emit (fresh or re-nudge); None until first
     reemit_attempts = 0        # re-nudge attempts in the current quiet period (capped)
+    demoted = False    # WP-19 flap-kill: True while a foreign live claimant has superseded us
+                       # (logged once per demotion episode, not per tick)
 
     while not stop_evt.is_set():
         try:
@@ -233,20 +279,34 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 reaction_cursor = None
                 last_emit_mono = None
                 reemit_attempts = 0
+                demoted = False
 
             now = time.monotonic()
             if now - last_hb >= HEARTBEAT_SECONDS:
-                write_agent_record(
-                    root, team, agent, timeout=2,
-                    channel=True, pid=os.getpid(), host=hostname,
-                    lastHeartbeat=now_timestamp(),
-                )
-                last_hb = now
-                # Refresh the muted-groups cache (≤5s staleness for a mute to take effect) so
-                # the per-poll wake filter below never adds a disk read.
+                # ONE read before the write (I1 flap-kill, gate composition note): decide
+                # whether a foreign LIVE claimant has superseded us, and refresh the
+                # muted-groups cache from the SAME read — folded into one read, not two.
                 hb_rec = read_agent_record(root, team, agent) or {}
                 muted = set(hb_rec.get("muted_groups", []))
-                # Reaction wakes (low-volume → only on the 5s heartbeat tick, not every poll):
+                my_instance_id = identity.get_instance_id()
+                my_epoch = identity.get_epoch()
+                if compute_heartbeat_permit(hb_rec, my_instance_id, my_epoch, datetime.now()):
+                    write_agent_record(
+                        root, team, agent, timeout=2,
+                        channel=True, pid=os.getpid(), host=hostname,
+                        instance_id=my_instance_id,
+                        lastHeartbeat=now_timestamp(),
+                    )
+                    demoted = False
+                elif not demoted:
+                    demoted = True
+                    print(f"[teammate-comms] superseded by a newer claimant for agent={agent!r} "
+                          f"(instance_id={hb_rec.get('instance_id')!r}, host={hb_rec.get('host')!r}, "
+                          f"pid={hb_rec.get('pid')!r}) — heartbeat write skipped until it goes stale.",
+                          file=sys.stderr, flush=True)
+                last_hb = now
+                # Reaction wakes still run every tick even when the write above was skipped
+                # (low-volume → only on the 5s heartbeat tick, not every poll):
                 # wake the AUTHOR of a reacted-to message. A high-water cursor drives the read
                 # window forward (since=reaction_cursor, oldest_first once seeded) so a burst
                 # larger than the limit pages across ticks instead of scrolling past a fixed

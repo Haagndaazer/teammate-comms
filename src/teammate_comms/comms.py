@@ -798,7 +798,7 @@ def strip_member_from_groups(root, team, name):
     return removed_from
 
 
-def write_agent_record(root, team, name, timeout=5, **fields):
+def write_agent_record(root, team, name, timeout=5, bump_epoch=False, **fields):
     """Field-level merge of ``fields`` into ``agents/<name>.json`` under a lock.
 
     Only provided keys are overwritten; existing keys are preserved, so the
@@ -807,6 +807,11 @@ def write_agent_record(root, team, name, timeout=5, **fields):
 
     Hardening: if the record file *exists* but currently reads as None (a
     concurrent mid-write), skip this write instead of clobbering ``type``.
+
+    ``bump_epoch=True`` (WP-19, register-time only) computes ``fields["epoch"]`` from the
+    CURRENT on-disk record's epoch (previous + 1, absent → 1) under THIS SAME lock/read — the
+    only race-free way to hand out a monotonic epoch when two callers might register the same
+    name at once (any literal ``epoch`` passed in ``fields`` is overridden).
     """
     agents_dir = get_agents_dir(root, team)
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -819,6 +824,9 @@ def write_agent_record(root, team, name, timeout=5, **fields):
             return False
         if not isinstance(record, dict):
             record = {}
+        if bump_epoch:
+            fields = dict(fields)
+            fields["epoch"] = (record.get("epoch") or 0) + 1
         record["name"] = name
         record.update(fields)
         write_json_atomic(record_path, record)
@@ -857,7 +865,25 @@ def _pid_alive(pid):
     return True
 
 
-def is_channel_alive(record, staleness=30, pid_check=True):
+# Default heartbeat-freshness window (seconds) — single source of truth shared by
+# is_channel_alive's cross-host fallback and the WP-19 flap-kill decision
+# (compute_heartbeat_permit in channel.py), so both agree on what "fresh" means.
+HEARTBEAT_STALENESS_SECONDS = 30
+
+
+def heartbeat_fresh(hb, now, staleness=HEARTBEAT_STALENESS_SECONDS):
+    """True if a ``lastHeartbeat`` timestamp string is within ``staleness`` seconds of ``now``
+    (a real ``datetime`` — injected, never read internally, so callers can test this pure)."""
+    if not hb:
+        return False
+    try:
+        last = datetime.strptime(hb, TIMESTAMP_FMT)
+    except (ValueError, TypeError):
+        return False
+    return (now - last).total_seconds() <= staleness
+
+
+def is_channel_alive(record, staleness=HEARTBEAT_STALENESS_SECONDS, pid_check=True):
     """Decide whether an agent's channel server is currently running.
 
     Same host with ``pid_check=True``: authoritative pid liveness (no staleness
@@ -873,14 +899,7 @@ def is_channel_alive(record, staleness=30, pid_check=True):
             alive = _pid_alive(record.get("pid"))
             if alive is not None:
                 return alive
-    hb = record.get("lastHeartbeat")
-    if not hb:
-        return False
-    try:
-        last = datetime.strptime(hb, TIMESTAMP_FMT)
-    except (ValueError, TypeError):
-        return False
-    return (datetime.now() - last).total_seconds() <= staleness
+    return heartbeat_fresh(record.get("lastHeartbeat"), datetime.now(), staleness)
 
 
 # ── Human-as-teammate + observability transcript ────────────────────────────────

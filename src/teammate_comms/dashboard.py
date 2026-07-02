@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -476,6 +477,17 @@ def start_dashboard(root, team, human_name, port=7842, open_browser=True):
                     last_err = e
             if httpd is None:
                 raise CommsError(f"Could not bind a dashboard port on 127.0.0.1: {last_err}")
+            # WP-19 D1 (dashboard half): if a human record under this name already exists on a
+            # DIFFERENT host, register_human below silently overwrites its host (two operators
+            # merging into one identity) — surface it before that happens. Presence
+            # staleness/clobber proper is WP-21; here we only warn at start_dashboard time.
+            existing_human = read_agent_record(root, team, human_name)
+            warning = None
+            if (existing_human and existing_human.get("host")
+                    and existing_human.get("host") != socket.gethostname()):
+                warning = (f"⚠️ another dashboard may already be registered as {human_name!r} "
+                           f"from host {existing_human.get('host')!r} — pass human_name to "
+                           f"distinguish operators.")
             try:
                 register_human(root, team, human_name)
             except CommsError as e:
@@ -488,6 +500,8 @@ def start_dashboard(root, team, human_name, port=7842, open_browser=True):
                 token, root, team, human_name
             url = f"http://127.0.0.1:{chosen}/?token={token}"
             result = {"url": url, "status": "running", "port": chosen}
+            if warning:
+                result["warning"] = warning
     if open_browser:
         _open_browser(result["url"])
     return result

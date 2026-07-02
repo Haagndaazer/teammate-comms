@@ -20,6 +20,8 @@ import socket
 import sys
 import threading
 import traceback
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__, channel
@@ -31,6 +33,7 @@ from .comms import (
     _looks_unset,
     ensure_inbox,
     get_inboxes_dir,
+    heartbeat_fresh,
     is_channel_alive,
     now_timestamp,
     read_agent_record,
@@ -74,6 +77,28 @@ class Identity:
         # re-registration (post-compaction) by comparing generations and resets known_ids,
         # clocks, and cursors so stale in-memory state doesn't suppress new wakes.
         self._generation = 0
+        # Minted ONCE per server process (this object is constructed once at module import)
+        # and never mutated after — a UUID, unlike a PID, is never reused across process
+        # restarts. WP-19: lets the register-time collision warning (S2) and the watcher's
+        # flap-kill (I1) both tell "truly the same running instance" from "a different
+        # instance that happens to share a name". No lock needed: immutable post-construction.
+        self.instance_id = uuid.uuid4().hex
+        # The epoch THIS instance minted at its own last register_identity call (None until
+        # the first register). Fed to compute_heartbeat_permit's TOCTOU tie-break: a foreign
+        # instance_id with an epoch that still matches ours means a competitor's heartbeat
+        # write raced OUR register, not a legitimate new registration — see channel.py.
+        self._epoch = None
+
+    def get_instance_id(self):
+        return self.instance_id
+
+    def set_epoch(self, epoch):
+        with self._lock:
+            self._epoch = epoch
+
+    def get_epoch(self):
+        with self._lock:
+            return self._epoch
 
     def set(self, agent, team, root, unread_file):
         with self._lock:
@@ -171,6 +196,18 @@ def register_identity(agent, team, comms_dir, profile=None):
             spawned_by = None
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
+    my_instance_id = _identity.get_instance_id()
+
+    # Read whatever is currently on disk for this name BEFORE any side effect — the human
+    # guard (WP-19 item 5, mandatory) must fire before ensure_inbox/write ever touch the
+    # human's inbox or record: an agent may never claim the operator's identity.
+    existing = read_agent_record(root, team, agent)
+    if existing and existing.get("type") == "human":
+        raise CommsError(
+            f"Cannot register as {agent!r}: that name belongs to the human operator "
+            f"(type=human, registered via teammate_dashboard). An agent may not claim "
+            f"the operator's identity — register under a distinct name."
+        )
 
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, agent)
@@ -182,24 +219,55 @@ def register_identity(agent, team, comms_dir, profile=None):
         write_agent_record(old_root, old_team, old_agent, timeout=2,
                            channel=False, lastHeartbeat=now_timestamp())
 
-    # Collision guard: warn (stderr) if another live channel server on this host
-    # already owns this agent name (the classic same-name misconfiguration).
-    existing = read_agent_record(root, team, agent)
-    if existing and existing.get("pid") != os.getpid() and is_channel_alive(existing):
-        log(f"WARNING: another live channel server (pid={existing.get('pid')}, "
-            f"host={existing.get('host')}) already owns agent {agent!r}. Two "
-            f"instances bound to the same agent will both nudge and fight over the "
-            f"registry — check the name you registered.")
+    # Collision guard (I1/S2): is `existing` another CURRENTLY LIVE claimant? Checked primarily
+    # via instance_id (a UUID — immune to PID reuse across process restarts, unlike a bare PID
+    # compare) with is_channel_alive as the fallback signal for legacy records that predate
+    # WP-19 (no instance_id yet). Policy stays "most-recent-register wins" (constraint from the
+    # brief) — we warn LOUDLY in the return text, we do not refuse.
+    warning = ""
+    note = ""
+    if existing:
+        foreign_id = existing.get("instance_id")
+        if foreign_id and foreign_id != my_instance_id:
+            is_live_foreign = heartbeat_fresh(existing.get("lastHeartbeat"), datetime.now())
+        else:
+            is_live_foreign = (not foreign_id and existing.get("pid") != os.getpid()
+                                and is_channel_alive(existing))
+        if is_live_foreign:
+            warning = (
+                f"⚠️ WARNING: another live instance already holds {agent!r} "
+                f"(host={existing.get('host')!r}, pid={existing.get('pid')!r}). Registering "
+                f"here WINS — that instance will stop heartbeating once this completes — but "
+                f"two agents sharing one name split messages unpredictably in the meantime. "
+                f"If this was accidental, re-register under a distinct name.\n\n"
+            )
+        elif not is_channel_alive(existing):
+            # Offline-adoption note (C5): silently inheriting another project's inbox/history
+            # under this name is exactly the "identity has no owner" failure mode — say so.
+            existing_project = existing.get("project") or ""
+            new_project = profile_fields.get("project") or ""
+            if existing_project and new_project and existing_project != new_project:
+                note = (
+                    f"\nNOTE: adopting an existing identity previously used in project "
+                    f"{existing_project!r} — you inherit its inbox and transcript attribution.\n"
+                )
 
     write_agent_record(
-        root, team, agent, timeout=5,
+        root, team, agent, timeout=5, bump_epoch=True,
         type="full", channel=True, pid=os.getpid(), host=hostname,
+        instance_id=my_instance_id,
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
         **profile_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),
     )
 
+    # Read the just-written record ONCE — reused for both the epoch stamp (TOCTOU tie-break,
+    # WP-19: fed to the watcher's flap-kill so it can tell "my own registration, heartbeat-
+    # stomped by a race" from "a genuinely later registration") and the profile echo below.
+    # Nothing else can have changed the record yet: this call is single-threaded up to here.
+    effective = read_agent_record(root, team, agent) or {}
     _identity.set(agent, team, root, unread_file)
+    _identity.set_epoch(effective.get("epoch"))
     _registered.set()
 
     unread = read_json_readonly(unread_file) or []
@@ -207,9 +275,7 @@ def register_identity(agent, team, comms_dir, profile=None):
     team_str = f", team {team!r}" if team else ""
 
     # Echo the effective profile back so the agent is reminded who it is (incl. its
-    # personality) — read the record so persisted fields from a prior registration
-    # show too, not just what this call passed.
-    effective = read_agent_record(root, team, agent) or {}
+    # personality).
     set_fields = [(k, effective[k]) for k in PROFILE_FIELDS if effective.get(k)]
     if set_fields:
         profile_str = "Your profile — " + "; ".join(f"{k}: {v!r}" for k, v in set_fields) + ". "
@@ -218,11 +284,11 @@ def register_identity(agent, team, comms_dir, profile=None):
             "No profile set — set one with teammate_update "
             "(role/personality/status/authority) so teammates know what you're doing. "
         )
-    return (
+    return warning + (
         f"Registered as {agent!r}{team_str}. Comms root: {root} (from {source}). "
         f"Channel armed. {profile_str}You have {len(unread)} unread message(s) — call "
         f"teammate_inbox to read them."
-    )
+    ) + note
 
 
 def handle(msg, ctx):

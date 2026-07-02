@@ -1600,12 +1600,15 @@ def _handle_dashboard(args, ctx):
     # Import lazily so the HTTP server module is only loaded when the tool is used.
     from . import dashboard
     info = dashboard.start_dashboard(root, team, human_name, port=port, open_browser=open_browser)
-    return (
+    text = (
         f"Dashboard {info['status']} at {info['url']}\n"
         f"You are '{human_name}' to the team — teammates can teammate_send to you and "
         f"invite you to groups like any teammate. The console stays up while this "
         f"instance runs."
     )
+    if info.get("warning"):
+        text = f"{info['warning']}\n\n{text}"
+    return text
 
 
 def _resolve_caller_project_key(agent, team, root):
