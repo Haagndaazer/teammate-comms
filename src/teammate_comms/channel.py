@@ -251,13 +251,23 @@ def merge_pending_into_unread(root, team, agent):
     ids from the ORIGINAL snapshot — a sender that appended something new in the meantime
     isn't wiped, it survives for the next tick.
 
+    The unlocked peek uses ``read_json_readonly`` (NEVER ``read_json_safe``) — this file is
+    MULTI-WRITER (any group sender appends to it under its own lock), so a lockless read that
+    catches a sender mid-write is a torn read, not corruption; the destructive
+    ``read_json_safe`` would reset it to ``[]`` and the recovery lane would lose the exact
+    messages it exists to save (the same anti-pattern C1 fixed on unread.json — here it's
+    worse, this file's whole job is never-lose). A torn/missing peek just retries next tick
+    (0.5s later) — never resolved by writing anything. Only the CLEAR step (under the pending
+    lock, where no writer can be mid-write) uses ``read_json_safe``; that asymmetry is
+    intentional, do not "simplify" it away.
+
     Returns True if anything was merged.
     """
     inboxes_dir = get_inboxes_dir(root, team)
     pending_file = inboxes_dir / f"{agent}_pending.json"
     unread_file = inboxes_dir / f"{agent}_unread.json"
 
-    pending = read_json_safe(pending_file)
+    pending = read_json_readonly(pending_file)
     if not pending:
         return False
     pending_ids = {m.get("id") for m in pending if m.get("id") is not None}

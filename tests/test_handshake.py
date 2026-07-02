@@ -2776,19 +2776,26 @@ def main():
         # ---- G-2: spawn launcher SEAM — mock subprocess.Popen so the launcher resolution + argv
         #      construction run WITHOUT actually spawning a terminal (the only hermetic way to cover
         #      spawn_in_terminal; the real detached launch stays out of scope, stated in the diff).
+        #      Also mock shutil.which (WP-23 W1 pre-spawn check) so this seam doesn't depend on
+        #      whether the CI runner happens to have a real `claude` on PATH.
         _real_popen = _sp9.subprocess.Popen
+        _real_which9 = _sp9.shutil.which
         _popen_calls = []
         try:
             class _FakePopen:
                 def __init__(self, *a, **k):
                     _popen_calls.append((a, k))
+                def poll(self):
+                    return 0  # already "exited" — reaped cleanly by the next _reap_children()
             _sp9.subprocess.Popen = _FakePopen
+            _sp9.shutil.which = lambda name: f"/fake/{name}"
             _argv = ["claude", "-p", "hi"]
             _launched = _sp9.spawn_in_terminal(_argv, "/tmp", {"X": "1"})
             if not (_popen_calls and _launched and all(a in _launched for a in _argv)):
                 failures.append(f"G-2 spawn_in_terminal seam: argv not execd by the launcher: {_launched}")
         finally:
             _sp9.subprocess.Popen = _real_popen
+            _sp9.shutil.which = _real_which9
 
         # ---- G-6: the dashboard static asset must be PACKAGED (the triple-fallback can otherwise
         #      serve a placeholder on a packaging mistake — assert via the packaged-resource API).
@@ -3771,6 +3778,163 @@ def main():
             _wt22f.join(timeout=2)
     except Exception as e:
         failures.append(f"WP-22 AC-5/AC-6 unit checks errored: {e}")
+
+    # ── WP-22 gate CR (M2) — a torn pending-file read must NOT reset it to [] ──
+    # Tautology: reverted code (read_json_safe peek) destructively resets a torn read to [],
+    # losing the exact messages the recovery lane exists to save.
+    try:
+        from teammate_comms import channel as _ch22g
+        from teammate_comms.comms import get_inboxes_dir as _gid22g, ensure_inbox as _ei22g
+
+        _t22g_root = tempfile.mkdtemp(prefix="tc-22-cr-")
+        _agent22g = "probe22cr"
+        _ix22g = _gid22g(_t22g_root, None)
+        _ei22g(_ix22g, _agent22g)
+        _pending_path22g = _ix22g / f"{_agent22g}_pending.json"
+        _pending_path22g.write_text("{torn", encoding="utf-8")  # simulates a sender mid-write
+
+        _result22g = _ch22g.merge_pending_into_unread(_t22g_root, None, _agent22g)
+        if _result22g is not False:
+            failures.append(f"WP-22 gate CR: merge on a torn pending read should return False "
+                             f"(retry next tick): {_result22g!r}")
+        _after22g = _pending_path22g.read_text(encoding="utf-8")
+        if _after22g != "{torn":
+            failures.append(f"WP-22 gate CR [tautology: a torn pending read must NOT be "
+                             f"rewritten to [] — the recovery lane's whole job is never-lose]: "
+                             f"file now reads {_after22g!r}")
+    except Exception as e:
+        failures.append(f"WP-22 gate CR unit check errored: {e}")
+
+    # ── WP-23 AC-1 (W6) — Windows: TEAMMATE_LAUNCH_ARGS backslash paths survive shlex.split ──
+    try:
+        from teammate_comms import spawn as _sp23a
+        import shlex as _shlex23a
+
+        _prev23a = os.environ.get("TEAMMATE_LAUNCH_ARGS")
+        try:
+            os.environ["TEAMMATE_LAUNCH_ARGS"] = r"claude --foo C:\Users\test"
+            _argv23a = _sp23a.build_claude_command("p")
+            if os.name == "nt":
+                if r"C:\Users\test" not in _argv23a:
+                    failures.append(f"WP-23 AC-1: Windows backslash path corrupted: {_argv23a}")
+                # Tautology setup sanity: posix=True WOULD have corrupted it (the bug this fixes) —
+                # confirms the test actually exercises the vulnerable code shape.
+                _posix_argv23a = _shlex23a.split(os.environ["TEAMMATE_LAUNCH_ARGS"], posix=True)
+                if r"C:\Users\test" in _posix_argv23a:
+                    failures.append("WP-23 AC-1 [tautology setup broken: posix=True did NOT "
+                                     "corrupt the path — this test no longer proves anything]")
+        finally:
+            if _prev23a is None:
+                os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            else:
+                os.environ["TEAMMATE_LAUNCH_ARGS"] = _prev23a
+    except Exception as e:
+        failures.append(f"WP-23 AC-1 unit check errored: {e}")
+
+    # ── WP-23 AC-2 (W5) — _children collects handles; _reap_children drops a finished one ──
+    try:
+        from teammate_comms import spawn as _sp23b
+
+        _proc23b = subprocess.Popen([sys.executable, "-c", "pass"])
+        _sp23b._children.append(_proc23b)
+        _proc23b.wait(timeout=5)
+        _sp23b._reap_children()
+        if _proc23b in _sp23b._children:
+            failures.append("WP-23 AC-2: _reap_children did not drop a finished child handle")
+        try:  # SIGCHLD path: guarded — calling it must never raise, on any OS.
+            _sp23b._ignore_sigchld_once()
+        except Exception as _e23b:
+            failures.append(f"WP-23 AC-2: _ignore_sigchld_once raised: {_e23b}")
+    except Exception as e:
+        failures.append(f"WP-23 AC-2 unit check errored: {e}")
+
+    # ── WP-23 AC-3 (W1) — marketplace resolution: env override → argv + allowlist match ──
+    try:
+        from teammate_comms import spawn as _sp23c
+
+        _prev_mp23c = os.environ.get("TEAMMATE_PLUGIN_MARKETPLACE")
+        try:
+            os.environ["TEAMMATE_PLUGIN_MARKETPLACE"] = "forkco"
+            _argv23c = _sp23c.build_claude_command("p", settings_paths=["/no/such/file.json"])
+            if not any("plugin:teammate-comms@forkco" in a for a in _argv23c):
+                failures.append(f"WP-23 AC-3: argv did not reference the overridden marketplace: {_argv23c}")
+            _d23c = tempfile.mkdtemp()
+            _ms23c = os.path.join(_d23c, "managed-settings.json")
+            with open(_ms23c, "w", encoding="utf-8") as _f23c:
+                json.dump({"channelsEnabled": True,
+                          "allowedChannelPlugins": [{"marketplace": "forkco", "plugin": "teammate-comms"}]},
+                         _f23c)
+            if not _sp23c.channel_allowlisted(settings_paths=[_ms23c]):
+                failures.append("WP-23 AC-3: channel_allowlisted did not match the overridden marketplace")
+        finally:
+            if _prev_mp23c is None:
+                os.environ.pop("TEAMMATE_PLUGIN_MARKETPLACE", None)
+            else:
+                os.environ["TEAMMATE_PLUGIN_MARKETPLACE"] = _prev_mp23c
+        # Unset → current (fallback) behavior byte-identical.
+        _argv23c2 = _sp23c.build_claude_command("p", settings_paths=["/no/such/file.json"])
+        if not any("plugin:teammate-comms@coltondyck" in a for a in _argv23c2):
+            failures.append(f"WP-23 AC-3: unset override should fall back to coltondyck: {_argv23c2}")
+    except Exception as e:
+        failures.append(f"WP-23 AC-3 unit check errored: {e}")
+
+    # ── WP-23 AC-4 (W1) — reincarnate with claude absent from PATH: actionable error, no Popen ──
+    try:
+        from teammate_comms import spawn as _sp23d
+
+        def _no_such_claude23d(name):
+            return None
+
+        def _forbidden_popen23d(*a, **k):
+            raise AssertionError("Popen must not be called when claude is absent from PATH")
+
+        _real_which23d = _sp23d.shutil.which
+        _real_popen23d = _sp23d.subprocess.Popen
+        try:
+            _sp23d.shutil.which = _no_such_claude23d
+            _sp23d.subprocess.Popen = _forbidden_popen23d
+            try:
+                _sp23d.spawn_in_terminal(["claude", "-p", "hi"], "/tmp", {})
+                failures.append("WP-23 AC-4: spawn_in_terminal should raise when claude is absent from PATH")
+            except FileNotFoundError as _e23d:
+                if "claude" not in str(_e23d).lower():
+                    failures.append(f"WP-23 AC-4: error text should name claude/PATH: {_e23d}")
+            except AssertionError as _e23d2:
+                failures.append(f"WP-23 AC-4 [tautology: {_e23d2}]")
+        finally:
+            _sp23d.shutil.which = _real_which23d
+            _sp23d.subprocess.Popen = _real_popen23d
+    except Exception as e:
+        failures.append(f"WP-23 AC-4 unit check errored: {e}")
+
+    # ── WP-23 AC-5 (H4) — whoami includes launch_args_override iff env set ──
+    try:
+        from teammate_comms.tools import _handle_whoami as _hw23e
+
+        class _Ctx23e:
+            def __init__(self, root):
+                self._root = root
+            def snapshot(self):
+                return ("someone23e", None, self._root, None)
+
+        _prev_la23e = os.environ.get("TEAMMATE_LAUNCH_ARGS")
+        try:
+            os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            _ctx23e = _Ctx23e(tempfile.mkdtemp(prefix="tc-23-ac5-"))
+            _out23e_unset = json.loads(_hw23e({}, {"identity": _ctx23e}))
+            if "launch_args_override" in _out23e_unset:
+                failures.append("WP-23 AC-5: launch_args_override present when env unset")
+            os.environ["TEAMMATE_LAUNCH_ARGS"] = "claude --custom"
+            _out23e_set = json.loads(_hw23e({}, {"identity": _ctx23e}))
+            if _out23e_set.get("launch_args_override") != "claude --custom":
+                failures.append(f"WP-23 AC-5: launch_args_override missing/wrong when env set: {_out23e_set}")
+        finally:
+            if _prev_la23e is None:
+                os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            else:
+                os.environ["TEAMMATE_LAUNCH_ARGS"] = _prev_la23e
+    except Exception as e:
+        failures.append(f"WP-23 AC-5 unit check errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

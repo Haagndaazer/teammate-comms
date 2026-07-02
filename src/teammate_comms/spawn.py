@@ -16,8 +16,10 @@ terminal launcher. Design rules:
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from .comms import CommsError
 
@@ -28,10 +30,51 @@ from .comms import CommsError
 # plain --channels flag and NO prompt — so we auto-detect that and prefer it (see
 # channel_allowlisted). $TEAMMATE_LAUNCH_ARGS overrides both, verbatim.
 PLUGIN_NAME = "teammate-comms"
-MARKETPLACE = "coltondyck"
-PLUGIN_SPEC = f"plugin:{PLUGIN_NAME}@{MARKETPLACE}"
-DANGEROUS_LAUNCH_ARGS = f"claude --dangerously-load-development-channels {PLUGIN_SPEC}"
-ALLOWLISTED_LAUNCH_ARGS = f"claude --channels {PLUGIN_SPEC}"
+# Fallback marketplace name when nothing else resolves it (W1) — the ORIGINAL marketplace this
+# plugin shipped from, kept only as a last resort so an unconfigured fork still gets a plausible
+# (if wrong) spec rather than an exception.
+_FALLBACK_MARKETPLACE = "coltondyck"
+
+
+def resolve_marketplace():
+    """Resolve the plugin marketplace name for THIS install (W1), in order:
+    1. ``$TEAMMATE_PLUGIN_MARKETPLACE`` — explicit override, always wins.
+    2. Best-effort derivation from ``$CLAUDE_PLUGIN_ROOT`` (the plugin cache path conventionally
+       contains a ``marketplaces/<name>/...`` segment). Parsed DEFENSIVELY: any doubt falls
+       through to (3) rather than guessing.
+    3. The fallback marketplace this plugin originally shipped from.
+
+    A hardcoded marketplace makes every spawn on a fork/rehost load a nonexistent plugin ref,
+    and the DEVNULL child makes that failure indistinguishable from success — this makes the
+    marketplace configurable and self-detecting instead.
+    """
+    override = os.environ.get("TEAMMATE_PLUGIN_MARKETPLACE")
+    if override and override.strip():
+        return override.strip()
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if plugin_root:
+        try:
+            parts = Path(plugin_root).parts
+            idx = parts.index("marketplaces")
+            candidate = parts[idx + 1]
+            if candidate:
+                return candidate
+        except (ValueError, IndexError):
+            pass  # doesn't match the known cache layout — fall through, never guess
+    return _FALLBACK_MARKETPLACE
+
+
+def plugin_spec():
+    """The ``plugin:<name>@<marketplace>`` spec for THIS install (resolved at call time)."""
+    return f"plugin:{PLUGIN_NAME}@{resolve_marketplace()}"
+
+
+def dangerous_launch_args():
+    return f"claude --dangerously-load-development-channels {plugin_spec()}"
+
+
+def allowlisted_launch_args():
+    return f"claude --channels {plugin_spec()}"
 
 
 def managed_settings_paths():
@@ -53,19 +96,23 @@ def managed_settings_paths():
     return ["/etc/claude-code/managed-settings.json"]
 
 
-def channel_allowlisted(plugin=PLUGIN_NAME, marketplace=MARKETPLACE, settings_paths=None):
+def channel_allowlisted(plugin=PLUGIN_NAME, marketplace=None, settings_paths=None):
     """True iff a managed-settings file marks this channel trusted, so it loads with the
     plain --channels flag (no dangerous flag, no startup prompt).
 
     Trusted = ``channelsEnabled`` truthy AND an ``allowedChannelPlugins`` entry matching this
-    plugin+marketplace. We REQUIRE ``channelsEnabled`` deliberately (do not relax it): if we
-    guess wrong and fall back to the dangerous flag, the channel still loads (maybe a prompt);
-    if we wrongly returned True, the child would launch with --channels but no dangerous flag
-    and the channel might not load at all — the worse failure. So we fail toward the safe flag.
+    plugin+marketplace. ``marketplace`` defaults to ``resolve_marketplace()`` (W1) — resolved
+    at CALL time, not a stale module-level constant, so a fork's env override is honored. We
+    REQUIRE ``channelsEnabled`` deliberately (do not relax it): if we guess wrong and fall back
+    to the dangerous flag, the channel still loads (maybe a prompt); if we wrongly returned
+    True, the child would launch with --channels but no dangerous flag and the channel might
+    not load at all — the worse failure. So we fail toward the safe flag.
 
     Best-effort: a missing/unreadable/malformed file (incl. PermissionError reading a
     Program Files file as non-admin) is skipped → False. utf-8-sig tolerates a Notepad BOM.
     """
+    if marketplace is None:
+        marketplace = resolve_marketplace()
     for path in (settings_paths if settings_paths is not None else managed_settings_paths()):
         try:
             with open(path, encoding="utf-8-sig") as fh:
@@ -87,15 +134,21 @@ def build_claude_command(prompt, extra_args=None, settings_paths=None):
 
     Base = shlex-split of ``$TEAMMATE_LAUNCH_ARGS`` if set (verbatim override), else the
     allowlisted ``--channels`` line when a managed-settings file trusts this channel, else
-    the ``--dangerously-load-development-channels`` line. Then ``--permission-mode
-    bypassPermissions``, then ``extra_args``, then the ``prompt`` as a single trailing
-    element. (No ``--name``: that flag is print-only.)
+    the ``--dangerously-load-development-channels`` line (both built against the RESOLVED
+    marketplace — W1). Then ``--permission-mode bypassPermissions``, then ``extra_args``,
+    then the ``prompt`` as a single trailing element. (No ``--name``: that flag is print-only.)
+
+    W6: ``posix=(os.name != "nt")`` — shlex.split defaults to POSIX quoting rules, which treat
+    backslash as an escape character and silently corrupt an unquoted Windows path
+    (``C:\\Users\\name`` → ``C:Usersname``) in TEAMMATE_LAUNCH_ARGS, in a Windows-first module.
+    Contract on Windows: LAUNCH_ARGS values are whitespace-split and quotes are PRESERVED
+    verbatim (not stripped) — acceptable; the alternative (corrupted paths) is worse.
     """
     base = os.environ.get("TEAMMATE_LAUNCH_ARGS")
     if not base:
-        base = (ALLOWLISTED_LAUNCH_ARGS if channel_allowlisted(settings_paths=settings_paths)
-                else DANGEROUS_LAUNCH_ARGS)
-    argv = shlex.split(base)
+        base = (allowlisted_launch_args() if channel_allowlisted(settings_paths=settings_paths)
+                else dangerous_launch_args())
+    argv = shlex.split(base, posix=(os.name != "nt"))
     argv += ["--permission-mode", "bypassPermissions"]
     if extra_args:
         argv += list(extra_args)
@@ -138,11 +191,57 @@ def build_child_env(base, agent, project_dir, team=None, comms_dir=None, spawned
     return env
 
 
+# W5: Popen handles were never collected, so completed spawn children accumulated as zombies
+# on POSIX for the life of the server (nothing ever waited on them). _children tracks every
+# handle spawn_in_terminal opens; _reap_children drops finished ones each call.
+_children = []
+_sigchld_ignored = False
+
+
+def _reap_children():
+    """Drop finished child handles from ``_children`` (W5). Best-effort: a handle that can't
+    be polled (e.g. a test double standing in for Popen) is dropped rather than raising —
+    reaping is opportunistic cleanup, never load-bearing for the spawn itself."""
+    still_running = []
+    for p in _children:
+        try:
+            if p.poll() is None:
+                still_running.append(p)
+        except Exception:
+            pass
+    _children[:] = still_running
+
+
+def _ignore_sigchld_once():
+    """POSIX only, once per process: ignore SIGCHLD so a spawned child's exit needs no reaping
+    in the first place (belt-and-suspenders with ``_reap_children``). Guarded — signal handlers
+    are only settable from the main thread; spawn is dispatched from the server's main stdin
+    loop, but this is wrapped in try/except anyway so a threading/platform quirk can never
+    break a spawn."""
+    global _sigchld_ignored
+    if _sigchld_ignored or os.name == "nt":
+        return
+    _sigchld_ignored = True
+    try:
+        import signal
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    except Exception:
+        pass
+
+
 def spawn_in_terminal(argv, cwd, env):
     """Open a new terminal window running ``argv`` in ``cwd`` with ``env``, detached, with
     child stdio = DEVNULL. Returns the launched argv for the status message. Raises
-    ``FileNotFoundError`` if no launcher succeeds (e.g. ``claude``/terminal not on PATH).
+    ``FileNotFoundError`` if ``claude`` isn't on PATH (checked BEFORE any Popen — W1) or if no
+    terminal launcher succeeds.
     """
+    _reap_children()
+    _ignore_sigchld_once()
+    if shutil.which("claude") is None:
+        raise FileNotFoundError(
+            "claude CLI not on PATH — the spawned teammate cannot launch. Install it or fix "
+            "PATH before retrying teammate_reincarnate."
+        )
     dn = subprocess.DEVNULL
     cwd = str(cwd)
     if os.name == "nt":
@@ -150,7 +249,8 @@ def spawn_in_terminal(argv, cwd, env):
         # re-parse) and wt is its own top-level process, so the child outlives the server.
         try:
             wt = ["wt.exe", "-d", cwd, "--"] + argv
-            subprocess.Popen(wt, env=env, stdin=dn, stdout=dn, stderr=dn)
+            p = subprocess.Popen(wt, env=env, stdin=dn, stdout=dn, stderr=dn)
+            _children.append(p)
             return wt
         except FileNotFoundError:
             pass
@@ -158,8 +258,9 @@ def spawn_in_terminal(argv, cwd, env):
         # needs a console). CREATE_BREAKAWAY_FROM_JOB guards against a kill-on-close job.
         CREATE_NEW_CONSOLE = 0x00000010
         CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-        subprocess.Popen(argv, cwd=cwd, env=env, stdin=dn, stdout=dn, stderr=dn,
-                         creationflags=CREATE_NEW_CONSOLE | CREATE_BREAKAWAY_FROM_JOB)
+        p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=dn, stdout=dn, stderr=dn,
+                             creationflags=CREATE_NEW_CONSOLE | CREATE_BREAKAWAY_FROM_JOB)
+        _children.append(p)
         return argv
     # POSIX best-effort: try terminal emulators, each exec'ing argv directly (list-form).
     candidates = [
@@ -171,8 +272,9 @@ def spawn_in_terminal(argv, cwd, env):
     last = None
     for cand in candidates:
         try:
-            subprocess.Popen(cand, cwd=cwd, env=env, stdin=dn, stdout=dn, stderr=dn,
-                             start_new_session=True)
+            p = subprocess.Popen(cand, cwd=cwd, env=env, stdin=dn, stdout=dn, stderr=dn,
+                                 start_new_session=True)
+            _children.append(p)
             return cand
         except FileNotFoundError as e:
             last = e

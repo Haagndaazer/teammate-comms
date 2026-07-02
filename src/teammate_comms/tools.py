@@ -988,6 +988,10 @@ def _handle_whoami(args, ctx):
     }
     if record.get("spawned_by"):
         info["spawned_by"] = record["spawned_by"]  # F-5 provenance breadcrumb, surfaced here
+    if os.environ.get("TEAMMATE_LAUNCH_ARGS"):
+        # H4: a launch override silently bypasses allowlist detection and inherits down the
+        # reincarnation chain forever — surface it so it's never invisible in whoami.
+        info["launch_args_override"] = os.environ["TEAMMATE_LAUNCH_ARGS"]
     if verbose:
         info["doctor"] = _doctor_report(root, team)   # G-5
     return json.dumps(info, indent=2, ensure_ascii=False)
@@ -1623,6 +1627,18 @@ def _handle_reincarnate(args, ctx):
         raise CommsError(f"Could not launch a terminal/claude: {e}")
     except OSError as e:
         raise CommsError(f"Spawn failed: {e}")
+    # W1: name the exact plugin spec used, so a fork/rehost operator can tell at a glance
+    # whether the marketplace resolved correctly (and how to fix it if not).
+    override_note = ""
+    if os.environ.get("TEAMMATE_LAUNCH_ARGS"):
+        # H4: TEAMMATE_LAUNCH_ARGS bypasses the plugin-spec/allowlist entirely — say so.
+        override_note = "\nLaunch override active (TEAMMATE_LAUNCH_ARGS) — allowlist detection bypassed."
+    else:
+        override_note = (
+            f"\nLaunched with plugin spec {spawn.plugin_spec()!r}. A fork/rehost that needs a "
+            f"different marketplace should set TEAMMATE_PLUGIN_MARKETPLACE or "
+            f"TEAMMATE_LAUNCH_ARGS."
+        )
     return (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
         f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "
@@ -1631,7 +1647,7 @@ def _handle_reincarnate(args, ctx):
         f"no-click context it may never register, which looks identical to success here. Verify "
         f"with teammate_list: {target} appears once it's live; if it hasn't after ~30s, check the "
         f"new window."
-    )
+    ) + override_note
 
 
 def _handle_dashboard(args, ctx):
