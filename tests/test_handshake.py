@@ -448,21 +448,30 @@ def main():
     # AC-1: malformed non-dict frames (null, a bare scalar, a JSON-RPC batch array — batching
     # is unsupported here) must not kill the server; a subsequent request (id 64) still answers.
     # ids 63/64/65 are free (out-of-sequence ids are fine; by_id is order-independent).
-    send_raw(proc, "null")
-    send_raw(proc, '"scalar"')
-    send_raw(proc, json.dumps([{"jsonrpc": "2.0", "id": 63, "method": "ping"}]))
-    time.sleep(0.4)
-    send(proc, {"jsonrpc": "2.0", "id": 64, "method": "ping"})
-    time.sleep(0.4)
-    # AC-2: a mid-session re-initialize with a bogus protocolVersion must be answered with OUR
-    # version (non-echo) — the FIRST initialize (id 1) can't prove this since the harness sent
-    # the same version we'd answer regardless.
-    send(proc, {"jsonrpc": "2.0", "id": 65, "method": "initialize",
-                "params": {"protocolVersion": "1999-01-01", "capabilities": {}}})
-    time.sleep(0.4)
-    # AC-3: a notification-form ping (no id) must produce NO response frame.
-    send(proc, {"jsonrpc": "2.0", "method": "ping"})
-    time.sleep(0.4)
+    # Crash-tolerant (gate micro-CR): if server.py regresses on S1, the server actually dies and
+    # writing to its closed stdin raises OSError — uncaught, that would abort this WHOLE script
+    # before any FAIL prints, so a real S1 regression would read as harness flakiness instead of
+    # a named failure. Catch it here, record the specific reason, and let the run finish so every
+    # other id's assertion still reports.
+    wp16_frame_error = None
+    try:
+        send_raw(proc, "null")
+        send_raw(proc, '"scalar"')
+        send_raw(proc, json.dumps([{"jsonrpc": "2.0", "id": 63, "method": "ping"}]))
+        time.sleep(0.4)
+        send(proc, {"jsonrpc": "2.0", "id": 64, "method": "ping"})
+        time.sleep(0.4)
+        # AC-2: a mid-session re-initialize with a bogus protocolVersion must be answered with
+        # OUR version (non-echo) — the FIRST initialize (id 1) can't prove this since the
+        # harness sent the same version we'd answer regardless.
+        send(proc, {"jsonrpc": "2.0", "id": 65, "method": "initialize",
+                    "params": {"protocolVersion": "1999-01-01", "capabilities": {}}})
+        time.sleep(0.4)
+        # AC-3: a notification-form ping (no id) must produce NO response frame.
+        send(proc, {"jsonrpc": "2.0", "method": "ping"})
+        time.sleep(0.4)
+    except OSError as e:
+        wp16_frame_error = str(e)
 
     proc.stdin.close()
     try:
@@ -524,6 +533,11 @@ def main():
         if "authority over the areas" not in _instr_l or "before you modify" not in _instr_l:
             failures.append(f"initialize instructions missing the authority-coordination rule (WP-10): {instr[:120]!r}")
 
+    # WP-16 gate micro-CR: the pipe block itself hit an OSError (server died mid-block) —
+    # report this FIRST and specifically, since it explains why the AC-1/2/3 checks below fail.
+    if wp16_frame_error:
+        failures.append(f"WP-16: server died on a malformed frame — S1 envelope-guard regression "
+                         f"(write failed: {wp16_frame_error})")
     # WP-16 AC-1: a malformed non-dict frame (null / bare scalar / batch array) must not kill
     # the server — assert the SPECIFIC reason (a -32600 frame emitted, id 64 still answered),
     # not just "something didn't throw" (a dead server would silently fail both checks below).

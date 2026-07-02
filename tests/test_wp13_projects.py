@@ -408,7 +408,7 @@ def run_server_tests():
     global _stdout_lines, _stderr_lines, _by_id
     _stdout_lines, _stderr_lines, _by_id = [], [], {}
 
-    with tempfile.TemporaryDirectory(prefix="tc-wp13-", dir="C:/cctmp") as tmp:
+    with tempfile.TemporaryDirectory(prefix="tc-wp13-") as tmp:
         env = os.environ.copy()
         env["TEAMMATE_COMMS_DIR"] = tmp
         env["PYTHONIOENCODING"] = "utf-8"
@@ -634,6 +634,8 @@ def run_server_tests():
 # ── Version sync (AC-9 companion) ────────────────────────────────────────
 
 def test_version_sync():
+    """__init__.py, pyproject.toml, and plugin.json all declare the SAME version — never a
+    hardcoded literal here (WP-18 Q3: a stale literal is the drift-guard-that-drifted bug)."""
     pkg = None
     init = REPO / "src" / "teammate_comms" / "__init__.py"
     text = init.read_text(encoding="utf-8")
@@ -646,9 +648,9 @@ def test_version_sync():
     m2 = re.search(r'^version\s*=\s*"([^"]+)"', pyp_text, re.MULTILINE)
     pyp = m2.group(1) if m2 else None
     check(
-        pkg == plug == pyp == "0.10.0",
+        pkg is not None and pkg == plug == pyp,
         f"tautology[version-sync]: version drift — pkg={pkg}, plugin={plug}, pyproject={pyp}; "
-        "all three must be 0.10.0 for v0.10.0 release"
+        "all three files must declare the same version"
     )
 
 

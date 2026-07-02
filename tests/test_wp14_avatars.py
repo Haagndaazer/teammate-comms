@@ -30,6 +30,13 @@ from pathlib import Path
 
 _failures = []
 _passes = 0
+_skips = []
+
+try:
+    import PIL  # noqa: F401
+    _HAS_PILLOW = True
+except ImportError:
+    _HAS_PILLOW = False
 
 
 def check(cond, msg):
@@ -38,6 +45,12 @@ def check(cond, msg):
         _passes += 1
     else:
         _failures.append(msg)
+
+
+def skip(msg):
+    """Record a Pillow-absent skip — informational only, never counted as a FAIL. CI syncs no
+    extras, so these tests must stay green (not red) when Pillow isn't installed."""
+    _skips.append(msg)
 
 
 def check_raises(fn, msg):
@@ -71,11 +84,10 @@ def _make_comms_root():
 
 def test_ac1_square_ingest_and_clear():
     """AC-1: square 64×64 PNG ingested → 256×256 sidecar; avatar.hash set; clear removes all."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-1 skipped: Pillow not installed (install teammate-comms[images])")
+    if not _HAS_PILLOW:
+        skip("AC-1 skipped: Pillow not installed (install teammate-comms[images])")
         return
+    from PIL import Image
 
     from teammate_comms.comms import (
         get_avatars_dir, read_agent_record, write_agent_record,
@@ -143,11 +155,10 @@ def test_ac1_square_ingest_and_clear():
 
 def test_ac2_non_square_pad():
     """AC-2: wide 200×50 PNG → 256×256; side strips are black (padding)."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-2 skipped: Pillow not installed")
+    if not _HAS_PILLOW:
+        skip("AC-2 skipped: Pillow not installed (install teammate-comms[images])")
         return
+    from PIL import Image
 
     from teammate_comms.comms import get_avatars_dir, write_agent_record
     from teammate_comms.avatars import ingest_avatar
@@ -230,10 +241,8 @@ def test_ac3_zero_dep():
 
 def test_ac4_avatar_http_route():
     """AC-4: /avatar serves PNG with correct Content-Type+ETag; bad token 401; unknown 404; traversal 422."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-4 skipped: Pillow not installed")
+    if not _HAS_PILLOW:
+        skip("AC-4 skipped: Pillow not installed (install teammate-comms[images])")
         return
 
     import threading
@@ -293,10 +302,8 @@ def test_ac4_avatar_http_route():
 
 def test_ac5_api_and_frontend():
     """AC-5: roster row has avatar hash; navItem renders img; CSP allows img-src 'self'."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-5 skipped: Pillow not installed")
+    if not _HAS_PILLOW:
+        skip("AC-5 skipped: Pillow not installed (install teammate-comms[images])")
         return
 
     from teammate_comms.comms import (
@@ -436,23 +443,28 @@ def test_ac7_tautology_summary():
 # ── AC-8: version sync ────────────────────────────────────────────────────────
 
 def test_ac8_version_sync():
-    """AC-8: version is 0.10.0 across __init__.py, pyproject.toml, and plugin.json."""
+    """AC-8: __init__.py, pyproject.toml, and plugin.json all declare the SAME version (never a
+    hardcoded literal here — a version bump must not require touching this test, and a stale
+    literal is exactly the drift-guard-that-drifted bug this replaces, WP-18 Q3)."""
+    import re
     import teammate_comms
-    check(teammate_comms.__version__ == "0.10.0",
-          f"AC-8 [tautology: __version__ must be 0.10.0 for WP-14; got {teammate_comms.__version__!r}]")
+    pkg = teammate_comms.__version__
 
     pyproject = Path(__file__).parent.parent / "pyproject.toml"
-    check('version = "0.10.0"' in pyproject.read_text(),
-          "AC-8 [tautology: pyproject.toml must declare version 0.10.0]")
+    pyp_text = pyproject.read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', pyp_text, re.MULTILINE)
+    pyp = m.group(1) if m else None
+    check(pyp is not None and pyp == pkg,
+          f"AC-8 [tautology: pyproject.toml version ({pyp!r}) must match __init__.py ({pkg!r})]")
 
     plugin_json = Path(__file__).parent.parent / ".claude-plugin" / "plugin.json"
     pdata = json.loads(plugin_json.read_text())
-    check(pdata.get("version") == "0.10.0",
-          f"AC-8 [tautology: plugin.json must declare version 0.10.0; got {pdata.get('version')!r}]")
+    plug = pdata.get("version")
+    check(plug == pkg,
+          f"AC-8 [tautology: plugin.json version ({plug!r}) must match __init__.py ({pkg!r})]")
 
     # [images] extra must exist in pyproject.toml
-    check("[project.optional-dependencies]" in pyproject.read_text() and
-          "Pillow" in pyproject.read_text(),
+    check("[project.optional-dependencies]" in pyp_text and "Pillow" in pyp_text,
           "AC-8 [tautology: pyproject.toml must declare [images] extra with Pillow>=10]")
 
 
@@ -475,7 +487,9 @@ def main():
         except Exception as exc:
             _failures.append(f"{t.__name__} raised unexpectedly: {exc}")
 
-    print(f"\nWP-14 avatar tests: {_passes} passed, {len(_failures)} failed")
+    print(f"\nWP-14 avatar tests: {_passes} passed, {len(_failures)} failed, {len(_skips)} skipped")
+    for s in _skips:
+        print(f"  SKIP: {s}")
     for f in _failures:
         print(f"  FAIL: {f}")
     if _failures:
