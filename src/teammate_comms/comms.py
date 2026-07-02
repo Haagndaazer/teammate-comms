@@ -13,6 +13,7 @@ changes for the plugin/MCP-server context:
    a tool error, never tear down the whole process.
 """
 
+import itertools
 import json
 import os
 import re
@@ -71,17 +72,120 @@ def now_timestamp():
     return datetime.now().strftime(TIMESTAMP_FMT)
 
 
-def validate_agent_name(name):
+# Per-process monotonic counter feeding new_message_id's disambiguator (B3).
+_id_counter = itertools.count()
+
+
+def new_message_id():
+    """Generate a message id: ``now_timestamp() + "." + <disambiguator>`` (B3).
+
+    Bare microsecond timestamps collide: two writers (or two calls in the SAME process
+    within one microsecond — exactly the scenario ``_window``'s docstring dismisses as
+    already handled) stamping the same value produce two records sharing ONE id. The
+    dashboard's global per-id dedup then silently drops one of them, and every id-keyed
+    consumer (ack, react, delete, cursors) becomes ambiguous about which record it means.
+
+    The disambiguator is ``pid + a per-process monotonic counter`` (both hex, compact):
+    pid alone isn't enough (same-process same-microsecond IS the collision above); a bare
+    counter alone isn't enough across process restarts (could repeat from zero). Hostname
+    is deliberately NOT included (too long for a per-message id) — a pid+timestamp collision
+    across two DIFFERENT hosts within the same microsecond is an accepted residual risk (see
+    the C4 note in DESIGN §storage: this disambiguator guarantees UNIQUENESS, not global
+    cross-host ORDER — ids order by each writer's local clock, and cross-host ordering is
+    only as good as clock sync between hosts).
+
+    Lexical ordering is preserved for a mixed old/new id population: for two ids sharing the
+    SAME timestamp prefix, the suffixed one sorts textually AFTER the bare (unsuffixed)
+    timestamp of that same value — a strict string prefix always sorts as "less than" its
+    own extension. Every comparison in this codebase is ``>=``/``max`` on strings, so this
+    holds everywhere without a migration: old bare ids and new suffixed ids coexist forever,
+    do not rewrite stored ids to "fix" this.
+    """
+    return f"{now_timestamp()}.{os.getpid():x}{next(_id_counter):x}"
+
+
+# Windows reserved device names (G5) — checked on EVERY OS, not just Windows: a shared comms
+# root can be read/written from Windows regardless of which OS created a given name, so a name
+# that's fine on Linux but reserved on Windows must be rejected everywhere up front rather than
+# failing opaquely later at file/lock creation on whichever host happens to touch it.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _check_reserved_name(value, label):
+    """Raise CommsError if ``value``'s FIRST dot-segment, lower-cased, is a Windows reserved
+    device name (con/prn/aux/nul/com1-9/lpt1-9) — e.g. "con" and "con.helper" are rejected,
+    "console" and "con-bot" are fine (G5)."""
+    first_segment = value.split(".", 1)[0].lower()
+    if first_segment in _WINDOWS_RESERVED_NAMES:
+        raise CommsError(
+            f"{label} {value!r} is a reserved device name on Windows ({first_segment!r}) — "
+            f"pick a different name."
+        )
+
+
+def find_case_variant(root, team, name):
+    """Return the exact spelling of an EXISTING agent/human record whose name matches
+    ``name`` case-insensitively but differs in case, or None (G2).
+
+    A shared comms root behaves differently by OS: Windows's case-insensitive filesystem
+    would silently MERGE "Bob" and "bob" into one record, while Linux's case-sensitive
+    filesystem SPLITS them into two shadow identities that never see each other — same root,
+    opposite failure modes, neither detected. Rejecting the collision at register time (the
+    caller raises using the returned spelling) means the retry self-corrects instead.
+    """
+    agents_dir = get_agents_dir(root, team)
+    if not agents_dir.exists():
+        return None
+    lname = name.lower()
+    for path in agents_dir.glob("*.json"):
+        existing = path.stem
+        if existing != name and existing.lower() == lname:
+            return existing
+    return None
+
+
+def find_group_case_variant(root, team, group):
+    """Return the exact spelling of an EXISTING group whose name matches ``group``
+    case-insensitively but differs in case, or None (G2 — checked at group CREATE only; open
+    membership means member names stay free-form addresses, not identities)."""
+    groups_dir = get_groups_dir(root, team)
+    if not groups_dir.exists():
+        return None
+    lname = group.lower()
+    for path in groups_dir.iterdir():
+        if not path.is_dir():
+            continue
+        existing = path.name
+        if existing != group and existing.lower() == lname:
+            return existing
+    return None
+
+
+def validate_agent_name(name, param=None):
     """Validate an agent name; raise CommsError on anything unsafe.
 
     Does NOT call sys.exit — a bad ``to``/``agent`` argument from a tool call
     must not kill the long-lived server.
+
+    N9: ``param``, if given, names the CALLER's own argument (``"to"``, ``"agent"``,
+    ``"members[0]"``...). When ``name`` is None/empty AND ``param`` is given, the error
+    reads "'<param>' is required (a teammate name)." instead of the generic-and-confusing
+    "Invalid agent name None ..." — a value that fails validation for any OTHER reason
+    (bad characters, reserved, non-None-but-still-falsy with no param) keeps the original
+    wording unchanged.
     """
+    if not name and param:
+        raise CommsError(f"'{param}' is required (a teammate name).")
     if not isinstance(name, str) or not AGENT_NAME_PATTERN.match(name) or ".." in name:
         raise CommsError(
             f"Invalid agent name {name!r}. Use alphanumerics, hyphens, "
             f"underscores, and dots only (no path separators)."
         )
+    _check_reserved_name(name, "Agent name")
 
 
 def validate_profile_field(name, value):
@@ -161,6 +265,8 @@ def validate_project_key(value):
         raise CommsError(
             f"Project key exceeds 100 characters after normalization ({len(normalized)} chars)."
         )
+    for segment in normalized.split("/"):
+        _check_reserved_name(segment, "Project key segment")  # G5, per "/"-component
     return normalized
 
 
@@ -191,14 +297,19 @@ def validate_project_field(name, value):
     return collapsed
 
 
-def validate_group_name(name):
+def validate_group_name(name, param=None):
     """Validate a group name (with or without a leading ``#``); return the clean name.
 
     Groups are addressed with a ``#`` sigil (``teammate_send(to="#design")``) so they
     occupy a separate namespace from agents and can never collide. The stored name and
     on-disk paths use the clean (sigil-stripped) form. Raises CommsError on anything
     unsafe — same character set as an agent name.
+
+    N9: ``param``, if given, names the CALLER's own argument — see ``validate_agent_name``'s
+    docstring for the same None/empty-vs-generic-error rationale.
     """
+    if not name and param:
+        raise CommsError(f"'{param}' is required (a group name).")
     if not isinstance(name, str):
         raise CommsError(f"Invalid group name {name!r}.")
     clean = name[1:] if name.startswith("#") else name
@@ -207,6 +318,7 @@ def validate_group_name(name):
             f"Invalid group name {name!r}. Use alphanumerics, hyphens, underscores, "
             f"and dots only (an optional leading '#' is allowed)."
         )
+    _check_reserved_name(clean, "Group name")
     return clean
 
 
@@ -398,26 +510,62 @@ def write_group_meta(root, team, group, meta):
     write_json_atomic(group_dir / "meta.json", meta)
 
 
-def read_group_messages(root, team, group):
-    """Read a group's transcript (``messages.json``) non-destructively; [] if absent.
+def _read_jsonl_records(path):
+    """Read a JSONL file into a list of records; [] if absent. A malformed line is skipped
+    (never raises) — matches ``read_json_readonly``'s never-mistake-a-partial-write-for-
+    corruption stance, extended to a line-oriented format."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except (FileNotFoundError, OSError):
+        pass
+    return out
 
-    Uses ``read_json_readonly`` (NOT read_json_safe) so a concurrent partial write is
-    never mistaken for corruption and the shared transcript is never reset to []. A
-    None (unreadable mid-write) is surfaced as [] to the caller for display.
+
+def _write_jsonl_records(path, records):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def read_group_messages(root, team, group):
+    """Read a group's transcript non-destructively; [] if absent (C3).
+
+    Reads BOTH stores, legacy-first (strictly older, so ordering is preserved): the full-array
+    ``messages.json`` (via ``read_json_readonly`` — a concurrent partial write is never
+    mistaken for corruption and reset) plus the newer NDJSON ``messages.jsonl`` (one record per
+    line, appended in O(1) instead of a read-modify-rewrite of the whole file on every post).
+    No migration: legacy files are read indefinitely, never rewritten to jsonl.
     """
-    msgs = read_json_readonly(get_group_dir(root, team, group) / "messages.json")
-    return msgs if isinstance(msgs, list) else []
+    group_dir = get_group_dir(root, team, group)
+    legacy = read_json_readonly(group_dir / "messages.json")
+    out = list(legacy) if isinstance(legacy, list) else []
+    out.extend(_read_jsonl_records(group_dir / "messages.jsonl"))
+    return out
 
 
 def append_group_message(root, team, group, record, timeout=10):
-    """Append one record to a group's transcript under a lock (atomic write)."""
+    """Append one record to a group's transcript (C3): O(1) NDJSON append, not a full
+    read-modify-rewrite. Locked under ``messages.json``'s lock PATH (kept as-is, even though
+    the write now targets ``messages.jsonl``) so a writer of either store still serializes
+    against the other — same lock, two stores."""
     group_dir = get_group_dir(root, team, group)
     group_dir.mkdir(parents=True, exist_ok=True)
-    messages_file = group_dir / "messages.json"
+    messages_file = group_dir / "messages.json"  # lock path only
+    jsonl_path = group_dir / "messages.jsonl"
     with file_lock(messages_file, timeout=timeout):
-        messages = read_group_messages(root, team, group)
-        messages.append(record)
-        write_json_atomic(messages_file, messages)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def delete_group(root, team, group):
@@ -732,14 +880,23 @@ def tombstone_in_inbox(root, team, member, msg_id, deleted_by):
 
 
 def tombstone_in_group_messages(root, team, group, msg_id, deleted_by):
-    """Tombstone a message (by id) in ``groups/<group>/messages.json`` under its lock."""
-    messages_file = get_group_dir(root, team, group) / "messages.json"
+    """Tombstone a message (by id) in EITHER store — legacy ``messages.json`` or the newer
+    ``messages.jsonl`` (C3) — under ``messages.json``'s lock. Tombstones are rare, so rewriting
+    the whole jsonl file here (O(n)) is fine; the O(1) append path is only for normal posts."""
+    group_dir = get_group_dir(root, team, group)
+    messages_file = group_dir / "messages.json"
+    jsonl_path = group_dir / "messages.jsonl"
     with file_lock(messages_file):
-        messages = read_group_messages(root, team, group)
-        if _apply_tombstone(messages, msg_id, deleted_by):
-            write_json_atomic(messages_file, messages)
-            return True
-    return False
+        found = False
+        legacy = read_json_readonly(messages_file)
+        if isinstance(legacy, list) and _apply_tombstone(legacy, msg_id, deleted_by):
+            write_json_atomic(messages_file, legacy)
+            found = True
+        jsonl_records = _read_jsonl_records(jsonl_path)
+        if jsonl_records and _apply_tombstone(jsonl_records, msg_id, deleted_by):
+            _write_jsonl_records(jsonl_path, jsonl_records)
+            found = True
+        return found
 
 
 def remove_group_messages_from_inbox(root, team, member, sigil):
@@ -764,17 +921,58 @@ def remove_group_messages_from_inbox(root, team, member, sigil):
                 write_json_atomic(f, kept)
 
 
-def remove_agent(root, team, name):
-    """Hard-delete an agent's registry record + inbox files (best-effort, never raises)."""
+def remove_agent(root, team, name, timeout=2):
+    """Locked, VERIFIED hard-delete of an agent's registry record + inbox files (audit I3).
+
+    Returns the list of file paths that could NOT be removed (empty = full success) instead of
+    swallowing every OSError — the old best-effort unlink let a Windows sharing violation
+    (e.g. a concurrent heartbeat write) silently no-op the deletion while the caller reported
+    unconditional success. The registry record is unlinked under its own ``file_lock`` (so a
+    concurrent writer can never be mid-write when we check); the two inbox files share the
+    unread file's lock, same as ``tombstone_in_inbox``. A short ``timeout`` (not the 10s
+    default) keeps a genuinely-contended delete from hanging — a real delete should acquire
+    near-instantly; a held lock past that IS the reportable failure.
+    D2: also unlinks avatar sidecars (``avatars/<name>.{png,ansi,txt}``) — they must not
+    survive teammate removal, or a name-reuser would inherit a stranger's image via a direct
+    ``/avatar`` URL.
+    """
     agents_dir = get_agents_dir(root, team)
     inboxes_dir = get_inboxes_dir(root, team)
-    for path in (agents_dir / f"{name}.json",
-                 inboxes_dir / f"{name}_unread.json",
-                 inboxes_dir / f"{name}_read.json"):
+    avatars_dir = get_avatars_dir(root, team)
+    record_path = agents_dir / f"{name}.json"
+    unread_file = inboxes_dir / f"{name}_unread.json"
+    read_file = inboxes_dir / f"{name}_read.json"
+    failed = []
+
+    def _unlink(path):
         try:
             path.unlink()
+        except FileNotFoundError:
+            pass  # already gone — not a failure, the goal (absent) is already met
         except OSError:
-            pass  # already gone / locked — best-effort, matches the codebase style
+            failed.append(str(path))
+
+    try:
+        with file_lock(record_path, timeout=timeout):
+            _unlink(record_path)
+    except CommsError:
+        failed.append(str(record_path))  # lock contended past timeout — reported, not swallowed
+
+    try:
+        with file_lock(unread_file, timeout=timeout):
+            _unlink(unread_file)
+            _unlink(read_file)
+    except CommsError:
+        failed.append(str(unread_file))
+        failed.append(str(read_file))
+
+    # D2: no dedicated lock exists for avatar sidecars (ingest_avatar's own clear path unlinks
+    # them unlocked too) — best-effort, reported like every other path here rather than
+    # swallowed.
+    for ext in ("png", "ansi", "txt"):
+        _unlink(avatars_dir / f"{name}.{ext}")
+
+    return failed
 
 
 def strip_member_from_groups(root, team, name):
@@ -798,15 +996,28 @@ def strip_member_from_groups(root, team, name):
     return removed_from
 
 
-def write_agent_record(root, team, name, timeout=5, **fields):
+def write_agent_record(root, team, name, timeout=5, bump_epoch=False, **fields):
     """Field-level merge of ``fields`` into ``agents/<name>.json`` under a lock.
 
     Only provided keys are overwritten; existing keys are preserved, so the
     register-owned ``type`` and the channel-owned ``pid``/``channel``/
-    ``lastHeartbeat`` coexist. Returns True if written.
+    ``lastHeartbeat`` coexist. Returns the MERGED RECORD DICT just written (never empty — it
+    always carries at least ``name``, so it's truthy) on success, or False on failure. Every
+    caller does a plain truthiness check (``if not write_agent_record(...)``), so this is a
+    drop-in-compatible upgrade — but a caller that needs a freshly-written field's value (e.g.
+    an atomically-computed epoch) can now read it straight off the return, with NO separate
+    read-back needed (a read-back is a fresh race window: see ``bump_epoch`` below).
 
     Hardening: if the record file *exists* but currently reads as None (a
     concurrent mid-write), skip this write instead of clobbering ``type``.
+
+    ``bump_epoch=True`` (WP-19, register-time only) computes ``fields["epoch"]`` from the
+    CURRENT on-disk record's epoch (previous + 1, absent → 1) under THIS SAME lock/read — the
+    only race-free way to hand out a monotonic epoch when two callers might register the same
+    name at once (any literal ``epoch`` passed in ``fields`` is overridden). A caller MUST take
+    its own epoch from this call's RETURN VALUE, never from a subsequent read-back — a
+    read-back is unlocked and can observe a LATER competing register's epoch instead of its
+    own (the exact flap this WP's epoch tie-break exists to kill; gate finding on WP-19).
     """
     agents_dir = get_agents_dir(root, team)
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -819,10 +1030,13 @@ def write_agent_record(root, team, name, timeout=5, **fields):
             return False
         if not isinstance(record, dict):
             record = {}
+        if bump_epoch:
+            fields = dict(fields)
+            fields["epoch"] = (record.get("epoch") or 0) + 1
         record["name"] = name
         record.update(fields)
         write_json_atomic(record_path, record)
-        return True
+        return record
 
 
 def read_agent_record(root, team, name):
@@ -857,7 +1071,25 @@ def _pid_alive(pid):
     return True
 
 
-def is_channel_alive(record, staleness=30, pid_check=True):
+# Default heartbeat-freshness window (seconds) — single source of truth shared by
+# is_channel_alive's cross-host fallback and the WP-19 flap-kill decision
+# (compute_heartbeat_permit in channel.py), so both agree on what "fresh" means.
+HEARTBEAT_STALENESS_SECONDS = 30
+
+
+def heartbeat_fresh(hb, now, staleness=HEARTBEAT_STALENESS_SECONDS):
+    """True if a ``lastHeartbeat`` timestamp string is within ``staleness`` seconds of ``now``
+    (a real ``datetime`` — injected, never read internally, so callers can test this pure)."""
+    if not hb:
+        return False
+    try:
+        last = datetime.strptime(hb, TIMESTAMP_FMT)
+    except (ValueError, TypeError):
+        return False
+    return (now - last).total_seconds() <= staleness
+
+
+def is_channel_alive(record, staleness=HEARTBEAT_STALENESS_SECONDS, pid_check=True):
     """Decide whether an agent's channel server is currently running.
 
     Same host with ``pid_check=True``: authoritative pid liveness (no staleness
@@ -873,14 +1105,7 @@ def is_channel_alive(record, staleness=30, pid_check=True):
             alive = _pid_alive(record.get("pid"))
             if alive is not None:
                 return alive
-    hb = record.get("lastHeartbeat")
-    if not hb:
-        return False
-    try:
-        last = datetime.strptime(hb, TIMESTAMP_FMT)
-    except (ValueError, TypeError):
-        return False
-    return (datetime.now() - last).total_seconds() <= staleness
+    return heartbeat_fresh(record.get("lastHeartbeat"), datetime.now(), staleness)
 
 
 # ── Human-as-teammate + observability transcript ────────────────────────────────
@@ -893,24 +1118,69 @@ def is_channel_alive(record, staleness=30, pid_check=True):
 # is_channel_alive). The human is reachable by flat name like any other teammate.
 
 
+# Presence counts as "online" only while presenceAt is within this many seconds of now (B1).
+# Back-compat: a record with NO presenceAt key (pre-WP-21) trusts the flat `presence` flag as-is
+# — see human_presence_online.
+PRESENCE_STALENESS_SECONDS = 60
+
+
+def human_presence_online(record, staleness=PRESENCE_STALENESS_SECONDS):
+    """True if a human record should render as online (B1: a flat presence flag, set once at
+    dashboard start and only ever flipped by a GRACEFUL shutdown, stays "online" forever if the
+    terminal is killed). ``presence == "online"`` counts only while ``presenceAt`` is fresh.
+
+    Back-compat (mandatory): a record with NO ``presenceAt`` key trusts the flag as-is — a
+    pre-WP-21 record must not flip to "away" the moment this ships.
+    """
+    if not record or record.get("presence") != "online":
+        return False
+    presence_at = record.get("presenceAt")
+    if not presence_at:
+        return True  # back-compat: no presenceAt yet — trust the flag
+    return heartbeat_fresh(presence_at, datetime.now(), staleness)
+
+
 def register_human(root, team, name):
     """Register a human operator as a teammate record (type="human") with an inbox.
 
     Additive over write_agent_record's field-merge: no pid, no channel — so the
     human is never a wakeable channel and never collides with a live agent of the
     same name. Idempotent (re-register just refreshes presence/host).
+
+    G2: raises if an existing record's name matches ``name`` case-insensitively but differs
+    in case — an exact re-register is unaffected (idempotent).
     """
     validate_agent_name(name)
+    existing_variant = find_case_variant(root, team, name)
+    if existing_variant:
+        raise CommsError(
+            f"A teammate is already registered as {existing_variant!r} — register with that "
+            f"exact spelling, or pick a distinct name."
+        )
     ensure_inbox(get_inboxes_dir(root, team), name)
     write_agent_record(
         root, team, name,
         type="human", host=socket.gethostname(),
         startedAt=now_timestamp(), presence="online",
+        # B1: presenceAt + dashboard_pid let presence be verified as fresh (human_presence_online)
+        # instead of trusted as a flat flag forever, and let shutdown's clobber guard (below)
+        # identify which dashboard process actually owns this "online" stamp.
+        presenceAt=now_timestamp(), dashboard_pid=os.getpid(),
     )
 
 
-def set_human_presence(root, team, name, state):
-    """Merge a presence marker ("online"/"away") into a human's record. Best-effort."""
+def set_human_presence(root, team, name, state, owner_pid=None):
+    """Merge a presence marker ("online"/"away") into a human's record. Best-effort.
+
+    ``owner_pid`` (B1 clobber guard): when given, the write is SKIPPED unless the record's
+    CURRENT ``dashboard_pid`` matches it — read-before-write, same best-effort discipline
+    ``write_agent_record`` already has. Without this, a SECOND dashboard's shutdown could mark
+    the FIRST (still-live) operator away just because they share a human name.
+    """
+    if owner_pid is not None:
+        record = read_agent_record(root, team, name)
+        if not record or record.get("dashboard_pid") != owner_pid:
+            return
     write_agent_record(root, team, name, presence=state)
 
 
@@ -921,6 +1191,11 @@ def group_read_positions(root, team, group, members):
     change). For each member, returns the max id among their read messages tagged with
     this group's sigil — an ack/seen upper bound (gaps possible), groups-only. Returns
     ``{member: id_or_None}``; reads are non-destructive.
+
+    M5: records tagged ``acked_unseen`` (drained by ack("all")'s cold-start path, or moved by
+    the T2 unread cap — neither was ever actually SEEN) are EXCLUDED from the max-id inference
+    — counting them would be a false read-receipt. See ``group_read_has_unseen_acks`` for the
+    companion "some positions used tagged records" signal.
     """
     sigil = group if str(group).startswith("#") else f"#{group}"
     inboxes_dir = get_inboxes_dir(root, team)
@@ -928,9 +1203,24 @@ def group_read_positions(root, team, group, members):
     for member in members:
         msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
         ids = [m.get("id") for m in msgs
-               if isinstance(m, dict) and m.get("group") == sigil and m.get("id")]
+               if isinstance(m, dict) and m.get("group") == sigil and m.get("id")
+               and not m.get("acked_unseen")]
         positions[member] = max(ids) if ids else None
     return positions
+
+
+def group_read_has_unseen_acks(root, team, group, members):
+    """True if ANY member's ``_read.json`` holds an ``acked_unseen`` record for this group
+    (M5) — drives the ``reads`` action's footnote ("startup-drained messages are not counted
+    as read")."""
+    sigil = group if str(group).startswith("#") else f"#{group}"
+    inboxes_dir = get_inboxes_dir(root, team)
+    for member in members:
+        msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
+        if any(isinstance(m, dict) and m.get("group") == sigil and m.get("acked_unseen")
+               for m in msgs):
+            return True
+    return False
 
 
 def get_transcript_file(root, team=None):
@@ -941,6 +1231,31 @@ def get_transcript_file(root, team=None):
     return base / "transcript.jsonl"
 
 
+# Size-gated rotation (C6): bounds the LIVE transcript file only. ``.1`` is a grace copy for
+# manual forensics, never read by any read path — resolve_message/react keep their 3-tier
+# fallbacks (group files + inboxes) for a rotated-away id, same as any other stale/disabled-
+# transcript scenario they already handle.
+TRANSCRIPT_ROTATE_BYTES = 16 * 1024 * 1024
+
+
+def _maybe_rotate_transcript(path):
+    """Cheap getsize gate → rotate. Never raises (observability must never affect delivery).
+    Call only with the transcript's lock held, and call it BEFORE appending the new record
+    (gate-then-append — WP-27 gate CR): rotating AFTER the append would put the
+    gate-triggering record straight into ``.1``, which no read path ever touches — a
+    deterministic once-per-``TRANSCRIPT_ROTATE_BYTES`` drop, not contention-luck. Gating first
+    means the triggering record always lands in the FRESH file instead. The byte-cursor
+    generation (a crc of the first line) changes when the file is recreated after rotation, so
+    a running dashboard poll transparently re-tails — that machinery already exists for
+    exactly this case."""
+    try:
+        if path.exists() and os.path.getsize(path) > TRANSCRIPT_ROTATE_BYTES:
+            rotated = path.with_name(path.name + ".1")
+            os.replace(path, rotated)  # clobbers any previous .1; next append recreates fresh
+    except Exception as e:
+        print(f"[teammate-comms] transcript rotation skipped: {e}", file=sys.stderr, flush=True)
+
+
 def append_transcript(root, team, record):
     """Best-effort tee of one message into the global NDJSON observability log.
 
@@ -948,6 +1263,9 @@ def append_transcript(root, team, record):
     group posts in one ordered stream. NEVER raises and NEVER blocks delivery:
     disabled by ``TEAMMATE_TRANSCRIPT=0``, uses a short non-blocking lock, and
     swallows every error to stderr. This is observability, not a delivery guarantee.
+    Size-gated rotation (see ``_maybe_rotate_transcript``) keeps the live file bounded —
+    checked BEFORE this call's own append, so ``record`` always lands in the file that
+    survives (never the one that just rotated away).
     """
     if os.environ.get("TEAMMATE_TRANSCRIPT", "1").strip() == "0":
         return
@@ -957,6 +1275,7 @@ def append_transcript(root, team, record):
         with file_lock_optional(path, timeout=2) as acquired:
             if not acquired:
                 return
+            _maybe_rotate_transcript(path)   # gate-then-append: rotate BEFORE writing (C6 CR)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:  # observability must never affect message delivery
@@ -1229,9 +1548,10 @@ def append_reaction(root, team, record, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
-            record["id"] = now_timestamp()
+            record["id"] = new_message_id()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            _maybe_compact_reactions(root, team)   # under the lock, never raises (C6)
     except CommsError:
         raise CommsError(
             f"Reaction not recorded: reactions.jsonl stayed locked for {timeout}s "
@@ -1268,10 +1588,46 @@ def read_reactions(root, team=None, since=None, limit=None, oldest_first=False):
     return _window(out, limit, oldest_first)
 
 
-def aggregate_reactions(events):
-    """Fold chronological add/remove events → ``{target: {emoji: [reactors sorted]}}``
-    (last op per (target, emoji, reactor) wins; empty sets dropped)."""
+# Compaction thresholds (C6, mirrors deletions' C-2 design — see _compact_deletions_locked).
+# RETAIN events stay in the live jsonl tail; older events fold into the state baseline. The
+# byte gate is a cheap getsize trip on append — it bounds the live-file SIZE only, it is NOT
+# a correctness input: every read path (inbox render, group history, dashboard fresh load)
+# reads baseline + the live tail together, so completeness holds no matter when the gate
+# fires. RETAIN MUST stay >= tools._REACTIONS_TAIL (asserted at import time in tools.py, and
+# in a test) so the read-side tail window always sits INSIDE the retained jsonl — no gap
+# between the compacted baseline and the tail read.
+REACTIONS_RETAIN = 2000
+REACTIONS_COMPACT_BYTES = 256 * 1024
+
+
+def get_reactions_state_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]reactions_state.json`` — the WP-27 compaction
+    baseline (``{target: {emoji: [reactors]}}``), mirroring ``deletions_set.json``'s role."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "reactions_state.json"
+
+
+def read_reaction_state(root, team=None):
+    """Return the compacted reaction baseline dict (the WP-27 fold target), or ``{}`` on any
+    miss/corruption. Read-only and lock-free (``write_json_atomic`` gives the reader
+    old-or-new, never partial)."""
+    v = read_json_readonly(get_reactions_state_file(root, team))
+    return v if isinstance(v, dict) else {}
+
+
+def aggregate_reactions_with_baseline(baseline, events):
+    """Fold chronological add/remove ``events`` → ``{target: {emoji: [reactors sorted]}}``,
+    SEEDED from ``baseline`` (the WP-27 compaction state — same shape this function returns)
+    before folding. Reactions are STATEFUL (``op: remove`` exists), so compacting them is
+    NOT a naive append-only union like deletions — a union would resurrect a reactor that was
+    removed in an event the compaction folded away. Seeding the fold from the baseline and
+    then re-applying add/discard on top is what keeps a fold-then-fold-again idempotent."""
     state = {}  # (target, emoji) -> set of reactors
+    for target, emoji_map in (baseline or {}).items():
+        for emoji, reactors in (emoji_map or {}).items():
+            state[(target, emoji)] = set(reactors or [])
     for e in events:
         target, emoji, who = e.get("target"), e.get("emoji"), e.get("from")
         if not (target and emoji and who):
@@ -1286,6 +1642,81 @@ def aggregate_reactions(events):
         if reactors:
             out.setdefault(target, {})[emoji] = sorted(reactors)
     return out
+
+
+def aggregate_reactions(events):
+    """Fold chronological add/remove events → ``{target: {emoji: [reactors sorted]}}``
+    (last op per (target, emoji, reactor) wins; empty sets dropped). Equivalent to
+    ``aggregate_reactions_with_baseline({}, events)`` — a thin wrapper for callers that
+    don't have (or don't need) a WP-27 compaction baseline."""
+    return aggregate_reactions_with_baseline({}, events)
+
+
+def _compact_reactions_locked(root, team):
+    """Fold all-but-the-newest ``REACTIONS_RETAIN`` reaction events into the state baseline,
+    then trim the jsonl to that tail. MUST be called with the reactions.jsonl lock already
+    held (mirrors ``_compact_deletions_locked``'s contract and crash-ordering exactly).
+
+    UNLIKE deletions (an append-only union), reactions carry ``op: "remove"`` — the fold is
+    STATEFUL: ``aggregate_reactions_with_baseline`` seeds from the EXISTING baseline, then
+    folds the head events on top, so a remove in the head correctly discards a reactor the
+    OLD baseline already recorded as added. This is why deletions' simple per-target
+    last-event-wins union would be WRONG here — it would silently resurrect a removed
+    reactor if an add from an earlier compaction batch and its cancelling remove from a
+    later one were folded independently instead of into one running state.
+
+    Idempotence: re-running this fold over an OVERLAPPING event range yields an IDENTICAL
+    state — folding the same add/remove sequence into an already-folded baseline re-applies
+    each op's ``set.add``/``discard`` with the same net effect (add is idempotent; discard of
+    an already-absent member is a no-op). So state-first-then-trim is safe under a crash: a
+    crash between the two writes leaves the head events BOTH in the state file AND still in
+    the jsonl (the trim never ran) — re-running the compaction next time re-folds that same
+    head into the state and lands on the identical result, never a double-count.
+    """
+    path = get_reactions_file(root, team)
+    all_events = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    all_events.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except (FileNotFoundError, OSError):
+        return
+    if len(all_events) <= REACTIONS_RETAIN:
+        return
+    head, tail = all_events[:-REACTIONS_RETAIN], all_events[-REACTIONS_RETAIN:]
+    baseline = read_reaction_state(root, team)
+    folded = aggregate_reactions_with_baseline(baseline, head)
+    write_json_atomic(get_reactions_state_file(root, team), folded)   # STATE FIRST (atomic)
+    tmp = path.with_name(path.name + ".compact.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in tail:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)      # THEN trim (atomic; a lockless reader sees old-full or new-tail)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()       # orphan cleanup if os.replace raised (e.g. Windows read race)
+        except OSError:
+            pass
+
+
+def _maybe_compact_reactions(root, team):
+    """Cheap getsize gate → compact. FULLY self-contained: never raises (so append_reaction
+    can't mislabel a successful event append as failed), best-effort. Call only with the
+    reactions.jsonl lock held."""
+    try:
+        path = get_reactions_file(root, team)
+        if os.path.getsize(path) > REACTIONS_COMPACT_BYTES:
+            _compact_reactions_locked(root, team)
+    except Exception as e:
+        print(f"[teammate-comms] reactions compaction skipped: {e}", file=sys.stderr, flush=True)
 
 
 # ── Deletions sub-stream ──────────────────────────────────────────────────────────
@@ -1423,7 +1854,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
             with file_lock_optional(path, timeout=2) as acquired:
                 if not acquired:
                     return
-                record["id"] = now_timestamp()
+                record["id"] = new_message_id()
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
@@ -1434,7 +1865,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
-            record["id"] = now_timestamp()
+            record["id"] = new_message_id()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)

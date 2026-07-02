@@ -1,6 +1,6 @@
 """WP-14 avatar acceptance tests.
 
-Covers all 8 acceptance criteria from WP-14-teammate-avatars.md §12.
+Covers all 8 acceptance criteria from docs/history/WP-14-teammate-avatars.md §12.
 Run: uv run --no-dev python tests/test_wp14_avatars.py
 
 AC-1: square png → 256×256 + avatar.hash; clear removes sidecars+key.
@@ -26,10 +26,23 @@ import urllib.request
 import urllib.parse
 from pathlib import Path
 
+# WP-21 gate micro-CR: an emoji in a FAIL message crashes the harness's own report with
+# UnicodeEncodeError under Windows cp1252 stdout, masking failure details. Harness-report-only.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 _failures = []
 _passes = 0
+_skips = []
+
+try:
+    import PIL  # noqa: F401
+    _HAS_PILLOW = True
+except ImportError:
+    _HAS_PILLOW = False
 
 
 def check(cond, msg):
@@ -38,6 +51,12 @@ def check(cond, msg):
         _passes += 1
     else:
         _failures.append(msg)
+
+
+def skip(msg):
+    """Record a Pillow-absent skip — informational only, never counted as a FAIL. CI syncs no
+    extras, so these tests must stay green (not red) when Pillow isn't installed."""
+    _skips.append(msg)
 
 
 def check_raises(fn, msg):
@@ -71,11 +90,10 @@ def _make_comms_root():
 
 def test_ac1_square_ingest_and_clear():
     """AC-1: square 64×64 PNG ingested → 256×256 sidecar; avatar.hash set; clear removes all."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-1 skipped: Pillow not installed (install teammate-comms[images])")
+    if not _HAS_PILLOW:
+        skip("AC-1 skipped: Pillow not installed (install teammate-comms[images])")
         return
+    from PIL import Image
 
     from teammate_comms.comms import (
         get_avatars_dir, read_agent_record, write_agent_record,
@@ -143,11 +161,10 @@ def test_ac1_square_ingest_and_clear():
 
 def test_ac2_non_square_pad():
     """AC-2: wide 200×50 PNG → 256×256; side strips are black (padding)."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-2 skipped: Pillow not installed")
+    if not _HAS_PILLOW:
+        skip("AC-2 skipped: Pillow not installed (install teammate-comms[images])")
         return
+    from PIL import Image
 
     from teammate_comms.comms import get_avatars_dir, write_agent_record
     from teammate_comms.avatars import ingest_avatar
@@ -230,10 +247,8 @@ def test_ac3_zero_dep():
 
 def test_ac4_avatar_http_route():
     """AC-4: /avatar serves PNG with correct Content-Type+ETag; bad token 401; unknown 404; traversal 422."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-4 skipped: Pillow not installed")
+    if not _HAS_PILLOW:
+        skip("AC-4 skipped: Pillow not installed (install teammate-comms[images])")
         return
 
     import threading
@@ -249,7 +264,11 @@ def test_ac4_avatar_http_route():
         avdir.mkdir(parents=True, exist_ok=True)
         write_bytes_atomic(avdir / f"{name}.png", png_bytes)
 
-        info = start_dashboard(root=root, team=None, human_name="human", open_browser=False)
+        # WP-33 addendum (WP-19 gate): port=0 (OS-assigned) instead of the fixed 7842+ range —
+        # two concurrent runs of this suite on one machine were observed cross-talking (a
+        # client reaching the OTHER process's dashboard, 401 with the wrong token). Matches
+        # the port=0 convention already used everywhere in test_handshake.py's dashboard block.
+        info = start_dashboard(root=root, team=None, human_name="human", port=0, open_browser=False)
         port = info["port"]
         # Token is embedded in the URL: http://127.0.0.1:<port>/?token=<tok>
         token = info["url"].split("token=")[1]
@@ -293,10 +312,8 @@ def test_ac4_avatar_http_route():
 
 def test_ac5_api_and_frontend():
     """AC-5: roster row has avatar hash; navItem renders img; CSP allows img-src 'self'."""
-    try:
-        from PIL import Image
-    except ImportError:
-        _failures.append("AC-5 skipped: Pillow not installed")
+    if not _HAS_PILLOW:
+        skip("AC-5 skipped: Pillow not installed (install teammate-comms[images])")
         return
 
     from teammate_comms.comms import (
@@ -311,7 +328,11 @@ def test_ac5_api_and_frontend():
         write_agent_record(root, None, name, type="ai",
                            avatar={"hash": rec_hash, "updated_at": "2026-06-01T00:00:00"})
 
-        info = start_dashboard(root=root, team=None, human_name="human", open_browser=False)
+        # WP-33 addendum (WP-19 gate): port=0 (OS-assigned) instead of the fixed 7842+ range —
+        # two concurrent runs of this suite on one machine were observed cross-talking (a
+        # client reaching the OTHER process's dashboard, 401 with the wrong token). Matches
+        # the port=0 convention already used everywhere in test_handshake.py's dashboard block.
+        info = start_dashboard(root=root, team=None, human_name="human", port=0, open_browser=False)
         port = info["port"]
         token = info["url"].split("token=")[1]
         base = f"http://127.0.0.1:{port}"
@@ -425,6 +446,110 @@ def test_ac6_statusline_cli():
               "validate_agent_name guard must fire before any path is constructed]")
 
 
+# ── WP-33 Q4: avatars.py error/edge paths — every failure names its specific reason ──
+
+def test_q4_avatar_error_paths():
+    """WP-33 Q4: oversize source, invalid base64, corrupt bytes, decompression bomb, and the
+    WP-28 pre-decode length check each raise CommsError naming the SPECIFIC reason (not just
+    "it raised")."""
+    from teammate_comms.comms import write_agent_record, CommsError
+    from teammate_comms import avatars as _av
+
+    td, root = _make_comms_root()
+    with td:
+        name = "ErrBot"
+        write_agent_record(root, None, name, type="ai")
+
+        # (1) WP-28 pre-decode length check: an oversize base64 STRING raises WITHOUT
+        # b64decode ever being called — Pillow-independent (the check precedes the lazy
+        # Pillow import), so this must pass in the no-Pillow run too.
+        real_b64decode = _av.base64.b64decode
+
+        def _forbidden_decode(*a, **k):
+            raise AssertionError("b64decode must not be called past the pre-decode byte cap")
+
+        _av.base64.b64decode = _forbidden_decode
+        try:
+            huge_b64 = "A" * (_av._MAX_SRC_BYTES * 4 // 3 + 100)
+            try:
+                _av.ingest_avatar(root, None, name, image_base64=huge_b64)
+                _failures.append("Q4: an over-cap base64 string should raise")
+            except AssertionError as exc:
+                _failures.append(f"Q4 [tautology: {exc}]")
+            except CommsError as exc:
+                check("50 MB" in str(exc),
+                      f"Q4: oversize base64 (pre-decode) error names the 50 MB cap: {exc}")
+        finally:
+            _av.base64.b64decode = real_b64decode
+
+        if not _HAS_PILLOW:
+            skip("Q4 remaining checks skipped: Pillow not installed (install teammate-comms[images])")
+            return
+
+        from PIL import Image
+
+        # (2) oversize DECODED bytes: monkeypatch _MAX_SRC_BYTES small so the test doesn't
+        # need to allocate 50MB for real — proves the post-decode byte-cap guard names the cap.
+        real_cap = _av._MAX_SRC_BYTES
+        _av._MAX_SRC_BYTES = 100
+        try:
+            b64_small = base64.b64encode(b"x" * 200).decode()   # > the shrunk cap, trivially small
+            try:
+                _av.ingest_avatar(root, None, name, image_base64=b64_small)
+                _failures.append("Q4: oversize decoded bytes should raise")
+            except CommsError as exc:
+                check("byte cap" in str(exc) or "MB" in str(exc),
+                      f"Q4 [tautology: oversize-decoded-bytes error must name the cap]: {exc}")
+        finally:
+            _av._MAX_SRC_BYTES = real_cap
+
+        # (3) invalid base64 -> CommsError "Invalid base64"
+        try:
+            _av.ingest_avatar(root, None, name, image_base64="not-valid-base64!!!")
+            _failures.append("Q4: invalid base64 should raise")
+        except CommsError as exc:
+            check("Invalid base64" in str(exc),
+                  f"Q4 [tautology: invalid base64 must say so, not a generic failure]: {exc}")
+
+        # (4) corrupt image bytes -> CommsError "Could not decode"
+        try:
+            _av.ingest_avatar(root, None, name,
+                              image_base64=base64.b64encode(b"not-an-image").decode())
+            _failures.append("Q4: corrupt image bytes should raise")
+        except CommsError as exc:
+            check("Could not decode" in str(exc),
+                  f"Q4 [tautology: corrupt image bytes must say 'Could not decode']: {exc}")
+
+        # (5) decompression bomb: small-bytes/huge-pixels PNG trips the MAX_IMAGE_PIXELS guard.
+        # A uniform 1-bit 20000×20000 image compresses to a tiny PNG on disk (kept tiny per the
+        # brief) while still declaring 400M pixels in its header — Pillow's decompression-bomb
+        # check fires from the header before any expensive full decode.
+        real_max_pixels = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = None   # disable PIL's OWN guard for constructing the fixture
+        try:
+            bomb = Image.new("1", (20000, 20000))
+            buf = io.BytesIO()
+            bomb.save(buf, format="PNG")
+            bomb_bytes = buf.getvalue()
+        finally:
+            Image.MAX_IMAGE_PIXELS = real_max_pixels
+        try:
+            _av.ingest_avatar(root, None, name, image_base64=base64.b64encode(bomb_bytes).decode())
+            _failures.append("Q4: a decompression-bomb image should raise")
+        except CommsError as exc:
+            check("Could not decode" in str(exc),
+                  f"Q4 [tautology: decompression bomb must be caught as 'Could not decode']: {exc}")
+
+        # (6) zero-dimension: Pillow itself rejects constructing/decoding a 0×0 image before
+        # ingest_avatar's own w==0/h==0 check is ever reached (a hand-crafted degenerate PNG
+        # with a zero IHDR dimension fails Pillow's OWN decode first, landing in case (4)'s
+        # "Could not decode" instead) — the guard is defensive-in-depth against a future
+        # decode path that DOES tolerate a 0-dimension result; not exercisable via ingest_avatar
+        # without forging a corrupt-but-decodable PNG, so this is a documented skip, not a gap.
+        skip("Q4 zero-dimension guard: unreachable via any real Pillow-decodable image — "
+             "Pillow itself rejects/fails on 0×0 before ingest_avatar's own size check runs")
+
+
 # ── AC-7: tautology guard — tests are enumerated in docstrings above ─────────
 # Each check() call above includes the specific reverted-code failure in its message.
 
@@ -436,23 +561,28 @@ def test_ac7_tautology_summary():
 # ── AC-8: version sync ────────────────────────────────────────────────────────
 
 def test_ac8_version_sync():
-    """AC-8: version is 0.10.0 across __init__.py, pyproject.toml, and plugin.json."""
+    """AC-8: __init__.py, pyproject.toml, and plugin.json all declare the SAME version (never a
+    hardcoded literal here — a version bump must not require touching this test, and a stale
+    literal is exactly the drift-guard-that-drifted bug this replaces, WP-18 Q3)."""
+    import re
     import teammate_comms
-    check(teammate_comms.__version__ == "0.10.0",
-          f"AC-8 [tautology: __version__ must be 0.10.0 for WP-14; got {teammate_comms.__version__!r}]")
+    pkg = teammate_comms.__version__
 
     pyproject = Path(__file__).parent.parent / "pyproject.toml"
-    check('version = "0.10.0"' in pyproject.read_text(),
-          "AC-8 [tautology: pyproject.toml must declare version 0.10.0]")
+    pyp_text = pyproject.read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', pyp_text, re.MULTILINE)
+    pyp = m.group(1) if m else None
+    check(pyp is not None and pyp == pkg,
+          f"AC-8 [tautology: pyproject.toml version ({pyp!r}) must match __init__.py ({pkg!r})]")
 
     plugin_json = Path(__file__).parent.parent / ".claude-plugin" / "plugin.json"
     pdata = json.loads(plugin_json.read_text())
-    check(pdata.get("version") == "0.10.0",
-          f"AC-8 [tautology: plugin.json must declare version 0.10.0; got {pdata.get('version')!r}]")
+    plug = pdata.get("version")
+    check(plug == pkg,
+          f"AC-8 [tautology: plugin.json version ({plug!r}) must match __init__.py ({pkg!r})]")
 
     # [images] extra must exist in pyproject.toml
-    check("[project.optional-dependencies]" in pyproject.read_text() and
-          "Pillow" in pyproject.read_text(),
+    check("[project.optional-dependencies]" in pyp_text and "Pillow" in pyp_text,
           "AC-8 [tautology: pyproject.toml must declare [images] extra with Pillow>=10]")
 
 
@@ -466,6 +596,7 @@ def main():
         test_ac4_avatar_http_route,
         test_ac5_api_and_frontend,
         test_ac6_statusline_cli,
+        test_q4_avatar_error_paths,
         test_ac7_tautology_summary,
         test_ac8_version_sync,
     ]
@@ -475,7 +606,9 @@ def main():
         except Exception as exc:
             _failures.append(f"{t.__name__} raised unexpectedly: {exc}")
 
-    print(f"\nWP-14 avatar tests: {_passes} passed, {len(_failures)} failed")
+    print(f"\nWP-14 avatar tests: {_passes} passed, {len(_failures)} failed, {len(_skips)} skipped")
+    for s in _skips:
+        print(f"  SKIP: {s}")
     for f in _failures:
         print(f"  FAIL: {f}")
     if _failures:

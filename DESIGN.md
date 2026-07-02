@@ -5,9 +5,16 @@
 > **Pure-stdlib** Python (zero runtime dependencies), shipped as a marketplace plugin.
 
 This document began as a pre-build blueprint; it has been **reconciled to the
-as-built implementation (v0.7.1)**. Where a design decision reversed during the
+as-built implementation (v0.12.0)**. Where a design decision reversed during the
 build, an *“Originally planned … shipped … because …”* note preserves the lineage —
 the rationale is the valuable part, even when the choice flipped.
+
+**Release doc-checklist (WP-32).** This document, README.md, and SKILL.md have drifted
+from the code before (the recurring fable-audit finding this WP fixes) — the enforcement
+that was always missing: every tool/behavior change touches all three docs in the SAME
+PR/commit as the code change, and this header's version framing bumps with every release
+(not just when someone remembers). If you're adding a tool or changing a documented
+behavior and you haven't touched README.md + SKILL.md + this file, the change isn't done.
 
 ---
 
@@ -38,8 +45,7 @@ arrive, so a peer's `send` *is* the nudge — no ports, no cross-instance addres
 ```
 teammate-comms/
 ├── .claude-plugin/
-│   ├── plugin.json             # inline mcpServers + channels (§4)
-│   └── marketplace.json        # in-repo manifest, name "colton-comms" (local dev; §4b)
+│   └── plugin.json             # inline mcpServers + channels (§4)
 ├── pyproject.toml              # hatchling; dependencies = [] (pure stdlib)
 ├── uv.lock                     # COMMITTED — reproducible installs (§3)
 ├── src/teammate_comms/
@@ -48,8 +54,10 @@ teammate-comms/
 │   ├── comms.py                # storage / registry / liveness / transcript (§8)
 │   ├── channel.py              # background inbox watcher + push (§7)
 │   ├── tools.py                # MCP tool definitions + handlers (§9)
+│   ├── instructions.py         # standing-instructions text + SessionStart reinject entry point (§6)
 │   ├── spawn.py                # teammate_reincarnate launcher (argv/env builders + spawn)
 │   ├── dashboard.py            # stdlib web console server (§9, teammate_dashboard)
+│   ├── avatars.py              # teammate_set_avatar ingest/render pipeline (§9, lazy Pillow import)
 │   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
 ├── hooks/
 │   ├── hooks.json
@@ -110,7 +118,7 @@ the plugin is self-contained and does not write into a project's `.mcp.json`.
 ```json
 {
   "name": "teammate-comms",
-  "version": "0.7.1",
+  "version": "0.12.0",
   "description": "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances.",
   "author": { "name": "ColtonDyck" },
   "license": "MIT",
@@ -151,10 +159,8 @@ plugin code stays in each plugin's own repo. Install:
 /plugin install teammate-comms@coltondyck
 ```
 
-This repo also carries an in-repo `.claude-plugin/marketplace.json` named
-**`colton-comms`** (a *distinct* name, so it cannot collide with `coltondyck`) for
-`--plugin-dir` local development. It is non-canonical but is re-pinned in parallel on
-each release.
+The canonical marketplace lives in `colton-claude-plugins`; there is no in-repo
+manifest.
 
 > *Originally a hazard:* a second marketplace **also** named `coltondyck` would
 > collide — Claude Code keys marketplaces by name, so only one `coltondyck` can be
@@ -220,6 +226,37 @@ stdout lock (no CRLF, no cp1252); stdin is decoded with `utf-8-sig` to tolerate 
 leading BOM. No handler may `print` to stdout (that's the protocol stream);
 diagnostics go to stderr → `~/.claude/debug/<session-id>.txt`.
 
+**H5 — the standing-instructions contract (WP-30):** everything in this doc about
+`INSTRUCTIONS` reaching the agent rests on one UNVERIFIED assumption: that Claude Code's
+`initialize.instructions` field is actually surfaced to the model every session, not just
+accepted and discarded. There is no in-repo test for this (none is possible — it depends on
+CC's own prompt assembly, outside this process). **How to verify by hand:** after
+`teammate_register`, run `/mcp` — the `teammate-comms` server should be listed; the standing
+rules text ("Update your teammate-comms status as you work...") should be visible somewhere
+in the session's MCP instructions block. If it's ever NOT there, the whole
+`instructions`/reinject-after-compact design (this section + `reinject-instructions.sh`)
+needs re-examination — h1's version stamp (below) at least tells you WHICH build's text you
+were looking at when you checked.
+
+**H1 — version stamps (WP-30):** the running server's `INSTRUCTIONS` are spawn-frozen for
+the process's lifetime, while a mid-session plugin update changes what's on disk — nothing
+used to record which version produced which text. `server.py` now logs
+`starting teammate-comms v<version>` once at startup (stderr → the debug log), and
+`instructions.py`'s `_REINJECT_HEADER` (the block `reinject-instructions.sh` emits after a
+compact) is stamped `# teammate-comms v<version> - Standing Practices ...` — a
+stale-vs-current mismatch between the two is now visible instead of silent.
+
+**H7/H8 — housekeeping notes (WP-30):** the tool list is **static per process** — new tools
+only ever arrive via a full server respawn (a plugin update + Claude Code restart), so no
+`notifications/tools/list_changed` emitter is needed; nothing in this design changes tools
+at runtime. `${CLAUDE_PLUGIN_ROOT}` is expanded independently by **three** consumers —
+`plugin.json`'s `mcpServers` spawn, `hooks/session-start.sh`, and
+`hooks/reinject-instructions.sh` — the invariant all three rely on is that Claude Code
+expands it identically for all three within one session (same plugin install → same path);
+if that ever diverges (e.g. a mid-session plugin reinstall changing the resolved root), the
+hooks and the server would disagree about which venv/instructions are current — no code
+change follows from this today, it's recorded so a future divergence isn't a mystery.
+
 ---
 
 ## 7. `channel.py` — wake mechanics
@@ -249,10 +286,12 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   `ack("all")` startup-drain (drains the whole inbox when never-read-this-session) and
   the watcher's unseen filter. **Do not persist `_last_seen` itself** — only the
   separate `seen_file` is persisted, so the sentinel semantics are preserved intact.
-- Emits `notifications/claude/channel` with `meta = {count, agent}` and content that
-  references the MCP tools. If the agent has a `personality` set, the content **leads
-  with `You are <name>: <personality>`** so a woken idle instance is reminded who it
-  is (personality is read from the registry only at nudge time, not every poll).
+- Emits `notifications/claude/channel` with `meta = {count, agent}` and **signal-only**
+  content naming WHERE the messages came from (senders / `#groups`) plus a 🔔 @mention
+  note and the group reply target when applicable (`emit_channel_event`,
+  `channel.py`). The v0.6 `You are <name>: <personality>` owner-reminder was **removed
+  in WP-11a** — the persona is durable in the agent's own session context from
+  registration, so repeating it on every wake was redundant token cost.
 - **Group reply target (v0.4.3, broadened v0.4.4):** when there's any **unseen**
   (unread, not-yet-read) group message, the content **names the group reply target** —
   *"reply to the group with `teammate_send to:'#<group>'`"* (distinct unseen groups,
@@ -316,6 +355,19 @@ inbox names must be unique across all projects (two repos each registering `lead
 collide on one inbox — the server's same-name collision warning still applies); team
 namespacing carves out subsets.
 
+**Message-id format & cross-host ordering (WP-26, B3/C4).** `new_message_id()` mints
+`now_timestamp() + "." + <disambiguator>`, where the disambiguator is the writer's pid
+plus a per-process monotonic counter (both hex). A bare microsecond timestamp collides:
+two writers stamping the same microsecond otherwise produce two records sharing one id,
+which the dashboard's global per-id dedup silently drops one of, and every id-keyed
+consumer (ack, react, delete, cursors) becomes ambiguous about which record it means.
+The disambiguator guarantees **uniqueness**, not global cross-host **order**: ids order
+by each writer's own local clock, so cross-host ordering is only as good as clock sync
+between hosts (NTP-synced hosts are the supported envelope) — the skew itself is
+unfixable client-side. Old bare ids and new suffixed ids coexist forever (no migration):
+lexical comparison handles the mix, since a bare timestamp is always a strict string
+prefix of its own suffixed extension and therefore sorts before it.
+
 ---
 
 ## 9. MCP tools
@@ -323,15 +375,16 @@ namespacing carves out subsets.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **17 tools (13 original + 4 project-profile tools added v0.9.0):**
+long-lived server. **18 tools (13 original + 4 project-profile tools v0.9.0 + 1 avatar
+tool v0.10.0):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, profile? (`project`/`role`/`personality`/`status`/`authority`) | Establish identity, register the inbox, arm the channel. Optionally set a profile (`project` is auto-filled). Re-registering only re-establishes identity + channel and **preserves** the existing profile. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. **A `#`-prefixed `to` posts to a group** (fan-out); `@name` tokens to group members become `mentions`. |
-| `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read this agent's unread messages (or just the count). `since`/`limit` page a large inbox; bodies already shown are suppressed by default (durable across sessions) — `show_all:true` re-reads them. Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
 | `teammate_ack` | `id` (or `"all"`) | Move a message from unread → read. |
-| `teammate_list` | — | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Humans show `🧑 (operator)` + `presence`. |
+| `teammate_list` | `all?` | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Defaults to your project only; `all:true` shows every project. Humans show `🧑 (operator)` + `presence`. |
 | `teammate_whoami` | `verbose?` | Resolved identity, team, comms dir, and own profile (diagnostics). `verbose:true` adds a read-only **doctor** section — comms root, per-agent heartbeat freshness/liveness, sub-stream file sizes, unread counts, leftover lock dirs (G-5). |
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
@@ -339,6 +392,7 @@ long-lived server. **17 tools (13 original + 4 project-profile tools added v0.9.
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (recorded in `reactions.jsonl`, shown in inbox/history/dashboard). **Wakes only the author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
+| `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set/clear a profile avatar (see §9b below). **Self-only** (WP-28 T1): `agent`, if given, must equal the caller — any other target raises. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one (XOR, enforced in the handler) | Delete a message (**tombstone**) or remove an **offline** teammate (see below). |
 | `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile (merge-upsert under blocking lock). `key` defaults to caller's normalized `project` label. `path` auto-fills from `$CLAUDE_PROJECT_DIR` on first create. |
 | `list_projects` | — | Concise directory: display name + live roster + summary per project. Trailing aggregate: undocumented project labels + near-miss agents. |
@@ -352,8 +406,10 @@ that is otherwise append-only:
 - **Message = tombstone, not erase.** `tombstone_fields()` rewrites a record in place —
   body → `"— message deleted —"`, `deleted:true`, `deleted_by` — while keeping `id`,
   `from`, `to`/`group`, `reply_to`, `post_type`. A group post shares ONE id across the
-  group `messages.json`, every member's inbox copy, and the transcript, so the tombstone is
-  applied to each durable store (the inbox helper locks the **unread** file and rewrites
+  group's message store (`tombstone_in_group_messages` rewrites BOTH the legacy
+  `messages.json` and `messages.jsonl` — WP-25's dual-store), every member's inbox copy,
+  and the transcript, so the tombstone is applied to each durable store (the inbox helper
+  locks the **unread** file and rewrites
   both `_unread`/`_read` under it — same lock discipline as `teammate_ack`). Keeping the id
   + `reply_to` means citations and thread/group continuity survive. Permission is
   **author-or-operator** (`is_operator=True` only on the dashboard path).
@@ -435,11 +491,19 @@ that is otherwise append-only:
   the cross-store atomicity deliberately not built. The MCP inbox read is the only surface that
   briefly shows the orphan, until it's acked.
 
-**Group chat (added 0.4.0).** Named group chats addressed with a `#` sigil
-(`teammate_send(to="#design")`) — a separate namespace from agents, so names can't
-collide. A group is a per-group subdir under `groups/`: `meta.json` (`name`, `members`,
-`creator`, `createdAt`) + an append-only `messages.json` transcript (the canonical
-ordered history; read via `teammate_group action=history`). Posting **fans the message
+**Group chat (added 0.4.0, storage changed WP-25/C3).** Named group chats addressed with
+a `#` sigil (`teammate_send(to="#design")`) — a separate namespace from agents, so names
+can't collide. A group is a per-group subdir under `groups/`: `meta.json` (`name`,
+`members`, `creator`, `createdAt`) + the message transcript (the canonical ordered
+history; read via `teammate_group action=history`). **Dual-store (WP-25):** new posts
+append to `messages.jsonl` (NDJSON, one line per post, O(1) — replacing the old
+`messages.json` full-array file, which rewrote its ENTIRE contents on every single post).
+`messages.json` is kept as a **legacy, read-only** store: `read_group_messages` reads it
+FIRST (strictly older, so ordering is preserved), then the jsonl lines appended after it —
+both under the same lock (keyed on the `messages.json` path, unchanged, so writers of
+either format still serialize against each other). No migration: a group created before
+WP-25 keeps its legacy file forever, read indefinitely, never rewritten to jsonl. Posting
+**fans the message
 out** into each member's `_unread.json` (group-tagged), so the **existing channel wake
 delivers it with no `channel.py` change** — the transcript is written first
 (authoritative), then fan-out is best-effort (a locked member inbox is non-fatal; they
@@ -474,6 +538,10 @@ watcher with **no `channel.py` change**.
 - **Lifecycle:** idempotent **per process** (a second call returns the same URL; two
   instances = two consoles); the server dies when the instance exits — `server.py`'s stdio
   `finally` calls `dashboard.shutdown_dashboard()` (marks the human `away`, frees the port).
+  A fresh `secrets.token_urlsafe(32)` is minted **per launch** (never persisted), so a
+  bookmarked URL from a prior instance 403s after that instance exits and a new one starts —
+  expected, not a bug; the relaunch affordance is simply to re-run `teammate_dashboard()`
+  (same URL, reused, while the current instance keeps running).
 
 **Group polish + reactions + reincarnate (added 0.6.0).**
 - **Typed posts:** an optional `post_type` (`decision`/`blocker`/`fyi`/`chatter`) on a
@@ -514,6 +582,8 @@ watcher with **no `channel.py` change**.
 - **Channel wake (changed):** the wake now names WHERE messages came from (DM senders +
   `#groups`); the personality reminder fires only every ~10 received messages (the
   registration return still echoes it), not every wake — cuts per-message token waste.
+  (Superseded in WP-11a: the reminder was removed from the wake entirely, not just
+  throttled — see §7's signal-only wake.)
 - **`teammate_reincarnate` + `spawn.py`:** spawns a new `claude` in a terminal with
   `TEAMMATE_AGENT` + `CLAUDE_PROJECT_DIR` in the child env (auto-register handoff).
   Default-off gate `TEAMMATE_REINCARNATE_ENABLED`; list-form exec only (the `prompt` is a
@@ -528,7 +598,13 @@ watcher with **no `channel.py` change**.
   `TEAMMATE_SPAWNED_BY` to the parent **unconditionally** (never inherited — a grand-child gets
   its immediate parent, the same never-inherit discipline as the stripped reincarnate gate, F-1),
   read at register and stored as a registry-record field (not a profile field) that survives the
-  heartbeat merge.
+  heartbeat merge. **Marketplace resolution (W1):** `resolve_marketplace()` picks the plugin
+  spec used for the child's launch line, in order: `$TEAMMATE_PLUGIN_MARKETPLACE` (explicit
+  override, always wins) → a best-effort parse of `$CLAUDE_PLUGIN_ROOT`'s
+  `marketplaces/<name>/...` path segment (defensive — any doubt falls through) → the fallback
+  `coltondyck` (this plugin's original marketplace). A hardcoded marketplace would make every
+  spawn on a fork/rehost load a nonexistent plugin ref, invisibly (the DEVNULL child hides the
+  failure) — this makes it configurable and self-detecting instead.
 - **Dashboard upgrades:** dropped the redundant "Direct messages" section (Teammates is
   the DM entry + shows presence); added an "Observed (read-only)" section (agent↔agent
   DMs) directly under Teammates; a right-hand live activity firehose (FIFO, newly-seen
@@ -616,9 +692,36 @@ registration (F-4 — so two repos sharing a basename like `api` are distinguish
 `teammate_list`; falls back to the bare name at a drive/UNC root, and is pre-truncated to the
 field cap so a deep path can never raise out of validation and break registration), overridable,
 so peers see who is working where now that comms are global. An agent's
-own profile is echoed in the `teammate_register` return, and the channel wake event
-leads with `You are <name>: <personality>`, so it stays reminded of who it is across
-waking.
+own profile is echoed in the `teammate_register` return; the persona then stays durable
+in the agent's own session context — the channel wake itself is signal-only (WP-11a; see
+§7) and carries no personality reminder.
+
+**Avatars (added 0.10.0, hardened WP-28).** `teammate_set_avatar` (`avatars.py`) ingests an
+image (`path` or `image_base64`), fits it to a 256×256 black canvas, and pre-renders three
+sidecars under `TeammateComms/[<team>/]avatars/<name>.{png,ansi,txt}` (PNG; xterm-256
+half-block ANSI 8×8; monochrome ASCII 8×8) — so the dashboard and the `teammate-comms
+avatar` statusline subcommand pay **zero render cost** and never import Pillow at read
+time. Pillow is imported lazily, ONLY inside `ingest_avatar` — the module top level and
+every read path stay pure stdlib.
+- **Self-only (WP-28 T1).** `agent`, if given, must equal the caller — any other target
+  raises, checked BEFORE the lazy Pillow import (so the guard works even without Pillow
+  installed). Mirrors `teammate_update`'s self-only semantics.
+- **Lifecycle GC (WP-28 D2).** `remove_teammate` also unlinks the three sidecars (best-effort,
+  reported like every other path there) — a name-reuser must not inherit a stranger's
+  image via a stale `/avatar` URL. The dashboard's `/avatar` route checks
+  `read_agent_record` after name validation: an unregistered name 404s even if a stale
+  sidecar file happens to still exist on disk.
+- **Pre-decode byte cap (WP-28 D3).** `image_base64`'s ENCODED length is checked (the
+  base64 expansion formula, `raw_cap * 4/3 + 4`) before `base64.b64decode` is ever called
+  — an over-cap payload is rejected before burning CPU/memory on a decode that would just
+  fail the post-decode cap anyway.
+- **Installable extra (WP-28 P2).** Pillow sits behind the `images` extra, not the default
+  zero-dep install. `TEAMMATE_AVATARS_ENABLED=1` (set before Claude Code launches) makes
+  `session-start.sh` run `uv sync --extra images`; the flag's value is part of the venv
+  stamp-hash INPUT, so toggling it alone invalidates the stamp and re-triggers the sync on
+  the next launch — not just when `pyproject.toml`/`uv.lock` happen to change. Without
+  Pillow, `teammate_set_avatar` raises a `CommsError` naming the env var and the manual
+  `uv sync --project <plugin-root> --extra images` fallback.
 
 ---
 
@@ -659,6 +762,15 @@ so no future feature mistakes a convenience for a boundary:
   directory tree (global by default — decision `ef4af8135c03`) with default OS-user file
   permissions; there is no per-agent secret. The trust domain is *all processes of this OS
   user*, full stop.
+- **Which tools are convention-gated, not access-controlled (WP-31/WP-32, T3/D1-doc):**
+  `project_register`/`project_delete` are **open-by-convention** — any caller CAN edit any
+  project's profile; the "only your own project" rule is a tool-description convention, not
+  an enforced check. `teammate_delete(teammate:...)` is **open-for-offline** — any caller can
+  remove any OFFLINE teammate (the only enforced gates are: not yourself, not the human
+  operator, not a currently-live teammate). `teammate_update` and `teammate_set_avatar` are
+  the exceptions that ARE enforced: both are **self-only** by code, not just convention
+  (`teammate_update`'s field-merge only ever writes the caller's own record;
+  `teammate_set_avatar`'s WP-28 T1 guard raises if `agent` != the caller).
 
 This is **correct and intentional** for the threat model — your own agents, on your own
 machine, cooperating. The hard rule: a future cross-host / multi-user feature must **NOT**
@@ -759,6 +871,16 @@ subheads with the profile `summary`/`status`. No second grouping structure.
 13. Project profiles + cross-OS roster fix + 4 new tools (0.9.0 WP-13).
 14. Teammate profile avatar images + statusline subcommand + zero-dep preserved (0.10.0 WP-14).
 15. Durable cross-session inbox body-suppression via `{agent}_seen.json` (0.11.0 WP-15).
+16. **Fable-audit hardening pass** (0.12.0, WP-16–WP-33): a full internal audit across
+    protocol core, identity/epoch races, group/reaction/deletion compaction correctness,
+    avatars lifecycle + installability, spawn/marketplace/managed-settings detection,
+    dashboard failure surfacing, comms-root divergence diagnostics, stable git-remote-derived
+    project identity, tool-surface polish (shared message renderer, param-aware errors),
+    harness/hook contract guards (first-install signal, reinject self-filter, version
+    stamps), and test-gap closure (avatars error paths, true multi-process lock contention).
+    Single branch (`fix/fable-audit-260701`), fix-forward, fix+proof in the same commit
+    throughout. This doc mega-pass (README/SKILL/DESIGN + version bump + CHANGELOG + local
+    tags) is WP-32, the last WP in the epic.
 
 **Remaining:**
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.

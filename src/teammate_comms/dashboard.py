@@ -20,8 +20,11 @@ import json
 import os
 import re
 import secrets
+import socket
+import socketserver
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -39,13 +42,16 @@ from .comms import (
     get_avatars_dir,
     get_groups_dir,
     group_read_positions,
+    human_presence_online,
     is_channel_alive,
     get_transcript_file,
     list_project_records,
+    now_timestamp,
     read_agent_record,
     read_deletions,
     read_deletions_set,
     read_group_meta,
+    read_reaction_state,
     read_reactions,
     read_transcript_after,
     register_human,
@@ -53,6 +59,7 @@ from .comms import (
     transcript_tail_and_cursor,
     validate_agent_name,
     validate_project_key,
+    write_agent_record,
 )
 
 
@@ -103,6 +110,19 @@ class _DashboardServer(ThreadingHTTPServer):
         self.root = root
         self.team = team
         self.human_name = human_name
+        # B1: monotonic time of the last presenceAt write, throttling refreshes to >=15s apart
+        # (the browser polls every ~1.5s — without this we'd write on every single poll).
+        self.last_presence_refresh = 0.0
+
+    def server_bind(self):
+        # WP-35: the base class's reverse-DNS FQDN lookup can hang for minutes on
+        # misconfigured-DNS runners (macOS CI is the classic case; seen wedging the whole
+        # process, since server construction runs inside a tool dispatch on the single
+        # JSON-RPC dispatch thread). We only ever bind to loopback, which needs no FQDN,
+        # so skip that lookup entirely and go straight to the plain socket bind.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
 
     def handle_error(self, request, client_address):  # never dump to stdout
         _log(f"request error from {client_address}")
@@ -226,6 +246,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             validate_agent_name(name)
         except CommsError:
             return self._json(422, {"error": "invalid agent name"})
+        # D2: an unregistered name gets the SAME 404 body as no-file — a stale sidecar left
+        # behind by a removed teammate (or one crafted directly on disk) must never be
+        # servable to a name-reuser just because the file happens to still exist.
+        if read_agent_record(self.server.root, self.server.team, name) is None:
+            return self._json(404, {"error": "no avatar for this agent"})
         png_path = get_avatars_dir(self.server.root, self.server.team) / f"{name}.png"
         try:
             data = png_path.read_bytes()
@@ -252,7 +277,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(rec, dict):
                     continue
                 kind = rec.get("type", "unknown")
-                online = (rec.get("presence") == "online") if kind == "human" \
+                online = human_presence_online(rec) if kind == "human" \
                     else is_channel_alive(rec, pid_check=False)
                 raw_proj = rec.get("project")
                 # Normalize project for cross-OS/case group convergence (AC-2). On failure
@@ -303,8 +328,21 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             "me": me, "groups": groups, "roster": roster, "dms": dms, "projects": projects,
         })
 
+    def _maybe_refresh_presence(self):
+        """Refresh presenceAt (B1) on a live poll, throttled to >=15s between writes — the
+        browser polls every ~1.5s, so this is ~1 write per 10 polls, not one per poll."""
+        server = self.server
+        now = time.monotonic()
+        if now - server.last_presence_refresh < 15:
+            return
+        server.last_presence_refresh = now
+        if server.human_name:
+            write_agent_record(server.root, server.team, server.human_name,
+                               presenceAt=now_timestamp())
+
     def _api_poll(self, cursor, rcursor, dcursor):
         root, team = self.server.root, self.server.team
+        self._maybe_refresh_presence()
         # Records sub-stream — BYTE cursor (P3). UNLIKE the id-based reactions/deletions cursors
         # below, this cursor is "<offset>|<generation>" (a byte position + a first-line crc) and is
         # OPAQUE to the browser. The two cursor families do NOT share reset semantics: a transcript
@@ -322,13 +360,33 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 _off, _gen = 0, ""                    # malformed cursor → force a clean re-tail
             records, _new_off, _new_gen, _reset = read_transcript_after(_tpath, _off, _gen, limit=200)
             new_cursor = f"{_new_off}|{_new_gen}"
+            transcript_enabled = None   # only meaningful on a fresh load
         else:
             records, _off0, _gen0 = transcript_tail_and_cursor(_tpath, limit=200)   # fresh: tail + mint
             new_cursor = f"{_off0}|{_gen0}"
+            # B4: an empty transcript when TEAMMATE_TRANSCRIPT=0 is indistinguishable from a bug
+            # in the browser, which can't see the server's env — tell it explicitly.
+            transcript_enabled = os.environ.get("TEAMMATE_TRANSCRIPT", "1").strip() != "0"
         # Reaction events sub-stream (own cursor). The frontend folds add/remove into
         # per-message chips client-side. Ambient — never woke anyone.
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500,
                                    oldest_first=bool(rcursor))
+        if not rcursor:
+            # Fresh load (WP-27 C6): prepend SYNTHETIC add-events derived from the compacted
+            # reaction baseline, so a chip whose events are ENTIRELY in the baseline (folded
+            # away by compaction) still renders — the frontend's existing client-side fold
+            # treats these exactly like any other add event. Synthetic events carry id=""
+            # so they can NEVER become the cursor: ordered FIRST here, so reactions[-1] below
+            # picks a real tail id whenever the live tail is non-empty. If the tail is
+            # genuinely empty, new_rcursor correctly stays "" — this is a fresh load, so
+            # there was no established real cursor to regress FROM.
+            synthetic = [
+                {"target": target, "emoji": emoji, "from": reactor, "op": "add", "id": ""}
+                for target, emoji_map in read_reaction_state(root, team).items()
+                for emoji, reactors in (emoji_map or {}).items()
+                for reactor in reactors
+            ]
+            reactions = synthetic + reactions
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
         # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set and
         # re-renders affected messages/groups — the firehose is append-only and id-keyed, so an
@@ -356,9 +414,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         else:
             deletions = _window([e for e in jsonl if e.get("id", "") >= dcursor], 1000, True)
             new_dcursor = deletions[-1]["id"] if deletions else dcursor   # last RETURNED id (burst paging)
-        return self._json(200, {"records": records, "cursor": new_cursor,
-                                "reactions": reactions, "rcursor": new_rcursor,
-                                "deletions": deletions, "dcursor": new_dcursor})
+        result = {"records": records, "cursor": new_cursor,
+                 "reactions": reactions, "rcursor": new_rcursor,
+                 "deletions": deletions, "dcursor": new_dcursor}
+        if transcript_enabled is not None:
+            result["transcript_enabled"] = transcript_enabled
+        return self._json(200, result)
 
     def _api_react(self, payload):
         root, team, me = self.server.root, self.server.team, self.server.human_name
@@ -476,6 +537,20 @@ def start_dashboard(root, team, human_name, port=7842, open_browser=True):
                     last_err = e
             if httpd is None:
                 raise CommsError(f"Could not bind a dashboard port on 127.0.0.1: {last_err}")
+            # WP-19 D1 (dashboard half): if a human record under this name already exists on a
+            # DIFFERENT host, register_human below silently overwrites its host (two operators
+            # merging into one identity) — surface it before that happens. WP-21 addendum: gate
+            # on presence-FRESHNESS, not bare host mismatch — a long-dead dashboard's stale host
+            # is a silent takeover (fine, that's the whole point of presence staleness); only a
+            # FRESH different-host/pid record is a real live collision worth warning about.
+            existing_human = read_agent_record(root, team, human_name)
+            warning = None
+            if (existing_human and existing_human.get("host")
+                    and existing_human.get("host") != socket.gethostname()
+                    and human_presence_online(existing_human)):
+                warning = (f"⚠️ another dashboard may already be registered as {human_name!r} "
+                           f"from host {existing_human.get('host')!r} — pass human_name to "
+                           f"distinguish operators.")
             try:
                 register_human(root, team, human_name)
             except CommsError as e:
@@ -488,6 +563,8 @@ def start_dashboard(root, team, human_name, port=7842, open_browser=True):
                 token, root, team, human_name
             url = f"http://127.0.0.1:{chosen}/?token={token}"
             result = {"url": url, "status": "running", "port": chosen}
+            if warning:
+                result["warning"] = warning
     if open_browser:
         _open_browser(result["url"])
     return result
@@ -504,7 +581,9 @@ def shutdown_dashboard():
         return
     if human_name and root is not None:
         try:
-            set_human_presence(root, team, human_name, "away")
+            # B1 clobber guard: only mark away if the record's dashboard_pid is still OURS —
+            # a second dashboard's shutdown can't mark the first (still-live) operator away.
+            set_human_presence(root, team, human_name, "away", owner_pid=os.getpid())
         except Exception as e:
             _log(f"presence-away failed: {e}")
     try:

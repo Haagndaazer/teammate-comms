@@ -24,8 +24,10 @@ from .comms import (
     PROJECT_FIELDS,
     PROJECT_STATUS,
     REACTION_EMOJI,
+    REACTIONS_RETAIN,
     CommsError,
     aggregate_reactions,
+    aggregate_reactions_with_baseline,
     append_deletion,
     append_group_message,
     append_reaction,
@@ -33,14 +35,18 @@ from .comms import (
     delete_group,
     ensure_inbox,
     file_lock,
+    find_group_case_variant,
     get_agents_dir,
     get_group_dir,
     get_groups_dir,
     get_inboxes_dir,
     get_transcript_file,
+    group_read_has_unseen_acks,
     group_read_positions,
+    human_presence_online,
     is_channel_alive,
     list_project_records,
+    new_message_id,
     now_timestamp,
     read_agent_record,
     read_group_messages,
@@ -49,6 +55,7 @@ from .comms import (
     read_json_safe,
     read_jsonl_tail,
     read_project_record,
+    read_reaction_state,
     read_reactions,
     read_transcript,
     remove_agent,
@@ -85,11 +92,29 @@ MAX_MESSAGE_CHARS = 64 * 1024
 # Cap on _read.json (acked-message history) entries — trimmed to the most recent N on ack so
 # the append-forever log can't grow without bound (audit C-3).
 _READ_CAP = 1000
+# Cap on a live {agent}_unread.json — the file every sender appends to and the watcher polls
+# twice a second (audit T2). Data-preserving, NOT a drop: overflow moves to _read.json (see
+# _cap_unread) so the union of unread+read is always the complete set of sent messages.
+_UNREAD_CAP = 1000
 # react()/resolve_message() resolve a target id from the transcript newest-first. The target is
 # almost always recent, so scan the last _RESOLVE_TAIL records first (read only the file's tail,
 # C-1) and only full-scan the whole stream if that window is saturated and missed (an older
 # target, or a log longer than the window).
 _RESOLVE_TAIL = 500
+# Cap on the reactions read for inbox render + group history (audit C2): those two call sites
+# are the hottest reaction readers and were parsing the ENTIRE global reactions.jsonl on every
+# call. A chip for an event older than this window stops rendering — the reaction itself is
+# never lost (reactions.jsonl is untouched; only the render window is capped).
+_REACTIONS_TAIL = 1000
+# WP-27 C6: REACTIONS_RETAIN (comms.py — events compaction keeps live) MUST stay >=
+# _REACTIONS_TAIL (the render window above), or the tail read could scroll past the retained
+# jsonl into a gap between it and the compacted baseline. A real (not assert-under--O) check
+# at import time so a future edit to either constant trips immediately, not just in a test.
+if REACTIONS_RETAIN < _REACTIONS_TAIL:
+    raise RuntimeError(
+        f"REACTIONS_RETAIN ({REACTIONS_RETAIN}) must be >= _REACTIONS_TAIL "
+        f"({_REACTIONS_TAIL}) — the render tail must sit inside the retained jsonl."
+    )
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -99,11 +124,38 @@ def _reaction_summary(reactions_by_emoji):
     couldn't say who). Callers wrap it as '    reactions: <this>'."""
     return "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in reactions_by_emoji.items())
 
+
+def _format_message_block(msg, *, agent=None, reactions=None):
+    """Render one message as the shared '--- id | from [tags] ---' block (N10): header line +
+    optional reply-line + body + optional reactions line, as a list of lines to extend into
+    the caller's output. Used by BOTH teammate_inbox and teammate_group(action="history") so
+    the two views render an identical block for the same message — field order/tags unify on
+    the richer INBOX form (group/post-type/urgent/mention flags; group history previously
+    omitted the group and mention tags, which is fine since a group's own history is already
+    scoped to it, but a single renderer beats two near-identical ad-hoc grammars).
+
+    ``agent``, if given, is the VIEWING agent — enables the 🔔(@you) mention flag.
+    ``reactions`` is that message's aggregated {emoji: [reactors]} dict (or None/empty for no
+    reactions line).
+    """
+    tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
+    grp = msg.get("group")
+    gtag = f" [👥 group: {grp}]" if grp else ""
+    ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
+    mtag = " 🔔(@you)" if agent and agent in (msg.get("mentions") or []) else ""
+    lines = [f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{ptag}{tag}{mtag} ---"]
+    if msg.get("reply_to"):
+        lines.append(f"    ↳ re {msg['reply_to']}")
+    lines.append(str(msg.get("message", "")))
+    if reactions:
+        lines.append(f"    reactions: {_reaction_summary(reactions)}")
+    return lines
+
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
     "project": (
-        "The project/repo you're working in. Auto-filled from the current project "
-        "directory at registration — set this only to override the auto-filled value."
+        "Your working project — auto-filled from the project directory when you "
+        "register; set to override."
     ),
     "role": "Your job/role on the team (e.g. 'backend / API').",
     "personality": (
@@ -206,7 +258,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "to": {"type": "string", "description": "Recipient agent name, or a '#'-prefixed group name (e.g. '#design')."},
-                "message": {"type": "string", "description": "Message body."},
+                "message": {"type": "string", "description": "Message body. Max 64 KB. @name in a group post mentions a member (they get a 🔔 flag in their wake and inbox)."},
                 "priority": {
                     "type": "string",
                     "enum": list(_PRIORITIES),
@@ -307,13 +359,17 @@ TOOL_DEFINITIONS = [
         "description": (
             "Manage group chats for brainstorming with multiple teammates. A group is "
             "addressed like a teammate but with a '#' prefix: post to it with "
-            "teammate_send(to=\"#<group>\"), which fans out to every member and wakes "
-            "them. The full ordered thread is kept in a shared transcript — use "
-            "action='history' as the canonical record (it survives inbox acks). "
-            "Membership is open (anyone can join/add). Actions: create, delete "
+            "teammate_send(to=\"#<group>\", message=\"...\") — @name in the post mentions "
+            "a member (they get a 🔔 flag in their wake and inbox) — which fans out to "
+            "every member and wakes them. The full ordered thread is kept in a shared "
+            "transcript — use action='history' as the canonical record (it survives inbox "
+            "acks). Groups are open: any registered teammate can join, post, and read "
+            "history — do not post secrets expecting privacy. Actions: create, delete "
             "(creator-only), join, leave, add (members), members (list), history (read "
             "the shared transcript; optionally filter by 'sender', 'post_type', and a "
-            "'since' id cursor — the decision trail)."
+            "'since' id cursor — the decision trail), mute, unmute (silence/restore this "
+            "group's channel wakes for you; messages still arrive), reads (who has acked "
+            "up to where)."
         ),
         "inputSchema": {
             "type": "object",
@@ -475,8 +531,10 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_set_avatar",
         "description": (
-            "Set or clear a profile avatar image for a registered teammate. "
-            "Requires Pillow (install teammate-comms[images]). "
+            "Set or clear your own avatar image (self-owned — see 'agent' below). "
+            "Requires Pillow: set TEAMMATE_AVATARS_ENABLED=1 before launching Claude Code "
+            "(re-syncs the plugin venv with the images extra), or run "
+            "`uv sync --project <plugin-root> --extra images`. "
             "Provide 'path' (local filesystem path to an image) OR 'image_base64' (base64-encoded bytes). "
             "Supported formats: PNG, JPEG, GIF, WEBP, and any format Pillow can open. "
             "Images are automatically resized to 256×256, centred on a black canvas. "
@@ -488,7 +546,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "agent": {
                     "type": "string",
-                    "description": "Name of the agent whose avatar to set. Defaults to yourself.",
+                    "description": "Defaults to yourself; only your own avatar can be set.",
                 },
                 "path": {
                     "type": "string",
@@ -512,10 +570,15 @@ def _require_registered(ctx):
     """Return (agent, team, root) or raise CommsError if not yet registered."""
     agent, team, root, _ = ctx["identity"].snapshot()
     if agent is None or root is None:
-        raise CommsError(
-            "Not registered yet. Call teammate_register(agent=\"<your-name>\") "
-            "first to establish your identity and start your channel."
-        )
+        msg = ("Not registered yet. Call teammate_register(agent=\"<your-name>\") "
+               "first to establish your identity and start your channel.")
+        # S4: if $TEAMMATE_AGENT auto-register failed earlier, say so here — the agent looks
+        # "not registered" for a REASON, not just because it hasn't called teammate_register.
+        get_err = ctx.get("auto_register_error")
+        err = get_err() if get_err else None
+        if err:
+            msg += f" Note: auto-register from $TEAMMATE_AGENT failed earlier: {err}"
+        raise CommsError(msg)
     return agent, team, root
 
 
@@ -523,7 +586,7 @@ def _require_registered(ctx):
 
 def _handle_register(args, ctx):
     agent = args.get("agent")
-    validate_agent_name(agent)  # raises CommsError on bad/missing
+    validate_agent_name(agent, param="agent")  # raises CommsError on bad/missing (N9)
     team = args.get("team")
     if team is not None and (not isinstance(team, str) or not team.strip()):
         team = None
@@ -585,7 +648,7 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     live recipient via their own channel watcher), THEN tees the global transcript
     (best-effort, LAST — observability never precedes or delays delivery).
     """
-    validate_agent_name(to)
+    validate_agent_name(to, param="to")
     if to == sender:
         raise CommsError(
             "Cannot send to yourself. teammate_send targets another teammate; "
@@ -599,7 +662,7 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     ensure_inbox(inboxes_dir, to)
     unread_file = inboxes_dir / f"{to}_unread.json"
 
-    record = {"id": now_timestamp(), "from": sender, "priority": priority, "message": content}
+    record = {"id": new_message_id(), "from": sender, "priority": priority, "message": content}
     if pt:
         record["post_type"] = pt  # additive: flows to inbox + NDJSON transcript
     if isinstance(reply_to, str) and reply_to.strip():
@@ -607,6 +670,7 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     with file_lock(unread_file):
         messages = read_json_safe(unread_file)
         messages.append(record)
+        messages = _cap_unread(messages, inboxes_dir / f"{to}_read.json")  # T2
         write_json_atomic(unread_file, messages)
 
     to_record = read_agent_record(root, team, to)
@@ -647,7 +711,9 @@ def _handle_send(args, ctx):
             f"NOTE: no teammate named {to!r} is registered (no agent record). The message is "
             f"queued in their inbox and will be delivered if/when they register under that exact "
             f"name — a typo'd recipient queues silently. If {to} is a spawned subagent, their "
-            f"lead must SendMessage-nudge them to read it."
+            f"lead must SendMessage-nudge them to read it. If {to} believes they ARE registered, "
+            f"compare 'comms_root' in both sides' teammate_whoami — different roots cannot "
+            f"exchange messages (G4)."
         )
     return "\n".join(lines)
 
@@ -664,7 +730,13 @@ def _handle_inbox(args, ctx):
     agent, team, root = _require_registered(ctx)
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, agent)
-    all_unread = read_json_safe(inboxes_dir / f"{agent}_unread.json")
+    unread_file = inboxes_dir / f"{agent}_unread.json"
+    # Locked (C1): unread.json is the highest-contention multi-writer file. Under the lock no
+    # writer can be mid-write, so a parse failure here is REAL corruption — read_json_safe's
+    # destructive reset-to-[] is then the correct self-heal, not a false-positive on a torn
+    # partial write. Scope covers ONLY this read (not the reactions read below).
+    with file_lock(unread_file):
+        all_unread = read_json_safe(unread_file)
     seen_file = inboxes_dir / f"{agent}_seen.json"
 
     if args.get("count_only"):
@@ -723,30 +795,45 @@ def _handle_inbox(args, ctx):
 
     render_msgs = messages if show_all else new_msgs
 
-    rx_all = aggregate_reactions(read_reactions(root, team))
+    # WP-27: baseline (compacted-away events) + the live tail together — completeness holds
+    # regardless of whether/when a compaction has run.
+    rx_all = aggregate_reactions_with_baseline(
+        read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
     header = f"=== {len(messages)} unread message(s) for {agent}"
     if len(messages) < len(all_unread):
         header += f" (showing {len(messages)} of {len(all_unread)}; page with since/limit)"
     header += " ==="
     out = [header]
     for msg in render_msgs:
-        tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
-        grp = msg.get("group")
-        gtag = f" [👥 group: {grp}]" if grp else ""
-        ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
-        mtag = " 🔔(@you)" if agent in (msg.get("mentions") or []) else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{ptag}{tag}{mtag} ---")
-        if msg.get("reply_to"):
-            out.append(f"    ↳ re {msg['reply_to']}")
-        out.append(str(msg.get("message", "")))
-        rx = rx_all.get(msg.get("id"))
-        if rx:
-            out.append(f"    reactions: {_reaction_summary(rx)}")   # names, matching group history (F-3)
+        out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
     if not show_all and seen_msgs:
         _sfrom = _sender_summary(seen_msgs)
         out.append(f"\n({len(seen_msgs)} message(s) already delivered (from: {_sfrom}) — not re-shown. "
                    f"Pass show_all=True to re-read.)")
     return "\n".join(out)
+
+
+def _cap_unread(unread, read_file):
+    """T2: if ``unread`` exceeds ``_UNREAD_CAP`` after an append, move the OLDEST overflow
+    records into ``read_file`` tagged ``acked_unseen`` (never actually read — same M5
+    semantics; a hard drop would be message loss, which the audit's own rubric calls
+    critical) AND ``capped`` (distinguishes cap-overflow from ack("all")'s startup-drain in
+    forensics). Caller must hold the SAME lock that guards ``read_file`` (the established
+    tombstone/ack pattern — this reads-modifies-writes it). Returns the (possibly trimmed)
+    unread list; the caller writes it back. Strictly-greater gate: exactly AT the cap never
+    triggers a move.
+    """
+    if len(unread) <= _UNREAD_CAP:
+        return unread
+    overflow_count = len(unread) - _UNREAD_CAP
+    overflow, kept = unread[:overflow_count], unread[overflow_count:]
+    tagged_overflow = [dict(m, acked_unseen=True, capped=True) for m in overflow]
+    read = read_json_safe(read_file)
+    read.extend(tagged_overflow)
+    if len(read) > _READ_CAP:
+        read = read[-_READ_CAP:]
+    write_json_atomic(read_file, read)
+    return kept
 
 
 def _handle_ack(args, ctx):
@@ -772,6 +859,11 @@ def _handle_ack(args, ctx):
             if last_seen is None:
                 # Never read this session → clear everything (startup-drain behavior).
                 acked, unread = unread, []
+                # M5: tag each drained record — it was never actually SEEN (drained cold, not
+                # read), so group_read_positions must not infer "caught up" from it (a false
+                # read-receipt via the startup-drain path). Seen-then-acked records (the else
+                # branch below) stay untagged — receipts on that path are unchanged.
+                acked = [dict(m, acked_unseen=True) for m in acked]
                 result = f"Acknowledged all {len(acked)} message(s)."
             else:
                 # Only ack messages the agent has actually SEEN; preserve arrivals that
@@ -806,6 +898,18 @@ def _handle_ack(args, ctx):
     return result
 
 
+def _norm_project_label(raw):
+    """Normalize a project label for CROSS-OS comparison (G1) via ``validate_project_key``.
+    Returns None on empty/unparseable input so the caller falls back to raw equality — an odd
+    label that fails normalization still matches itself, never a false split."""
+    if not raw:
+        return None
+    try:
+        return validate_project_key(raw)
+    except CommsError:
+        return None
+
+
 def _handle_list(args, ctx):
     _agent, team, root = _require_registered(ctx)
     show_all = bool(args.get("all"))
@@ -814,6 +918,7 @@ def _handle_list(args, ctx):
     # re-registering, my_project may lag behind; pass all=True to see everyone.
     my_record = read_agent_record(root, team, _agent) or {}
     my_project = my_record.get("project") or ""
+    my_project_norm = _norm_project_label(my_project)
 
     agents_dir = get_agents_dir(root, team)
     if not agents_dir.exists():
@@ -829,16 +934,26 @@ def _handle_list(args, ctx):
         # Agents with no project set (human operator, legacy) are never filtered out.
         if not show_all and path.stem != _agent and my_project:
             agent_project = record.get("project") or ""
-            if agent_project and agent_project != my_project:
-                filtered_count += 1
-                continue
+            if agent_project:
+                # Compare NORMALIZED keys (G1) so e.g. "Projects\Foo" (Windows auto-fill) and
+                # "projects/foo" (Unix) match. Fall back to raw equality when either side is
+                # unparseable — never a false split from an odd label.
+                agent_project_norm = _norm_project_label(agent_project)
+                if my_project_norm is not None and agent_project_norm is not None:
+                    mismatch = agent_project_norm != my_project_norm
+                else:
+                    mismatch = agent_project != my_project
+                if mismatch:
+                    filtered_count += 1
+                    continue
         kind = record.get("type", "unknown")
         me = " (you)" if path.stem == _agent else ""
         if kind == "human":
             # A human has no channel — show their dashboard presence instead, marked
-            # distinctly so agents KNOW it's the operator (not just another agent).
-            rows.append(f"  - {path.stem}{me}: type=human 🧑 (operator), "
-                        f"presence={record.get('presence', 'away')}")
+            # distinctly so agents KNOW it's the operator (not just another agent). Verified
+            # fresh (human_presence_online), not the flat flag — a killed terminal ages out.
+            _presence = "online" if human_presence_online(record) else "away"
+            rows.append(f"  - {path.stem}{me}: type=human 🧑 (operator), presence={_presence}")
         else:
             # Heartbeat-freshness only (no per-agent liveness subprocess).
             live = is_channel_alive(record, pid_check=False)
@@ -884,6 +999,12 @@ def _doctor_report(root, team):
     base = get_inboxes_dir(root, team).parent      # .../TeammateComms[/team]
     rep = {"comms_root": str(root)}
     agents = {}
+    # G4: agents whose recorded comms_root differs from the CALLER's own root — a peer that
+    # resolved a different root can never exchange a message with the caller (different roots
+    # don't share files), and until now that divergence was invisible: sender output looked
+    # textually identical to a genuinely-offline recipient.
+    my_root_key = str(root).lower() if os.name == "nt" else str(root)
+    root_mismatches = []
     try:
         for f in sorted(get_agents_dir(root, team).glob("*.json")):
             r = read_json_readonly(f)
@@ -897,11 +1018,18 @@ def _doctor_report(root, team):
                     "alive": bool(is_channel_alive(r, pid_check=False)) if r.get("type") == "full" else None,
                     "lastHeartbeat": r.get("lastHeartbeat"),
                 }
+                other_root = r.get("comms_root")
+                if other_root:
+                    other_key = other_root.lower() if os.name == "nt" else other_root
+                    if other_key != my_root_key:
+                        root_mismatches.append({"agent": r.get("name", f.stem), "comms_root": other_root})
     except OSError:
         pass
     rep["agents"] = agents
+    rep["root_mismatches"] = root_mismatches
     files = {}
     for label, fname in (("transcript", "transcript.jsonl"),
+                         ("transcript_rotated", "transcript.jsonl.1"),  # WP-27 C6 grace copy
                          ("reactions", "reactions.jsonl"), ("deletions", "deletions.jsonl")):
         try:
             files[label] = {"bytes": (base / fname).stat().st_size}
@@ -938,6 +1066,10 @@ def _handle_whoami(args, ctx):
             "registered": False,
             "hint": "Call teammate_register(agent=\"<your-name>\") to establish identity.",
         }
+        get_err = ctx.get("auto_register_error")
+        err = get_err() if get_err else None
+        if err:
+            out["auto_register_error"] = err
         if verbose:
             out["doctor"] = {"note": "not registered — no comms root resolved yet."}
         return json.dumps(out, indent=2)
@@ -952,6 +1084,10 @@ def _handle_whoami(args, ctx):
     }
     if record.get("spawned_by"):
         info["spawned_by"] = record["spawned_by"]  # F-5 provenance breadcrumb, surfaced here
+    if os.environ.get("TEAMMATE_LAUNCH_ARGS"):
+        # H4: a launch override silently bypasses allowlist detection and inherits down the
+        # reincarnation chain forever — surface it so it's never invisible in whoami.
+        info["launch_args_override"] = os.environ["TEAMMATE_LAUNCH_ARGS"]
     if verbose:
         info["doctor"] = _doctor_report(root, team)   # G-5
     return json.dumps(info, indent=2, ensure_ascii=False)
@@ -977,7 +1113,8 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     me = " (you)" if is_self else ""
     lines = [f"Profile: {name}{me}", f"  {'type:':<13}{kind}"]
     if kind == "human":
-        lines.append(f"  {'presence:':<13}{record.get('presence', 'away')} (human operator)")
+        _presence = "online" if human_presence_online(record) else "away"
+        lines.append(f"  {'presence:':<13}{_presence} (human operator)")
     else:
         live = is_channel_alive(record, pid_check=False)
         lines.append(f"  {'channel:':<13}{'live' if live else 'offline'}")
@@ -1012,6 +1149,15 @@ def _handle_set_avatar(args, ctx):
     target = args.get("agent")
     if target is not None:
         validate_agent_name(target)
+        # T1: avatars are self-owned (mirrors teammate_update's self-only semantics) — any
+        # OTHER target is a silent-griefing vector (one teammate overwriting or clearing
+        # another's avatar). Checked BEFORE ingest_avatar's lazy Pillow import (below), so
+        # this guard — and its test — works even without Pillow installed.
+        if target != agent:
+            raise CommsError(
+                f"Avatars are self-owned — only {agent!r} can change {agent!r}'s avatar "
+                f"(got agent={target!r})."
+            )
     else:
         target = agent
     clear = bool(args.get("clear", False))
@@ -1044,7 +1190,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
     ``{id, sigil, delivered, live, deferred}`` (the counts are computed in the loop
     and are load-bearing for the wrapper's strings).
     """
-    group = validate_group_name(to_sigil)  # strips '#', validates
+    group = validate_group_name(to_sigil, param="to")  # strips '#', validates
     sigil = f"#{group}"
     meta = read_group_meta(root, team, group)
     if meta is None:
@@ -1067,7 +1213,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
                 meta["members"] = members
                 write_group_meta(root, team, group, meta)
 
-    record = {"id": now_timestamp(), "from": sender, "group": sigil,
+    record = {"id": new_message_id(), "from": sender, "group": sigil,
               "priority": priority, "message": content}
     if pt:
         record["post_type"] = pt  # additive: flows to inbox + group transcript + NDJSON
@@ -1085,7 +1231,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
     # Best-effort fan-out into each other member's inbox. A locked/failed inbox is
     # NON-FATAL: the transcript is authoritative and the member catches up via history.
     inboxes_dir = get_inboxes_dir(root, team)
-    delivered, live, deferred = [], 0, []
+    delivered, live, deferred, pended = [], 0, [], []
     for member in members:
         if member == sender:
             continue
@@ -1095,24 +1241,37 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
             with file_lock(unread_file):
                 msgs = read_json_safe(unread_file)
                 msgs.append(record)
+                msgs = _cap_unread(msgs, inboxes_dir / f"{member}_read.json")  # T2
                 write_json_atomic(unread_file, msgs)
             delivered.append(member)
             rec = read_agent_record(root, team, member)
             if rec and is_channel_alive(rec, pid_check=False):  # heartbeat-only (no N tasklist)
                 live += 1
         except CommsError:
-            deferred.append(member)
+            # M2: the member's unread lock was contended — retry via THEIR OWN pending file (a
+            # separate, rarely-contended lock) so their watcher recovers it on its next poll
+            # tick instead of the message silently vanishing until a manual history check.
+            try:
+                pending_file = inboxes_dir / f"{member}_pending.json"
+                with file_lock(pending_file):
+                    pending = read_json_safe(pending_file)
+                    pending.append(record)
+                    write_json_atomic(pending_file, pending)
+                pended.append(member)
+            except CommsError:
+                deferred.append(member)  # both locks contended — never raise, today's fallback
 
     append_transcript(root, team, {**record, "kind": "group"})  # tee LAST (firehose)
     return {"id": record["id"], "sigil": sigil,
-            "delivered": delivered, "live": live, "deferred": deferred}
+            "delivered": delivered, "live": live, "deferred": deferred, "pended": pended}
 
 
 def _send_to_group(agent, team, root, to_sigil, args):
     """Thin wrapper: format send_group()'s accounting into the human-readable summary."""
     res = send_group(root, team, agent, to_sigil, args.get("message"), args.get("priority", "normal"),
                      post_type=args.get("post_type"), reply_to=args.get("reply_to"))
-    delivered, live, deferred = res["delivered"], res["live"], res["deferred"]
+    delivered, live = res["delivered"], res["live"]
+    deferred, pended = res["deferred"], res["pended"]
     lines = [f"Posted to {res['sigil']} (id: {res['id']})."]
     if delivered:
         lines.append(
@@ -1121,6 +1280,8 @@ def _send_to_group(agent, team, root, to_sigil, args):
         )
     else:
         lines.append("No other members yet — recorded in the transcript only.")
+    if pended:
+        lines.append(f"Queued for retry — their watcher will pick it up: {', '.join(pended)}.")
     if deferred:
         lines.append(f"Deferred (inbox busy; will catch up via history): {', '.join(deferred)}.")
     return "\n".join(lines)
@@ -1142,15 +1303,23 @@ def _handle_group(args, ctx):
     action = args.get("action")
     if action not in _GROUP_ACTIONS:  # MCP clients don't enforce the schema enum
         raise CommsError(f"'action' must be one of {list(_GROUP_ACTIONS)}.")
-    group = validate_group_name(args.get("group"))  # raises on missing/bad
+    group = validate_group_name(args.get("group"), param="group")  # raises on missing/bad (N9)
     sigil = f"#{group}"
 
     if action == "create":
         members = [agent]
-        for m in args.get("members") or []:
-            validate_agent_name(m)
+        for i, m in enumerate(args.get("members") or []):
+            validate_agent_name(m, param=f"members[{i}]")
             if m not in members:
                 members.append(m)
+        # G2: case-variant collision check at CREATE only — open membership means member
+        # NAMES stay free-form addresses, not identities, so this doesn't extend there.
+        existing_group_variant = find_group_case_variant(root, team, group)
+        if existing_group_variant:
+            raise CommsError(
+                f"A group is already registered as '#{existing_group_variant}' — create with "
+                f"that exact spelling, or pick a distinct name."
+            )
         get_group_dir(root, team, group).mkdir(parents=True, exist_ok=True)  # so the .lock dir can be made
         with file_lock(_group_meta_file(root, team, group)):
             if read_group_meta(root, team, group) is not None:
@@ -1222,8 +1391,8 @@ def _handle_group(args, ctx):
         to_add = args.get("members") or []
         if not to_add:
             raise CommsError("Provide 'members' (a list of names) to add.")
-        for m in to_add:
-            validate_agent_name(m)
+        for i, m in enumerate(to_add):
+            validate_agent_name(m, param=f"members[{i}]")
 
         def mutate(meta):
             members = meta.get("members", [])
@@ -1272,6 +1441,8 @@ def _handle_group(args, ctx):
         lines = [f"{sigil} read positions (furthest-acked group message per member):"]
         for m in members:
             lines.append(f"  - {m}: {positions.get(m) or '(none acked)'}")
+        if group_read_has_unseen_acks(root, team, group, members):
+            lines.append("(startup-drained messages are not counted as read)")
         return "\n".join(lines)
 
     # action == "history"
@@ -1307,18 +1478,13 @@ def _handle_group(args, ctx):
         return f"{sigil} has no messages{by} yet."
     total = len(messages)
     recent = messages[-limit:]
-    rx_all = aggregate_reactions(read_reactions(root, team))
+    # WP-27: baseline (compacted-away events) + the live tail together — completeness holds
+    # regardless of whether/when a compaction has run.
+    rx_all = aggregate_reactions_with_baseline(
+        read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
     out = [f"=== {sigil} transcript{by} ({len(recent)} of {total} message(s)) ==="]
     for msg in recent:
-        urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""
-        ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{ptag}{urgent} ---")
-        if msg.get("reply_to"):
-            out.append(f"    ↳ re {msg['reply_to']}")
-        out.append(str(msg.get("message", "")))
-        rx = rx_all.get(msg.get("id"))
-        if rx:
-            out.append(f"    reactions: {_reaction_summary(rx)}")   # shared helper (F-3)
+        out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
     return "\n".join(out)
 
 
@@ -1350,18 +1516,26 @@ def react(root, team, reactor, target, emoji, remove=False):
     """Core: append a reaction add/remove event as ``reactor`` (sender-explicit so the
     dashboard reacts AS the human).
 
-    Stamps ``target_from`` (the reacted-to message's author, resolved from the durable
-    transcript) so the watcher can wake ONLY that author. If the author can't be resolved
-    (target not in the transcript, or TEAMMATE_TRANSCRIPT=0) the reaction still records but
-    won't wake anyone.
+    Stamps ``target_from`` (the reacted-to message's author) so the watcher can wake ONLY
+    that author, resolved via ``resolve_message()``'s 3-tier fallback (transcript tail→full,
+    group files, inboxes) — the SAME resolution ``delete_message`` already uses (M4: react
+    used to resolve transcript-only, so TEAMMATE_TRANSCRIPT=0 or a rotated-away id silently
+    dropped the wake while delete on the same id worked via its 3-tier fallback).
+
+    A clean miss now raises (N8: reacting to a nonexistent id used to return a success
+    string) — matching ack/delete's error idiom. Reacting to a TOMBSTONED message still
+    works and still wakes the author (S4, known-intentional: a tombstone keeps the id + from,
+    it doesn't erase them).
     """
     if not isinstance(target, str) or not target.strip():
         raise CommsError("'to_message' is required (the id of the message to react to).")
     if emoji not in _REACTIONS:
         raise CommsError(f"'emoji' must be one of {list(_REACTIONS)}.")
     target = target.strip()
-    _hit = _scan_transcript_for_id(root, team, target)  # tail-first; full-scan fallback (C-1)
-    target_from = _hit.get("from") if _hit else None
+    resolved = resolve_message(root, team, target)
+    if resolved is None:
+        raise CommsError(f"No message with id {target!r} found.")
+    target_from = resolved.get("from")
     # id is stamped inside append_reaction under the lock (file order == id order — see its
     # docstring); we read it back off `record` for the return value.
     record = {"target": target, "from": reactor,
@@ -1462,7 +1636,7 @@ def remove_teammate(root, team, caller, name, is_operator=False):
     memberships. Their authored messages stay attributed. Raises CommsError on a guard
     violation (self, the human operator, a missing name, or a LIVE teammate).
     """
-    validate_agent_name(name)
+    validate_agent_name(name, param="teammate")
     if name == caller:
         raise CommsError("You can't remove yourself.")
     record = read_agent_record(root, team, name)
@@ -1477,14 +1651,26 @@ def remove_teammate(root, team, caller, name, is_operator=False):
             f"the record."
         )
     removed_from = strip_member_from_groups(root, team, name)
-    remove_agent(root, team, name)
+    failed_paths = remove_agent(root, team, name)
+    extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
+             if removed_from else "")
+    record_path = str(get_agents_dir(root, team) / f"{name}.json")
+    if record_path in failed_paths:
+        # The registry record itself is still there — the teammate ISN'T actually gone, so
+        # the deletion event must NOT be appended (emit-event-LAST is the natural early return
+        # here: no event means a fresh dashboard/history load never claims a removal that
+        # didn't happen). Report the partial failure honestly instead of "Removed ...".
+        return (f"Partially removed teammate {name}: registry record could not be deleted "
+                f"(locked by another process) — {len(failed_paths)} file(s) failed. Retry "
+                f"teammate_delete to finish: {', '.join(failed_paths)}.{extra}")
     # best-effort (block=False): the record is already unlinked, so a blocking raise here
     # would lose the event permanently on retry (re-entry hits "No teammate named …"). A
     # fresh dashboard load omits the absent teammate; emit-event-LAST stays consistent.
     append_deletion(root, team, {"target": "@" + name,  # id stamped under the lock inside append_deletion
                                  "kind": "teammate", "by": caller, "op": "delete"}, block=False)
-    extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
-             if removed_from else "")
+    if failed_paths:
+        return (f"Removed teammate {name} (registry) but {len(failed_paths)} file(s) were "
+                f"locked — retry teammate_delete to finish: {', '.join(failed_paths)}.{extra}")
     return f"Removed teammate {name} (registry + inbox).{extra}"
 
 
@@ -1506,6 +1692,11 @@ def _reincarnate_enabled():
     return bool(v) and v.strip().lower() not in ("", "0", "false", "no", "off")
 
 
+# W2: stderr-logged once per process (not once per call) — the return-text warning below still
+# fires on every reincarnate call while the gate stays durably set.
+_gate_durable_stderr_logged = False
+
+
 def _handle_reincarnate(args, ctx):
     # Gate first (cheap) — opt-in only; spawning OS processes from a tool is high-power.
     if not _reincarnate_enabled():
@@ -1514,14 +1705,34 @@ def _handle_reincarnate(args, ctx):
             "server's environment to enable it (it launches a new OS terminal + Claude "
             "instance)."
         )
+    global _gate_durable_stderr_logged
+    from . import spawn
+    durable_warning = ""
+    if spawn._gate_durably_set():
+        durable_warning = (
+            "⚠ TEAMMATE_REINCARNATE_ENABLED is set DURABLY (registry/user env) — this enables "
+            "process-spawning for every future session machine-wide. Recommended: remove the "
+            "durable setting and set it per-session instead (see README).\n\n"
+        )
+        if not _gate_durable_stderr_logged:
+            _gate_durable_stderr_logged = True
+            print(f"[teammate-comms] WARNING: {durable_warning.strip()}", file=sys.stderr, flush=True)
     agent, team, root = _require_registered(ctx)
     target = args.get("agent")
-    validate_agent_name(target)
+    validate_agent_name(target, param="agent")
     project_dir = validate_project_dir(args.get("project_dir"))
     # Best-effort live-name collision guard (TOCTOU — the child's own auto-register only
     # WARNS, server.py): refuse only if the name is already a LIVE channel. Reincarnating
     # an OFFLINE name is the whole point.
     existing = read_agent_record(root, team, target)
+    # I2: the human guard MUST come before the is_channel_alive check below — register_human
+    # never sets `channel`, so is_channel_alive(existing) is always False for a human record
+    # and the live-check is structurally blind to it. Without this, reincarnating the
+    # operator's name spawns a child whose auto-register merge-writes type=full over the
+    # human record (WP-19 blocks the CHILD's own auto-register from completing that; this
+    # blocks the SPAWN itself — defense at both ends).
+    if existing and existing.get("type") == "human":
+        raise CommsError(f"{target!r} is the human operator — not reincarnate-able.")
     if existing and is_channel_alive(existing):
         raise CommsError(
             f"{target!r} is already live (pid={existing.get('pid')}, "
@@ -1534,7 +1745,6 @@ def _handle_reincarnate(args, ctx):
     team_arg = (args.get("team") or "").strip() or team
     comms_dir = args.get("comms_dir")
 
-    from . import spawn
     argv = spawn.build_claude_command(prompt)
     env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir,
                                 spawned_by=agent)  # provenance breadcrumb (F-5)
@@ -1544,7 +1754,19 @@ def _handle_reincarnate(args, ctx):
         raise CommsError(f"Could not launch a terminal/claude: {e}")
     except OSError as e:
         raise CommsError(f"Spawn failed: {e}")
-    return (
+    # W1: name the exact plugin spec used, so a fork/rehost operator can tell at a glance
+    # whether the marketplace resolved correctly (and how to fix it if not).
+    override_note = ""
+    if os.environ.get("TEAMMATE_LAUNCH_ARGS"):
+        # H4: TEAMMATE_LAUNCH_ARGS bypasses the plugin-spec/allowlist entirely — say so.
+        override_note = "\nLaunch override active (TEAMMATE_LAUNCH_ARGS) — allowlist detection bypassed."
+    else:
+        override_note = (
+            f"\nLaunched with plugin spec {spawn.plugin_spec()!r}. A fork/rehost that needs a "
+            f"different marketplace should set TEAMMATE_PLUGIN_MARKETPLACE or "
+            f"TEAMMATE_LAUNCH_ARGS."
+        )
+    return durable_warning + (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
         f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "
         f"within ~10-20s (it will register with spawned_by={agent!r}). If the new window shows a "
@@ -1552,7 +1774,7 @@ def _handle_reincarnate(args, ctx):
         f"no-click context it may never register, which looks identical to success here. Verify "
         f"with teammate_list: {target} appears once it's live; if it hasn't after ~30s, check the "
         f"new window."
-    )
+    ) + override_note
 
 
 def _handle_dashboard(args, ctx):
@@ -1567,12 +1789,15 @@ def _handle_dashboard(args, ctx):
     # Import lazily so the HTTP server module is only loaded when the tool is used.
     from . import dashboard
     info = dashboard.start_dashboard(root, team, human_name, port=port, open_browser=open_browser)
-    return (
+    text = (
         f"Dashboard {info['status']} at {info['url']}\n"
         f"You are '{human_name}' to the team — teammates can teammate_send to you and "
         f"invite you to groups like any teammate. The console stays up while this "
         f"instance runs."
     )
+    if info.get("warning"):
+        text = f"{info['warning']}\n\n{text}"
+    return text
 
 
 def _resolve_caller_project_key(agent, team, root):

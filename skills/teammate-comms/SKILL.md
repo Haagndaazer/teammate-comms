@@ -8,16 +8,19 @@ File-backed messaging between Claude Code agents, plus a **channel** that wakes 
 idle *full instance* the moment a teammate sends it a message. Provided as MCP
 tools by the bundled `teammate-comms` server — call the tools; do not shell out.
 
+> See also: [README.md](../../README.md) for install/launch instructions, a
+> Quickstart walkthrough, and a Troubleshooting table (symptom → cause → fix).
+
 ## Tools
 
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** — fans out to every member; `@name` (a member) flags a mention; `post_type` builds a decision trail. |
-| `teammate_inbox` | `count_only?`, `show_all?` | Read *your* unread messages (or just the count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies of messages already delivered are suppressed by default (durable across sessions) — pass `show_all=True` to re-read them (useful after context compaction). |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read *your* unread messages (or just the count). `since`/`limit` page a large inbox (id cursor + most-recent-N). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies of messages already delivered are suppressed by default (durable across sessions) — pass `show_all=True` to re-read them (useful after context compaction). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. `"all"` clears only what you've **seen** as of your last `teammate_inbox` read — arrivals since then are kept. |
 | `teammate_list` | `all?` | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`, `role` when set**), plus a **Groups** section. Defaults to your project only — pass `all=True` for a global view (cross-project authority owners are hidden in the default view). The human operator shows as `🧑 (operator)`. Use `teammate_profile` for full details including personality. |
-| `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
+| `teammate_whoami` | `verbose?` | Your registration state, identity, team, comms dir, and your own profile (diagnostics). `verbose:true` adds a read-only **doctor** report — comms root, per-agent heartbeat liveness, sub-stream file sizes, unread counts, leftover lock dirs. |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. Post with `teammate_send(to="#<group>")`; `history` reads the shared transcript (filterable into a decision trail). `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's acked up to where. |
@@ -25,6 +28,7 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers). Gated by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration — verify via `teammate_list`. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (the group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive, so citations still resolve. Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry record + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. Deletions reflect live in the dashboard. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) + register the human operator as a first-class teammate. |
+| `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set or clear your avatar image (resized to 256×256, pre-rendered as PNG/ANSI/ASCII). **Self-owned**: `agent` defaults to you; any other target is rejected. Requires Pillow — see README's Avatars section. |
 | `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile. `key` defaults to your own normalized project label. **By convention: only register/edit the profile for your own project directory** unless the user asks you to document another. Merge-upsert — omit a field to leave it unchanged; pass `""` to clear it. `path` auto-fills from `$CLAUDE_PROJECT_DIR` on first register. |
 | `list_projects` | — | List all registered project profiles: display name + live teammate roster + summary per project. Use `project_profile` for full details. Also surfaces undocumented project labels (agents active with no profile) and near-miss agents (raw field differs from canonical key). |
 | `project_profile` | `key?` | Full detail for one project — all stored fields, provenance (created_by/at, updated_by/at), and the live-derived teammate roster with liveness. `key` defaults to your project. |
@@ -105,15 +109,32 @@ a teammate name.
 
 ## Reliability contract
 
-- The inbox JSON is the **source of truth**. A dropped/missed channel push never
-  loses a message — it is read on the next `teammate_inbox`.
+- The inbox JSON is the **durable source of truth** — a message is never lost once
+  written. But an idle agent never reads its inbox unprompted, so "you'll see it on the
+  next read" only holds once *something* wakes you — and **channel pushes are
+  sometimes dropped by Claude Code itself** (known, unresolved upstream issues: GH
+  #38736 drops mid-turn, #61797 sporadic silent drops at idle). To compensate, the
+  watcher **re-nudges** still-unseen unread messages on a capped backoff after the
+  first emit (120s, then 240s, then 480s — 3 attempts, content-agnostic: DM, group,
+  urgent, and @mention all qualify equally). **Residual risk:** if every attempt is
+  also dropped, the message still sits durably in your inbox, but nothing will nudge
+  you again for it — the recovery affordance is a manual `teammate_inbox` call (e.g. at
+  the start of a new turn, or periodically if you suspect a wake was missed). This is
+  the honest contract: drops are real, not hypothetical; recovery is capped, not
+  guaranteed. Full mechanism in `DESIGN.md` §7; see also
+  [README.md](../../README.md#troubleshooting)'s Troubleshooting section.
 - `teammate_send` **warns** when the recipient's channel is offline (message
   queued, seen on their next start) — never a silent no-op.
 - Exactly **one live channel per agent name per machine**. Launching two instances
-  with the same `TEAMMATE_AGENT` makes both bind the same inbox; the server logs a
-  loud stderr collision warning.
+  with the same `TEAMMATE_AGENT` makes both bind the same inbox — the newer
+  registration wins and its **`teammate_register` response itself carries the
+  collision warning**, in-band (not a stderr log); the older, now-superseded instance
+  separately logs its own stderr "superseded by a newer claimant" line once its
+  heartbeat starts being skipped.
 - Diagnostics (resolved identity, comms root, warnings) go to stderr →
-  `~/.claude/debug/<session-id>.txt`. Check `/mcp` for connection status.
+  `~/.claude/debug/<session-id>.txt`. Check `/mcp` for connection status. If a
+  teammate never seems to receive your messages, compare `comms_root` in **both
+  sides'** `teammate_whoami` — different roots can never exchange a message.
 
 ## Launching a full instance (channel)
 

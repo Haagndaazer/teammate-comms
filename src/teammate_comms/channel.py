@@ -30,14 +30,21 @@ import os
 import socket
 import sys
 import time
+from datetime import datetime
 
 from .comms import (
+    HEARTBEAT_STALENESS_SECONDS,
     REACTION_EMOJI,
+    file_lock,
+    get_inboxes_dir,
+    heartbeat_fresh,
     now_timestamp,
     read_agent_record,
     read_json_readonly,
+    read_json_safe,
     read_reactions,
     write_agent_record,
+    write_json_atomic,
 )
 
 HEARTBEAT_SECONDS = 5
@@ -174,6 +181,47 @@ def compute_reemit(unseen_ids, now_mono, last_emit_mono, attempts):
     return (False, attempts, last_emit_mono)
 
 
+def compute_heartbeat_permit(record, my_instance_id, my_epoch, now):
+    """Pure flap-kill decision for one heartbeat tick (no I/O — hermetically testable, I1).
+
+    Ownership model: OWNERSHIP TRANSFERS ONLY AT REGISTER (register_identity writes
+    instance_id + epoch=prev+1); a heartbeat never steals a fresh record outright — it only
+    decides whether to keep writing in between registrations. ``record`` is the CURRENT
+    on-disk agent record, read fresh this same tick; ``my_epoch`` is the epoch THIS instance
+    minted at its own last register (stored on Identity, not recomputed here).
+
+    Returns True (permit the write) when:
+      * no record, or its instance_id is absent/ours — nothing foreign to detect (also covers
+        every legacy pre-WP-19 record, which never had an instance_id to begin with); or
+      * the foreign instance_id's heartbeat has gone STALE (not within
+        ``HEARTBEAT_STALENESS_SECONDS`` of ``now``) — a legitimate re-claim of a dead process's
+        record; never wait forever for a winner that crashed; or
+      * TOCTOU tie-break: the record's epoch equals ``my_epoch``. A window exists where MY
+        heartbeat reads the record before a COMPETITOR's register lands, and an unguarded
+        write would then stamp MY instance_id back OVER their fresh registration (the
+        field-merge keeps THEIR epoch, since heartbeats never write epoch — so the record's
+        epoch stays theirs even if instance_id gets clobbered). If the on-disk epoch still
+        matches what I minted at MY OWN register, no one has re-registered since I did — a
+        foreign instance_id here can only be a heartbeat-write STOMP from that race, not a
+        legitimate new registration, so I re-claim. The stomper reads foreign+fresh (with a
+        DIFFERENT epoch — theirs) next tick and demotes. Converges to most-recent-REGISTER
+        within 2 ticks, deterministically.
+
+    False (skip this tick's write) only for a foreign, FRESH, tie-break-losing record — i.e. a
+    genuinely different, currently-live claimant registered after we did.
+    """
+    if not record:
+        return True
+    foreign_id = record.get("instance_id")
+    if not foreign_id or foreign_id == my_instance_id:
+        return True
+    if not heartbeat_fresh(record.get("lastHeartbeat"), now, HEARTBEAT_STALENESS_SECONDS):
+        return True  # foreign but stale — legitimate re-claim of a dead process's record
+    if record.get("epoch") == my_epoch:
+        return True  # TOCTOU tie-break: this is MY registration, heartbeat-stomped by a race
+    return False
+
+
 def _wake_payload(messages, unseen_ids, agent):
     """Pure: the wake's at-a-glance context for ``unseen_ids`` → ``(count, group_targets,
     mentioned, senders)``. Shared by the fresh-nudge and re-nudge paths so a re-nudge is
@@ -187,6 +235,55 @@ def _wake_payload(messages, unseen_ids, agent):
                if m.get("id") in unseen_ids and not m.get("group") and m.get("from")}
     return len(unseen_ids), group_targets, mentioned, senders
 
+
+def merge_pending_into_unread(root, team, agent):
+    """Fold ``{agent}_pending.json`` into ``{agent}_unread.json`` (M2 recovery lane).
+
+    A group fan-out that couldn't acquire a member's unread lock appends the record to their
+    OWN pending file instead (a separate, rarely-contended lock) so it's never silently lost.
+    Each poll tick, the owning watcher merges it back in, deduped by id against current unread
+    (idempotent — a crash between the merge and the clear just re-merges harmlessly, since the
+    id is already present next time).
+
+    THREE sequential critical sections, lock order FIXED and never nested (both are
+    non-reentrant mkdir locks): read pending (unlocked, cheap peek) → lock+merge unread →
+    lock+clear pending. The clear step re-reads pending UNDER its lock and removes only the
+    ids from the ORIGINAL snapshot — a sender that appended something new in the meantime
+    isn't wiped, it survives for the next tick.
+
+    The unlocked peek uses ``read_json_readonly`` (NEVER ``read_json_safe``) — this file is
+    MULTI-WRITER (any group sender appends to it under its own lock), so a lockless read that
+    catches a sender mid-write is a torn read, not corruption; the destructive
+    ``read_json_safe`` would reset it to ``[]`` and the recovery lane would lose the exact
+    messages it exists to save (the same anti-pattern C1 fixed on unread.json — here it's
+    worse, this file's whole job is never-lose). A torn/missing peek just retries next tick
+    (0.5s later) — never resolved by writing anything. Only the CLEAR step (under the pending
+    lock, where no writer can be mid-write) uses ``read_json_safe``; that asymmetry is
+    intentional, do not "simplify" it away.
+
+    Returns True if anything was merged.
+    """
+    inboxes_dir = get_inboxes_dir(root, team)
+    pending_file = inboxes_dir / f"{agent}_pending.json"
+    unread_file = inboxes_dir / f"{agent}_unread.json"
+
+    pending = read_json_readonly(pending_file)
+    if not pending:
+        return False
+    pending_ids = {m.get("id") for m in pending if m.get("id") is not None}
+
+    with file_lock(unread_file):
+        unread = read_json_safe(unread_file)
+        existing_ids = {m.get("id") for m in unread}
+        new_msgs = [m for m in pending if m.get("id") not in existing_ids]
+        if new_msgs:
+            write_json_atomic(unread_file, unread + new_msgs)
+
+    with file_lock(pending_file):
+        current = read_json_safe(pending_file)
+        remaining = [m for m in current if m.get("id") not in pending_ids]
+        write_json_atomic(pending_file, remaining)
+    return True
 
 
 def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
@@ -205,6 +302,10 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     reaction_cursor = None     # high-water mark (max reaction id seen) driving the read window
     last_emit_mono = None      # monotonic time of the last wake emit (fresh or re-nudge); None until first
     reemit_attempts = 0        # re-nudge attempts in the current quiet period (capped)
+    demoted = False    # WP-19 flap-kill: True while a foreign live claimant has superseded us
+                       # (logged once per demotion episode, not per tick)
+    hb_failed = False  # W7: True while a heartbeat write is lock-contended (logged once per
+                       # consecutive-failure episode, not per tick)
 
     while not stop_evt.is_set():
         try:
@@ -212,8 +313,10 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 stop_evt.wait(POLL_SECONDS)
                 continue
 
-            agent, team, root, unread_file = identity.snapshot()
-            generation = identity.get_generation()
+            # W4: ONE lock acquisition — snapshot() + get_generation() as two separate calls
+            # could have a set() land in between, pairing a STALE root/inbox with a NEW
+            # generation for one tick.
+            agent, team, root, unread_file, generation = identity.snapshot_with_generation()
             if agent is None or root is None:
                 stop_evt.wait(POLL_SECONDS)
                 continue
@@ -233,20 +336,59 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 reaction_cursor = None
                 last_emit_mono = None
                 reemit_attempts = 0
+                demoted = False
+                hb_failed = False
 
             now = time.monotonic()
             if now - last_hb >= HEARTBEAT_SECONDS:
-                write_agent_record(
-                    root, team, agent, timeout=2,
-                    channel=True, pid=os.getpid(), host=hostname,
-                    lastHeartbeat=now_timestamp(),
-                )
-                last_hb = now
-                # Refresh the muted-groups cache (≤5s staleness for a mute to take effect) so
-                # the per-poll wake filter below never adds a disk read.
+                # ONE read before the write (I1 flap-kill, gate composition note): decide
+                # whether a foreign LIVE claimant has superseded us, and refresh the
+                # muted-groups cache from the SAME read — folded into one read, not two.
                 hb_rec = read_agent_record(root, team, agent) or {}
                 muted = set(hb_rec.get("muted_groups", []))
-                # Reaction wakes (low-volume → only on the 5s heartbeat tick, not every poll):
+                my_instance_id = identity.get_instance_id()
+                my_epoch = identity.get_epoch()
+                if compute_heartbeat_permit(hb_rec, my_instance_id, my_epoch, datetime.now()):
+                    # I4: stamp type="full" — truthful, since run_watcher only ever runs for a
+                    # registered full instance — so a delete-then-heartbeat resurrection carries
+                    # a real type instead of a type-less ghost. MANDATORY guard: never stomp an
+                    # existing type="human" record (the same read above already has it) — this
+                    # composes with the flap-kill's foreign-instance skip above, which already
+                    # covers a foreign AGENT; a human record has no instance_id at all, so it
+                    # would otherwise sail through compute_heartbeat_permit's "nothing foreign to
+                    # detect" branch and get overwritten here.
+                    type_field = {} if hb_rec.get("type") == "human" else {"type": "full"}
+                    wrote = write_agent_record(
+                        root, team, agent, timeout=2,
+                        channel=True, pid=os.getpid(), host=hostname,
+                        instance_id=my_instance_id,
+                        lastHeartbeat=now_timestamp(),
+                        **type_field,
+                    )
+                    demoted = False
+                    if wrote:
+                        hb_failed = False
+                        last_hb = now  # only advance on a SUCCESSFUL write
+                    elif not hb_failed:
+                        # W7: lock-contended (False return) — do NOT advance last_hb, so the
+                        # next 0.5s poll retries instead of waiting a full 5s; a live agent must
+                        # not look stale to is_channel_alive (which reincarnate's guard trusts)
+                        # just because one heartbeat write raced a lock. Log once per episode.
+                        hb_failed = True
+                        print(f"[teammate-comms] heartbeat write contended for agent={agent!r} "
+                              f"— retrying next poll (no lastHeartbeat advance this tick).",
+                              file=sys.stderr, flush=True)
+                else:
+                    hb_failed = False
+                    if not demoted:
+                        demoted = True
+                        print(f"[teammate-comms] superseded by a newer claimant for agent={agent!r} "
+                              f"(instance_id={hb_rec.get('instance_id')!r}, host={hb_rec.get('host')!r}, "
+                              f"pid={hb_rec.get('pid')!r}) — heartbeat write skipped until it goes stale.",
+                              file=sys.stderr, flush=True)
+                    last_hb = now  # DELIBERATE skip (foreign claimant) — we're not retrying this
+                # Reaction wakes still run every tick even when the write above was skipped
+                # (low-volume → only on the 5s heartbeat tick, not every poll):
                 # wake the AUTHOR of a reacted-to message. A high-water cursor drives the read
                 # window forward (since=reaction_cursor, oldest_first once seeded) so a burst
                 # larger than the limit pages across ticks instead of scrolling past a fixed
@@ -262,6 +404,13 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                     _log_emit("reaction", len(fresh_rx), 0)
                 if new_rcursor is not None:
                     reaction_cursor = new_rcursor
+
+            # M2: merge any records a group fan-out couldn't deliver directly (lock-contended
+            # unread) but recovered into our OWN pending file. Cheap Path.exists() gate — one
+            # os.stat per poll, not a full reparse — before touching the pending file at all.
+            pending_file = unread_file.with_name(f"{agent}_pending.json")
+            if pending_file.exists():
+                merge_pending_into_unread(root, team, agent)
 
             messages = read_json_readonly(unread_file)
             if messages is not None:  # None = unreadable mid-write; skip cycle
@@ -281,9 +430,13 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                     # and any muted-group message are excluded, so neither can ever (re-)nudge:
                     # that shared computation is what keeps the v0.4.2 no-noise contract intact.
                     # Muted ids are still tracked in known_ids below, so an unmute never
-                    # retro-nudges.
+                    # retro-nudges. M3: also exclude durable_seen — ids WP-15 already delivered
+                    # (full body) in a PRIOR session, per the persisted seen-file snapshotted at
+                    # registration — so a wake firing before this session's first
+                    # teammate_inbox read doesn't over-count them as "new".
                     last_seen = identity.get_last_seen() or set()
-                    unseen_ids = (unread_ids - muted_ids) - last_seen
+                    durable_seen = identity.get_durable_seen()
+                    unseen_ids = (unread_ids - muted_ids) - last_seen - durable_seen
                     fresh = unseen_ids - known_ids
                     if fresh:
                         # A genuinely-new message → first nudge. group_targets name the reply

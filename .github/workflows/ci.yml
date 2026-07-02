@@ -1,8 +1,10 @@
 name: CI
 
-# Run the (zero-dependency, stdlib-only) handshake harness on both OSes. The harness drives
-# the MCP server over a pipe and exercises the in-process unit blocks (storage, channel,
-# dashboard HTTP, hooks). No secrets, no network.
+# Run all three (zero-dependency, stdlib-only) acceptance suites on every OS. The handshake
+# harness drives the MCP server over a pipe and exercises the in-process unit blocks (storage,
+# channel, dashboard HTTP, hooks); the WP-13/WP-14 suites cover project profiles and avatars.
+# No secrets, no network. CI syncs no extras — the WP-14 suite's Pillow-dependent checks
+# self-skip (never fail) when Pillow isn't installed; see test_wp14_avatars.py's _HAS_PILLOW.
 on:
   push:
     branches: [main]
@@ -23,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Actions are SHA-pinned to their exact release commit (supply-chain hardening — a moving
@@ -37,6 +39,12 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       - name: Sync environment
         run: uv sync
-      # --no-sync: the env is already synced above; the harness imports only stdlib.
+      # --no-sync: the env is already synced above; each suite imports only stdlib (+ an
+      # optional Pillow import in the WP-14 suite, which self-skips when absent — no extras
+      # step is added here, matching the zero-dep default `uv sync`).
       - name: Run handshake harness
         run: uv run --no-sync python tests/test_handshake.py
+      - name: Run WP-13 project-profile suite
+        run: uv run --no-sync python tests/test_wp13_projects.py
+      - name: Run WP-14 avatar suite
+        run: uv run --no-sync python tests/test_wp14_avatars.py

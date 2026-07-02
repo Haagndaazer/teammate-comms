@@ -147,29 +147,45 @@ def ingest_avatar(root, team, name, *, path=None, image_base64=None, clear=False
                 pass
         return None
 
+    # Argument presence + the D3 pre-decode length cap are pure stdlib checks — run them
+    # BEFORE the lazy Pillow import (gate CR): a fresh-adopter env with no `images` extra
+    # synced (CI, no shared dev venv) hit the ImportError first, masking the 50MB-cap error
+    # AC-3 asserts. The brief's own wording was "before the import", not just "before the
+    # decode" — this now honors that literally.
+    if path is None and image_base64 is None:
+        raise CommsError("Provide 'path' (image file path) or 'image_base64'.")
+    if image_base64 is not None:
+        # byte-cap the ENCODED string BEFORE decoding — base64 expands ~4/3x, so decoding
+        # first would let an over-cap payload burn CPU/memory on the decode itself before the
+        # post-decode check below ever catches it. (4/3 + a 4-byte pad allowance, matching the
+        # base64 encoded-length formula: ceil(n/3)*4.)
+        if len(image_base64) > _MAX_SRC_BYTES * 4 // 3 + 4:
+            raise CommsError(
+                "Source image (base64-encoded) exceeds the 50 MB byte cap. "
+                "Resize or compress the image first."
+            )
+
     # Lazy Pillow import — the ONLY place PIL enters the process.
     try:
         from PIL import Image
     except ImportError:
         raise CommsError(
-            "Pillow is not installed. "
-            "Install the images extra to enable avatar ingest: "
-            "pip install teammate-comms[images]"
+            "Pillow is not installed. Set TEAMMATE_AVATARS_ENABLED=1 before launching Claude "
+            "Code (re-syncs the plugin venv with the images extra on next session start), or "
+            "run: uv sync --project <plugin-root> --extra images"
         )
 
-    # Obtain raw bytes from path or base64.
+    # Obtain raw bytes from path or base64 (presence already validated above).
     if path is not None:
         try:
             src_bytes = Path(path).read_bytes()
         except OSError as exc:
             raise CommsError(f"Could not read image file {path!r}: {exc}")
-    elif image_base64 is not None:
+    else:
         try:
             src_bytes = base64.b64decode(image_base64)
         except Exception as exc:
             raise CommsError(f"Invalid base64 image data: {exc}")
-    else:
-        raise CommsError("Provide 'path' (image file path) or 'image_base64'.")
 
     # 50 MB byte cap before touching PIL (CPU-bomb / decompression-bomb guard).
     if len(src_bytes) > _MAX_SRC_BYTES:

@@ -51,7 +51,17 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+
+# WP-21 gate micro-CR: a FAIL message containing an emoji (the presence/warning strings this
+# WP added — 🧑/⚠️) crashes the harness's own report with UnicodeEncodeError under Windows
+# cp1252 stdout, masking every failure detail behind a bare traceback — breaking only on the
+# exact path whose job is telling you what broke. Harness-report-only; never strip emoji from
+# product strings.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
 
 REPO = Path(__file__).resolve().parents[1]
 SRC = REPO / "src"
@@ -81,6 +91,12 @@ def reader(stream, sink):
 
 def send(proc, obj):
     proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+    proc.stdin.flush()
+
+
+def send_raw(proc, raw_line):
+    """Write a raw line to stdin verbatim — for frames that aren't a JSON object (WP-16 AC-1)."""
+    proc.stdin.write((raw_line + "\n").encode("utf-8"))
     proc.stdin.flush()
 
 
@@ -438,6 +454,35 @@ def main():
                 "params": {"name": "teammate_list", "arguments": {"all": True}}})
     time.sleep(0.5)
 
+    # ── WP-16: envelope guard + version negotiation + notification discipline ──
+    # AC-1: malformed non-dict frames (null, a bare scalar, a JSON-RPC batch array — batching
+    # is unsupported here) must not kill the server; a subsequent request (id 64) still answers.
+    # ids 63/64/65 are free (out-of-sequence ids are fine; by_id is order-independent).
+    # Crash-tolerant (gate micro-CR): if server.py regresses on S1, the server actually dies and
+    # writing to its closed stdin raises OSError — uncaught, that would abort this WHOLE script
+    # before any FAIL prints, so a real S1 regression would read as harness flakiness instead of
+    # a named failure. Catch it here, record the specific reason, and let the run finish so every
+    # other id's assertion still reports.
+    wp16_frame_error = None
+    try:
+        send_raw(proc, "null")
+        send_raw(proc, '"scalar"')
+        send_raw(proc, json.dumps([{"jsonrpc": "2.0", "id": 63, "method": "ping"}]))
+        time.sleep(0.4)
+        send(proc, {"jsonrpc": "2.0", "id": 64, "method": "ping"})
+        time.sleep(0.4)
+        # AC-2: a mid-session re-initialize with a bogus protocolVersion must be answered with
+        # OUR version (non-echo) — the FIRST initialize (id 1) can't prove this since the
+        # harness sent the same version we'd answer regardless.
+        send(proc, {"jsonrpc": "2.0", "id": 65, "method": "initialize",
+                    "params": {"protocolVersion": "1999-01-01", "capabilities": {}}})
+        time.sleep(0.4)
+        # AC-3: a notification-form ping (no id) must produce NO response frame.
+        send(proc, {"jsonrpc": "2.0", "method": "ping"})
+        time.sleep(0.4)
+    except OSError as e:
+        wp16_frame_error = str(e)
+
     proc.stdin.close()
     try:
         proc.wait(timeout=5)
@@ -498,6 +543,28 @@ def main():
         if "authority over the areas" not in _instr_l or "before you modify" not in _instr_l:
             failures.append(f"initialize instructions missing the authority-coordination rule (WP-10): {instr[:120]!r}")
 
+    # WP-16 gate micro-CR: the pipe block itself hit an OSError (server died mid-block) —
+    # report this FIRST and specifically, since it explains why the AC-1/2/3 checks below fail.
+    if wp16_frame_error:
+        failures.append(f"WP-16: server died on a malformed frame — S1 envelope-guard regression "
+                         f"(write failed: {wp16_frame_error})")
+    # WP-16 AC-1: a malformed non-dict frame (null / bare scalar / batch array) must not kill
+    # the server — assert the SPECIFIC reason (a -32600 frame emitted, id 64 still answered),
+    # not just "something didn't throw" (a dead server would silently fail both checks below).
+    bad_frame_errors = [m for m in msgs if m.get("id") is None and (m.get("error") or {}).get("code") == -32600]
+    if not bad_frame_errors:
+        failures.append("no -32600 error frame emitted for a malformed non-dict request (WP-16 AC-1)")
+    if by_id.get(64, {}).get("result") != {}:
+        failures.append(f"ping (id 64) after malformed frames unanswered — server likely died (WP-16 AC-1): {by_id.get(64)}")
+    # WP-16 AC-2: mid-session re-initialize with a bogus protocolVersion answers with OUR
+    # version, proving non-echo (the id-1 initialize alone can't prove this).
+    if by_id.get(65, {}).get("result", {}).get("protocolVersion") != "2025-06-18":
+        failures.append(f"re-initialize (id 65) did not answer with our protocol version (WP-16 AC-2): {by_id.get(65)}")
+    # WP-16 AC-3: a notification-form ping (no id) produces NO response frame. -32600 error
+    # frames legitimately carry id null — only exclude those, don't over-assert.
+    if any("id" in m and m["id"] is None and "result" in m for m in msgs):
+        failures.append("notification-form ping produced a response frame (WP-16 AC-3, should be silent)")
+
     # tools/list: 18 tools (13 original + 4 project-profile tools + 1 avatar tool), each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
@@ -527,6 +594,10 @@ def main():
     # register return echoes the profile back (personality reminder at session start)
     if PERSONALITY not in text(5) or ROLE not in text(5):
         failures.append(f"teammate_register did not echo profile: {text(5)}")
+    # WP-19 AC-5: the normal single-owner register path must stay silent — no collision warning.
+    if "WARNING" in text(5):
+        failures.append(f"WP-19 AC-5: normal single-owner register wrongly printed a "
+                         f"collision warning: {text(5)}")
     if '"registered": true' not in text(6).lower() or AGENT not in text(6):
         failures.append(f"whoami after register wrong: {text(6)}")
     # whoami echoes the profile set at registration
@@ -630,8 +701,9 @@ def main():
     agent_txt = agent_unread.read_text(encoding="utf-8") if agent_unread.exists() else ""
     if "group hello" in agent_txt:
         failures.append("group send echoed to the sender's own inbox (should skip sender)")
-    # transcript recorded the message
-    transcript = groups_dir(root) / GROUP / "messages.json"
+    # transcript recorded the message — WP-25 C3: the append path is now messages.jsonl
+    # (NDJSON, O(1) append), not the legacy full-array messages.json.
+    transcript = groups_dir(root) / GROUP / "messages.jsonl"
     if not transcript.exists() or "group hello" not in transcript.read_text(encoding="utf-8"):
         failures.append(f"group transcript missing message at {transcript}")
     # history returns it
@@ -857,6 +929,19 @@ def main():
         argv_allow = _spawn.build_claude_command("p", settings_paths=[_ms])
         if "--channels" not in argv_allow or "--dangerously-load-development-channels" in argv_allow:
             failures.append(f"allowlisted should use --channels, not the dangerous flag: {argv_allow}")
+        # (b2) WP-30 AC-3 (H2): choosing the allowlisted path stderr-logs the verification
+        # vintage + the TEAMMATE_LAUNCH_ARGS escape hatch, so a future managed-settings schema
+        # change is diagnosable from the debug log instead of a mysterious channel-loading failure.
+        import io as _io30c, contextlib as _ctxlib30c
+        _stderr_capture30c = _io30c.StringIO()
+        with _ctxlib30c.redirect_stderr(_stderr_capture30c):
+            _spawn.build_claude_command("p", settings_paths=[_ms])
+        _stderr_text30c = _stderr_capture30c.getvalue()
+        if (_spawn.MANAGED_SETTINGS_VERIFIED not in _stderr_text30c
+                or "TEAMMATE_LAUNCH_ARGS" not in _stderr_text30c):
+            failures.append(f"WP-30 AC-3 [tautology: choosing the allowlisted path must "
+                             f"stderr-log the verification vintage + escape hatch]: "
+                             f"{_stderr_text30c!r}")
         # (c) channelsEnabled false → NOT trusted → fall back to the dangerous flag
         with open(_ms, "w", encoding="utf-8") as _f:
             json.dump({"channelsEnabled": False,
@@ -1447,12 +1532,20 @@ def main():
                 def get_generation(self):
                     with self._lock:
                         return self._gen
+                def snapshot_with_generation(self):  # WP-22: single-lock W4 contract
+                    return self.snapshot() + (self.get_generation(),)
+                def get_durable_seen(self):  # WP-22 M3: no persisted seen-file in these tests
+                    return set()
                 def get_last_seen(self):
                     with self._lock:
                         return self._ls
                 def set_last_seen(self, v):
                     with self._lock:
                         self._ls = v
+                def get_instance_id(self):  # WP-19: run_watcher's heartbeat branch needs this
+                    return "test-instance-id"
+                def get_epoch(self):
+                    return 1
 
             _id12a = _Id12a()
             _id12a.set(_agent12a, None, _wroot12a, _unread12a)
@@ -1530,12 +1623,20 @@ def main():
                 def get_generation(self):
                     with self._lock:
                         return self._gen
+                def snapshot_with_generation(self):  # WP-22: single-lock W4 contract
+                    return self.snapshot() + (self.get_generation(),)
+                def get_durable_seen(self):  # WP-22 M3: no persisted seen-file in these tests
+                    return set()
                 def get_last_seen(self):
                     with self._lock:
                         return self._ls
                 def set_last_seen(self, v):
                     with self._lock:
                         self._ls = v
+                def get_instance_id(self):  # WP-19: run_watcher's heartbeat branch needs this
+                    return "test-instance-id"
+                def get_epoch(self):
+                    return 1
 
             _id12b = _Id12b()
             _init12b = _th12.Event()
@@ -1606,6 +1707,10 @@ def main():
                 def get_generation(self):
                     with self._lock:
                         return self._gen
+                def snapshot_with_generation(self):  # WP-22: single-lock W4 contract
+                    return self.snapshot() + (self.get_generation(),)
+                def get_durable_seen(self):  # WP-22 M3: no persisted seen-file in these tests
+                    return set()
                 def bump(self):
                     with self._lock:
                         self._gen += 1
@@ -1615,6 +1720,10 @@ def main():
                 def set_last_seen(self, v):
                     with self._lock:
                         self._ls = v
+                def get_instance_id(self):  # WP-19: run_watcher's heartbeat branch needs this
+                    return "test-instance-id"
+                def get_epoch(self):
+                    return 1
 
             _id12c = _Id12c()
             _init12c = _th12.Event()
@@ -1678,6 +1787,19 @@ def main():
         # (a different token → spurious 401/403). An ephemeral port keeps the block hermetic.
         _dres = _dash.start_dashboard(ddroot, None, "Operator", port=0, open_browser=False)
         _dport, _dtok = _dres["port"], _dash._STATE.token
+
+        # ── WP-35 — source tripwire: HTTPServer.server_bind() calls socket.getfqdn(host), a
+        #    reverse-DNS lookup that hangs for minutes on misconfigured-DNS runners (bit us on
+        #    macOS CI, wedging the whole process — server construction runs inside a tool
+        #    dispatch on the single JSON-RPC dispatch thread). A slow-DNS hang isn't
+        #    hermetically reproducible, so assert instead that the override exists and its
+        #    source never reaches getfqdn. The real bind above already exercised the override.
+        import http.server as _hs
+        import inspect as _insp
+        if _dash._DashboardServer.server_bind is _hs.HTTPServer.server_bind:
+            failures.append("WP-35: _DashboardServer does not override server_bind (getfqdn hang risk)")
+        elif "getfqdn" in _insp.getsource(_dash._DashboardServer.server_bind):
+            failures.append("WP-35: _DashboardServer.server_bind still reaches socket.getfqdn")
 
         def _dreq(method, path, token=None, host="127.0.0.1", body=None):
             conn = _hc.HTTPConnection("127.0.0.1", _dport, timeout=5)
@@ -1751,12 +1873,16 @@ def main():
             if _dreq("POST", "/api/send", token=_dtok,
                      body={"to": "Carol", "message": "x", "post_type": "bogus"})[0] != 400:
                 failures.append("WP-4 send with bogus post_type did not 400")
-            # /api/react: a valid emoji always 200 (records best-effort, no transcript setup);
-            # a bogus emoji → 400 (the whitelist gate).
-            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "fire"})[0] != 200:
-                failures.append("WP-3 /api/react valid emoji did not 200")
-            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "bogus"})[0] != 400:
+            # /api/react: a valid emoji on a RESOLVABLE target (the group post above) → 200;
+            # a bogus emoji → 400 (the whitelist gate). WP-26 N8: reacting to an unresolvable
+            # target ("x", no transcript/group/inbox record anywhere) now 400s too — it used
+            # to silently 200 (a reaction to nothing), matching ack/delete's not-found idiom.
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": _gmid, "emoji": "fire"})[0] != 200:
+                failures.append("WP-3 /api/react valid emoji on a resolvable target did not 200")
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": _gmid, "emoji": "bogus"})[0] != 400:
                 failures.append("WP-3 /api/react bogus emoji did not 400")
+            if _dreq("POST", "/api/react", token=_dtok, body={"target": "x", "emoji": "fire"})[0] != 400:
+                failures.append("WP-26 N8: /api/react on an unresolvable target should now 400")
             # /api/delete: XOR guard (neither message nor teammate) → 400. "Operator" is
             # registered so we reach the 400 guard, NOT the 409 no-identity branch.
             if _dreq("POST", "/api/delete", token=_dtok, body={})[0] != 400:
@@ -2681,19 +2807,26 @@ def main():
         # ---- G-2: spawn launcher SEAM — mock subprocess.Popen so the launcher resolution + argv
         #      construction run WITHOUT actually spawning a terminal (the only hermetic way to cover
         #      spawn_in_terminal; the real detached launch stays out of scope, stated in the diff).
+        #      Also mock shutil.which (WP-23 W1 pre-spawn check) so this seam doesn't depend on
+        #      whether the CI runner happens to have a real `claude` on PATH.
         _real_popen = _sp9.subprocess.Popen
+        _real_which9 = _sp9.shutil.which
         _popen_calls = []
         try:
             class _FakePopen:
                 def __init__(self, *a, **k):
                     _popen_calls.append((a, k))
+                def poll(self):
+                    return 0  # already "exited" — reaped cleanly by the next _reap_children()
             _sp9.subprocess.Popen = _FakePopen
+            _sp9.shutil.which = lambda name: f"/fake/{name}"
             _argv = ["claude", "-p", "hi"]
             _launched = _sp9.spawn_in_terminal(_argv, "/tmp", {"X": "1"})
             if not (_popen_calls and _launched and all(a in _launched for a in _argv)):
                 failures.append(f"G-2 spawn_in_terminal seam: argv not execd by the launcher: {_launched}")
         finally:
             _sp9.subprocess.Popen = _real_popen
+            _sp9.shutil.which = _real_which9
 
         # ---- G-6: the dashboard static asset must be PACKAGED (the triple-fallback can otherwise
         #      serve a placeholder on a packaging mistake — assert via the packaged-resource API).
@@ -2891,6 +3024,2327 @@ def main():
 
     except Exception as e:
         failures.append(f"WP-15 cross-session suppression unit checks errored: {e}")
+
+    # ── WP-16 AC-4 — handle_safely: a dispatch crash is answered -32603, the loop survives ──
+    try:
+        from teammate_comms import server as _srv16
+        sent16 = []
+        _orig_send16 = _srv16.send_message
+        _orig_dispatch16 = _srv16.tools_mod.dispatch
+        _srv16.send_message = lambda obj: sent16.append(obj)
+
+        def _boom16(name, arguments, ctx):
+            raise RuntimeError("WP-16 AC-4 induced crash")
+
+        _srv16.tools_mod.dispatch = _boom16
+        try:
+            _srv16.handle_safely(
+                {"jsonrpc": "2.0", "id": 9016, "method": "tools/call",
+                 "params": {"name": "whatever", "arguments": {}}},
+                {"identity": None, "register": None},
+            )
+        finally:
+            _srv16.tools_mod.dispatch = _orig_dispatch16
+            _srv16.send_message = _orig_send16
+        crash_resp = next((m for m in sent16 if m.get("id") == 9016), None)
+        if not crash_resp or (crash_resp.get("error") or {}).get("code") != -32603:
+            failures.append(f"WP-16 AC-4: handler crash not answered -32603: {sent16}")
+    except Exception as e:
+        failures.append(f"WP-16 AC-4 unit check errored: {e}")
+
+    # ── WP-17 AC-1/AC-2 (G1) — teammate_list project comparison is cross-OS normalized ──
+    # Tautology guard: this MUST fail against current main (raw string compare splits the two
+    # spellings) — the assertions below check the SPECIFIC symptom (peer missing from default
+    # list), not just "an exception was raised".
+    try:
+        from teammate_comms.tools import _handle_list as _hl17
+        from teammate_comms import comms as _c17
+
+        class _Id17:
+            def __init__(self, agent, root, team=None):
+                self._agent, self._root, self._team = agent, root, team
+            def snapshot(self):
+                return (self._agent, self._team, self._root, None)
+
+        _t17_root = tempfile.mkdtemp(prefix="tc-17-g1-")
+        _ag17 = _c17.get_agents_dir(_t17_root, None)
+        _ag17.mkdir(parents=True, exist_ok=True)
+        _hb17 = "2026-01-01T00:00:00.000000"
+        _records17 = {
+            "caller17":   {"type": "full", "project": "Projects\\Foo", "lastHeartbeat": _hb17},
+            "peer17":     {"type": "full", "project": "projects/foo", "lastHeartbeat": _hb17},
+            "outsider17": {"type": "full", "project": "other/bar", "lastHeartbeat": _hb17},
+        }
+        for _n17, _rec17 in _records17.items():
+            _c17.write_json_atomic(_ag17 / f"{_n17}.json", _rec17)
+        _ctx17 = {"identity": _Id17("caller17", _t17_root)}
+        _default17 = _hl17({}, _ctx17)
+        if "peer17" not in _default17:
+            failures.append(f"WP-17 G1: default list dropped a same-project peer with a "
+                             f"different-OS spelling (Windows vs Unix): {_default17[:200]!r}")
+        if "outsider17" in _default17:
+            failures.append(f"WP-17 G1: default list wrongly showed a different-project outsider: {_default17[:200]!r}")
+        _all17 = _hl17({"all": True}, _ctx17)
+        if "peer17" not in _all17 or "outsider17" not in _all17:
+            failures.append(f"WP-17 G1: all=True did not show every teammate: {_all17[:200]!r}")
+    except Exception as e:
+        failures.append(f"WP-17 G1 unit checks errored: {e}")
+
+    # ── WP-17 AC-3 (C1) — _handle_inbox locks the unread read; corrupt file still self-heals ──
+    try:
+        import inspect
+        from teammate_comms.tools import _handle_inbox as _hi17c1
+        from teammate_comms import comms as _c17c1
+
+        _src17c1 = inspect.getsource(_hi17c1)
+        if "file_lock(unread_file)" not in _src17c1:
+            failures.append("WP-17 AC-3: _handle_inbox source missing the file_lock(unread_file) tripwire")
+
+        class _Id17c1:
+            def __init__(self, agent, root, team=None):
+                self._agent, self._root, self._team = agent, root, team
+                self._ls = None
+            def snapshot(self):
+                return (self._agent, self._team, self._root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        _t17c1_root = tempfile.mkdtemp(prefix="tc-17-c1-")
+        _ix17c1 = _c17c1.get_inboxes_dir(_t17c1_root, None)
+        _c17c1.ensure_inbox(_ix17c1, "probe17c1")
+        (_ix17c1 / "probe17c1_unread.json").write_text("{torn", encoding="utf-8")
+        _ctx17c1 = {"identity": _Id17c1("probe17c1", _t17c1_root)}
+        _res17c1 = _hi17c1({}, _ctx17c1)
+        if "No unread messages" not in _res17c1:
+            failures.append(f"WP-17 AC-3: a really-corrupt unread file did not self-heal to an empty inbox: {_res17c1[:120]!r}")
+        _healed17c1 = json.loads((_ix17c1 / "probe17c1_unread.json").read_text(encoding="utf-8"))
+        if _healed17c1 != []:
+            failures.append(f"WP-17 AC-3: unread file not reset to [] after corruption: {_healed17c1!r}")
+    except Exception as e:
+        failures.append(f"WP-17 AC-3 unit checks errored: {e}")
+
+    # ── WP-17 AC-4 (C2) — no unbounded read_reactions(root, team) call remains in tools.py ──
+    try:
+        _tools_src17 = (SRC / "teammate_comms" / "tools.py").read_text(encoding="utf-8")
+        _unbounded17 = re.findall(r"read_reactions\(\s*root,\s*team\s*\)", _tools_src17)
+        if _unbounded17:
+            failures.append(f"WP-17 AC-4: unbounded read_reactions(root, team) call(s) remain in tools.py: {len(_unbounded17)}")
+    except Exception as e:
+        failures.append(f"WP-17 AC-4 unit check errored: {e}")
+
+    # ── WP-19 AC-1 — instance_id/epoch stamped at register; re-register bumps epoch, keeps profile ──
+    try:
+        from teammate_comms import server as _srv19
+        from teammate_comms.comms import read_agent_record as _rar19
+
+        _t19_root = tempfile.mkdtemp(prefix="tc-19-ac1-")
+        _name19 = "probe19ac1"
+        _srv19.register_identity(_name19, None, _t19_root,
+                                  {"role": "tester19", "personality": "curt-and-dry"})
+        _rec19a = _rar19(_t19_root, None, _name19) or {}
+        _iid19 = _rec19a.get("instance_id")
+        if not (isinstance(_iid19, str) and len(_iid19) == 32):
+            failures.append(f"WP-19 AC-1: instance_id missing/malformed after register: {_iid19!r}")
+        if _rec19a.get("epoch") != 1:
+            failures.append(f"WP-19 AC-1: first register epoch should be 1, got {_rec19a.get('epoch')!r}")
+
+        # Re-register same name: epoch bumps, profile fields (not re-passed) are PRESERVED.
+        _srv19.register_identity(_name19, None, _t19_root, {})
+        _rec19b = _rar19(_t19_root, None, _name19) or {}
+        if _rec19b.get("epoch") != 2:
+            failures.append(f"WP-19 AC-1: re-register should bump epoch to 2, got {_rec19b.get('epoch')!r}")
+        if _rec19b.get("instance_id") != _iid19:
+            failures.append(f"WP-19 AC-1: instance_id changed across re-register in the SAME "
+                             f"process: {_iid19!r} -> {_rec19b.get('instance_id')!r}")
+        if _rec19b.get("role") != "tester19" or _rec19b.get("personality") != "curt-and-dry":
+            failures.append(f"WP-19 AC-1: re-register lost the prior profile: {_rec19b!r}")
+    except Exception as e:
+        failures.append(f"WP-19 AC-1 unit checks errored: {e}")
+
+    # ── WP-19 gate CR — write_agent_record(bump_epoch=True) hands out DISTINCT epochs from its
+    # OWN RETURN VALUE, never from a separate read-back (a read-back would race a competitor's
+    # register and could return THEIR epoch — see comms.write_agent_record's docstring). Two
+    # bump_epoch writes to the same name must return epochs N+1 and N+2, strictly increasing.
+    try:
+        from teammate_comms.comms import write_agent_record as _warcr19
+
+        _tcr19_root = tempfile.mkdtemp(prefix="tc-19-epoch-cr-")
+        _rcr19a = _warcr19(_tcr19_root, None, "epochprobe19", timeout=5, bump_epoch=True, type="full")
+        _rcr19b = _warcr19(_tcr19_root, None, "epochprobe19", timeout=5, bump_epoch=True, type="full")
+        if not (isinstance(_rcr19a, dict) and isinstance(_rcr19b, dict)):
+            failures.append(f"WP-19 gate CR: write_agent_record must return the merged record "
+                             f"dict, not True/False: {_rcr19a!r}, {_rcr19b!r}")
+        elif not (_rcr19a.get("epoch") == 1 and _rcr19b.get("epoch") == 2):
+            failures.append(f"WP-19 gate CR: two bump_epoch writes should return epochs 1 then "
+                             f"2 from their RETURN VALUES: {_rcr19a.get('epoch')!r}, "
+                             f"{_rcr19b.get('epoch')!r}")
+    except Exception as e:
+        failures.append(f"WP-19 gate CR unit check errored: {e}")
+
+    # ── WP-19 AC-2 (flap kill) + TOCTOU tie-break — compute_heartbeat_permit pure-function tests ──
+    # No real sleeps: timestamps are injected (Silvie gate addendum (d)).
+    try:
+        from teammate_comms import channel as _ch19
+        from teammate_comms.comms import TIMESTAMP_FMT as _TSFMT19
+
+        _now19 = datetime(2026, 1, 1, 12, 0, 0)
+        _my_id19, _my_epoch19 = "mine", 5
+
+        # (b) no record / instance_id-absent record (all pre-WP-19 legacy records) → permit.
+        if not _ch19.compute_heartbeat_permit(None, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2(b): no record should permit the write")
+        if not _ch19.compute_heartbeat_permit({}, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2(b): instance_id-absent record should permit the write")
+
+        # AC-2: foreign + FRESH (right now) → SKIP (demoted).
+        _foreign_fresh19 = {"instance_id": "other", "epoch": 99,
+                            "lastHeartbeat": _now19.strftime(_TSFMT19)}
+        if _ch19.compute_heartbeat_permit(_foreign_fresh19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2: foreign+fresh record should SKIP the write (demoted)")
+
+        # AC-2: foreign + STALE (>30s old) → PERMIT (legitimate re-claim of a dead process).
+        _stale_hb19 = (_now19 - timedelta(seconds=31)).strftime(_TSFMT19)
+        _foreign_stale19 = {"instance_id": "other", "epoch": 99, "lastHeartbeat": _stale_hb19}
+        if not _ch19.compute_heartbeat_permit(_foreign_stale19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 AC-2: foreign+stale record should PERMIT the write (re-claim)")
+
+        # TOCTOU tie-break: foreign instance_id but epoch matches MINE → I was heartbeat-stomped
+        # by a race, not superseded by a real registration → re-claim (write).
+        _stomped19 = {"instance_id": "stomper", "epoch": _my_epoch19,
+                      "lastHeartbeat": _now19.strftime(_TSFMT19)}
+        if not _ch19.compute_heartbeat_permit(_stomped19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 TOCTOU: foreign+fresh but epoch==mine should re-claim (write)")
+
+        # A genuinely later registration (foreign instance_id, a DIFFERENT epoch, fresh) → skip.
+        _other19 = {"instance_id": "other", "epoch": _my_epoch19 + 1,
+                    "lastHeartbeat": _now19.strftime(_TSFMT19)}
+        if _ch19.compute_heartbeat_permit(_other19, _my_id19, _my_epoch19, _now19):
+            failures.append("WP-19 TOCTOU: foreign+fresh with a DIFFERENT epoch should skip "
+                             "(a genuinely later claimant)")
+    except Exception as e:
+        failures.append(f"WP-19 AC-2/TOCTOU unit checks errored: {e}")
+
+    # ── WP-19 AC-3 (S2) — register warning names a live foreign claimant's host/pid ──
+    try:
+        from teammate_comms import server as _srv19b
+        from teammate_comms.comms import write_agent_record as _war19, now_timestamp as _nt19
+
+        _t19c_root = tempfile.mkdtemp(prefix="tc-19-ac3-")
+        _name19c = "probe19ac3"
+        _war19(_t19c_root, None, _name19c, type="full", channel=True,
+               pid=999999, host="some-other-host", instance_id="foreign-instance",
+               epoch=1, lastHeartbeat=_nt19())
+        _msg19c = _srv19b.register_identity(_name19c, None, _t19c_root, {})
+        if "WARNING" not in _msg19c or "some-other-host" not in _msg19c or "999999" not in _msg19c:
+            failures.append(f"WP-19 AC-3: register did not warn naming the foreign host/pid: {_msg19c[:200]!r}")
+
+        # (c) self must never warn: re-registering the SAME identity (own instance_id, fresh)
+        # in the SAME process must be silent — twice, to prove it holds on the second call too.
+        _name19c2 = "probe19ac3-self"
+        _msg19c2 = _srv19b.register_identity(_name19c2, None, _t19c_root, {})
+        if "WARNING" in _msg19c2:
+            failures.append(f"WP-19 AC-3(c): first register wrongly warned: {_msg19c2[:200]!r}")
+        _msg19c3 = _srv19b.register_identity(_name19c2, None, _t19c_root, {})
+        if "WARNING" in _msg19c3:
+            failures.append(f"WP-19 AC-3(c): own re-register wrongly warned (same instance_id): {_msg19c3[:200]!r}")
+
+        # (c) a STALE foreign record must not warn either (dead claimant, not live).
+        _name19c4 = "probe19ac3-stale"
+        _stale_hb19c = (datetime.now() - timedelta(seconds=60)).strftime(_TSFMT19)
+        _war19(_t19c_root, None, _name19c4, type="full", channel=True,
+               pid=999998, host="another-host", instance_id="foreign-instance-2",
+               epoch=1, lastHeartbeat=_stale_hb19c)
+        _msg19c4 = _srv19b.register_identity(_name19c4, None, _t19c_root, {})
+        if "WARNING" in _msg19c4:
+            failures.append(f"WP-19 AC-3(c): stale foreign record wrongly warned: {_msg19c4[:200]!r}")
+    except Exception as e:
+        failures.append(f"WP-19 AC-3 unit checks errored: {e}")
+
+    # ── WP-19 AC-4 — human guard: registering over a type=human record raises CommsError ──
+    # Tautology: this MUST fail against current main (register currently succeeds silently).
+    try:
+        from teammate_comms import server as _srv19d
+        from teammate_comms.comms import register_human as _rh19, CommsError as _CE19
+
+        _t19d_root = tempfile.mkdtemp(prefix="tc-19-ac4-")
+        _human19 = "Operator19"
+        _rh19(_t19d_root, None, _human19)
+        try:
+            _srv19d.register_identity(_human19, None, _t19d_root, {})
+            failures.append("WP-19 AC-4 [tautology: register_identity must raise CommsError over "
+                             "a type=human record — reverted code lets this silently succeed]")
+        except _CE19 as _e19d:
+            if _human19 not in str(_e19d):
+                failures.append(f"WP-19 AC-4: human-guard error text must name the human: {_e19d}")
+        except Exception as _e19d2:
+            failures.append(f"WP-19 AC-4: wrong exception type ({type(_e19d2).__name__}), "
+                             f"want CommsError: {_e19d2}")
+    except Exception as e:
+        failures.append(f"WP-19 AC-4 unit checks errored: {e}")
+
+    # ── WP-19/WP-21 D1 (dashboard half) — collision warning ONLY for a FRESH foreign host ──
+    # WP-21 gate addendum tightened this: a host mismatch alone is not enough — a long-dead
+    # dashboard's stale host is a silent (fine) takeover; only FRESH presence from a different
+    # host should warn.
+    try:
+        from teammate_comms import dashboard as _dash19
+        from teammate_comms.comms import (
+            write_agent_record as _war19e,
+            now_timestamp as _nt19e,
+            TIMESTAMP_FMT as _TSFMT19d1,
+        )
+
+        # Fresh + different host → warns.
+        _t19e_root = tempfile.mkdtemp(prefix="tc-19-d1-")
+        _human19e = "Operator19d1"
+        _war19e(_t19e_root, None, _human19e, type="human", host="some-other-machine",
+                startedAt=_nt19e(), presence="online", presenceAt=_nt19e(), dashboard_pid=424242)
+        _info19e = _dash19.start_dashboard(_t19e_root, None, _human19e, port=0, open_browser=False)
+        if "some-other-machine" not in (_info19e.get("warning") or ""):
+            failures.append(f"WP-19/21 D1: fresh foreign-host record should warn: {_info19e}")
+        _dash19.shutdown_dashboard()
+
+        # Stale + different host → silent (a dead dashboard's stale host is a fine takeover).
+        _t19f_root = tempfile.mkdtemp(prefix="tc-19-d1-stale-")
+        _human19f = "Operator19d1stale"
+        _stale_hb19f = (datetime.now() - timedelta(seconds=120)).strftime(_TSFMT19d1)
+        _war19e(_t19f_root, None, _human19f, type="human", host="some-other-machine",
+                startedAt=_stale_hb19f, presence="online", presenceAt=_stale_hb19f,
+                dashboard_pid=424242)
+        _info19f = _dash19.start_dashboard(_t19f_root, None, _human19f, port=0, open_browser=False)
+        if _info19f.get("warning"):
+            failures.append(f"WP-19/21 D1: stale foreign-host record should NOT warn: {_info19f}")
+        _dash19.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-19/21 D1 unit check errored: {e}")
+
+    # ── WP-20 AC-1/AC-2 (I3) — locked, verified teammate deletion (tautology on current main) ──
+    try:
+        from teammate_comms import tools as _tools20
+        from teammate_comms import comms as _c20
+        from teammate_comms.comms import (
+            file_lock as _flock20,
+            write_agent_record as _war20,
+            read_agent_record as _rar20,
+            read_deletions as _rd20,
+            get_agents_dir as _gad20,
+        )
+
+        _t20_root = tempfile.mkdtemp(prefix="tc-20-ac1-")
+        _victim20 = "victim20"
+        _war20(_t20_root, None, _victim20, type="full", channel=False, pid=1,
+               host="wherever", instance_id="v-instance", epoch=1)
+        _c20.ensure_inbox(_c20.get_inboxes_dir(_t20_root, None), _victim20)
+        _record_path20 = _gad20(_t20_root, None) / f"{_victim20}.json"
+
+        # Hold the record's lock (simulates a concurrent writer) and attempt removal.
+        with _flock20(_record_path20):
+            _msg20a = _tools20.remove_teammate(_t20_root, None, "caller20", _victim20)
+        if "Removed teammate" in _msg20a and "locked" not in _msg20a.lower():
+            failures.append(f"WP-20 AC-1/AC-2 [tautology: removal under a held lock must NOT "
+                             f"report unconditional success — reverted code silently no-ops "
+                             f"the unlink and reports success anyway]: {_msg20a}")
+        if "locked" not in _msg20a.lower():
+            failures.append(f"WP-20 AC-1: partial-failure text missing: {_msg20a}")
+        _events20a = _rd20(_t20_root, None)
+        if any(e.get("target") == "@" + _victim20 for e in _events20a):
+            failures.append("WP-20 AC-1: deletion event appended despite the registry record "
+                             "surviving (teammate isn't actually gone)")
+        if not _rar20(_t20_root, None, _victim20):
+            failures.append("WP-20 AC-1: registry record was removed despite the held lock "
+                             "(the lock did not actually protect it)")
+
+        # Release + retry: clean success + event appended.
+        _msg20b = _tools20.remove_teammate(_t20_root, None, "caller20", _victim20)
+        if "Removed teammate" not in _msg20b or "locked" in _msg20b.lower():
+            failures.append(f"WP-20 AC-1: retry after lock release should cleanly succeed: {_msg20b}")
+        _events20b = _rd20(_t20_root, None)
+        if not any(e.get("target") == "@" + _victim20 for e in _events20b):
+            failures.append("WP-20 AC-1: deletion event missing after a clean successful removal")
+        if _rar20(_t20_root, None, _victim20):
+            failures.append("WP-20 AC-1: registry record still present after a clean removal")
+    except Exception as e:
+        failures.append(f"WP-20 AC-1/AC-2 unit checks errored: {e}")
+
+    # ── WP-20 AC-3/AC-4 (I4) — heartbeat-shaped write stamps type=full; never stomps type=human ──
+    try:
+        from teammate_comms import channel as _ch20
+        from teammate_comms.comms import (
+            write_agent_record as _war20b,
+            read_agent_record as _rar20b,
+            get_inboxes_dir as _gid20b,
+            ensure_inbox as _ei20b,
+        )
+
+        class _Id20:
+            def __init__(self, agent, root, unread_file):
+                self._agent, self._team, self._root, self._uf = agent, None, root, unread_file
+            def snapshot(self):
+                return (self._agent, self._team, self._root, self._uf)
+            def get_generation(self):
+                return 1
+            def snapshot_with_generation(self):
+                return self.snapshot() + (self.get_generation(),)
+            def get_durable_seen(self):
+                return set()
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, v):
+                pass
+            def get_instance_id(self):
+                return "ghost-instance-20"
+            def get_epoch(self):
+                return 1
+
+        # AC-3: simulate the delete-then-heartbeat ghost. A registered agent's record is gone
+        # (simulating I3's remove_teammate); its still-running watcher's very first heartbeat
+        # tick (last_hb starts at 0.0 → fires immediately) must re-create the record WITH
+        # type=full, not a type-less ghost.
+        _t20c_root = tempfile.mkdtemp(prefix="tc-20-ac3-")
+        _ghost20 = "ghost20"
+        _ix20c = _gid20b(_t20c_root, None)
+        _ei20b(_ix20c, _ghost20)
+        _id20 = _Id20(_ghost20, _t20c_root, _ix20c / f"{_ghost20}_unread.json")
+        _init20, _reg20, _stop20 = threading.Event(), threading.Event(), threading.Event()
+        _init20.set(); _reg20.set()
+        _wt20 = threading.Thread(target=_ch20.run_watcher,
+                                  args=(lambda obj: None, _id20, _init20, _reg20, _stop20),
+                                  daemon=True)
+        _wt20.start()
+        try:
+            _ok20 = wait_until(
+                lambda: (_rar20b(_t20c_root, None, _ghost20) or {}).get("type") == "full",
+                timeout=3.0)
+            if not _ok20:
+                failures.append(f"WP-20 AC-3: watcher heartbeat did not re-create a type=full "
+                                 f"record: {_rar20b(_t20c_root, None, _ghost20)!r}")
+        finally:
+            _stop20.set()
+            _wt20.join(timeout=2)
+
+        # AC-4: a type=human record must KEEP type=human after a heartbeat-shaped write for the
+        # SAME name (unreachable via WP-19's register-time guard in practice, but the guard
+        # inside the watcher must hold on its own).
+        _t20d_root = tempfile.mkdtemp(prefix="tc-20-ac4-")
+        _human20 = "human20"
+        _ix20d = _gid20b(_t20d_root, None)
+        _ei20b(_ix20d, _human20)
+        _war20b(_t20d_root, None, _human20, type="human", host="somewhere", presence="online")
+        _id20h = _Id20(_human20, _t20d_root, _ix20d / f"{_human20}_unread.json")
+        _init20h, _reg20h, _stop20h = threading.Event(), threading.Event(), threading.Event()
+        _init20h.set(); _reg20h.set()
+        _wt20h = threading.Thread(target=_ch20.run_watcher,
+                                   args=(lambda obj: None, _id20h, _init20h, _reg20h, _stop20h),
+                                   daemon=True)
+        _wt20h.start()
+        try:
+            wait_until(lambda: (_rar20b(_t20d_root, None, _human20) or {}).get("channel") is True,
+                       timeout=3.0)  # let at least one heartbeat tick land
+            _rec20h = _rar20b(_t20d_root, None, _human20) or {}
+            if _rec20h.get("type") != "human":
+                failures.append(f"WP-20 AC-4: heartbeat-shaped write stomped a human record's "
+                                 f"type: {_rec20h!r}")
+        finally:
+            _stop20h.set()
+            _wt20h.join(timeout=2)
+    except Exception as e:
+        failures.append(f"WP-20 AC-3/AC-4 unit checks errored: {e}")
+
+    # ── WP-20 AC-5 (I2) — reincarnate refuses a human-typed target; gate-off still checks first ──
+    try:
+        from teammate_comms.tools import _handle_reincarnate as _hr20e, CommsError as _CE20e
+        from teammate_comms.comms import write_agent_record as _war20e
+
+        _t20e_root = tempfile.mkdtemp(prefix="tc-20-ac5-")
+        _human20e = "human20e"
+        _war20e(_t20e_root, None, _human20e, type="human", host="wherever", presence="away")
+
+        class _Id20e:
+            def snapshot(self):
+                return ("caller20e", None, _t20e_root, None)
+        _ctx20e = {"identity": _Id20e()}
+
+        _prev_gate20e = os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+        try:
+            # Gate-off path must short-circuit FIRST — before the human-record read.
+            try:
+                _hr20e({"agent": _human20e, "project_dir": str(REPO)}, _ctx20e)
+                failures.append("WP-20 AC-5: reincarnate should raise when gated off")
+            except _CE20e as _ge20e:
+                if "disabled" not in str(_ge20e):
+                    failures.append(f"WP-20 AC-5: gate-off error text wrong: {_ge20e}")
+
+            # Gate enabled + human target → must raise, naming the operator. Tautology: on
+            # current main is_channel_alive(existing) is always False for a human record
+            # (register_human never sets `channel`) — the live-check is blind, so this would
+            # otherwise sail through and spawn a child.
+            os.environ["TEAMMATE_REINCARNATE_ENABLED"] = "1"
+            try:
+                _hr20e({"agent": _human20e, "project_dir": str(REPO)}, _ctx20e)
+                failures.append("WP-20 AC-5 [tautology: reincarnate must raise for a type=human "
+                                 "target — reverted code's live-check can't see it and would "
+                                 "spawn a child over the operator's identity]")
+            except _CE20e as _e20e:
+                if _human20e not in str(_e20e):
+                    failures.append(f"WP-20 AC-5: reincarnate-human error must name the operator: {_e20e}")
+        finally:
+            if _prev_gate20e is None:
+                os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+            else:
+                os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _prev_gate20e
+    except Exception as e:
+        failures.append(f"WP-20 AC-5 unit checks errored: {e}")
+
+    # ── WP-21 AC-1 (B1) — human_presence_online: fresh/aged presenceAt, back-compat no-presenceAt ──
+    try:
+        from teammate_comms.comms import human_presence_online as _hpo21, TIMESTAMP_FMT as _TSFMT21
+
+        _now21 = datetime.now()
+        _fresh21 = {"presence": "online", "presenceAt": _now21.strftime(_TSFMT21)}
+        if not _hpo21(_fresh21):
+            failures.append("WP-21 AC-1: fresh presenceAt should read online")
+
+        _aged21 = {"presence": "online",
+                   "presenceAt": (_now21 - timedelta(seconds=90)).strftime(_TSFMT21)}
+        if _hpo21(_aged21):
+            failures.append("WP-21 AC-1: aged (>60s) presenceAt should read away")
+
+        _legacy21 = {"presence": "online"}  # no presenceAt key at all — back-compat
+        if not _hpo21(_legacy21):
+            failures.append("WP-21 AC-1: back-compat — presence=online with NO presenceAt "
+                             "key must still read online")
+    except Exception as e:
+        failures.append(f"WP-21 AC-1 unit checks errored: {e}")
+
+    # ── WP-21 AC-2 (B1) — shutdown clobber guard: only OUR dashboard_pid can mark away ──
+    try:
+        from teammate_comms.comms import (
+            write_agent_record as _war21b, read_agent_record as _rar21b,
+            set_human_presence as _shp21b,
+        )
+        _t21b_root = tempfile.mkdtemp(prefix="tc-21-ac2-")
+        _human21b = "human21ac2"
+        _war21b(_t21b_root, None, _human21b, type="human", presence="online", dashboard_pid=111)
+        # Foreign pid attempt → untouched.
+        _shp21b(_t21b_root, None, _human21b, "away", owner_pid=222)
+        if (_rar21b(_t21b_root, None, _human21b) or {}).get("presence") != "online":
+            failures.append("WP-21 AC-2: a FOREIGN dashboard_pid marked presence away (clobber)")
+        # Our pid → away.
+        _shp21b(_t21b_root, None, _human21b, "away", owner_pid=111)
+        if (_rar21b(_t21b_root, None, _human21b) or {}).get("presence") != "away":
+            failures.append("WP-21 AC-2: matching dashboard_pid failed to mark presence away")
+    except Exception as e:
+        failures.append(f"WP-21 AC-2 unit checks errored: {e}")
+
+    # ── WP-21 AC-3 (G2) — case-variant collision rejected at register; exact re-register OK ──
+    # Tautology: this MUST fail against current main (register silently proceeds).
+    try:
+        from teammate_comms import server as _srv21c
+        from teammate_comms.comms import CommsError as _CE21c
+
+        _t21c_root = tempfile.mkdtemp(prefix="tc-21-ac3-")
+        _srv21c.register_identity("Bob21", None, _t21c_root, {})
+        try:
+            _srv21c.register_identity("bob21", None, _t21c_root, {})
+            failures.append("WP-21 AC-3 [tautology: register must reject a case-variant "
+                             "collision — reverted code silently proceeds, letting Windows "
+                             "merge/Linux split the identity]")
+        except _CE21c as _e21c:
+            if "Bob21" not in str(_e21c):
+                failures.append(f"WP-21 AC-3: case-collision error must name the existing "
+                                 f"spelling: {_e21c}")
+        # Exact re-register of the SAME spelling stays idempotent.
+        try:
+            _srv21c.register_identity("Bob21", None, _t21c_root, {})
+        except Exception as _e21c2:
+            failures.append(f"WP-21 AC-3: exact re-register of the same spelling should "
+                             f"succeed: {_e21c2}")
+    except Exception as e:
+        failures.append(f"WP-21 AC-3 unit checks errored: {e}")
+
+    # ── WP-21 AC-4 (G5) — Windows reserved device names rejected; near-misses accepted ──
+    try:
+        from teammate_comms.comms import (
+            validate_agent_name as _van21, validate_group_name as _vgn21,
+            validate_project_key as _vpk21, CommsError as _CE21d,
+        )
+        _rejected21 = ["con", "NUL", "com3", "con.helper"]
+        _accepted21 = ["console", "con-bot", "lpt10"]
+        for _n21 in _rejected21:
+            for _label21, _fn21 in (("agent", _van21), ("group", _vgn21)):
+                try:
+                    _fn21(_n21)
+                    failures.append(f"WP-21 AC-4: {_label21} validator accepted reserved name {_n21!r}")
+                except _CE21d:
+                    pass
+            try:
+                _vpk21(_n21)
+                failures.append(f"WP-21 AC-4: project key validator accepted reserved name {_n21!r}")
+            except _CE21d:
+                pass
+            try:
+                _vpk21(f"parent/{_n21}")
+                failures.append(f"WP-21 AC-4: project key validator accepted reserved SEGMENT {_n21!r}")
+            except _CE21d:
+                pass
+        for _n21 in _accepted21:
+            try:
+                _van21(_n21)
+            except _CE21d as _e21d:
+                failures.append(f"WP-21 AC-4: agent validator wrongly rejected {_n21!r}: {_e21d}")
+            try:
+                _vgn21(_n21)
+            except _CE21d as _e21d:
+                failures.append(f"WP-21 AC-4: group validator wrongly rejected {_n21!r}: {_e21d}")
+            try:
+                _vpk21(_n21)
+            except _CE21d as _e21d:
+                failures.append(f"WP-21 AC-4: project key validator wrongly rejected {_n21!r}: {_e21d}")
+    except Exception as e:
+        failures.append(f"WP-21 AC-4 unit checks errored: {e}")
+
+    # ── WP-22 AC-1 (W4) — snapshot_with_generation is a single-lock read; watcher uses it ──
+    try:
+        import inspect
+        from teammate_comms import server as _srv22, channel as _ch22
+
+        if not hasattr(_srv22.Identity, "snapshot_with_generation"):
+            failures.append("WP-22 AC-1: Identity.snapshot_with_generation is missing")
+        _src22a = inspect.getsource(_ch22.run_watcher)
+        if "snapshot_with_generation" not in _src22a:
+            failures.append("WP-22 AC-1: run_watcher does not use snapshot_with_generation")
+        if "identity.snapshot()" in _src22a and "identity.get_generation()" in _src22a:
+            failures.append("WP-22 AC-1 [tautology: run_watcher still calls snapshot() and "
+                             "get_generation() as two separate lock acquisitions]")
+    except Exception as e:
+        failures.append(f"WP-22 AC-1 unit check errored: {e}")
+
+    # ── WP-22 AC-2 (W7) — a False heartbeat write leaves last_hb unadvanced (retries at 0.5s) ──
+    # Tautology by construction: reverted code advances last_hb unconditionally, so only ~1
+    # write attempt would land in the ~1.3s window below instead of several.
+    try:
+        from teammate_comms import channel as _ch22b
+        from teammate_comms.comms import get_inboxes_dir as _gid22b, ensure_inbox as _ei22b
+
+        _t22b_root = tempfile.mkdtemp(prefix="tc-22-ac2-")
+        _agent22b = "probe22ac2"
+        _ix22b = _gid22b(_t22b_root, None)
+        _ei22b(_ix22b, _agent22b)
+
+        class _Id22b:
+            def snapshot_with_generation(self):
+                return (_agent22b, None, _t22b_root, _ix22b / f"{_agent22b}_unread.json", 1)
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, v):
+                pass
+            def get_instance_id(self):
+                return "id22b"
+            def get_epoch(self):
+                return 1
+            def get_durable_seen(self):
+                return set()
+
+        _calls22b = []
+        _orig_war22b = _ch22b.write_agent_record
+
+        def _fake_war22b(*a, **kw):
+            _calls22b.append(1)
+            return False  # simulate persistent lock contention
+
+        _ch22b.write_agent_record = _fake_war22b
+        try:
+            _init22b, _reg22b, _stop22b = threading.Event(), threading.Event(), threading.Event()
+            _init22b.set(); _reg22b.set()
+            _wt22b = threading.Thread(target=_ch22b.run_watcher,
+                                      args=(lambda obj: None, _Id22b(), _init22b, _reg22b, _stop22b),
+                                      daemon=True)
+            _wt22b.start()
+            time.sleep(1.3)  # ~2-3 poll cycles at 0.5s if last_hb never advances
+        finally:
+            _stop22b.set()
+            _wt22b.join(timeout=2)
+            _ch22b.write_agent_record = _orig_war22b
+        if len(_calls22b) < 2:
+            failures.append(f"WP-22 AC-2 [tautology: a False heartbeat write must leave last_hb "
+                             f"unadvanced so the very NEXT 0.5s poll retries — only "
+                             f"{len(_calls22b)} write attempt(s) landed in ~1.3s]")
+    except Exception as e:
+        failures.append(f"WP-22 AC-2 unit check errored: {e}")
+
+    # ── WP-22 AC-3 (M3) — durable_seen excludes a prior-session id from the wake COUNT ──
+    # Tautology: fails on current main (counts A+B=2 instead of B alone).
+    try:
+        from teammate_comms import server as _srv22c, channel as _ch22c
+        from teammate_comms.comms import (
+            get_inboxes_dir as _gid22c, ensure_inbox as _ei22c, write_json_atomic as _wja22c,
+        )
+
+        _t22c_root = tempfile.mkdtemp(prefix="tc-22-ac3-")
+        _agent22c = "probe22ac3"
+        _ix22c = _gid22c(_t22c_root, None)
+        _ei22c(_ix22c, _agent22c)
+        _msg_a22c = {"id": "22c-a", "from": "alice", "priority": "normal", "message": "prior-body"}
+        _wja22c(_ix22c / f"{_agent22c}_unread.json", [_msg_a22c])
+        _wja22c(_ix22c / f"{_agent22c}_seen.json", ["22c-a"])  # A already delivered a PRIOR session
+
+        _srv22c.register_identity(_agent22c, None, _t22c_root, {})  # seeds durable_seen={A}
+
+        _emits22c = []
+        def _send22c(obj):
+            if obj.get("method") == "notifications/claude/channel":
+                _emits22c.append(obj)
+        _init22c, _reg22c, _stop22c = threading.Event(), threading.Event(), threading.Event()
+        _init22c.set(); _reg22c.set()
+        _wt22c = threading.Thread(target=_ch22c.run_watcher,
+                                  args=(_send22c, _srv22c._identity, _init22c, _reg22c, _stop22c),
+                                  daemon=True)
+        _wt22c.start()
+        try:
+            time.sleep(0.7)  # let tick 1 seed known_ids={A} on unread=[A] alone (no wake yet)
+            # NOW a brand-new message B arrives.
+            _msg_b22c = {"id": "22c-b", "from": "bob", "priority": "normal", "message": "new-body"}
+            _wja22c(_ix22c / f"{_agent22c}_unread.json", [_msg_a22c, _msg_b22c])
+            _ok22c = wait_until(lambda: len(_emits22c) >= 1, timeout=3.0)
+            if not _ok22c:
+                failures.append("WP-22 AC-3: no wake fired for the new message B")
+            else:
+                _meta22c = _emits22c[0].get("params", {}).get("meta", {})
+                if _meta22c.get("count") != "1":
+                    failures.append(f"WP-22 AC-3 [tautology: wake count must be 1 (B only) — "
+                                     f"durable_seen must exclude A]: {_meta22c}")
+        finally:
+            _stop22c.set()
+            _wt22c.join(timeout=2)
+    except Exception as e:
+        failures.append(f"WP-22 AC-3 unit check errored: {e}")
+    # AC-4 (M3): ack("all")-with-no-prior-read still drains everything including a durable_seen
+    # id — unchanged, since durable_seen never touches Identity._last_seen/_handle_ack at all.
+    # Covered by the (untouched) WP-15 T3 block elsewhere in this same run; not duplicated here.
+
+    # ── WP-22 AC-5/AC-6 (M2) — pending-file recovery: idempotent merge, sender pended-text,
+    # composed with M3 so a pending-merged already-seen id doesn't re-nudge ──
+    try:
+        from teammate_comms import channel as _ch22e
+        from teammate_comms.comms import (
+            get_inboxes_dir as _gid22e, ensure_inbox as _ei22e,
+            write_json_atomic as _wja22e, read_json_safe as _rjs22e, file_lock as _fl22e,
+        )
+        from teammate_comms import tools as _tools22e
+
+        # AC-5a: direct merge — idempotent (run twice, still exactly one copy), pending emptied.
+        _t22e_root = tempfile.mkdtemp(prefix="tc-22-ac5a-")
+        _agent22e = "probe22ac5a"
+        _ix22e = _gid22e(_t22e_root, None)
+        _ei22e(_ix22e, _agent22e)
+        _pend_rec22e = {"id": "22e-p1", "from": "carol", "group": "#g", "priority": "normal",
+                        "message": "pended-body"}
+        _wja22e(_ix22e / f"{_agent22e}_pending.json", [_pend_rec22e])
+        _ch22e.merge_pending_into_unread(_t22e_root, None, _agent22e)
+        _ch22e.merge_pending_into_unread(_t22e_root, None, _agent22e)  # second run: no dup
+        _unread22e = _rjs22e(_ix22e / f"{_agent22e}_unread.json")
+        if sum(1 for m in _unread22e if m.get("id") == "22e-p1") != 1:
+            failures.append(f"WP-22 AC-5a: pending record not merged exactly once: {_unread22e}")
+        if _rjs22e(_ix22e / f"{_agent22e}_pending.json"):
+            failures.append("WP-22 AC-5a: pending file not emptied after merge")
+
+        # AC-5b: sender side — a held member unread lock falls back to THEIR pending file, and
+        # the wrapper text says queued-for-retry (not "will catch up via history").
+        _t22e2_root = tempfile.mkdtemp(prefix="tc-22-ac5b-")
+        _sender22e, _member22e, _grp22e = "sender22e", "member22e", "grp22e"
+        from teammate_comms.tools import _handle_group as _hg22e, _handle_send as _hs22e
+        class _Ctx22e:
+            def __init__(self, agent):
+                self._agent = agent
+            def snapshot(self):
+                return (self._agent, None, _t22e2_root, None)
+        _hg22e({"action": "create", "group": f"#{_grp22e}", "members": [_member22e]},
+              {"identity": _Ctx22e(_sender22e)})
+        _member_unread22e = _gid22e(_t22e2_root, None) / f"{_member22e}_unread.json"
+        _ei22e(_gid22e(_t22e2_root, None), _member22e)
+        with _fl22e(_member_unread22e):
+            _text22e = _hs22e({"to": f"#{_grp22e}", "message": "hi via pending"},
+                              {"identity": _Ctx22e(_sender22e)})
+        if "queued for retry" not in _text22e.lower():
+            failures.append(f"WP-22 AC-5b: pended-member text should say queued-for-retry: {_text22e}")
+        _member_pending22e = _gid22e(_t22e2_root, None) / f"{_member22e}_pending.json"
+        if not _rjs22e(_member_pending22e):
+            failures.append("WP-22 AC-5b: message did not land in the member's pending file")
+
+        # AC-6: compose M2 with M3 — an id already in {agent}_seen.json (durable_seen) that
+        # ALSO shows up via a pending merge must not cause a fresh wake or a duplicate entry.
+        _t22f_root = tempfile.mkdtemp(prefix="tc-22-ac6-")
+        _agent22f = "probe22ac6"
+        _ix22f = _gid22e(_t22f_root, None)
+        _ei22e(_ix22f, _agent22f)
+        _msg22f = {"id": "22f-a", "from": "dave", "priority": "normal", "message": "already-seen-body"}
+        _wja22e(_ix22f / f"{_agent22f}_unread.json", [_msg22f])
+        _wja22e(_ix22f / f"{_agent22f}_seen.json", ["22f-a"])
+        _wja22e(_ix22f / f"{_agent22f}_pending.json", [dict(_msg22f)])  # duplicate retry, same id
+
+        from teammate_comms import server as _srv22f
+        _srv22f.register_identity(_agent22f, None, _t22f_root, {})  # durable_seen={22f-a}
+        _emits22f = []
+        def _send22f(obj):
+            if obj.get("method") == "notifications/claude/channel":
+                _emits22f.append(obj)
+        _init22f, _reg22f, _stop22f = threading.Event(), threading.Event(), threading.Event()
+        _init22f.set(); _reg22f.set()
+        _wt22f = threading.Thread(target=_ch22e.run_watcher,
+                                  args=(_send22f, _srv22f._identity, _init22f, _reg22f, _stop22f),
+                                  daemon=True)
+        _wt22f.start()
+        try:
+            time.sleep(1.2)  # several poll ticks — the pending merge + seed both land
+            if _emits22f:
+                failures.append(f"WP-22 AC-6: a pending-merged already-seen id caused a spurious "
+                                 f"wake: {_emits22f}")
+            _unread22f = _rjs22e(_ix22f / f"{_agent22f}_unread.json")
+            if sum(1 for m in _unread22f if m.get("id") == "22f-a") != 1:
+                failures.append(f"WP-22 AC-6: duplicate entry after pending merge: {_unread22f}")
+        finally:
+            _stop22f.set()
+            _wt22f.join(timeout=2)
+    except Exception as e:
+        failures.append(f"WP-22 AC-5/AC-6 unit checks errored: {e}")
+
+    # ── WP-22 gate CR (M2) — a torn pending-file read must NOT reset it to [] ──
+    # Tautology: reverted code (read_json_safe peek) destructively resets a torn read to [],
+    # losing the exact messages the recovery lane exists to save.
+    try:
+        from teammate_comms import channel as _ch22g
+        from teammate_comms.comms import get_inboxes_dir as _gid22g, ensure_inbox as _ei22g
+
+        _t22g_root = tempfile.mkdtemp(prefix="tc-22-cr-")
+        _agent22g = "probe22cr"
+        _ix22g = _gid22g(_t22g_root, None)
+        _ei22g(_ix22g, _agent22g)
+        _pending_path22g = _ix22g / f"{_agent22g}_pending.json"
+        _pending_path22g.write_text("{torn", encoding="utf-8")  # simulates a sender mid-write
+
+        _result22g = _ch22g.merge_pending_into_unread(_t22g_root, None, _agent22g)
+        if _result22g is not False:
+            failures.append(f"WP-22 gate CR: merge on a torn pending read should return False "
+                             f"(retry next tick): {_result22g!r}")
+        _after22g = _pending_path22g.read_text(encoding="utf-8")
+        if _after22g != "{torn":
+            failures.append(f"WP-22 gate CR [tautology: a torn pending read must NOT be "
+                             f"rewritten to [] — the recovery lane's whole job is never-lose]: "
+                             f"file now reads {_after22g!r}")
+    except Exception as e:
+        failures.append(f"WP-22 gate CR unit check errored: {e}")
+
+    # ── WP-23 AC-1 (W6) — Windows: TEAMMATE_LAUNCH_ARGS backslash paths survive shlex.split ──
+    try:
+        from teammate_comms import spawn as _sp23a
+        import shlex as _shlex23a
+
+        _prev23a = os.environ.get("TEAMMATE_LAUNCH_ARGS")
+        try:
+            os.environ["TEAMMATE_LAUNCH_ARGS"] = r"claude --foo C:\Users\test"
+            _argv23a = _sp23a.build_claude_command("p")
+            if os.name == "nt":
+                if r"C:\Users\test" not in _argv23a:
+                    failures.append(f"WP-23 AC-1: Windows backslash path corrupted: {_argv23a}")
+                # Tautology setup sanity: posix=True WOULD have corrupted it (the bug this fixes) —
+                # confirms the test actually exercises the vulnerable code shape.
+                _posix_argv23a = _shlex23a.split(os.environ["TEAMMATE_LAUNCH_ARGS"], posix=True)
+                if r"C:\Users\test" in _posix_argv23a:
+                    failures.append("WP-23 AC-1 [tautology setup broken: posix=True did NOT "
+                                     "corrupt the path — this test no longer proves anything]")
+        finally:
+            if _prev23a is None:
+                os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            else:
+                os.environ["TEAMMATE_LAUNCH_ARGS"] = _prev23a
+    except Exception as e:
+        failures.append(f"WP-23 AC-1 unit check errored: {e}")
+
+    # ── WP-23 AC-2 (W5) — _children collects handles; _reap_children drops a finished one ──
+    try:
+        from teammate_comms import spawn as _sp23b
+
+        _proc23b = subprocess.Popen([sys.executable, "-c", "pass"])
+        _sp23b._children.append(_proc23b)
+        _proc23b.wait(timeout=5)
+        _sp23b._reap_children()
+        if _proc23b in _sp23b._children:
+            failures.append("WP-23 AC-2: _reap_children did not drop a finished child handle")
+        try:  # SIGCHLD path: guarded — calling it must never raise, on any OS.
+            _sp23b._ignore_sigchld_once()
+        except Exception as _e23b:
+            failures.append(f"WP-23 AC-2: _ignore_sigchld_once raised: {_e23b}")
+    except Exception as e:
+        failures.append(f"WP-23 AC-2 unit check errored: {e}")
+
+    # ── WP-23 AC-3 (W1) — marketplace resolution: env override → argv + allowlist match ──
+    try:
+        from teammate_comms import spawn as _sp23c
+
+        _prev_mp23c = os.environ.get("TEAMMATE_PLUGIN_MARKETPLACE")
+        try:
+            os.environ["TEAMMATE_PLUGIN_MARKETPLACE"] = "forkco"
+            _argv23c = _sp23c.build_claude_command("p", settings_paths=["/no/such/file.json"])
+            if not any("plugin:teammate-comms@forkco" in a for a in _argv23c):
+                failures.append(f"WP-23 AC-3: argv did not reference the overridden marketplace: {_argv23c}")
+            _d23c = tempfile.mkdtemp()
+            _ms23c = os.path.join(_d23c, "managed-settings.json")
+            with open(_ms23c, "w", encoding="utf-8") as _f23c:
+                json.dump({"channelsEnabled": True,
+                          "allowedChannelPlugins": [{"marketplace": "forkco", "plugin": "teammate-comms"}]},
+                         _f23c)
+            if not _sp23c.channel_allowlisted(settings_paths=[_ms23c]):
+                failures.append("WP-23 AC-3: channel_allowlisted did not match the overridden marketplace")
+        finally:
+            if _prev_mp23c is None:
+                os.environ.pop("TEAMMATE_PLUGIN_MARKETPLACE", None)
+            else:
+                os.environ["TEAMMATE_PLUGIN_MARKETPLACE"] = _prev_mp23c
+        # Unset → current (fallback) behavior byte-identical.
+        _argv23c2 = _sp23c.build_claude_command("p", settings_paths=["/no/such/file.json"])
+        if not any("plugin:teammate-comms@coltondyck" in a for a in _argv23c2):
+            failures.append(f"WP-23 AC-3: unset override should fall back to coltondyck: {_argv23c2}")
+    except Exception as e:
+        failures.append(f"WP-23 AC-3 unit check errored: {e}")
+
+    # ── WP-23 AC-4 (W1) — reincarnate with claude absent from PATH: actionable error, no Popen ──
+    try:
+        from teammate_comms import spawn as _sp23d
+
+        def _no_such_claude23d(name):
+            return None
+
+        def _forbidden_popen23d(*a, **k):
+            raise AssertionError("Popen must not be called when claude is absent from PATH")
+
+        _real_which23d = _sp23d.shutil.which
+        _real_popen23d = _sp23d.subprocess.Popen
+        try:
+            _sp23d.shutil.which = _no_such_claude23d
+            _sp23d.subprocess.Popen = _forbidden_popen23d
+            try:
+                _sp23d.spawn_in_terminal(["claude", "-p", "hi"], "/tmp", {})
+                failures.append("WP-23 AC-4: spawn_in_terminal should raise when claude is absent from PATH")
+            except FileNotFoundError as _e23d:
+                if "claude" not in str(_e23d).lower():
+                    failures.append(f"WP-23 AC-4: error text should name claude/PATH: {_e23d}")
+            except AssertionError as _e23d2:
+                failures.append(f"WP-23 AC-4 [tautology: {_e23d2}]")
+        finally:
+            _sp23d.shutil.which = _real_which23d
+            _sp23d.subprocess.Popen = _real_popen23d
+    except Exception as e:
+        failures.append(f"WP-23 AC-4 unit check errored: {e}")
+
+    # ── WP-23 AC-5 (H4) — whoami includes launch_args_override iff env set ──
+    try:
+        from teammate_comms.tools import _handle_whoami as _hw23e
+
+        class _Ctx23e:
+            def __init__(self, root):
+                self._root = root
+            def snapshot(self):
+                return ("someone23e", None, self._root, None)
+
+        _prev_la23e = os.environ.get("TEAMMATE_LAUNCH_ARGS")
+        try:
+            os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            _ctx23e = _Ctx23e(tempfile.mkdtemp(prefix="tc-23-ac5-"))
+            _out23e_unset = json.loads(_hw23e({}, {"identity": _ctx23e}))
+            if "launch_args_override" in _out23e_unset:
+                failures.append("WP-23 AC-5: launch_args_override present when env unset")
+            os.environ["TEAMMATE_LAUNCH_ARGS"] = "claude --custom"
+            _out23e_set = json.loads(_hw23e({}, {"identity": _ctx23e}))
+            if _out23e_set.get("launch_args_override") != "claude --custom":
+                failures.append(f"WP-23 AC-5: launch_args_override missing/wrong when env set: {_out23e_set}")
+        finally:
+            if _prev_la23e is None:
+                os.environ.pop("TEAMMATE_LAUNCH_ARGS", None)
+            else:
+                os.environ["TEAMMATE_LAUNCH_ARGS"] = _prev_la23e
+    except Exception as e:
+        failures.append(f"WP-23 AC-5 unit check errored: {e}")
+
+    # ── WP-24 AC-1/AC-2 (W2) — gate durable-detection (fake winreg) + reincarnate warning text ──
+    try:
+        from teammate_comms import spawn as _sp24a
+        from teammate_comms import tools as _t24a
+
+        class _FakeWinreg24:
+            HKEY_CURRENT_USER = "HKCU"
+            HKEY_LOCAL_MACHINE = "HKLM"
+
+            class _Key:
+                def __init__(self, present):
+                    self._present = present
+                def __enter__(self):
+                    if not self._present:
+                        raise OSError("no such key")
+                    return self
+                def __exit__(self, *a):
+                    return False
+
+            def __init__(self, present_hives):
+                self._present_hives = present_hives  # set of hive names with the var present
+
+            def OpenKey(self, hive, subkey):
+                return _FakeWinreg24._Key(hive in self._present_hives)
+
+            def QueryValueEx(self, key, name):
+                return ("1", 1)
+
+        if os.name == "nt":
+            _real_winreg24 = _sp24a.winreg
+            try:
+                _sp24a.winreg = _FakeWinreg24({"HKCU"})  # (a) HKCU names it → True
+                if _sp24a._gate_durably_set() is not True:
+                    failures.append("WP-24 AC-1: HKCU durable var should read True")
+                _sp24a.winreg = _FakeWinreg24(set())  # (b) neither hive → False
+                if _sp24a._gate_durably_set() is not False:
+                    failures.append("WP-24 AC-1: absent from both hives should read False")
+                _sp24a.winreg = _FakeWinreg24({"HKLM"})  # (c) HKLM only → True
+                if _sp24a._gate_durably_set() is not True:
+                    failures.append("WP-24 AC-1: HKLM-only durable var should read True")
+
+                class _ExplodingWinreg24:
+                    HKEY_CURRENT_USER = "HKCU"
+                    HKEY_LOCAL_MACHINE = "HKLM"
+                    def OpenKey(self, hive, subkey):
+                        raise OSError("access denied")
+                _sp24a.winreg = _ExplodingWinreg24()  # (d) never raises out
+                if _sp24a._gate_durably_set() is not False:
+                    failures.append("WP-24 AC-1: a raising winreg should degrade to False, never raise")
+            finally:
+                _sp24a.winreg = _real_winreg24
+        else:
+            if _sp24a._gate_durably_set() is not None:
+                failures.append("WP-24 AC-1: non-Windows should be undetectable (None)")
+
+        # Reincarnate text carries the warning iff gate on + durably set (hermetic monkeypatch);
+        # Popen/shutil.which mocked so this never opens a real terminal window (G-2 pattern).
+        _real_gate_check24a = _sp24a._gate_durably_set
+        _real_reincarnate_enabled24a = os.environ.get("TEAMMATE_REINCARNATE_ENABLED")
+        _real_popen24a = _sp24a.subprocess.Popen
+        _real_which24a = _sp24a.shutil.which
+        try:
+            os.environ["TEAMMATE_REINCARNATE_ENABLED"] = "1"
+            _sp24a.shutil.which = lambda name: f"/fake/{name}"
+
+            class _FakePopen24a:
+                def __init__(self, *a, **k):
+                    pass
+            _sp24a.subprocess.Popen = _FakePopen24a
+
+            class _Ctx24a:
+                def snapshot(self):
+                    return ("caller24a", None, tempfile.mkdtemp(prefix="tc-24-ac1-"), None)
+            _ctx24a = {"identity": _Ctx24a()}
+
+            _sp24a._gate_durably_set = lambda: True
+            _t24a._gate_durable_stderr_logged = False  # reset the once-per-process log flag
+            _msg24a = _t24a._handle_reincarnate({"agent": "child24a", "project_dir": str(REPO)}, _ctx24a)
+            if "DURABLY" not in _msg24a:
+                failures.append(f"WP-24 AC-1: reincarnate text missing the durable-set warning: {_msg24a[:200]!r}")
+
+            _sp24a._gate_durably_set = lambda: False
+            _msg24a2 = _t24a._handle_reincarnate({"agent": "child24a2", "project_dir": str(REPO)}, _ctx24a)
+            if "DURABLY" in _msg24a2:
+                failures.append(f"WP-24 AC-1: reincarnate text wrongly warned when NOT durably set: {_msg24a2[:200]!r}")
+
+            # AC-2: gate-off stays byte-identical (unaffected by the durable check, which sits
+            # AFTER the cheap gate). The live pipe harness's id-52 probe already covers this
+            # end-to-end; confirmed here too for a hermetic pin.
+            os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+            try:
+                _t24a._handle_reincarnate({"agent": "child24a3", "project_dir": str(REPO)}, _ctx24a)
+                failures.append("WP-24 AC-2: reincarnate should still raise when gated off")
+            except Exception as _e24a:
+                if "disabled" not in str(_e24a):
+                    failures.append(f"WP-24 AC-2: gate-off text changed unexpectedly: {_e24a}")
+        finally:
+            _sp24a._gate_durably_set = _real_gate_check24a
+            _sp24a.subprocess.Popen = _real_popen24a
+            _sp24a.shutil.which = _real_which24a
+            if _real_reincarnate_enabled24a is None:
+                os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+            else:
+                os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _real_reincarnate_enabled24a
+    except Exception as e:
+        failures.append(f"WP-24 AC-1/AC-2 unit checks errored: {e}")
+
+    # ── WP-24 AC-3/AC-4 (S4) — auto-register failure surfaced in whoami + not-registered errors ──
+    # Tautology: on current main, whoami has no trace of the failure.
+    try:
+        from teammate_comms import server as _srv24c
+        from teammate_comms.tools import _handle_whoami as _hw24c, _handle_inbox as _hi24c
+
+        _prev_agent24c = os.environ.get("TEAMMATE_AGENT")
+        _prev_team24c = os.environ.get("TEAMMATE_TEAM")
+        try:
+            os.environ["TEAMMATE_AGENT"] = "../evil"  # invalid — register_identity will raise
+            os.environ.pop("TEAMMATE_TEAM", None)
+            _srv24c._maybe_auto_register()
+            if _srv24c._get_auto_register_error() is None:
+                failures.append("WP-24 AC-3: _maybe_auto_register did not record the failure")
+
+            class _FreshId24c:
+                def snapshot(self):
+                    return (None, None, None, None)
+
+            _ctx24c = {"identity": _FreshId24c(),
+                      "auto_register_error": _srv24c._get_auto_register_error}
+            _who24c = json.loads(_hw24c({}, _ctx24c))
+            if "auto_register_error" not in _who24c:
+                failures.append(f"WP-24 AC-4 [tautology: whoami has no trace of the "
+                                 f"auto-register failure]: {_who24c}")
+
+            try:
+                _hi24c({}, _ctx24c)
+                failures.append("WP-24 AC-3: a messaging tool should raise when never registered")
+            except Exception as _e24c:
+                if "auto-register" not in str(_e24c).lower():
+                    failures.append(f"WP-24 AC-3: not-registered error missing the "
+                                     f"auto-register note: {_e24c}")
+
+            # After a successful register, both surfaces go clean.
+            _t24c_root = tempfile.mkdtemp(prefix="tc-24-ac3-")
+            _srv24c.register_identity("cleanagent24c", None, _t24c_root, {})
+            if _srv24c._get_auto_register_error() is not None:
+                failures.append("WP-24 AC-3: a successful register did not clear the stale error")
+            _who24c2 = json.loads(_hw24c({}, {"identity": _srv24c._identity,
+                                              "auto_register_error": _srv24c._get_auto_register_error}))
+            if "auto_register_error" in _who24c2:
+                failures.append(f"WP-24 AC-3: whoami still shows a cleared auto-register error: {_who24c2}")
+        finally:
+            if _prev_agent24c is None:
+                os.environ.pop("TEAMMATE_AGENT", None)
+            else:
+                os.environ["TEAMMATE_AGENT"] = _prev_agent24c
+            if _prev_team24c is None:
+                os.environ.pop("TEAMMATE_TEAM", None)
+            else:
+                os.environ["TEAMMATE_TEAM"] = _prev_team24c
+    except Exception as e:
+        failures.append(f"WP-24 AC-3/AC-4 unit checks errored: {e}")
+
+    # ── WP-25 AC-1 (M5) — acked_unseen tag: cold-start drain doesn't inflate read positions ──
+    # Tautology: current main reports the drained id as the position.
+    try:
+        from teammate_comms import tools as _t25a
+        from teammate_comms import comms as _c25a
+
+        _t25a_root = tempfile.mkdtemp(prefix="tc-25-ac1-")
+        _grp25a = "g25a"
+        _sender25a, _member25a = "sender25a", "member25a"
+        _c25a.write_group_meta(_t25a_root, None, _grp25a,
+                               {"name": _grp25a, "members": [_sender25a, _member25a],
+                                "creator": _sender25a, "createdAt": _c25a.now_timestamp()})
+        _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "first message")
+
+        class _Id25a:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+                self._ls = None
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        _ctx25a = {"identity": _Id25a(_member25a, _t25a_root)}
+        _t25a._handle_ack({"id": "all"}, _ctx25a)  # cold-start drain (last_seen is None)
+
+        _positions25a = _c25a.group_read_positions(_t25a_root, None, _grp25a,
+                                                    [_sender25a, _member25a])
+        if _positions25a.get(_member25a) is not None:
+            failures.append(f"WP-25 AC-1 [tautology: a cold-start-drained (never-seen) message "
+                             f"must NOT advance the read position — got "
+                             f"{_positions25a.get(_member25a)!r}, want None]")
+
+        # A seen-then-acked message still advances the position (receipts unchanged there).
+        _mid25a = _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "second message")["id"]
+        _ctx25a["identity"].set_last_seen({_mid25a})  # simulate a real teammate_inbox read
+        _t25a._handle_ack({"id": "all"}, _ctx25a)
+        _positions25a2 = _c25a.group_read_positions(_t25a_root, None, _grp25a,
+                                                     [_sender25a, _member25a])
+        if _positions25a2.get(_member25a) != _mid25a:
+            failures.append(f"WP-25 AC-1: a seen-then-acked message should still advance the "
+                             f"position: {_positions25a2.get(_member25a)!r} != {_mid25a!r}")
+    except Exception as e:
+        failures.append(f"WP-25 AC-1 unit checks errored: {e}")
+
+    # ── WP-25 AC-2/AC-3 (T2) — unread cap: data-preserving overflow move, strict boundary ──
+    try:
+        from teammate_comms import tools as _t25b
+        from teammate_comms import comms as _c25b
+
+        _t25b_root = tempfile.mkdtemp(prefix="tc-25-ac2-")
+        _to25b = "capprobe25b"
+        _c25b.ensure_inbox(_c25b.get_inboxes_dir(_t25b_root, None), _to25b)
+
+        for i in range(_t25b._UNREAD_CAP):  # AC-3 boundary: exactly the cap — no move yet.
+            _t25b.send_dm(_t25b_root, None, "sender25b", _to25b, f"msg-{i}")
+        _unread_at_cap = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_unread.json")
+        if len(_unread_at_cap) != _t25b._UNREAD_CAP:
+            failures.append(f"WP-25 AC-3: unread should hold exactly the cap "
+                             f"({_t25b._UNREAD_CAP}) before overflow: {len(_unread_at_cap)}")
+        _read_at_cap = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_read.json")
+        if _read_at_cap:
+            failures.append(f"WP-25 AC-3: no move should happen exactly AT the cap: {_read_at_cap}")
+
+        # AC-2: the (cap+1)th message triggers a move — oldest lands in _read.json, both tags.
+        _t25b.send_dm(_t25b_root, None, "sender25b", _to25b, "overflow-msg")
+        _unread25b = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_unread.json")
+        _read25b = _c25b.read_json_safe(
+            _c25b.get_inboxes_dir(_t25b_root, None) / f"{_to25b}_read.json")
+        if len(_unread25b) != _t25b._UNREAD_CAP:
+            failures.append(f"WP-25 AC-2: unread should still hold exactly the cap after "
+                             f"overflow: {len(_unread25b)}")
+        if len(_read25b) != 1:
+            failures.append(f"WP-25 AC-2: exactly one overflow record should move to "
+                             f"_read.json: {len(_read25b)}")
+        elif not (_read25b[0].get("acked_unseen") and _read25b[0].get("capped")):
+            failures.append(f"WP-25 AC-2: overflow record missing acked_unseen/capped tags: {_read25b[0]}")
+        elif _read25b[0].get("message") != "msg-0":
+            failures.append(f"WP-25 AC-2: the OLDEST record should be the one moved, got "
+                             f"{_read25b[0].get('message')!r}")
+        _all_ids25b = {m.get("id") for m in _unread25b} | {m.get("id") for m in _read25b}
+        if len(_all_ids25b) != _t25b._UNREAD_CAP + 1:
+            failures.append(f"WP-25 AC-2: union of unread+read should be all sent messages "
+                             f"({_t25b._UNREAD_CAP + 1}): got {len(_all_ids25b)}")
+    except Exception as e:
+        failures.append(f"WP-25 AC-2/AC-3 unit checks errored: {e}")
+
+    # ── WP-25 AC-4/AC-5 (C3) — group NDJSON: O(1) append, legacy+jsonl read-back, either-store tombstone ──
+    try:
+        from teammate_comms import comms as _c25c
+
+        _t25c_root = tempfile.mkdtemp(prefix="tc-25-ac4-")
+        _grp25c = "g25c"
+        _gdir25c = _c25c.get_group_dir(_t25c_root, None, _grp25c)
+        _gdir25c.mkdir(parents=True, exist_ok=True)
+
+        _c25c.append_group_message(_t25c_root, None, _grp25c, {"id": "c25c-1", "from": "a", "message": "one"})
+        if not (_gdir25c / "messages.jsonl").exists():
+            failures.append("WP-25 AC-4: messages.jsonl was not created by append_group_message")
+        if (_gdir25c / "messages.json").exists():
+            failures.append("WP-25 AC-4: append_group_message should NOT create the legacy messages.json")
+
+        # A legacy array + new jsonl lines read back in order (legacy first — strictly older).
+        _c25c.write_json_atomic(_gdir25c / "messages.json",
+                               [{"id": "c25c-0", "from": "a", "message": "legacy"}])
+        _c25c.append_group_message(_t25c_root, None, _grp25c, {"id": "c25c-2", "from": "a", "message": "two"})
+        _all25c = _c25c.read_group_messages(_t25c_root, None, _grp25c)
+        _ids25c = [m.get("id") for m in _all25c]
+        if _ids25c != ["c25c-0", "c25c-1", "c25c-2"]:
+            failures.append(f"WP-25 AC-4: legacy+jsonl read-back order wrong: {_ids25c}")
+
+        # Tombstone by id hits records in EITHER store.
+        _c25c.tombstone_in_group_messages(_t25c_root, None, _grp25c, "c25c-0", "a")  # legacy
+        _c25c.tombstone_in_group_messages(_t25c_root, None, _grp25c, "c25c-1", "a")  # jsonl
+        _after25c = _c25c.read_group_messages(_t25c_root, None, _grp25c)
+        _tomb25c = {m.get("id"): m.get("deleted") for m in _after25c}
+        if not (_tomb25c.get("c25c-0") and _tomb25c.get("c25c-1")):
+            failures.append(f"WP-25 AC-4: tombstone did not hit both stores: {_tomb25c}")
+        if _tomb25c.get("c25c-2"):
+            failures.append("WP-25 AC-4: tombstone wrongly hit an untouched record")
+
+        # AC-5: sequential appends under lock contention all produce intact lines (no torn write).
+        _t25d_root = tempfile.mkdtemp(prefix="tc-25-ac5-")
+        _grp25d = "g25d"
+        _c25c.get_group_dir(_t25d_root, None, _grp25d).mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            _c25c.append_group_message(_t25d_root, None, _grp25d,
+                                       {"id": f"c25d-{i}", "from": "a", "message": f"m{i}"})
+        _lines25d = _c25c.read_group_messages(_t25d_root, None, _grp25d)
+        if len(_lines25d) != 5 or [m.get("id") for m in _lines25d] != [f"c25d-{i}" for i in range(5)]:
+            failures.append(f"WP-25 AC-5: sequential appends produced wrong/missing lines: {_lines25d}")
+    except Exception as e:
+        failures.append(f"WP-25 AC-4/AC-5 unit checks errored: {e}")
+
+    # ── WP-26 AC-1 (B3) — 1000 minted ids unique + non-decreasing; end-to-end id consistency ──
+    try:
+        from teammate_comms.comms import new_message_id as _nmi26a
+
+        _ids26a = [_nmi26a() for _ in range(1000)]
+        if len(set(_ids26a)) != 1000:
+            failures.append(f"WP-26 AC-1: 1000 minted ids were not all unique "
+                             f"({len(set(_ids26a))} distinct)")
+        if _ids26a != sorted(_ids26a):
+            failures.append("WP-26 AC-1: minted ids were not lexically non-decreasing")
+
+        # End-to-end: a DM's id flows consistently through inbox -> react -> resolution.
+        from teammate_comms import tools as _t26a
+        from teammate_comms import comms as _c26a
+
+        class _Id26a:
+            def __init__(self, agent, root):
+                self.agent, self.root = agent, root
+            def snapshot(self):
+                return (self.agent, None, self.root, None)
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, v):
+                pass
+
+        _t26a_root = tempfile.mkdtemp(prefix="tc-26-ac1-")
+        _dm26a = _t26a.send_dm(_t26a_root, None, "alice26a", "bob26a", "hello")
+        _mid26a = _dm26a["id"]
+        _inbox_text26a = _t26a._handle_inbox({}, {"identity": _Id26a("bob26a", _t26a_root)})
+        if _mid26a not in _inbox_text26a:
+            failures.append(f"WP-26 AC-1: DM's minted id not shown verbatim in the recipient's "
+                             f"inbox: {_mid26a!r} not in {_inbox_text26a[:200]!r}")
+        _rx26a = _t26a.react(_t26a_root, None, "carol26a", _mid26a, "fire")
+        if _rx26a.get("target") != _mid26a or _rx26a.get("target_from") != "alice26a":
+            failures.append(f"WP-26 AC-1: reaction did not carry the DM's exact id/author through: {_rx26a}")
+    except Exception as e:
+        failures.append(f"WP-26 AC-1 unit checks errored: {e}")
+
+    # ── WP-26 AC-2 (B3) — same frozen now_timestamp() still produces distinct ids ──
+    # Tautology: identical ids on current main (bare now_timestamp(), no disambiguator).
+    try:
+        from teammate_comms import tools as _t26b
+        from teammate_comms import comms as _c26b
+
+        _t26b_root = tempfile.mkdtemp(prefix="tc-26-ac2-")
+        _real_nt26b = _c26b.now_timestamp
+        try:
+            _c26b.now_timestamp = lambda: "2026-01-01T00:00:00.000000"  # frozen clock
+            _r1_26b = _t26b.send_dm(_t26b_root, None, "s26b", "to26b-1", "one")
+            _r2_26b = _t26b.send_dm(_t26b_root, None, "s26b", "to26b-2", "two")
+            if _r1_26b["id"] == _r2_26b["id"]:
+                failures.append(f"WP-26 AC-2 [tautology: two send_dm calls under the SAME frozen "
+                                 f"clock produced the SAME id — the disambiguator isn't wired in]: "
+                                 f"{_r1_26b['id']!r}")
+        finally:
+            _c26b.now_timestamp = _real_nt26b
+    except Exception as e:
+        failures.append(f"WP-26 AC-2 unit check errored: {e}")
+
+    # ── WP-26 AC-3 (M4) — TEAMMATE_TRANSCRIPT=0: react resolves target_from via group-file fallback ──
+    # Tautology: current main (transcript-only resolution) records no target_from here.
+    try:
+        from teammate_comms import tools as _t26c
+        from teammate_comms import comms as _c26c
+
+        _prev_tr26c = os.environ.get("TEAMMATE_TRANSCRIPT")
+        try:
+            os.environ["TEAMMATE_TRANSCRIPT"] = "0"
+            _t26c_root = tempfile.mkdtemp(prefix="tc-26-ac3-")
+            _grp26c = "g26c"
+            _c26c.write_group_meta(_t26c_root, None, _grp26c,
+                                   {"name": _grp26c, "members": ["author26c", "reactor26c"],
+                                    "creator": "author26c", "createdAt": _c26c.now_timestamp()})
+            _gmid26c = _t26c.send_group(_t26c_root, None, "author26c", f"#{_grp26c}", "group post")["id"]
+            _transcript26c = _c26c.get_transcript_file(_t26c_root, None)
+            if _transcript26c.exists() and _transcript26c.read_text(encoding="utf-8").strip():
+                failures.append("WP-26 AC-3 setup: transcript should be empty with TEAMMATE_TRANSCRIPT=0")
+            _rx26c = _t26c.react(_t26c_root, None, "reactor26c", _gmid26c, "fire")
+            if _rx26c.get("target_from") != "author26c":
+                failures.append(f"WP-26 AC-3 [tautology: react must resolve target_from via the "
+                                 f"group-file fallback when the transcript is disabled]: {_rx26c}")
+        finally:
+            if _prev_tr26c is None:
+                os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+            else:
+                os.environ["TEAMMATE_TRANSCRIPT"] = _prev_tr26c
+    except Exception as e:
+        failures.append(f"WP-26 AC-3 unit check errored: {e}")
+
+    # ── WP-26 AC-4 (N8) — reacting to a nonexistent id raises, naming the id ──
+    try:
+        from teammate_comms import tools as _t26d
+        from teammate_comms.comms import CommsError as _CE26d
+
+        _t26d_root = tempfile.mkdtemp(prefix="tc-26-ac4-")
+        try:
+            _t26d.react(_t26d_root, None, "reactor26d", "totally-bogus-id", "fire")
+            failures.append("WP-26 AC-4 [tautology: reacting to a nonexistent id must raise — "
+                             "reverted code returns a success string]")
+        except _CE26d as _e26d:
+            if "totally-bogus-id" not in str(_e26d):
+                failures.append(f"WP-26 AC-4: error text must name the id: {_e26d}")
+    except Exception as e:
+        failures.append(f"WP-26 AC-4 unit check errored: {e}")
+
+    # ── WP-27 AC-1/AC-2 (C6) — reactions.jsonl compaction is a STATEFUL fold, not a union; idempotent ──
+    try:
+        from teammate_comms import comms as _cp27
+        from teammate_comms import tools as _t27
+
+        _save_retain27, _save_bytes27 = _cp27.REACTIONS_RETAIN, _cp27.REACTIONS_COMPACT_BYTES
+        try:
+            _cp27.REACTIONS_RETAIN = 3
+            _cp27.REACTIONS_COMPACT_BYTES = 1   # trip the gate on every append
+
+            p27root = tempfile.mkdtemp(prefix="tc-27-ac1-")
+            # react() (WP-26) requires a RESOLVABLE target, so seed real DMs first.
+            _mid0_27 = _t27.send_dm(p27root, None, "sender27", "to27-0", "m0")["id"]
+            # alice adds fire, bob also adds fire, alice REMOVES hers — all three fold away.
+            # The peer-review resurrection case: bob's surviving add must NOT be lost, and
+            # alice's cancelled-out add must NOT reappear (a naive per-target union, unlike a
+            # stateful fold, could get either wrong).
+            _t27.react(p27root, None, "alice27", _mid0_27, "fire")
+            _t27.react(p27root, None, "bob27", _mid0_27, "fire")
+            _t27.react(p27root, None, "alice27", _mid0_27, "fire", remove=True)
+            for i in range(1, 6):
+                _mid_i_27 = _t27.send_dm(p27root, None, "sender27", f"to27-{i}", f"m{i}")["id"]
+                _t27.react(p27root, None, "carol27", _mid_i_27, "thumbsup")
+            _state27 = _cp27.read_reaction_state(p27root, None)
+            _live27 = _cp27.read_reactions(p27root, None, limit=None)
+            if len(_live27) != _cp27.REACTIONS_RETAIN:
+                failures.append(f"WP-27 AC-1: jsonl not trimmed to RETAIN: {len(_live27)}")
+            _msg0_27 = _state27.get(_mid0_27, {})
+            if "bob27" not in (_msg0_27.get("fire") or []):
+                failures.append(f"WP-27 AC-1: a surviving add was lost in the fold: {_state27}")
+            if "alice27" in (_msg0_27.get("fire") or []):
+                failures.append(f"WP-27 AC-1 [tautology: a REMOVED reactor reappeared in the "
+                                 f"folded baseline — a naive union would resurrect it]: {_state27}")
+
+            # AC-2: idempotence — re-running the fold over the same (overlapping) range yields
+            # an IDENTICAL state.
+            _rjsonl27 = _cp27.get_reactions_file(p27root, None)
+            with _cp27.file_lock(_rjsonl27, timeout=10):
+                _cp27._compact_reactions_locked(p27root, None)
+            _state27b = _cp27.read_reaction_state(p27root, None)
+            if _state27b != _state27:
+                failures.append(f"WP-27 AC-2: re-running compaction changed the state (not "
+                                 f"idempotent): {_state27} != {_state27b}")
+        finally:
+            _cp27.REACTIONS_RETAIN, _cp27.REACTIONS_COMPACT_BYTES = _save_retain27, _save_bytes27
+    except Exception as e:
+        failures.append(f"WP-27 AC-1/AC-2 unit checks errored: {e}")
+
+    # ── WP-27 AC-3 (C6) — a chip whose events are entirely folded away still renders everywhere ──
+    try:
+        from teammate_comms import comms as _cp27c
+        from teammate_comms import tools as _t27c
+        from teammate_comms import dashboard as _dash27c
+        import http.client as _hc27c
+
+        _save_retain27c, _save_bytes27c = _cp27c.REACTIONS_RETAIN, _cp27c.REACTIONS_COMPACT_BYTES
+        try:
+            _cp27c.REACTIONS_RETAIN = 1
+            _cp27c.REACTIONS_COMPACT_BYTES = 1
+
+            p27c_root = tempfile.mkdtemp(prefix="tc-27-ac3-")
+            _grp27c = "g27c"
+            _cp27c.write_group_meta(p27c_root, None, _grp27c,
+                                   {"name": _grp27c, "members": ["alice27c", "bob27c"],
+                                    "creator": "alice27c", "createdAt": _cp27c.now_timestamp()})
+            _gmid27c = _t27c.send_group(p27c_root, None, "alice27c", f"#{_grp27c}", "hi")["id"]
+            _unrelated_mid27c = _t27c.send_dm(p27c_root, None, "alice27c", "someone27c", "other")["id"]
+            _t27c.react(p27c_root, None, "bob27c", _gmid27c, "fire")
+            _t27c.react(p27c_root, None, "carol27c", _unrelated_mid27c, "thumbsup")  # pushes the fire event out
+            _live_targets27c = {e.get("target") for e in _cp27c.read_reactions(p27c_root, None, limit=None)}
+            if _gmid27c in _live_targets27c:
+                failures.append("WP-27 AC-3 setup: the reaction did not actually get folded away")
+
+            class _Id27c:
+                def __init__(self, agent, root):
+                    self.agent, self.root = agent, root
+                def snapshot(self):
+                    return (self.agent, None, self.root, None)
+                def get_last_seen(self):
+                    return None
+                def set_last_seen(self, v):
+                    pass
+
+            _inbox_text27c = _t27c._handle_inbox({}, {"identity": _Id27c("bob27c", p27c_root)})
+            if "🔥" not in _inbox_text27c:
+                failures.append(f"WP-27 AC-3: inbox did not render a chip for a fully-baselined "
+                                 f"message: {_inbox_text27c[:300]!r}")
+
+            _hist27c = _t27c._handle_group({"action": "history", "group": f"#{_grp27c}"},
+                                           {"identity": _Id27c("alice27c", p27c_root)})
+            if "🔥" not in _hist27c:
+                failures.append(f"WP-27 AC-3: group history did not render a chip for a "
+                                 f"fully-baselined message: {_hist27c[:300]!r}")
+
+            _dres27c = _dash27c.start_dashboard(p27c_root, None, "Operator27c", port=0, open_browser=False)
+            _dport27c, _dtok27c = _dres27c["port"], _dash27c._STATE.token
+            try:
+                _c27c = _hc27c.HTTPConnection("127.0.0.1", _dport27c, timeout=5)
+                _c27c.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                                 skip_host=True, skip_accept_encoding=True)
+                _c27c.putheader("Host", "127.0.0.1")
+                _c27c.putheader("X-Dashboard-Token", _dtok27c)
+                _c27c.endheaders()
+                _r27c = _c27c.getresponse()
+                _poll27c = json.loads(_r27c.read())
+                _c27c.close()
+                _synthetic_hits27c = [r for r in _poll27c.get("reactions", [])
+                                      if r.get("target") == _gmid27c and r.get("id") == ""]
+                if not _synthetic_hits27c:
+                    failures.append(f"WP-27 AC-3: dashboard fresh poll did not include a "
+                                     f"synthetic event for the fully-baselined reaction: "
+                                     f"{_poll27c.get('reactions')}")
+            finally:
+                _dash27c.shutdown_dashboard()
+
+            # Silvie's hunt item: if the live tail is EMPTY (baseline-only, no live reactions
+            # at all), new_rcursor must stay "" — this is a fresh load, so there's no
+            # established real cursor to regress FROM.
+            p27c2_root = tempfile.mkdtemp(prefix="tc-27-ac3-emptytail-")
+            _state_file27c2 = _cp27c.get_reactions_state_file(p27c2_root, None)
+            _state_file27c2.parent.mkdir(parents=True, exist_ok=True)
+            _cp27c.write_json_atomic(_state_file27c2, {"solo-msg": {"fire": ["dave27c"]}})
+            _dres27c2 = _dash27c.start_dashboard(p27c2_root, None, "Operator27c2", port=0, open_browser=False)
+            _dport27c2, _dtok27c2 = _dres27c2["port"], _dash27c._STATE.token
+            try:
+                _c27c2 = _hc27c.HTTPConnection("127.0.0.1", _dport27c2, timeout=5)
+                _c27c2.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                                  skip_host=True, skip_accept_encoding=True)
+                _c27c2.putheader("Host", "127.0.0.1")
+                _c27c2.putheader("X-Dashboard-Token", _dtok27c2)
+                _c27c2.endheaders()
+                _r27c2 = _c27c2.getresponse()
+                _poll27c2 = json.loads(_r27c2.read())
+                _c27c2.close()
+                if _poll27c2.get("rcursor") != "":
+                    failures.append(f"WP-27 AC-3: empty live tail (baseline-only) should keep "
+                                     f"rcursor empty on a fresh load: {_poll27c2.get('rcursor')!r}")
+                if not any(r.get("target") == "solo-msg" for r in _poll27c2.get("reactions", [])):
+                    failures.append("WP-27 AC-3: baseline-only reaction missing from fresh poll "
+                                    "when the live tail is empty")
+            finally:
+                _dash27c.shutdown_dashboard()
+        finally:
+            _cp27c.REACTIONS_RETAIN, _cp27c.REACTIONS_COMPACT_BYTES = _save_retain27c, _save_bytes27c
+    except Exception as e:
+        failures.append(f"WP-27 AC-3 unit checks errored: {e}")
+
+    # ── WP-27 AC-4 (C6) — transcript size-gated rotation; running cursor re-tails; ids still resolve ──
+    try:
+        from teammate_comms import comms as _cp27d
+        from teammate_comms import tools as _t27d
+
+        _save_rotate27d = _cp27d.TRANSCRIPT_ROTATE_BYTES
+        try:
+            p27d_root = tempfile.mkdtemp(prefix="tc-27-ac4-")
+            _tpath27d = _cp27d.get_transcript_file(p27d_root, None)
+
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = 10**9   # disabled for the first append
+            _cp27d.append_transcript(p27d_root, None, {"id": "t27d-1", "kind": "dm", "message": "first"})
+            _first_size27d = os.path.getsize(_tpath27d)
+            # WP-27 gate CR: the check now runs BEFORE the write (gate-then-append) — re-arm
+            # just BELOW the current size so the SECOND append's gate (seeing only t27d-1)
+            # trips FIRST, rotating t27d-1 away, and t27d-2 then lands in the fresh file.
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = _first_size27d - 1
+
+            _recs1_27d, _off1_27d, _gen1_27d, _ = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)
+            if [r.get("id") for r in _recs1_27d] != ["t27d-1"]:
+                failures.append(f"WP-27 AC-4 setup: initial tail read wrong: {_recs1_27d}")
+
+            _cp27d.append_transcript(p27d_root, None, {"id": "t27d-2", "kind": "dm", "message": "second"})
+            _rotated27d = _tpath27d.with_name(_tpath27d.name + ".1")
+            if not _rotated27d.exists():
+                failures.append("WP-27 AC-4: transcript was not rotated to .1 past the byte gate")
+            elif [json.loads(l).get("id") for l in _rotated27d.read_text(encoding="utf-8").splitlines()] \
+                    != ["t27d-1"]:
+                failures.append(f"WP-27 AC-4: .1 grace copy missing/wrong content: "
+                                 f"{_rotated27d.read_text(encoding='utf-8')!r}")
+
+            # WP-27 gate CR — the exact tautology this fix needs: the TRIGGERING record
+            # (t27d-2) must be readable from the LIVE (post-rotation) file, not silently
+            # dropped into .1 alongside the record that tripped the gate. This test would have
+            # passed under EITHER ordering before the CR (rotate-after-append vs
+            # gate-then-append) — asserting the live file's content is what actually pins it.
+            _live_after27d = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)[0]
+            if [r.get("id") for r in _live_after27d] != ["t27d-2"]:
+                failures.append(f"WP-27 gate CR [tautology: the triggering record must land "
+                                 f"in the FRESH file, never the one that rotated away]: "
+                                 f"{[r.get('id') for r in _live_after27d]}")
+
+            # A running poll (using the offset/generation from BEFORE rotation) re-tails
+            # transparently: reset=True, no crash, and now correctly SHOWS the triggering
+            # record (not a drop).
+            _recs2_27d, _, _, _rst2_27d = _cp27d.read_transcript_after(
+                _tpath27d, _off1_27d, _gen1_27d, 200)
+            if not _rst2_27d:
+                failures.append("WP-27 AC-4: a running poll across rotation did not reset/re-tail")
+            if [r.get("id") for r in _recs2_27d] != ["t27d-2"]:
+                failures.append(f"WP-27 AC-4: post-rotation re-tail should show the triggering "
+                                 f"record: {[r.get('id') for r in _recs2_27d]}")
+
+            # A THIRD message lands in the fresh (post-rotation) live file alongside t27d-2 —
+            # disarm rotation first so this append doesn't ALSO trip the (now tiny) gate.
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = 10**9
+            _cp27d.append_transcript(p27d_root, None, {"id": "t27d-3", "kind": "dm", "message": "third"})
+            _recs3_27d, _, _, _ = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)
+            if [r.get("id") for r in _recs3_27d] != ["t27d-2", "t27d-3"]:
+                failures.append(f"WP-27 AC-4: post-rotation fresh file has the wrong content: "
+                                 f"{[r.get('id') for r in _recs3_27d]}")
+
+            # react/delete on a rotated-away id still resolve via the 3-tier fallback (a DM
+            # exercises the inbox tier).
+            _dmres27d = _t27d.send_dm(p27d_root, None, "s27d", "to27d", "will rotate away")
+            _mid27d = _dmres27d["id"]
+            _cp27d.append_transcript(p27d_root, None,
+                                     {"id": "filler27d", "kind": "dm", "message": "z" * 80})
+            _resolved27d = _t27d.resolve_message(p27d_root, None, _mid27d)
+            if not _resolved27d or _resolved27d.get("from") != "s27d":
+                failures.append(f"WP-27 AC-4: a rotated-away id did not resolve via the inbox "
+                                 f"fallback: {_resolved27d}")
+            _rx27d = _t27d.react(p27d_root, None, "reactor27d", _mid27d, "fire")
+            if _rx27d.get("target_from") != "s27d":
+                failures.append(f"WP-27 AC-4: react on a rotated-away id did not resolve "
+                                 f"target_from via the fallback: {_rx27d}")
+        finally:
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = _save_rotate27d
+    except Exception as e:
+        failures.append(f"WP-27 AC-4 unit checks errored: {e}")
+
+    # ── WP-27 AC-5 — REACTIONS_RETAIN >= _REACTIONS_TAIL relationship, asserted (not just at import) ──
+    try:
+        from teammate_comms.comms import REACTIONS_RETAIN as _RR27e
+        from teammate_comms.tools import _REACTIONS_TAIL as _RT27e
+        if _RR27e < _RT27e:
+            failures.append(f"WP-27 AC-5: REACTIONS_RETAIN ({_RR27e}) must be >= "
+                             f"_REACTIONS_TAIL ({_RT27e}) — the render tail must sit inside "
+                             f"the retained jsonl.")
+    except Exception as e:
+        failures.append(f"WP-27 AC-5 unit check errored: {e}")
+
+    # ── WP-28 AC-1 (T1) — avatars are self-owned; targeting another agent raises ──
+    # Tautology: current main happily targets another agent.
+    try:
+        from teammate_comms.tools import _handle_set_avatar as _hsa28a
+        from teammate_comms.comms import CommsError as _CE28a, write_agent_record as _war28a
+
+        class _Ctx28a:
+            def __init__(self, agent, root):
+                self._agent, self._root = agent, root
+            def snapshot(self):
+                return (self._agent, None, self._root, None)
+
+        _root28a = tempfile.mkdtemp(prefix="tc-28-ac1-")
+        _war28a(_root28a, None, "me28a", type="full")  # agents_dir must exist for the clear-lock
+        try:
+            _hsa28a({"agent": "someone-else-28a", "clear": True},
+                   {"identity": _Ctx28a("me28a", _root28a)})
+            failures.append("WP-28 AC-1 [tautology: set_avatar must raise when targeting "
+                             "another agent — reverted code happily proceeds]")
+        except _CE28a as _e28a:
+            if "me28a" not in str(_e28a):
+                failures.append(f"WP-28 AC-1: error text should name the caller: {_e28a}")
+
+        # agent omitted or ==caller proceeds — clear=True never touches Pillow, so this also
+        # proves the authz check runs BEFORE ingest_avatar's lazy Pillow import.
+        try:
+            _hsa28a({"clear": True}, {"identity": _Ctx28a("me28a", _root28a)})
+        except Exception as _e28a2:
+            failures.append(f"WP-28 AC-1: omitted agent (defaults to self) should proceed: {_e28a2}")
+        try:
+            _hsa28a({"agent": "me28a", "clear": True}, {"identity": _Ctx28a("me28a", _root28a)})
+        except Exception as _e28a3:
+            failures.append(f"WP-28 AC-1: agent==caller should proceed: {_e28a3}")
+    except Exception as e:
+        failures.append(f"WP-28 AC-1 unit checks errored: {e}")
+
+    # ── WP-28 AC-2 (D2) — sidecars removed on teammate removal; /avatar 404s an unregistered name ──
+    try:
+        from teammate_comms import comms as _cp28b
+        from teammate_comms import tools as _t28b
+        from teammate_comms import dashboard as _dash28b
+        import http.client as _hc28b
+
+        _root28b = tempfile.mkdtemp(prefix="tc-28-ac2-")
+        _cp28b.write_agent_record(_root28b, None, "victim28b", type="full", channel=False,
+                                  pid=1, host="wherever", instance_id="v28b", epoch=1)
+        _cp28b.ensure_inbox(_cp28b.get_inboxes_dir(_root28b, None), "victim28b")
+        _avdir28b = _cp28b.get_avatars_dir(_root28b, None)
+        _avdir28b.mkdir(parents=True, exist_ok=True)
+        for _ext28b in ("png", "ansi", "txt"):
+            (_avdir28b / f"victim28b.{_ext28b}").write_text("stub", encoding="utf-8")
+
+        _t28b.remove_teammate(_root28b, None, "caller28b", "victim28b")
+        for _ext28b in ("png", "ansi", "txt"):
+            if (_avdir28b / f"victim28b.{_ext28b}").exists():
+                failures.append(f"WP-28 AC-2: avatar sidecar .{_ext28b} survived teammate removal")
+
+        # /avatar for an unregistered name -> 404 even with a stale PNG present on disk.
+        (_avdir28b / "ghost28b.png").write_bytes(b"stale-png-bytes")
+        _dres28b = _dash28b.start_dashboard(_root28b, None, "Operator28b", port=0, open_browser=False)
+        _dport28b, _dtok28b = _dres28b["port"], _dash28b._STATE.token
+        try:
+            _c28b = _hc28b.HTTPConnection("127.0.0.1", _dport28b, timeout=5)
+            _c28b.putrequest("GET", f"/avatar?name=ghost28b&token={_dtok28b}",
+                             skip_host=True, skip_accept_encoding=True)
+            _c28b.putheader("Host", "127.0.0.1")
+            _c28b.endheaders()
+            _r28b = _c28b.getresponse()
+            _status28b = _r28b.getcode()
+            _r28b.read()
+            _c28b.close()
+            if _status28b != 404:
+                failures.append(f"WP-28 AC-2 [tautology: /avatar for an unregistered name with "
+                                 f"a stale file present must 404 — reverted code serves it]: "
+                                 f"got {_status28b}")
+        finally:
+            _dash28b.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-28 AC-2 unit checks errored: {e}")
+
+    # ── WP-28 AC-3 (D3) — over-long base64 raises the cap WITHOUT decoding ──
+    try:
+        from teammate_comms import avatars as _av28c
+        from teammate_comms.comms import CommsError as _CE28c
+
+        _real_b64decode28c = _av28c.base64.b64decode
+
+        def _forbidden_decode28c(*a, **k):
+            raise AssertionError("b64decode must not be called past the pre-decode byte cap")
+
+        _av28c.base64.b64decode = _forbidden_decode28c
+        try:
+            _huge28c = "A" * (_av28c._MAX_SRC_BYTES * 4 // 3 + 100)  # comfortably over the cap
+            _root28c = tempfile.mkdtemp(prefix="tc-28-ac3-")
+            try:
+                _av28c.ingest_avatar(_root28c, None, "someone28c", image_base64=_huge28c)
+                failures.append("WP-28 AC-3: an over-cap base64 string should raise")
+            except AssertionError as _e28c2:
+                failures.append(f"WP-28 AC-3 [tautology: {_e28c2}]")
+            except _CE28c as _e28c:
+                if "50 MB" not in str(_e28c):
+                    failures.append(f"WP-28 AC-3: error text should mention the 50 MB cap: {_e28c}")
+        finally:
+            _av28c.base64.b64decode = _real_b64decode28c
+    except Exception as e:
+        failures.append(f"WP-28 AC-3 unit checks errored: {e}")
+
+    # ── WP-28 AC-4 (P2) — session-start.sh stamp hash includes the avatars flag; ImportError text ──
+    try:
+        import shutil as _sh28d
+        _bash28d = _sh28d.which("bash")
+        if _bash28d:
+            _plugin_root28d = tempfile.mkdtemp(prefix="tc-28-ac4-root-")
+            (Path(_plugin_root28d) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+            (Path(_plugin_root28d) / "uv.lock").write_text("fake-lock\n", encoding="utf-8")
+
+            # A fake `uv` on PATH that always "succeeds" instantly — isolates this test from a
+            # real network sync while still exercising the REAL session-start.sh script.
+            _fakebin28d = tempfile.mkdtemp(prefix="tc-28-ac4-bin-")
+            _fake_uv28d = Path(_fakebin28d) / "uv"
+            _fake_uv28d.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            _fake_uv28d.chmod(0o755)
+
+            _env28d = dict(os.environ)
+            _env28d["CLAUDE_PLUGIN_ROOT"] = _plugin_root28d
+            _env28d["PATH"] = _fakebin28d + os.pathsep + _env28d.get("PATH", "")
+            _env28d.pop("TEAMMATE_AVATARS_ENABLED", None)
+
+            _script28d = str(REPO / "hooks" / "session-start.sh")
+            _stamp_path28d = Path(_plugin_root28d) / ".venv" / ".uv-sync-stamp"
+
+            subprocess.run([_bash28d, _script28d], env=_env28d, input=b"",
+                          capture_output=True, timeout=30)
+            _stamp_off28d = _stamp_path28d.read_text(encoding="utf-8").strip() if _stamp_path28d.exists() else None
+            if not _stamp_off28d:
+                failures.append("WP-28 AC-4 setup: stamp file was not written with the fake uv "
+                                "(check PATH/exec-bit resolution for the fake binary on this OS)")
+            else:
+                _env28d["TEAMMATE_AVATARS_ENABLED"] = "1"
+                subprocess.run([_bash28d, _script28d], env=_env28d, input=b"",
+                              capture_output=True, timeout=30)
+                _stamp_on28d = _stamp_path28d.read_text(encoding="utf-8").strip() if _stamp_path28d.exists() else None
+                if _stamp_on28d == _stamp_off28d:
+                    failures.append(f"WP-28 AC-4 [tautology: toggling TEAMMATE_AVATARS_ENABLED "
+                                     f"must change the stamp hash (and re-trigger sync) — "
+                                     f"reverted script hashes only pyproject.toml+uv.lock]: "
+                                     f"{_stamp_off28d!r} == {_stamp_on28d!r}")
+
+        # ImportError text is actionable + truthful (no "pip install", names the env var).
+        import base64 as _b64_28d2
+        from teammate_comms import avatars as _av28d2
+        import sys as _sys28d2
+
+        _real_pil28d2 = _sys28d2.modules.get("PIL")
+        _real_pil_image28d2 = _sys28d2.modules.get("PIL.Image")
+        _sys28d2.modules["PIL"] = None
+        try:
+            try:
+                _av28d2.ingest_avatar(tempfile.mkdtemp(prefix="tc-28-ac4-imp-"), None, "x28d2",
+                                     image_base64=_b64_28d2.b64encode(b"tiny").decode())
+                failures.append("WP-28 AC-4: ingest_avatar should raise when Pillow is absent")
+            except Exception as _e28d2:
+                _msg28d2 = str(_e28d2)
+                if "TEAMMATE_AVATARS_ENABLED" not in _msg28d2:
+                    failures.append(f"WP-28 AC-4: ImportError text missing TEAMMATE_AVATARS_ENABLED: {_msg28d2}")
+                if "pip install" in _msg28d2:
+                    failures.append(f"WP-28 AC-4: ImportError text still mentions pip install: {_msg28d2}")
+        finally:
+            if _real_pil28d2 is None:
+                _sys28d2.modules.pop("PIL", None)
+            else:
+                _sys28d2.modules["PIL"] = _real_pil28d2
+            if _real_pil_image28d2 is not None:
+                _sys28d2.modules["PIL.Image"] = _real_pil_image28d2
+    except Exception as e:
+        failures.append(f"WP-28 AC-4 unit checks errored: {e}")
+
+    # ── WP-29 AC-1 (D4) — dashboard status banner (source grep) + transcript_enabled in /api/poll ──
+    try:
+        from teammate_comms import dashboard as _dash29a
+
+        _index_src29a = (SRC / "teammate_comms" / "static" / "index.html").read_text(encoding="utf-8")
+        for _needle29a in ("status-banner", "reportFetchError", "Session token expired",
+                          "Connection lost", "transcript_enabled"):
+            if _needle29a not in _index_src29a:
+                failures.append(f"WP-29 AC-1: index.html missing expected string {_needle29a!r}")
+
+        _root29a = tempfile.mkdtemp(prefix="tc-29-ac1-")
+        _dres29a = _dash29a.start_dashboard(_root29a, None, "Operator29a", port=0, open_browser=False)
+        _dport29a, _dtok29a = _dres29a["port"], _dash29a._STATE.token
+        try:
+            import http.client as _hc29a
+
+            _c29a = _hc29a.HTTPConnection("127.0.0.1", _dport29a, timeout=5)
+            _c29a.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                             skip_host=True, skip_accept_encoding=True)
+            _c29a.putheader("Host", "127.0.0.1")
+            _c29a.putheader("X-Dashboard-Token", "bad-token-29a")
+            _c29a.endheaders()
+            _r29a = _c29a.getresponse()
+            _status29a = _r29a.getcode()
+            _r29a.read()
+            _c29a.close()
+            if _status29a != 401:
+                failures.append(f"WP-29 AC-1: /api/poll with a bad token did not 401: {_status29a}")
+
+            def _poll29a(token):
+                c = _hc29a.HTTPConnection("127.0.0.1", _dport29a, timeout=5)
+                c.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                             skip_host=True, skip_accept_encoding=True)
+                c.putheader("Host", "127.0.0.1")
+                c.putheader("X-Dashboard-Token", token)
+                c.endheaders()
+                r = c.getresponse()
+                d = json.loads(r.read())
+                c.close()
+                return d
+
+            _prev_tr29a = os.environ.get("TEAMMATE_TRANSCRIPT")
+            try:
+                os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+                _d_on29a = _poll29a(_dtok29a)
+                if _d_on29a.get("transcript_enabled") is not True:
+                    failures.append(f"WP-29 AC-1: transcript_enabled should be True by "
+                                     f"default: {_d_on29a.get('transcript_enabled')}")
+                os.environ["TEAMMATE_TRANSCRIPT"] = "0"
+                _d_off29a = _poll29a(_dtok29a)
+                if _d_off29a.get("transcript_enabled") is not False:
+                    failures.append(f"WP-29 AC-1: transcript_enabled should be False when "
+                                     f"TEAMMATE_TRANSCRIPT=0: {_d_off29a.get('transcript_enabled')}")
+            finally:
+                if _prev_tr29a is None:
+                    os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+                else:
+                    os.environ["TEAMMATE_TRANSCRIPT"] = _prev_tr29a
+        finally:
+            _dash29a.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-29 AC-1 unit checks errored: {e}")
+
+    # ── WP-29 AC-2 (G4) — comms_root persisted at register; doctor flags a mismatch; send's NOTE hints whoami ──
+    try:
+        from teammate_comms import server as _srv29b
+        from teammate_comms import tools as _t29b
+        from teammate_comms.comms import read_agent_record as _rar29b, write_agent_record as _war29b
+
+        _root29b = tempfile.mkdtemp(prefix="tc-29-ac2-")
+        _srv29b.register_identity("agent29b", None, _root29b, {})
+        _a29b, _team29b, _rootactual29b, _ = _srv29b._identity.snapshot()
+        _rec29b = _rar29b(_rootactual29b, _team29b, "agent29b") or {}
+        if _rec29b.get("comms_root") != str(_rootactual29b):
+            failures.append(f"WP-29 AC-2: comms_root not persisted correctly at register: "
+                             f"{_rec29b.get('comms_root')!r} != {str(_rootactual29b)!r}")
+
+        _war29b(_rootactual29b, _team29b, "divergent29b", type="full", channel=False,
+               comms_root="/some/totally/different/root")
+        _doctor29b = _t29b._doctor_report(_rootactual29b, _team29b)
+        _mismatch_names29b = {m.get("agent") for m in _doctor29b.get("root_mismatches", [])}
+        if "divergent29b" not in _mismatch_names29b:
+            failures.append(f"WP-29 AC-2: doctor did not flag the divergent comms_root: "
+                             f"{_doctor29b.get('root_mismatches')}")
+        if "agent29b" in _mismatch_names29b:
+            failures.append(f"WP-29 AC-2: doctor wrongly flagged the caller's OWN root as a "
+                             f"mismatch: {_doctor29b.get('root_mismatches')}")
+
+        class _Ctx29b:
+            def snapshot(self):
+                return ("sender29b", _team29b, _rootactual29b, None)
+        _msg29b = _t29b._handle_send({"to": "ghost29b", "message": "hi"}, {"identity": _Ctx29b()})
+        if "comms_root" not in _msg29b or "teammate_whoami" not in _msg29b:
+            failures.append(f"WP-29 AC-2: unregistered-recipient NOTE missing the "
+                             f"comms_root/whoami hint: {_msg29b!r}")
+    except Exception as e:
+        failures.append(f"WP-29 AC-2 unit checks errored: {e}")
+
+    # ── WP-29 AC-3 (G3) — _project_label_from_remote unit matrix + auto-fill integration ──
+    try:
+        from teammate_comms import server as _srv29c
+        from teammate_comms.comms import read_agent_record as _rar29c
+
+        _matrix29c = [
+            ("https://github.com/owner/repo.git", "owner/repo"),
+            ("https://github.com/owner/repo", "owner/repo"),
+            ("git@github.com:owner/repo.git", "owner/repo"),
+            ("git@github.com:owner/repo", "owner/repo"),
+            ("https://github.com/", None),
+            ("not a url at all", None),
+            ("", None),
+        ]
+        for _url29c, _want29c in _matrix29c:
+            _got29c = _srv29c._project_label_from_remote(_url29c)
+            if _got29c != _want29c:
+                failures.append(f"WP-29 AC-3: _project_label_from_remote({_url29c!r}) = "
+                                 f"{_got29c!r}, want {_want29c!r}")
+
+        import shutil as _sh29c
+        _git29c = _sh29c.which("git")
+        if _git29c:
+            _repo_dir29c = tempfile.mkdtemp(prefix="tc-29-ac3-repo-")
+            subprocess.run([_git29c, "init", "-q"], cwd=_repo_dir29c, capture_output=True, timeout=10)
+            subprocess.run([_git29c, "remote", "add", "origin",
+                           "https://github.com/fakeowner29c/fakerepo29c.git"],
+                          cwd=_repo_dir29c, capture_output=True, timeout=10)
+            _root29c = tempfile.mkdtemp(prefix="tc-29-ac3-root-")
+            _prev_pd29c = os.environ.get("CLAUDE_PROJECT_DIR")
+            try:
+                os.environ["CLAUDE_PROJECT_DIR"] = _repo_dir29c
+                _srv29c.register_identity("gitagent29c", None, _root29c, {})
+                _a29c, _team29c, _rootactual29c, _ = _srv29c._identity.snapshot()
+                _rec29c = _rar29c(_rootactual29c, _team29c, "gitagent29c") or {}
+                if _rec29c.get("project") != "fakeowner29c/fakerepo29c":
+                    failures.append(f"WP-29 AC-3: git-repo auto-fill wrong: "
+                                     f"{_rec29c.get('project')!r}")
+            finally:
+                if _prev_pd29c is None:
+                    os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                else:
+                    os.environ["CLAUDE_PROJECT_DIR"] = _prev_pd29c
+
+        # Non-repo dir -> falls back to parent/name (the existing harness PROJECT assertion
+        # already covers this end-to-end since CLAUDE_PROJECT_DIR there is NOT a git repo;
+        # pinned here too as a hermetic, isolated check).
+        _nonrepo29c = tempfile.mkdtemp(prefix="tc-29-ac3-nonrepo-")
+        _root29c2 = tempfile.mkdtemp(prefix="tc-29-ac3-root2-")
+        _prev_pd29c2 = os.environ.get("CLAUDE_PROJECT_DIR")
+        try:
+            os.environ["CLAUDE_PROJECT_DIR"] = _nonrepo29c
+            _srv29c.register_identity("pathagent29c", None, _root29c2, {})
+            _a29c2, _team29c2, _rootactual29c2, _ = _srv29c._identity.snapshot()
+            _rec29c2 = _rar29c(_rootactual29c2, _team29c2, "pathagent29c") or {}
+            _expected29c2 = _srv29c._project_label(_nonrepo29c)
+            if _rec29c2.get("project") != _expected29c2:
+                failures.append(f"WP-29 AC-3: non-repo dir should fall back to the path "
+                                 f"label: {_rec29c2.get('project')!r} != {_expected29c2!r}")
+        finally:
+            if _prev_pd29c2 is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = _prev_pd29c2
+    except Exception as e:
+        failures.append(f"WP-29 AC-3 unit checks errored: {e}")
+
+    # ── WP-30 AC-1 (H3) — session-start.sh first-install signal ──
+    try:
+        import shutil as _sh30a
+        _bash30a = _sh30a.which("bash")
+        if _bash30a:
+            _plugin_root30a = tempfile.mkdtemp(prefix="tc-30-ac1-root-")
+            (Path(_plugin_root30a) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+            (Path(_plugin_root30a) / "uv.lock").write_text("fake-lock\n", encoding="utf-8")
+
+            # A fake `uv` on PATH that always "succeeds" instantly — same isolation trick as
+            # WP-28 AC-4, avoids a real network sync while exercising the real script.
+            _fakebin30a = tempfile.mkdtemp(prefix="tc-30-ac1-bin-")
+            _fake_uv30a = Path(_fakebin30a) / "uv"
+            _fake_uv30a.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            _fake_uv30a.chmod(0o755)
+
+            _env30a = dict(os.environ)
+            _env30a["CLAUDE_PLUGIN_ROOT"] = _plugin_root30a
+            _env30a["PATH"] = _fakebin30a + os.pathsep + _env30a.get("PATH", "")
+            _env30a.pop("TEAMMATE_AVATARS_ENABLED", None)
+
+            _script30a = str(REPO / "hooks" / "session-start.sh")
+            _p1_30a = subprocess.run([_bash30a, _script30a], env=_env30a, input=b"",
+                                     capture_output=True, timeout=30)
+            _out1_30a = _p1_30a.stdout.decode("utf-8", "replace").strip()
+            if "first time" not in _out1_30a or "restart" not in _out1_30a.lower():
+                failures.append(f"WP-30 AC-1 [tautology: first run (no stamp) must emit the "
+                                 f"restart additionalContext]: {_out1_30a!r}")
+
+            _p2_30a = subprocess.run([_bash30a, _script30a], env=_env30a, input=b"",
+                                     capture_output=True, timeout=30)
+            _out2_30a = _p2_30a.stdout.decode("utf-8", "replace").strip()
+            if _out2_30a != "{}":
+                failures.append(f"WP-30 AC-1: second run (stamp present, hash match) should "
+                                 f"emit '{{}}' (silent — not a repeat first-install notice): "
+                                 f"{_out2_30a!r}")
+    except Exception as e:
+        failures.append(f"WP-30 AC-1 unit checks errored: {e}")
+
+    # ── WP-30 AC-2 (P5/H1) — reinject-instructions.sh self-filter + version stamp ──
+    try:
+        import shutil as _sh30b
+        _bash30b = _sh30b.which("bash")
+        if _bash30b:
+            # Silvie's gate CR: the original version of this test pointed CLAUDE_PLUGIN_ROOT at
+            # THIS repo and relied on its .venv already being synced — works on a machine that
+            # already ran the dev setup, fails on a bare checkout (a fresh gate worktree has no
+            # .venv). Fix: a fake `uv` on PATH whose "run" re-dispatches straight to the CURRENT
+            # test interpreter with src/ on PYTHONPATH — no real venv anywhere. This still proves
+            # everything the test is FOR (self-filter, '{}'-on-noncompact, payload emission, the
+            # H1 version stamp) through the hook's real bash plumbing.
+            _plugin_root30b = tempfile.mkdtemp(prefix="tc-30-ac2-root-")
+            _fakebin30b = tempfile.mkdtemp(prefix="tc-30-ac2-bin-")
+            _fake_uv30b = Path(_fakebin30b) / "uv"
+            _fake_uv30b.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"$1\" = \"run\" ]; then\n"
+                "    shift\n"
+                "    while [ $# -gt 0 ] && [ \"$1\" != \"python\" ]; do shift; done\n"
+                "    if [ \"$1\" = \"python\" ]; then\n"
+                "        shift\n"
+                "        PYTHONPATH=\"${TC_TEST_SRC}\" exec \"${TC_TEST_PYTHON}\" \"$@\"\n"
+                "    fi\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            _fake_uv30b.chmod(0o755)
+
+            _script30b = str(REPO / "hooks" / "reinject-instructions.sh")
+            _env30b = dict(os.environ)
+            _env30b["CLAUDE_PLUGIN_ROOT"] = _plugin_root30b
+            _env30b["PATH"] = _fakebin30b + os.pathsep + _env30b.get("PATH", "")
+            _env30b["TC_TEST_PYTHON"] = sys.executable
+            _env30b["TC_TEST_SRC"] = str(SRC)
+
+            _p1_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
+                                     input=b'{"source":"startup"}', capture_output=True, timeout=30)
+            _out1_30b = _p1_30b.stdout.decode("utf-8", "replace").strip()
+            if _out1_30b != "{}":
+                failures.append(f"WP-30 AC-2 [tautology: source=startup must self-filter to "
+                                 f"'{{}}' without ever exec'ing the instructions module]: "
+                                 f"{_out1_30b!r} stderr={_p1_30b.stderr.decode('utf-8', 'replace')!r}")
+
+            _p2_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
+                                     input=b'{"source":"compact"}', capture_output=True, timeout=30)
+            _out2_30b = _p2_30b.stdout.decode("utf-8", "replace").strip()
+            from teammate_comms import __version__ as _ver30b
+            if "Update your teammate-comms status" not in _out2_30b:
+                failures.append(f"WP-30 AC-2: source=compact should emit the standing-rules "
+                                 f"payload: {_out2_30b!r} "
+                                 f"stderr={_p2_30b.stderr.decode('utf-8', 'replace')!r}")
+            if f"v{_ver30b}" not in _out2_30b:
+                failures.append(f"WP-30 AC-2: source=compact payload missing the H1 version "
+                                 f"stamp v{_ver30b}: {_out2_30b!r}")
+    except Exception as e:
+        failures.append(f"WP-30 AC-2 unit checks errored: {e}")
+
+    # ── WP-30 AC-4 (H5/H7/H8) — DESIGN.md carries the new notes (source grep) ──
+    try:
+        _design_src30d = (REPO / "DESIGN.md").read_text(encoding="utf-8")
+        for _needle30d in ("H5 — the standing-instructions contract", "H1 — version stamps",
+                          "H7/H8 — housekeeping notes", "tools/list_changed"):
+            if _needle30d not in _design_src30d:
+                failures.append(f"WP-30 AC-4: DESIGN.md missing expected note {_needle30d!r}")
+    except Exception as e:
+        failures.append(f"WP-30 AC-4 unit check errored: {e}")
+
+    # ── WP-31 AC-1 (N6/N7/N9) — schema-level text greps ──
+    try:
+        from teammate_comms.tools import TOOL_DEFINITIONS as _TD31a
+
+        _by_name31a = {t["name"]: t for t in _TD31a}
+        _send31a = _by_name31a["teammate_send"]
+        _group31a = _by_name31a["teammate_group"]
+        _update31a = _by_name31a["teammate_update"]
+
+        _send_msg_desc31a = _send31a["inputSchema"]["properties"]["message"]["description"]
+        if "@" not in _send_msg_desc31a or "mention" not in _send_msg_desc31a.lower():
+            failures.append(f"WP-31 AC-1: teammate_send message description missing the "
+                             f"@mention hint (N7): {_send_msg_desc31a!r}")
+        if "64 KB" not in _send_msg_desc31a:
+            failures.append(f"WP-31 AC-1: teammate_send message description missing the 64 "
+                             f"KB cap disclosure (N9): {_send_msg_desc31a!r}")
+
+        _group_desc31a = _group31a["description"]
+        if "mention" not in _group_desc31a.lower():
+            failures.append(f"WP-31 AC-1: teammate_group description missing the @mention "
+                             f"hint (N7): {_group_desc31a!r}")
+        if "open" not in _group_desc31a.lower() or "privacy" not in _group_desc31a.lower():
+            failures.append(f"WP-31 AC-1: teammate_group description missing the open-groups "
+                             f"/ privacy disclosure (N6): {_group_desc31a!r}")
+        for _action31a in ("create", "delete", "join", "leave", "add", "members", "history",
+                          "mute", "unmute", "reads"):
+            if _action31a not in _group_desc31a:
+                failures.append(f"WP-31 AC-1: teammate_group description missing action "
+                                 f"{_action31a!r} (N9 — all 10 actions must be named)")
+
+        _update_project_desc31a = _update31a["inputSchema"]["properties"]["project"]["description"]
+        if "at registration" in _update_project_desc31a:
+            failures.append(f"WP-31 AC-1: teammate_update's project description still says "
+                             f"'at registration' (N9): {_update_project_desc31a!r}")
+    except Exception as e:
+        failures.append(f"WP-31 AC-1 unit checks errored: {e}")
+
+    # ── WP-31 AC-2 (N9) — param-aware "is required" errors; a bad-but-present name unchanged ──
+    try:
+        from teammate_comms.tools import _handle_send as _hs31b, _handle_group as _hg31b
+        from teammate_comms.comms import CommsError as _CE31b
+
+        class _Ctx31b:
+            def __init__(self, root):
+                self._root = root
+            def snapshot(self):
+                return ("sender31b", None, self._root, None)
+
+        _root31b = tempfile.mkdtemp(prefix="tc-31-ac2-")
+        _ctx31b = {"identity": _Ctx31b(_root31b)}
+
+        try:
+            _hs31b({"message": "hi"}, _ctx31b)   # missing 'to'
+            failures.append("WP-31 AC-2: teammate_send with a missing 'to' should raise")
+        except _CE31b as _e31b:
+            if "'to' is required" not in str(_e31b):
+                failures.append(f"WP-31 AC-2: missing-'to' error wording wrong: {_e31b}")
+
+        try:
+            _hg31b({"action": "create"}, _ctx31b)   # missing 'group'
+            failures.append("WP-31 AC-2: teammate_group with a missing 'group' should raise")
+        except _CE31b as _e31b2:
+            if "'group' is required" not in str(_e31b2):
+                failures.append(f"WP-31 AC-2: missing-'group' error wording wrong: {_e31b2}")
+
+        # Tautology guard: a BAD but non-empty name must keep the ORIGINAL generic wording,
+        # not the new "is required" text — param= must only fire for None/empty.
+        try:
+            _hs31b({"to": "bad name!!", "message": "hi"}, _ctx31b)
+            failures.append("WP-31 AC-2: a bad (non-empty) 'to' name should raise")
+        except _CE31b as _e31b3:
+            if "Invalid agent name" not in str(_e31b3) or "is required" in str(_e31b3):
+                failures.append(f"WP-31 AC-2 [tautology: a bad non-empty name must keep the "
+                                 f"generic 'Invalid agent name' wording, not 'is required']: "
+                                 f"{_e31b3}")
+
+        # The 'to'/'group' checks above hit PRE-EXISTING early guards in _handle_send/
+        # _handle_group that never actually reach validate_agent_name/validate_group_name —
+        # exercise the new param= behavior directly (unit) AND through call sites that have NO
+        # earlier guard (teammate_register's 'agent', remove_teammate's name), so this test
+        # actually proves the new code, not just pre-existing behavior it happens to overlap.
+        from teammate_comms.comms import validate_agent_name as _van31b, validate_group_name as _vgn31b
+        try:
+            _van31b(None, param="agent")
+            failures.append("WP-31 AC-2: validate_agent_name(None, param=...) should raise")
+        except _CE31b as _e31b4:
+            if str(_e31b4) != "'agent' is required (a teammate name).":
+                failures.append(f"WP-31 AC-2: validate_agent_name param wording wrong: {_e31b4}")
+        try:
+            _vgn31b("", param="group")
+            failures.append("WP-31 AC-2: validate_group_name('', param=...) should raise")
+        except _CE31b as _e31b5:
+            if str(_e31b5) != "'group' is required (a group name).":
+                failures.append(f"WP-31 AC-2: validate_group_name param wording wrong: {_e31b5}")
+
+        from teammate_comms.tools import _handle_register as _hr31b, remove_teammate as _rt31b
+        try:
+            _hr31b({}, _ctx31b)   # missing 'agent' — no earlier guard in _handle_register
+            failures.append("WP-31 AC-2: teammate_register with a missing 'agent' should raise")
+        except _CE31b as _e31b6:
+            if "'agent' is required" not in str(_e31b6):
+                failures.append(f"WP-31 AC-2: missing-'agent' (register) error wording wrong: {_e31b6}")
+        try:
+            _rt31b(_root31b, None, "caller31b", None)   # missing name — no earlier guard
+            failures.append("WP-31 AC-2: remove_teammate with a missing name should raise")
+        except _CE31b as _e31b7:
+            if "'teammate' is required" not in str(_e31b7):
+                failures.append(f"WP-31 AC-2: missing-name (remove_teammate) error wording "
+                                 f"wrong: {_e31b7}")
+    except Exception as e:
+        failures.append(f"WP-31 AC-2 unit checks errored: {e}")
+
+    # ── WP-31 AC-3 (N10) — inbox and group history render an identical block for the SAME message ──
+    try:
+        from teammate_comms import server as _srv31c
+        from teammate_comms import tools as _t31c
+        from teammate_comms.comms import write_group_meta as _wgm31c, get_group_dir as _ggd31c, \
+            now_timestamp as _nts31c
+
+        _root31c = tempfile.mkdtemp(prefix="tc-31-ac3-")
+        _srv31c.register_identity("sender31c", None, _root31c, {})
+        _a31c, _team31c, _rootactual31c, _ = _srv31c._identity.snapshot()
+        _srv31c.register_identity("peer31c", None, str(_rootactual31c), {})
+
+        _ggd31c(_rootactual31c, _team31c, "grp31c").mkdir(parents=True, exist_ok=True)
+        _wgm31c(_rootactual31c, _team31c, "grp31c", {
+            "name": "grp31c", "members": ["sender31c", "peer31c"],
+            "creator": "sender31c", "createdAt": _nts31c(),
+        })
+        _t31c.send_group(_rootactual31c, _team31c, "sender31c", "#grp31c",
+                         "hello @peer31c", priority="urgent", post_type="decision")
+
+        class _Ctx31c:
+            def __init__(self, agent):
+                self._agent = agent
+            def snapshot(self):
+                return (self._agent, _team31c, _rootactual31c, None)
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, ids):
+                pass
+
+        _hist31c = _t31c._handle_group({"action": "history", "group": "grp31c"},
+                                       {"identity": _Ctx31c("peer31c")})
+        _inbox31c = _t31c._handle_inbox({}, {"identity": _Ctx31c("peer31c")})
+
+        # Strip the outer header/footer (legitimately different: "=== ... transcript ..."
+        # vs "=== N unread message(s) ..."); the per-message BLOCK (from "--- id:" through the
+        # reactions line, if any) must be byte-identical — one renderer, not two grammars.
+        def _extract_block31c(text):
+            lines = text.splitlines()
+            start = next(i for i, l in enumerate(lines) if l.startswith("--- id:") or l.startswith("--- id: "))
+            # Block runs until the next blank-preceded "--- id:" or end/footer paren-note.
+            end = len(lines)
+            for i in range(start + 1, len(lines)):
+                if lines[i].startswith("(") or lines[i].startswith("--- id:"):
+                    end = i
+                    break
+            return lines[start:end]
+
+        _block_hist31c = _extract_block31c(_hist31c)
+        _block_inbox31c = _extract_block31c(_inbox31c)
+        if _block_hist31c != _block_inbox31c:
+            failures.append(f"WP-31 AC-3 [tautology: inbox and group history must render an "
+                             f"IDENTICAL block for the same message]: "
+                             f"history={_block_hist31c!r} inbox={_block_inbox31c!r}")
+        # Sanity: the shared block actually carries the rich (inbox-style) tags this test is
+        # FOR — a mention flag and a post-type tag — so an empty/trivial match can't pass.
+        if not any("🔔" in l for l in _block_hist31c) or not any("[DECISION]" in l for l in _block_hist31c):
+            failures.append(f"WP-31 AC-3: shared block missing expected mention/post-type "
+                             f"tags: {_block_hist31c!r}")
+    except Exception as e:
+        failures.append(f"WP-31 AC-3 unit checks errored: {e}")
+
+    # ── WP-33 Q5 — true multi-process lock contention (N processes × M appends, one file) ──
+    # All prior concurrency coverage in this harness is thread-based in ONE interpreter; the
+    # product's actual shape (separate teammate-comms server PROCESSES contending on the mkdir
+    # lock across separate inboxes/records) was inferred, never proven. This drives N=4 real
+    # OS processes each appending M=25 records to the SAME file via file_lock's
+    # read-modify-write, and asserts the union is complete and duplicate-free.
+    try:
+        _N33, _M33 = 4, 25
+        _probe_dir33 = tempfile.mkdtemp(prefix="tc-33-q5-")
+        _probe_path33 = str(Path(_probe_dir33) / "probe_unread.json")
+
+        _env33 = dict(os.environ)
+        _env33["PYTHONPATH"] = str(SRC) + os.pathsep + _env33.get("PYTHONPATH", "")
+
+        _worker_src33 = (
+            "import sys\n"
+            "from teammate_comms.comms import file_lock, read_json_safe, write_json_atomic\n"
+            f"path = {_probe_path33!r}\n"
+            "wid = int(sys.argv[1])\n"
+            f"for seq in range({_M33}):\n"
+            "    with file_lock(path, timeout=10):\n"
+            "        data = read_json_safe(path)\n"
+            "        if not isinstance(data, list):\n"
+            "            data = []\n"
+            "        data.append({'worker': wid, 'seq': seq})\n"
+            "        write_json_atomic(path, data)\n"
+        )
+
+        _procs33 = [
+            subprocess.Popen([sys.executable, "-c", _worker_src33, str(_wid33)],
+                             env=_env33, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            for _wid33 in range(_N33)
+        ]
+
+        _deadline33 = time.time() + 20   # generous but bounded — no fixed sleeps, deadline-poll via communicate
+        _worker_errs33 = []
+        for _p33 in _procs33:
+            _remaining33 = max(0.1, _deadline33 - time.time())
+            try:
+                _out33, _err33 = _p33.communicate(timeout=_remaining33)
+                if _p33.returncode != 0:
+                    _worker_errs33.append(_err33.decode("utf-8", "replace"))
+            except subprocess.TimeoutExpired:
+                _p33.kill()
+                _p33.communicate()
+                _worker_errs33.append("TIMEOUT waiting for a Q5 worker process")
+
+        if _worker_errs33:
+            failures.append(f"WP-33 Q5: {len(_worker_errs33)} worker process(es) failed/timed "
+                             f"out: {_worker_errs33}")
+        else:
+            _expected33 = _N33 * _M33
+            _final33 = json.loads(Path(_probe_path33).read_text(encoding="utf-8"))
+            _pairs33 = [(r.get("worker"), r.get("seq")) for r in _final33]
+            _distinct33 = set(_pairs33)
+            if len(_final33) != _expected33:
+                failures.append(f"WP-33 Q5 [tautology: {_N33} processes × {_M33} appends under "
+                                 f"file_lock must yield EXACTLY {_expected33} records if the "
+                                 f"mkdir lock truly excludes across PROCESSES]: got "
+                                 f"{len(_final33)} records")
+            if len(_pairs33) != len(_distinct33):
+                failures.append(f"WP-33 Q5: {len(_pairs33) - len(_distinct33)} duplicate "
+                                 f"(worker,seq) record(s) — a racing read-modify-write clobbered "
+                                 f"another worker's append instead of being excluded by the lock")
+            if len(_distinct33) != _expected33:
+                failures.append(f"WP-33 Q5: expected {_expected33} distinct (worker,seq) pairs, "
+                                 f"got {len(_distinct33)} — some appends were LOST under "
+                                 f"cross-process contention")
+    except Exception as e:
+        failures.append(f"WP-33 Q5 unit checks errored: {e}")
+
+    # ── WP-32 AC-2/AC-5 — doc-drift guards (grep-level, durable regression protection) ──
+    try:
+        from teammate_comms.tools import TOOL_DEFINITIONS as _TD32
+        _actual_tool_count32 = len(_TD32)
+
+        _readme32 = (REPO / "README.md").read_text(encoding="utf-8")
+        _skill32 = (REPO / "skills" / "teammate-comms" / "SKILL.md").read_text(encoding="utf-8")
+        _design32 = (REPO / "DESIGN.md").read_text(encoding="utf-8")
+
+        # AC-2: SKILL.md must not contradict DESIGN §7's honest reliability contract.
+        for _stale32 in ("never loses a message", "is read on the next"):
+            if _stale32 in _skill32:
+                failures.append(f"WP-32 AC-2 [tautology: SKILL.md must not contradict the "
+                                 f"honest reliability contract]: found {_stale32!r}")
+
+        # AC-5: no stale tool-count strings, no per-WP-branch references, anywhere current-state.
+        import re as _re32
+        for _fname32, _text32 in (("README.md", _readme32), ("SKILL.md", _skill32),
+                                  ("DESIGN.md", _design32)):
+            for _m32 in _re32.finditer(r"(\d+)\s+tools\b", _text32):
+                _n32 = int(_m32.group(1))
+                if _n32 != _actual_tool_count32:
+                    failures.append(f"WP-32 AC-5: {_fname32} claims {_n32} tools but "
+                                     f"TOOL_DEFINITIONS has {_actual_tool_count32}: "
+                                     f"{_text32[max(0, _m32.start() - 40):_m32.end() + 10]!r}")
+            for _needle32 in ("per-WP branch", "per-wp branch"):
+                if _needle32 in _text32:
+                    failures.append(f"WP-32 AC-5: {_fname32} references {_needle32!r} — this "
+                                     f"epic is single-branch, fix-forward")
+
+        # teammate_set_avatar must appear in both README's and SKILL's tool tables (it was
+        # missing from both since v0.10.0 until this WP).
+        for _fname32b, _text32b in (("README.md", _readme32), ("SKILL.md", _skill32)):
+            if "teammate_set_avatar" not in _text32b:
+                failures.append(f"WP-32 AC-1: {_fname32b}'s tool table is missing "
+                                 f"teammate_set_avatar")
+    except Exception as e:
+        failures.append(f"WP-32 doc-drift guard unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

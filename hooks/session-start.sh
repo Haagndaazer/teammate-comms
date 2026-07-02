@@ -45,17 +45,30 @@ EOF
 
 # ── Step 1: require uv ───────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
-    emit_context "WARNING: the teammate-comms plugin requires 'uv' (Python package manager) but it was not found on PATH. Install it: https://docs.astral.sh/uv/getting-started/installation/"
+    emit_context "WARNING: the teammate-comms plugin requires 'uv' (Python package manager) but it was not found on PATH. Install it: https://docs.astral.sh/uv/getting-started/installation/ — after installing, restart Claude Code once and check with /mcp."
     exit 0
 fi
 
-# ── Step 2: conditional venv build (stamped on pyproject.toml + uv.lock) ──
+# ── Step 2: conditional venv build (stamped on pyproject.toml + uv.lock + the avatars flag) ──
+# P2: the avatars flag is part of the hash INPUT, not just a branch on the sync args — toggling
+# TEAMMATE_AVATARS_ENABLED must invalidate the stamp and trigger a re-sync on its own; otherwise
+# enabling it does nothing until pyproject.toml/uv.lock happen to change for an unrelated reason.
+AVATARS_FLAG="${TEAMMATE_AVATARS_ENABLED:-}"
 if command -v sha256sum &>/dev/null; then
-    HASH=$(cat "${PLUGIN_ROOT}/pyproject.toml" "${PLUGIN_ROOT}/uv.lock" 2>/dev/null | sha256sum | cut -d' ' -f1)
+    HASH=$( { cat "${PLUGIN_ROOT}/pyproject.toml" "${PLUGIN_ROOT}/uv.lock" 2>/dev/null; printf '%s' "$AVATARS_FLAG"; } | sha256sum | cut -d' ' -f1)
 elif command -v shasum &>/dev/null; then
-    HASH=$(cat "${PLUGIN_ROOT}/pyproject.toml" "${PLUGIN_ROOT}/uv.lock" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
+    HASH=$( { cat "${PLUGIN_ROOT}/pyproject.toml" "${PLUGIN_ROOT}/uv.lock" 2>/dev/null; printf '%s' "$AVATARS_FLAG"; } | shasum -a 256 | cut -d' ' -f1)
 else
     HASH="no-hash-tool"
+fi
+
+# H3: a first install can't have the venv built before the FIRST MCP spawn tries to use it —
+# capture "no stamp at all yet" BEFORE the sync attempt below, so a successful first sync can
+# tell the agent to restart once (the prior fix was prose-only in README/DESIGN, invisible
+# in-session; missing uv/bash otherwise present as the identical silent "no teammate_* tools").
+FIRST_INSTALL=0
+if [ ! -f "$STAMP" ]; then
+    FIRST_INSTALL=1
 fi
 
 if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
@@ -63,9 +76,17 @@ if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
     # half-built venv is recorded as done, the next session's hash matches and SKIPS the sync,
     # and the server fails to launch with no diagnostic. No stamp → next session retries
     # (self-healing). The build stays best-effort: a failure here never blocks the handshake.
-    if UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync --project "${PLUGIN_ROOT}" --no-dev 2>/dev/null; then
+    SYNC_ARGS=(--project "${PLUGIN_ROOT}" --no-dev)
+    if [ "$AVATARS_FLAG" = "1" ]; then
+        SYNC_ARGS+=(--extra images)
+    fi
+    if UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync "${SYNC_ARGS[@]}" 2>/dev/null; then
         mkdir -p "${VENV_DIR}"
         echo "$HASH" > "$STAMP"
+        if [ "$FIRST_INSTALL" = "1" ]; then
+            emit_context "teammate-comms just built its environment for the first time. If the teammate_* tools are not available in this session, restart Claude Code once (check with /mcp)."
+            exit 0
+        fi
     fi
 fi
 
