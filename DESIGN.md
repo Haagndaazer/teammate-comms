@@ -45,8 +45,7 @@ arrive, so a peer's `send` *is* the nudge — no ports, no cross-instance addres
 ```
 teammate-comms/
 ├── .claude-plugin/
-│   ├── plugin.json             # inline mcpServers + channels (§4)
-│   └── marketplace.json        # in-repo manifest, name "colton-comms" (local dev; §4b)
+│   └── plugin.json             # inline mcpServers + channels (§4)
 ├── pyproject.toml              # hatchling; dependencies = [] (pure stdlib)
 ├── uv.lock                     # COMMITTED — reproducible installs (§3)
 ├── src/teammate_comms/
@@ -160,10 +159,8 @@ plugin code stays in each plugin's own repo. Install:
 /plugin install teammate-comms@coltondyck
 ```
 
-This repo also carries an in-repo `.claude-plugin/marketplace.json` named
-**`colton-comms`** (a *distinct* name, so it cannot collide with `coltondyck`) for
-`--plugin-dir` local development. It is non-canonical but is re-pinned in parallel on
-each release.
+The canonical marketplace lives in `colton-claude-plugins`; there is no in-repo
+manifest.
 
 > *Originally a hazard:* a second marketplace **also** named `coltondyck` would
 > collide — Claude Code keys marketplaces by name, so only one `coltondyck` can be

@@ -1,6 +1,6 @@
 """WP-13 — Project profiles (v0.9.0) acceptance tests.
 
-Covers all 9 acceptance criteria from WP-13-project-profiles.md:
+Covers all 9 acceptance criteria from docs/history/WP-13-project-profiles.md:
   AC-1: round-trip all fields; status rejects invalid; over-cap fields truncated
   AC-2: cross-OS/case key convergence — roster AND dashboard grouping
   AC-3: type=='human' records excluded from project roster

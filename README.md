@@ -428,11 +428,6 @@ commit SHA):
 /plugin install teammate-comms@coltondyck
 ```
 
-> This repo also still carries an in-repo `.claude-plugin/marketplace.json` (named
-> `colton-comms`) for direct `--plugin-dir` development, but the `coltondyck`
-> marketplace above is the canonical install path. Both are re-pinned to the same
-> release commit on each version bump.
-
 ## Uninstall & upgrade
 
 `/plugin uninstall` removes the plugin code but **does not touch your comms data** —

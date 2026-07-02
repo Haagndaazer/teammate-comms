@@ -1,6 +1,6 @@
 """WP-14 avatar acceptance tests.
 
-Covers all 8 acceptance criteria from WP-14-teammate-avatars.md §12.
+Covers all 8 acceptance criteria from docs/history/WP-14-teammate-avatars.md §12.
 Run: uv run --no-dev python tests/test_wp14_avatars.py
 
 AC-1: square png → 256×256 + avatar.hash; clear removes sidecars+key.
