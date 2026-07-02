@@ -124,11 +124,38 @@ def _reaction_summary(reactions_by_emoji):
     couldn't say who). Callers wrap it as '    reactions: <this>'."""
     return "; ".join(f"{_REACTIONS.get(e, e)} {', '.join(who)}" for e, who in reactions_by_emoji.items())
 
+
+def _format_message_block(msg, *, agent=None, reactions=None):
+    """Render one message as the shared '--- id | from [tags] ---' block (N10): header line +
+    optional reply-line + body + optional reactions line, as a list of lines to extend into
+    the caller's output. Used by BOTH teammate_inbox and teammate_group(action="history") so
+    the two views render an identical block for the same message — field order/tags unify on
+    the richer INBOX form (group/post-type/urgent/mention flags; group history previously
+    omitted the group and mention tags, which is fine since a group's own history is already
+    scoped to it, but a single renderer beats two near-identical ad-hoc grammars).
+
+    ``agent``, if given, is the VIEWING agent — enables the 🔔(@you) mention flag.
+    ``reactions`` is that message's aggregated {emoji: [reactors]} dict (or None/empty for no
+    reactions line).
+    """
+    tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
+    grp = msg.get("group")
+    gtag = f" [👥 group: {grp}]" if grp else ""
+    ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
+    mtag = " 🔔(@you)" if agent and agent in (msg.get("mentions") or []) else ""
+    lines = [f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{ptag}{tag}{mtag} ---"]
+    if msg.get("reply_to"):
+        lines.append(f"    ↳ re {msg['reply_to']}")
+    lines.append(str(msg.get("message", "")))
+    if reactions:
+        lines.append(f"    reactions: {_reaction_summary(reactions)}")
+    return lines
+
 # Per-field descriptions reused by teammate_register and teammate_update schemas.
 _PROFILE_DESCRIPTIONS = {
     "project": (
-        "The project/repo you're working in. Auto-filled from the current project "
-        "directory at registration — set this only to override the auto-filled value."
+        "Your working project — auto-filled from the project directory when you "
+        "register; set to override."
     ),
     "role": "Your job/role on the team (e.g. 'backend / API').",
     "personality": (
@@ -231,7 +258,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "to": {"type": "string", "description": "Recipient agent name, or a '#'-prefixed group name (e.g. '#design')."},
-                "message": {"type": "string", "description": "Message body."},
+                "message": {"type": "string", "description": "Message body. Max 64 KB. @name in a group post mentions a member (they get a 🔔 flag in their wake and inbox)."},
                 "priority": {
                     "type": "string",
                     "enum": list(_PRIORITIES),
@@ -332,13 +359,17 @@ TOOL_DEFINITIONS = [
         "description": (
             "Manage group chats for brainstorming with multiple teammates. A group is "
             "addressed like a teammate but with a '#' prefix: post to it with "
-            "teammate_send(to=\"#<group>\"), which fans out to every member and wakes "
-            "them. The full ordered thread is kept in a shared transcript — use "
-            "action='history' as the canonical record (it survives inbox acks). "
-            "Membership is open (anyone can join/add). Actions: create, delete "
+            "teammate_send(to=\"#<group>\", message=\"...\") — @name in the post mentions "
+            "a member (they get a 🔔 flag in their wake and inbox) — which fans out to "
+            "every member and wakes them. The full ordered thread is kept in a shared "
+            "transcript — use action='history' as the canonical record (it survives inbox "
+            "acks). Groups are open: any registered teammate can join, post, and read "
+            "history — do not post secrets expecting privacy. Actions: create, delete "
             "(creator-only), join, leave, add (members), members (list), history (read "
             "the shared transcript; optionally filter by 'sender', 'post_type', and a "
-            "'since' id cursor — the decision trail)."
+            "'since' id cursor — the decision trail), mute, unmute (silence/restore this "
+            "group's channel wakes for you; messages still arrive), reads (who has acked "
+            "up to where)."
         ),
         "inputSchema": {
             "type": "object",
@@ -553,7 +584,7 @@ def _require_registered(ctx):
 
 def _handle_register(args, ctx):
     agent = args.get("agent")
-    validate_agent_name(agent)  # raises CommsError on bad/missing
+    validate_agent_name(agent, param="agent")  # raises CommsError on bad/missing (N9)
     team = args.get("team")
     if team is not None and (not isinstance(team, str) or not team.strip()):
         team = None
@@ -615,7 +646,7 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     live recipient via their own channel watcher), THEN tees the global transcript
     (best-effort, LAST — observability never precedes or delays delivery).
     """
-    validate_agent_name(to)
+    validate_agent_name(to, param="to")
     if to == sender:
         raise CommsError(
             "Cannot send to yourself. teammate_send targets another teammate; "
@@ -772,18 +803,7 @@ def _handle_inbox(args, ctx):
     header += " ==="
     out = [header]
     for msg in render_msgs:
-        tag = " [URGENT]" if msg.get("priority") == "urgent" else ""
-        grp = msg.get("group")
-        gtag = f" [👥 group: {grp}]" if grp else ""
-        ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
-        mtag = " 🔔(@you)" if agent in (msg.get("mentions") or []) else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{gtag}{ptag}{tag}{mtag} ---")
-        if msg.get("reply_to"):
-            out.append(f"    ↳ re {msg['reply_to']}")
-        out.append(str(msg.get("message", "")))
-        rx = rx_all.get(msg.get("id"))
-        if rx:
-            out.append(f"    reactions: {_reaction_summary(rx)}")   # names, matching group history (F-3)
+        out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
     if not show_all and seen_msgs:
         _sfrom = _sender_summary(seen_msgs)
         out.append(f"\n({len(seen_msgs)} message(s) already delivered (from: {_sfrom}) — not re-shown. "
@@ -1168,7 +1188,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
     ``{id, sigil, delivered, live, deferred}`` (the counts are computed in the loop
     and are load-bearing for the wrapper's strings).
     """
-    group = validate_group_name(to_sigil)  # strips '#', validates
+    group = validate_group_name(to_sigil, param="to")  # strips '#', validates
     sigil = f"#{group}"
     meta = read_group_meta(root, team, group)
     if meta is None:
@@ -1281,13 +1301,13 @@ def _handle_group(args, ctx):
     action = args.get("action")
     if action not in _GROUP_ACTIONS:  # MCP clients don't enforce the schema enum
         raise CommsError(f"'action' must be one of {list(_GROUP_ACTIONS)}.")
-    group = validate_group_name(args.get("group"))  # raises on missing/bad
+    group = validate_group_name(args.get("group"), param="group")  # raises on missing/bad (N9)
     sigil = f"#{group}"
 
     if action == "create":
         members = [agent]
-        for m in args.get("members") or []:
-            validate_agent_name(m)
+        for i, m in enumerate(args.get("members") or []):
+            validate_agent_name(m, param=f"members[{i}]")
             if m not in members:
                 members.append(m)
         # G2: case-variant collision check at CREATE only — open membership means member
@@ -1369,8 +1389,8 @@ def _handle_group(args, ctx):
         to_add = args.get("members") or []
         if not to_add:
             raise CommsError("Provide 'members' (a list of names) to add.")
-        for m in to_add:
-            validate_agent_name(m)
+        for i, m in enumerate(to_add):
+            validate_agent_name(m, param=f"members[{i}]")
 
         def mutate(meta):
             members = meta.get("members", [])
@@ -1462,15 +1482,7 @@ def _handle_group(args, ctx):
         read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
     out = [f"=== {sigil} transcript{by} ({len(recent)} of {total} message(s)) ==="]
     for msg in recent:
-        urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""
-        ptag = f" [{msg['post_type'].upper()}]" if msg.get("post_type") else ""
-        out.append(f"\n--- id: {msg.get('id')} | from: {msg.get('from')}{ptag}{urgent} ---")
-        if msg.get("reply_to"):
-            out.append(f"    ↳ re {msg['reply_to']}")
-        out.append(str(msg.get("message", "")))
-        rx = rx_all.get(msg.get("id"))
-        if rx:
-            out.append(f"    reactions: {_reaction_summary(rx)}")   # shared helper (F-3)
+        out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
     return "\n".join(out)
 
 
@@ -1622,7 +1634,7 @@ def remove_teammate(root, team, caller, name, is_operator=False):
     memberships. Their authored messages stay attributed. Raises CommsError on a guard
     violation (self, the human operator, a missing name, or a LIVE teammate).
     """
-    validate_agent_name(name)
+    validate_agent_name(name, param="teammate")
     if name == caller:
         raise CommsError("You can't remove yourself.")
     record = read_agent_record(root, team, name)
@@ -1705,7 +1717,7 @@ def _handle_reincarnate(args, ctx):
             print(f"[teammate-comms] WARNING: {durable_warning.strip()}", file=sys.stderr, flush=True)
     agent, team, root = _require_registered(ctx)
     target = args.get("agent")
-    validate_agent_name(target)
+    validate_agent_name(target, param="agent")
     project_dir = validate_project_dir(args.get("project_dir"))
     # Best-effort live-name collision guard (TOCTOU — the child's own auto-register only
     # WARNS, server.py): refuse only if the name is already a LIVE channel. Reincarnating

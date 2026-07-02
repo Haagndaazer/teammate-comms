@@ -165,12 +165,21 @@ def find_group_case_variant(root, team, group):
     return None
 
 
-def validate_agent_name(name):
+def validate_agent_name(name, param=None):
     """Validate an agent name; raise CommsError on anything unsafe.
 
     Does NOT call sys.exit — a bad ``to``/``agent`` argument from a tool call
     must not kill the long-lived server.
+
+    N9: ``param``, if given, names the CALLER's own argument (``"to"``, ``"agent"``,
+    ``"members[0]"``...). When ``name`` is None/empty AND ``param`` is given, the error
+    reads "'<param>' is required (a teammate name)." instead of the generic-and-confusing
+    "Invalid agent name None ..." — a value that fails validation for any OTHER reason
+    (bad characters, reserved, non-None-but-still-falsy with no param) keeps the original
+    wording unchanged.
     """
+    if not name and param:
+        raise CommsError(f"'{param}' is required (a teammate name).")
     if not isinstance(name, str) or not AGENT_NAME_PATTERN.match(name) or ".." in name:
         raise CommsError(
             f"Invalid agent name {name!r}. Use alphanumerics, hyphens, "
@@ -288,14 +297,19 @@ def validate_project_field(name, value):
     return collapsed
 
 
-def validate_group_name(name):
+def validate_group_name(name, param=None):
     """Validate a group name (with or without a leading ``#``); return the clean name.
 
     Groups are addressed with a ``#`` sigil (``teammate_send(to="#design")``) so they
     occupy a separate namespace from agents and can never collide. The stored name and
     on-disk paths use the clean (sigil-stripped) form. Raises CommsError on anything
     unsafe — same character set as an agent name.
+
+    N9: ``param``, if given, names the CALLER's own argument — see ``validate_agent_name``'s
+    docstring for the same None/empty-vs-generic-error rationale.
     """
+    if not name and param:
+        raise CommsError(f"'{param}' is required (a group name).")
     if not isinstance(name, str):
         raise CommsError(f"Invalid group name {name!r}.")
     clean = name[1:] if name.startswith("#") else name

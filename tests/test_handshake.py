@@ -4985,9 +4985,37 @@ def main():
         import shutil as _sh30b
         _bash30b = _sh30b.which("bash")
         if _bash30b:
+            # Silvie's gate CR: the original version of this test pointed CLAUDE_PLUGIN_ROOT at
+            # THIS repo and relied on its .venv already being synced — works on a machine that
+            # already ran the dev setup, fails on a bare checkout (a fresh gate worktree has no
+            # .venv). Fix: a fake `uv` on PATH whose "run" re-dispatches straight to the CURRENT
+            # test interpreter with src/ on PYTHONPATH — no real venv anywhere. This still proves
+            # everything the test is FOR (self-filter, '{}'-on-noncompact, payload emission, the
+            # H1 version stamp) through the hook's real bash plumbing.
+            _plugin_root30b = tempfile.mkdtemp(prefix="tc-30-ac2-root-")
+            _fakebin30b = tempfile.mkdtemp(prefix="tc-30-ac2-bin-")
+            _fake_uv30b = Path(_fakebin30b) / "uv"
+            _fake_uv30b.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"$1\" = \"run\" ]; then\n"
+                "    shift\n"
+                "    while [ $# -gt 0 ] && [ \"$1\" != \"python\" ]; do shift; done\n"
+                "    if [ \"$1\" = \"python\" ]; then\n"
+                "        shift\n"
+                "        PYTHONPATH=\"${TC_TEST_SRC}\" exec \"${TC_TEST_PYTHON}\" \"$@\"\n"
+                "    fi\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            _fake_uv30b.chmod(0o755)
+
             _script30b = str(REPO / "hooks" / "reinject-instructions.sh")
             _env30b = dict(os.environ)
-            _env30b["CLAUDE_PLUGIN_ROOT"] = str(REPO)
+            _env30b["CLAUDE_PLUGIN_ROOT"] = _plugin_root30b
+            _env30b["PATH"] = _fakebin30b + os.pathsep + _env30b.get("PATH", "")
+            _env30b["TC_TEST_PYTHON"] = sys.executable
+            _env30b["TC_TEST_SRC"] = str(SRC)
 
             _p1_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
                                      input=b'{"source":"startup"}', capture_output=True, timeout=30)
@@ -4995,15 +5023,16 @@ def main():
             if _out1_30b != "{}":
                 failures.append(f"WP-30 AC-2 [tautology: source=startup must self-filter to "
                                  f"'{{}}' without ever exec'ing the instructions module]: "
-                                 f"{_out1_30b!r}")
+                                 f"{_out1_30b!r} stderr={_p1_30b.stderr.decode('utf-8', 'replace')!r}")
 
             _p2_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
-                                     input=b'{"source":"compact"}', capture_output=True, timeout=45)
+                                     input=b'{"source":"compact"}', capture_output=True, timeout=30)
             _out2_30b = _p2_30b.stdout.decode("utf-8", "replace").strip()
             from teammate_comms import __version__ as _ver30b
             if "Update your teammate-comms status" not in _out2_30b:
                 failures.append(f"WP-30 AC-2: source=compact should emit the standing-rules "
-                                 f"payload: {_out2_30b!r}")
+                                 f"payload: {_out2_30b!r} "
+                                 f"stderr={_p2_30b.stderr.decode('utf-8', 'replace')!r}")
             if f"v{_ver30b}" not in _out2_30b:
                 failures.append(f"WP-30 AC-2: source=compact payload missing the H1 version "
                                  f"stamp v{_ver30b}: {_out2_30b!r}")
@@ -5019,6 +5048,180 @@ def main():
                 failures.append(f"WP-30 AC-4: DESIGN.md missing expected note {_needle30d!r}")
     except Exception as e:
         failures.append(f"WP-30 AC-4 unit check errored: {e}")
+
+    # ── WP-31 AC-1 (N6/N7/N9) — schema-level text greps ──
+    try:
+        from teammate_comms.tools import TOOL_DEFINITIONS as _TD31a
+
+        _by_name31a = {t["name"]: t for t in _TD31a}
+        _send31a = _by_name31a["teammate_send"]
+        _group31a = _by_name31a["teammate_group"]
+        _update31a = _by_name31a["teammate_update"]
+
+        _send_msg_desc31a = _send31a["inputSchema"]["properties"]["message"]["description"]
+        if "@" not in _send_msg_desc31a or "mention" not in _send_msg_desc31a.lower():
+            failures.append(f"WP-31 AC-1: teammate_send message description missing the "
+                             f"@mention hint (N7): {_send_msg_desc31a!r}")
+        if "64 KB" not in _send_msg_desc31a:
+            failures.append(f"WP-31 AC-1: teammate_send message description missing the 64 "
+                             f"KB cap disclosure (N9): {_send_msg_desc31a!r}")
+
+        _group_desc31a = _group31a["description"]
+        if "mention" not in _group_desc31a.lower():
+            failures.append(f"WP-31 AC-1: teammate_group description missing the @mention "
+                             f"hint (N7): {_group_desc31a!r}")
+        if "open" not in _group_desc31a.lower() or "privacy" not in _group_desc31a.lower():
+            failures.append(f"WP-31 AC-1: teammate_group description missing the open-groups "
+                             f"/ privacy disclosure (N6): {_group_desc31a!r}")
+        for _action31a in ("create", "delete", "join", "leave", "add", "members", "history",
+                          "mute", "unmute", "reads"):
+            if _action31a not in _group_desc31a:
+                failures.append(f"WP-31 AC-1: teammate_group description missing action "
+                                 f"{_action31a!r} (N9 — all 10 actions must be named)")
+
+        _update_project_desc31a = _update31a["inputSchema"]["properties"]["project"]["description"]
+        if "at registration" in _update_project_desc31a:
+            failures.append(f"WP-31 AC-1: teammate_update's project description still says "
+                             f"'at registration' (N9): {_update_project_desc31a!r}")
+    except Exception as e:
+        failures.append(f"WP-31 AC-1 unit checks errored: {e}")
+
+    # ── WP-31 AC-2 (N9) — param-aware "is required" errors; a bad-but-present name unchanged ──
+    try:
+        from teammate_comms.tools import _handle_send as _hs31b, _handle_group as _hg31b
+        from teammate_comms.comms import CommsError as _CE31b
+
+        class _Ctx31b:
+            def __init__(self, root):
+                self._root = root
+            def snapshot(self):
+                return ("sender31b", None, self._root, None)
+
+        _root31b = tempfile.mkdtemp(prefix="tc-31-ac2-")
+        _ctx31b = {"identity": _Ctx31b(_root31b)}
+
+        try:
+            _hs31b({"message": "hi"}, _ctx31b)   # missing 'to'
+            failures.append("WP-31 AC-2: teammate_send with a missing 'to' should raise")
+        except _CE31b as _e31b:
+            if "'to' is required" not in str(_e31b):
+                failures.append(f"WP-31 AC-2: missing-'to' error wording wrong: {_e31b}")
+
+        try:
+            _hg31b({"action": "create"}, _ctx31b)   # missing 'group'
+            failures.append("WP-31 AC-2: teammate_group with a missing 'group' should raise")
+        except _CE31b as _e31b2:
+            if "'group' is required" not in str(_e31b2):
+                failures.append(f"WP-31 AC-2: missing-'group' error wording wrong: {_e31b2}")
+
+        # Tautology guard: a BAD but non-empty name must keep the ORIGINAL generic wording,
+        # not the new "is required" text — param= must only fire for None/empty.
+        try:
+            _hs31b({"to": "bad name!!", "message": "hi"}, _ctx31b)
+            failures.append("WP-31 AC-2: a bad (non-empty) 'to' name should raise")
+        except _CE31b as _e31b3:
+            if "Invalid agent name" not in str(_e31b3) or "is required" in str(_e31b3):
+                failures.append(f"WP-31 AC-2 [tautology: a bad non-empty name must keep the "
+                                 f"generic 'Invalid agent name' wording, not 'is required']: "
+                                 f"{_e31b3}")
+
+        # The 'to'/'group' checks above hit PRE-EXISTING early guards in _handle_send/
+        # _handle_group that never actually reach validate_agent_name/validate_group_name —
+        # exercise the new param= behavior directly (unit) AND through call sites that have NO
+        # earlier guard (teammate_register's 'agent', remove_teammate's name), so this test
+        # actually proves the new code, not just pre-existing behavior it happens to overlap.
+        from teammate_comms.comms import validate_agent_name as _van31b, validate_group_name as _vgn31b
+        try:
+            _van31b(None, param="agent")
+            failures.append("WP-31 AC-2: validate_agent_name(None, param=...) should raise")
+        except _CE31b as _e31b4:
+            if str(_e31b4) != "'agent' is required (a teammate name).":
+                failures.append(f"WP-31 AC-2: validate_agent_name param wording wrong: {_e31b4}")
+        try:
+            _vgn31b("", param="group")
+            failures.append("WP-31 AC-2: validate_group_name('', param=...) should raise")
+        except _CE31b as _e31b5:
+            if str(_e31b5) != "'group' is required (a group name).":
+                failures.append(f"WP-31 AC-2: validate_group_name param wording wrong: {_e31b5}")
+
+        from teammate_comms.tools import _handle_register as _hr31b, remove_teammate as _rt31b
+        try:
+            _hr31b({}, _ctx31b)   # missing 'agent' — no earlier guard in _handle_register
+            failures.append("WP-31 AC-2: teammate_register with a missing 'agent' should raise")
+        except _CE31b as _e31b6:
+            if "'agent' is required" not in str(_e31b6):
+                failures.append(f"WP-31 AC-2: missing-'agent' (register) error wording wrong: {_e31b6}")
+        try:
+            _rt31b(_root31b, None, "caller31b", None)   # missing name — no earlier guard
+            failures.append("WP-31 AC-2: remove_teammate with a missing name should raise")
+        except _CE31b as _e31b7:
+            if "'teammate' is required" not in str(_e31b7):
+                failures.append(f"WP-31 AC-2: missing-name (remove_teammate) error wording "
+                                 f"wrong: {_e31b7}")
+    except Exception as e:
+        failures.append(f"WP-31 AC-2 unit checks errored: {e}")
+
+    # ── WP-31 AC-3 (N10) — inbox and group history render an identical block for the SAME message ──
+    try:
+        from teammate_comms import server as _srv31c
+        from teammate_comms import tools as _t31c
+        from teammate_comms.comms import write_group_meta as _wgm31c, get_group_dir as _ggd31c, \
+            now_timestamp as _nts31c
+
+        _root31c = tempfile.mkdtemp(prefix="tc-31-ac3-")
+        _srv31c.register_identity("sender31c", None, _root31c, {})
+        _a31c, _team31c, _rootactual31c, _ = _srv31c._identity.snapshot()
+        _srv31c.register_identity("peer31c", None, str(_rootactual31c), {})
+
+        _ggd31c(_rootactual31c, _team31c, "grp31c").mkdir(parents=True, exist_ok=True)
+        _wgm31c(_rootactual31c, _team31c, "grp31c", {
+            "name": "grp31c", "members": ["sender31c", "peer31c"],
+            "creator": "sender31c", "createdAt": _nts31c(),
+        })
+        _t31c.send_group(_rootactual31c, _team31c, "sender31c", "#grp31c",
+                         "hello @peer31c", priority="urgent", post_type="decision")
+
+        class _Ctx31c:
+            def __init__(self, agent):
+                self._agent = agent
+            def snapshot(self):
+                return (self._agent, _team31c, _rootactual31c, None)
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, ids):
+                pass
+
+        _hist31c = _t31c._handle_group({"action": "history", "group": "grp31c"},
+                                       {"identity": _Ctx31c("peer31c")})
+        _inbox31c = _t31c._handle_inbox({}, {"identity": _Ctx31c("peer31c")})
+
+        # Strip the outer header/footer (legitimately different: "=== ... transcript ..."
+        # vs "=== N unread message(s) ..."); the per-message BLOCK (from "--- id:" through the
+        # reactions line, if any) must be byte-identical — one renderer, not two grammars.
+        def _extract_block31c(text):
+            lines = text.splitlines()
+            start = next(i for i, l in enumerate(lines) if l.startswith("--- id:") or l.startswith("--- id: "))
+            # Block runs until the next blank-preceded "--- id:" or end/footer paren-note.
+            end = len(lines)
+            for i in range(start + 1, len(lines)):
+                if lines[i].startswith("(") or lines[i].startswith("--- id:"):
+                    end = i
+                    break
+            return lines[start:end]
+
+        _block_hist31c = _extract_block31c(_hist31c)
+        _block_inbox31c = _extract_block31c(_inbox31c)
+        if _block_hist31c != _block_inbox31c:
+            failures.append(f"WP-31 AC-3 [tautology: inbox and group history must render an "
+                             f"IDENTICAL block for the same message]: "
+                             f"history={_block_hist31c!r} inbox={_block_inbox31c!r}")
+        # Sanity: the shared block actually carries the rich (inbox-style) tags this test is
+        # FOR — a mention flag and a post-type tag — so an empty/trivial match can't pass.
+        if not any("🔔" in l for l in _block_hist31c) or not any("[DECISION]" in l for l in _block_hist31c):
+            failures.append(f"WP-31 AC-3: shared block missing expected mention/post-type "
+                             f"tags: {_block_hist31c!r}")
+    except Exception as e:
+        failures.append(f"WP-31 AC-3 unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
