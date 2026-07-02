@@ -26,15 +26,25 @@
    record's epoch + 1, read under the same write; absent → 1) onto the agent record. The
    watcher's heartbeat write carries the same `instance_id` (NOT epoch — epoch is
    register-owned, like `type`).
-2. **Flap kill (policy: most-recent-register wins):** in `run_watcher`, before the heartbeat
-   write, read the current record (you already read it right after for `muted_groups` — fold
-   into ONE read before the write). If the record's `instance_id` is present, NOT ours, AND
-   its `lastHeartbeat` is fresh (within the existing 30s staleness constant —
-   `is_channel_alive`'s default; import/reuse, don't re-invent), then SKIP our heartbeat write
-   this tick and stderr-log (once per demotion episode, not per tick — keep a local flag) that
-   this instance has been superseded by a newer claimant. RESUME writing when the foreign
-   heartbeat goes stale (>30s) or the record's instance_id becomes ours/absent — the staleness
-   check re-runs every tick, so a dead winner never silences us forever (peer-review H).
+2. **Flap kill (policy: most-recent-register wins; ADDENDUM 2026-07-02 — ownership model
+   made precise after a TOCTOU war-game):** ownership transfers ONLY at register while the
+   record is fresh; heartbeats never steal a fresh record.
+   - Heartbeat permit (each tick, ONE record read folded with the muted-cache read): WRITE
+     iff `record.instance_id` is absent/ours, OR the record is STALE (lastHeartbeat older
+     than the 30s constant — reuse `is_channel_alive`'s staleness). Foreign + fresh → SKIP
+     (demoted; stderr-log once per episode, local flag). Foreign + stale → write (legitimate
+     re-claim over a dead winner) — the check re-runs every tick, so a dead winner never
+     silences us forever (peer-review H).
+   - Epoch is REGISTER-OWNED: heartbeat writes never include `epoch`.
+   - TOCTOU tie-break: a competitor's heartbeat can read-before-our-register and merge-write
+     its `instance_id` OVER our fresh registration (their merge keeps OUR epoch). Detection:
+     `record.epoch == the epoch I minted at register` AND `record.instance_id` foreign → I am
+     the stomped rightful owner → re-claim (write, incl. my instance_id). The stomper then
+     reads foreign+fresh and demotes. Converges to most-recent-REGISTER in ≤2 ticks.
+     Store "my epoch" on watcher/Identity state at register.
+   - Extract the decision as a pure function `compute_heartbeat_permit(record,
+     my_instance_id, my_epoch, now)` (the compute_reemit pattern) — hermetic one-liner tests.
+   - The demotion skip must NOT skip the muted-cache refresh or the reaction-wake tick.
 3. **Register warning IN the return text (S2):** when the existing record is another LIVE
    claimant (existing instance_id != ours and heartbeat fresh, or the current
    `is_channel_alive` check trips), still proceed (register wins, epoch bumps) but PREPEND a
