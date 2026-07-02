@@ -1122,7 +1122,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
     # Best-effort fan-out into each other member's inbox. A locked/failed inbox is
     # NON-FATAL: the transcript is authoritative and the member catches up via history.
     inboxes_dir = get_inboxes_dir(root, team)
-    delivered, live, deferred = [], 0, []
+    delivered, live, deferred, pended = [], 0, [], []
     for member in members:
         if member == sender:
             continue
@@ -1138,18 +1138,30 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
             if rec and is_channel_alive(rec, pid_check=False):  # heartbeat-only (no N tasklist)
                 live += 1
         except CommsError:
-            deferred.append(member)
+            # M2: the member's unread lock was contended — retry via THEIR OWN pending file (a
+            # separate, rarely-contended lock) so their watcher recovers it on its next poll
+            # tick instead of the message silently vanishing until a manual history check.
+            try:
+                pending_file = inboxes_dir / f"{member}_pending.json"
+                with file_lock(pending_file):
+                    pending = read_json_safe(pending_file)
+                    pending.append(record)
+                    write_json_atomic(pending_file, pending)
+                pended.append(member)
+            except CommsError:
+                deferred.append(member)  # both locks contended — never raise, today's fallback
 
     append_transcript(root, team, {**record, "kind": "group"})  # tee LAST (firehose)
     return {"id": record["id"], "sigil": sigil,
-            "delivered": delivered, "live": live, "deferred": deferred}
+            "delivered": delivered, "live": live, "deferred": deferred, "pended": pended}
 
 
 def _send_to_group(agent, team, root, to_sigil, args):
     """Thin wrapper: format send_group()'s accounting into the human-readable summary."""
     res = send_group(root, team, agent, to_sigil, args.get("message"), args.get("priority", "normal"),
                      post_type=args.get("post_type"), reply_to=args.get("reply_to"))
-    delivered, live, deferred = res["delivered"], res["live"], res["deferred"]
+    delivered, live = res["delivered"], res["live"]
+    deferred, pended = res["deferred"], res["pended"]
     lines = [f"Posted to {res['sigil']} (id: {res['id']})."]
     if delivered:
         lines.append(
@@ -1158,6 +1170,8 @@ def _send_to_group(agent, team, root, to_sigil, args):
         )
     else:
         lines.append("No other members yet — recorded in the transcript only.")
+    if pended:
+        lines.append(f"Queued for retry — their watcher will pick it up: {', '.join(pended)}.")
     if deferred:
         lines.append(f"Deferred (inbox busy; will catch up via history): {', '.join(deferred)}.")
     return "\n".join(lines)

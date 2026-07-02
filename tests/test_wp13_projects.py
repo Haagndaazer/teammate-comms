@@ -23,6 +23,12 @@ import threading
 import time
 from pathlib import Path
 
+# WP-21 gate micro-CR: an emoji in a FAIL message crashes the harness's own report with
+# UnicodeEncodeError under Windows cp1252 stdout, masking failure details. Harness-report-only.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 REPO = Path(__file__).resolve().parents[1]
 SRC = REPO / "src"
 sys.path.insert(0, str(SRC))

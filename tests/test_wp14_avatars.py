@@ -26,6 +26,12 @@ import urllib.request
 import urllib.parse
 from pathlib import Path
 
+# WP-21 gate micro-CR: an emoji in a FAIL message crashes the harness's own report with
+# UnicodeEncodeError under Windows cp1252 stdout, masking failure details. Harness-report-only.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 _failures = []

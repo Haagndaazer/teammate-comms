@@ -54,6 +54,15 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# WP-21 gate micro-CR: a FAIL message containing an emoji (the presence/warning strings this
+# WP added — 🧑/⚠️) crashes the harness's own report with UnicodeEncodeError under Windows
+# cp1252 stdout, masking every failure detail behind a bare traceback — breaking only on the
+# exact path whose job is telling you what broke. Harness-report-only; never strip emoji from
+# product strings.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
 REPO = Path(__file__).resolve().parents[1]
 SRC = REPO / "src"
 AGENT = "test-chan"
@@ -1509,6 +1518,10 @@ def main():
                 def get_generation(self):
                     with self._lock:
                         return self._gen
+                def snapshot_with_generation(self):  # WP-22: single-lock W4 contract
+                    return self.snapshot() + (self.get_generation(),)
+                def get_durable_seen(self):  # WP-22 M3: no persisted seen-file in these tests
+                    return set()
                 def get_last_seen(self):
                     with self._lock:
                         return self._ls
@@ -1596,6 +1609,10 @@ def main():
                 def get_generation(self):
                     with self._lock:
                         return self._gen
+                def snapshot_with_generation(self):  # WP-22: single-lock W4 contract
+                    return self.snapshot() + (self.get_generation(),)
+                def get_durable_seen(self):  # WP-22 M3: no persisted seen-file in these tests
+                    return set()
                 def get_last_seen(self):
                     with self._lock:
                         return self._ls
@@ -1676,6 +1693,10 @@ def main():
                 def get_generation(self):
                     with self._lock:
                         return self._gen
+                def snapshot_with_generation(self):  # WP-22: single-lock W4 contract
+                    return self.snapshot() + (self.get_generation(),)
+                def get_durable_seen(self):  # WP-22 M3: no persisted seen-file in these tests
+                    return set()
                 def bump(self):
                     with self._lock:
                         self._gen += 1
@@ -3326,6 +3347,10 @@ def main():
                 return (self._agent, self._team, self._root, self._uf)
             def get_generation(self):
                 return 1
+            def snapshot_with_generation(self):
+                return self.snapshot() + (self.get_generation(),)
+            def get_durable_seen(self):
+                return set()
             def get_last_seen(self):
                 return None
             def set_last_seen(self, v):
@@ -3541,6 +3566,211 @@ def main():
                 failures.append(f"WP-21 AC-4: project key validator wrongly rejected {_n21!r}: {_e21d}")
     except Exception as e:
         failures.append(f"WP-21 AC-4 unit checks errored: {e}")
+
+    # ── WP-22 AC-1 (W4) — snapshot_with_generation is a single-lock read; watcher uses it ──
+    try:
+        import inspect
+        from teammate_comms import server as _srv22, channel as _ch22
+
+        if not hasattr(_srv22.Identity, "snapshot_with_generation"):
+            failures.append("WP-22 AC-1: Identity.snapshot_with_generation is missing")
+        _src22a = inspect.getsource(_ch22.run_watcher)
+        if "snapshot_with_generation" not in _src22a:
+            failures.append("WP-22 AC-1: run_watcher does not use snapshot_with_generation")
+        if "identity.snapshot()" in _src22a and "identity.get_generation()" in _src22a:
+            failures.append("WP-22 AC-1 [tautology: run_watcher still calls snapshot() and "
+                             "get_generation() as two separate lock acquisitions]")
+    except Exception as e:
+        failures.append(f"WP-22 AC-1 unit check errored: {e}")
+
+    # ── WP-22 AC-2 (W7) — a False heartbeat write leaves last_hb unadvanced (retries at 0.5s) ──
+    # Tautology by construction: reverted code advances last_hb unconditionally, so only ~1
+    # write attempt would land in the ~1.3s window below instead of several.
+    try:
+        from teammate_comms import channel as _ch22b
+        from teammate_comms.comms import get_inboxes_dir as _gid22b, ensure_inbox as _ei22b
+
+        _t22b_root = tempfile.mkdtemp(prefix="tc-22-ac2-")
+        _agent22b = "probe22ac2"
+        _ix22b = _gid22b(_t22b_root, None)
+        _ei22b(_ix22b, _agent22b)
+
+        class _Id22b:
+            def snapshot_with_generation(self):
+                return (_agent22b, None, _t22b_root, _ix22b / f"{_agent22b}_unread.json", 1)
+            def get_last_seen(self):
+                return None
+            def set_last_seen(self, v):
+                pass
+            def get_instance_id(self):
+                return "id22b"
+            def get_epoch(self):
+                return 1
+            def get_durable_seen(self):
+                return set()
+
+        _calls22b = []
+        _orig_war22b = _ch22b.write_agent_record
+
+        def _fake_war22b(*a, **kw):
+            _calls22b.append(1)
+            return False  # simulate persistent lock contention
+
+        _ch22b.write_agent_record = _fake_war22b
+        try:
+            _init22b, _reg22b, _stop22b = threading.Event(), threading.Event(), threading.Event()
+            _init22b.set(); _reg22b.set()
+            _wt22b = threading.Thread(target=_ch22b.run_watcher,
+                                      args=(lambda obj: None, _Id22b(), _init22b, _reg22b, _stop22b),
+                                      daemon=True)
+            _wt22b.start()
+            time.sleep(1.3)  # ~2-3 poll cycles at 0.5s if last_hb never advances
+        finally:
+            _stop22b.set()
+            _wt22b.join(timeout=2)
+            _ch22b.write_agent_record = _orig_war22b
+        if len(_calls22b) < 2:
+            failures.append(f"WP-22 AC-2 [tautology: a False heartbeat write must leave last_hb "
+                             f"unadvanced so the very NEXT 0.5s poll retries — only "
+                             f"{len(_calls22b)} write attempt(s) landed in ~1.3s]")
+    except Exception as e:
+        failures.append(f"WP-22 AC-2 unit check errored: {e}")
+
+    # ── WP-22 AC-3 (M3) — durable_seen excludes a prior-session id from the wake COUNT ──
+    # Tautology: fails on current main (counts A+B=2 instead of B alone).
+    try:
+        from teammate_comms import server as _srv22c, channel as _ch22c
+        from teammate_comms.comms import (
+            get_inboxes_dir as _gid22c, ensure_inbox as _ei22c, write_json_atomic as _wja22c,
+        )
+
+        _t22c_root = tempfile.mkdtemp(prefix="tc-22-ac3-")
+        _agent22c = "probe22ac3"
+        _ix22c = _gid22c(_t22c_root, None)
+        _ei22c(_ix22c, _agent22c)
+        _msg_a22c = {"id": "22c-a", "from": "alice", "priority": "normal", "message": "prior-body"}
+        _wja22c(_ix22c / f"{_agent22c}_unread.json", [_msg_a22c])
+        _wja22c(_ix22c / f"{_agent22c}_seen.json", ["22c-a"])  # A already delivered a PRIOR session
+
+        _srv22c.register_identity(_agent22c, None, _t22c_root, {})  # seeds durable_seen={A}
+
+        _emits22c = []
+        def _send22c(obj):
+            if obj.get("method") == "notifications/claude/channel":
+                _emits22c.append(obj)
+        _init22c, _reg22c, _stop22c = threading.Event(), threading.Event(), threading.Event()
+        _init22c.set(); _reg22c.set()
+        _wt22c = threading.Thread(target=_ch22c.run_watcher,
+                                  args=(_send22c, _srv22c._identity, _init22c, _reg22c, _stop22c),
+                                  daemon=True)
+        _wt22c.start()
+        try:
+            time.sleep(0.7)  # let tick 1 seed known_ids={A} on unread=[A] alone (no wake yet)
+            # NOW a brand-new message B arrives.
+            _msg_b22c = {"id": "22c-b", "from": "bob", "priority": "normal", "message": "new-body"}
+            _wja22c(_ix22c / f"{_agent22c}_unread.json", [_msg_a22c, _msg_b22c])
+            _ok22c = wait_until(lambda: len(_emits22c) >= 1, timeout=3.0)
+            if not _ok22c:
+                failures.append("WP-22 AC-3: no wake fired for the new message B")
+            else:
+                _meta22c = _emits22c[0].get("params", {}).get("meta", {})
+                if _meta22c.get("count") != "1":
+                    failures.append(f"WP-22 AC-3 [tautology: wake count must be 1 (B only) — "
+                                     f"durable_seen must exclude A]: {_meta22c}")
+        finally:
+            _stop22c.set()
+            _wt22c.join(timeout=2)
+    except Exception as e:
+        failures.append(f"WP-22 AC-3 unit check errored: {e}")
+    # AC-4 (M3): ack("all")-with-no-prior-read still drains everything including a durable_seen
+    # id — unchanged, since durable_seen never touches Identity._last_seen/_handle_ack at all.
+    # Covered by the (untouched) WP-15 T3 block elsewhere in this same run; not duplicated here.
+
+    # ── WP-22 AC-5/AC-6 (M2) — pending-file recovery: idempotent merge, sender pended-text,
+    # composed with M3 so a pending-merged already-seen id doesn't re-nudge ──
+    try:
+        from teammate_comms import channel as _ch22e
+        from teammate_comms.comms import (
+            get_inboxes_dir as _gid22e, ensure_inbox as _ei22e,
+            write_json_atomic as _wja22e, read_json_safe as _rjs22e, file_lock as _fl22e,
+        )
+        from teammate_comms import tools as _tools22e
+
+        # AC-5a: direct merge — idempotent (run twice, still exactly one copy), pending emptied.
+        _t22e_root = tempfile.mkdtemp(prefix="tc-22-ac5a-")
+        _agent22e = "probe22ac5a"
+        _ix22e = _gid22e(_t22e_root, None)
+        _ei22e(_ix22e, _agent22e)
+        _pend_rec22e = {"id": "22e-p1", "from": "carol", "group": "#g", "priority": "normal",
+                        "message": "pended-body"}
+        _wja22e(_ix22e / f"{_agent22e}_pending.json", [_pend_rec22e])
+        _ch22e.merge_pending_into_unread(_t22e_root, None, _agent22e)
+        _ch22e.merge_pending_into_unread(_t22e_root, None, _agent22e)  # second run: no dup
+        _unread22e = _rjs22e(_ix22e / f"{_agent22e}_unread.json")
+        if sum(1 for m in _unread22e if m.get("id") == "22e-p1") != 1:
+            failures.append(f"WP-22 AC-5a: pending record not merged exactly once: {_unread22e}")
+        if _rjs22e(_ix22e / f"{_agent22e}_pending.json"):
+            failures.append("WP-22 AC-5a: pending file not emptied after merge")
+
+        # AC-5b: sender side — a held member unread lock falls back to THEIR pending file, and
+        # the wrapper text says queued-for-retry (not "will catch up via history").
+        _t22e2_root = tempfile.mkdtemp(prefix="tc-22-ac5b-")
+        _sender22e, _member22e, _grp22e = "sender22e", "member22e", "grp22e"
+        from teammate_comms.tools import _handle_group as _hg22e, _handle_send as _hs22e
+        class _Ctx22e:
+            def __init__(self, agent):
+                self._agent = agent
+            def snapshot(self):
+                return (self._agent, None, _t22e2_root, None)
+        _hg22e({"action": "create", "group": f"#{_grp22e}", "members": [_member22e]},
+              {"identity": _Ctx22e(_sender22e)})
+        _member_unread22e = _gid22e(_t22e2_root, None) / f"{_member22e}_unread.json"
+        _ei22e(_gid22e(_t22e2_root, None), _member22e)
+        with _fl22e(_member_unread22e):
+            _text22e = _hs22e({"to": f"#{_grp22e}", "message": "hi via pending"},
+                              {"identity": _Ctx22e(_sender22e)})
+        if "queued for retry" not in _text22e.lower():
+            failures.append(f"WP-22 AC-5b: pended-member text should say queued-for-retry: {_text22e}")
+        _member_pending22e = _gid22e(_t22e2_root, None) / f"{_member22e}_pending.json"
+        if not _rjs22e(_member_pending22e):
+            failures.append("WP-22 AC-5b: message did not land in the member's pending file")
+
+        # AC-6: compose M2 with M3 — an id already in {agent}_seen.json (durable_seen) that
+        # ALSO shows up via a pending merge must not cause a fresh wake or a duplicate entry.
+        _t22f_root = tempfile.mkdtemp(prefix="tc-22-ac6-")
+        _agent22f = "probe22ac6"
+        _ix22f = _gid22e(_t22f_root, None)
+        _ei22e(_ix22f, _agent22f)
+        _msg22f = {"id": "22f-a", "from": "dave", "priority": "normal", "message": "already-seen-body"}
+        _wja22e(_ix22f / f"{_agent22f}_unread.json", [_msg22f])
+        _wja22e(_ix22f / f"{_agent22f}_seen.json", ["22f-a"])
+        _wja22e(_ix22f / f"{_agent22f}_pending.json", [dict(_msg22f)])  # duplicate retry, same id
+
+        from teammate_comms import server as _srv22f
+        _srv22f.register_identity(_agent22f, None, _t22f_root, {})  # durable_seen={22f-a}
+        _emits22f = []
+        def _send22f(obj):
+            if obj.get("method") == "notifications/claude/channel":
+                _emits22f.append(obj)
+        _init22f, _reg22f, _stop22f = threading.Event(), threading.Event(), threading.Event()
+        _init22f.set(); _reg22f.set()
+        _wt22f = threading.Thread(target=_ch22e.run_watcher,
+                                  args=(_send22f, _srv22f._identity, _init22f, _reg22f, _stop22f),
+                                  daemon=True)
+        _wt22f.start()
+        try:
+            time.sleep(1.2)  # several poll ticks — the pending merge + seed both land
+            if _emits22f:
+                failures.append(f"WP-22 AC-6: a pending-merged already-seen id caused a spurious "
+                                 f"wake: {_emits22f}")
+            _unread22f = _rjs22e(_ix22f / f"{_agent22f}_unread.json")
+            if sum(1 for m in _unread22f if m.get("id") == "22f-a") != 1:
+                failures.append(f"WP-22 AC-6: duplicate entry after pending merge: {_unread22f}")
+        finally:
+            _stop22f.set()
+            _wt22f.join(timeout=2)
+    except Exception as e:
+        failures.append(f"WP-22 AC-5/AC-6 unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
