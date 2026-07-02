@@ -678,7 +678,9 @@ def _handle_send(args, ctx):
             f"NOTE: no teammate named {to!r} is registered (no agent record). The message is "
             f"queued in their inbox and will be delivered if/when they register under that exact "
             f"name — a typo'd recipient queues silently. If {to} is a spawned subagent, their "
-            f"lead must SendMessage-nudge them to read it."
+            f"lead must SendMessage-nudge them to read it. If {to} believes they ARE registered, "
+            f"compare 'comms_root' in both sides' teammate_whoami — different roots cannot "
+            f"exchange messages (G4)."
         )
     return "\n".join(lines)
 
@@ -975,6 +977,12 @@ def _doctor_report(root, team):
     base = get_inboxes_dir(root, team).parent      # .../TeammateComms[/team]
     rep = {"comms_root": str(root)}
     agents = {}
+    # G4: agents whose recorded comms_root differs from the CALLER's own root — a peer that
+    # resolved a different root can never exchange a message with the caller (different roots
+    # don't share files), and until now that divergence was invisible: sender output looked
+    # textually identical to a genuinely-offline recipient.
+    my_root_key = str(root).lower() if os.name == "nt" else str(root)
+    root_mismatches = []
     try:
         for f in sorted(get_agents_dir(root, team).glob("*.json")):
             r = read_json_readonly(f)
@@ -988,9 +996,15 @@ def _doctor_report(root, team):
                     "alive": bool(is_channel_alive(r, pid_check=False)) if r.get("type") == "full" else None,
                     "lastHeartbeat": r.get("lastHeartbeat"),
                 }
+                other_root = r.get("comms_root")
+                if other_root:
+                    other_key = other_root.lower() if os.name == "nt" else other_root
+                    if other_key != my_root_key:
+                        root_mismatches.append({"agent": r.get("name", f.stem), "comms_root": other_root})
     except OSError:
         pass
     rep["agents"] = agents
+    rep["root_mismatches"] = root_mismatches
     files = {}
     for label, fname in (("transcript", "transcript.jsonl"),
                          ("transcript_rotated", "transcript.jsonl.1"),  # WP-27 C6 grace copy

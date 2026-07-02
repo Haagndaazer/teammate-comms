@@ -16,7 +16,9 @@ newline-delimited JSON-RPC 2.0 in BOM-free UTF-8.
 
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import threading
 import traceback
@@ -190,6 +192,65 @@ def _project_label(proj_dir):
     return label[:PROFILE_FIELDS["project"]]
 
 
+# G3: path-derived labels (_project_label above) split the SAME repo cloned at different paths
+# on two machines into two roster entries — the mirror-image of the F-4 fix that introduced
+# them. A git remote URL is stable across clones/machines, so it's tried FIRST; the path label
+# stays the fallback (a non-repo dir, a repo with no origin, git missing, or an unparseable URL).
+_GIT_REMOTE_SSH = re.compile(r"^[\w.-]+@[\w.-]+:([^/].*)$")
+_GIT_REMOTE_URL = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+/(.+)$")
+
+
+def _project_label_from_remote(url):
+    """Pure: parse a git remote URL into an ``owner/repo`` label, or None if it doesn't match a
+    recognized shape. Handles ``https://host/owner/repo(.git)`` and
+    ``git@host:owner/repo(.git)`` (SSH shorthand); anything else (a bare host with no path,
+    garbage, empty) → None — deliberately conservative, since a WRONG guess is worse than no
+    guess (profiles are keyed on this label). Never raises.
+    """
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    if url.endswith(".git"):
+        url = url[:-4]
+    m = _GIT_REMOTE_SSH.match(url)
+    path = m.group(1) if m else None
+    if path is None:
+        m2 = _GIT_REMOTE_URL.match(url)
+        if not m2:
+            return None
+        path = m2.group(1)
+    parts = [p for p in path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[-2], parts[-1]
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}"
+
+
+def _project_label_from_git_remote(proj_dir):
+    """Best-effort: resolve ``proj_dir``'s git ``origin`` remote → an owner/repo label via
+    ``_project_label_from_remote``. Returns None on ANY failure (not a git repo, no origin, git
+    not on PATH, timeout, unparseable URL) — the caller falls back to the path-derived label.
+    3s timeout so a hung/misbehaving git (an interactive credential prompt, a slow remote
+    helper) can never stall registration. ``CREATE_NO_WINDOW`` on Windows so this subprocess
+    never flashes a console during what is otherwise a silent, headless registration.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(proj_dir), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _project_label_from_remote(result.stdout.strip())
+
+
 def register_identity(agent, team, comms_dir, profile=None):
     """Establish identity + start watching. Raises CommsError on bad input.
 
@@ -206,7 +267,17 @@ def register_identity(agent, team, comms_dir, profile=None):
     if "project" not in profile:
         proj_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if not _looks_unset(proj_dir):
-            profile["project"] = _project_label(proj_dir.strip())
+            stripped_dir = proj_dir.strip()
+            # G3: prefer the git remote-derived label (stable across clones/machines) over the
+            # path-derived one (which splits the SAME repo cloned at different paths). The
+            # remote label needs the SAME truncation guard _project_label applies internally —
+            # an auto-fill convenience must not be able to raise out of validate_profile_field.
+            label = _project_label_from_git_remote(stripped_dir)
+            if label:
+                label = label[:PROFILE_FIELDS["project"]]
+            else:
+                label = _project_label(stripped_dir)
+            profile["project"] = label
     profile_fields = {k: validate_profile_field(k, v) for k, v in profile.items()}
     # Provenance (F-5): a reincarnated child records WHO spawned it. `build_child_env` sets
     # TEAMMATE_SPAWNED_BY unconditionally (never inherited), so a present value is trustworthy.
@@ -292,6 +363,11 @@ def register_identity(agent, team, comms_dir, profile=None):
         root, team, agent, timeout=5, bump_epoch=True,
         type="full", channel=True, pid=os.getpid(), host=hostname,
         instance_id=my_instance_id,
+        # G4: persist the resolved comms root (already logged below) so a divergent peer —
+        # one that resolved a DIFFERENT root and can therefore never exchange a message with
+        # this instance — is diagnosable after the fact via teammate_whoami/doctor instead of
+        # looking textually identical to a genuinely-offline recipient.
+        comms_root=str(root),
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
         **profile_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),

@@ -4763,6 +4763,171 @@ def main():
     except Exception as e:
         failures.append(f"WP-28 AC-4 unit checks errored: {e}")
 
+    # ── WP-29 AC-1 (D4) — dashboard status banner (source grep) + transcript_enabled in /api/poll ──
+    try:
+        from teammate_comms import dashboard as _dash29a
+
+        _index_src29a = (SRC / "teammate_comms" / "static" / "index.html").read_text(encoding="utf-8")
+        for _needle29a in ("status-banner", "reportFetchError", "Session token expired",
+                          "Connection lost", "transcript_enabled"):
+            if _needle29a not in _index_src29a:
+                failures.append(f"WP-29 AC-1: index.html missing expected string {_needle29a!r}")
+
+        _root29a = tempfile.mkdtemp(prefix="tc-29-ac1-")
+        _dres29a = _dash29a.start_dashboard(_root29a, None, "Operator29a", port=0, open_browser=False)
+        _dport29a, _dtok29a = _dres29a["port"], _dash29a._STATE.token
+        try:
+            import http.client as _hc29a
+
+            _c29a = _hc29a.HTTPConnection("127.0.0.1", _dport29a, timeout=5)
+            _c29a.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                             skip_host=True, skip_accept_encoding=True)
+            _c29a.putheader("Host", "127.0.0.1")
+            _c29a.putheader("X-Dashboard-Token", "bad-token-29a")
+            _c29a.endheaders()
+            _r29a = _c29a.getresponse()
+            _status29a = _r29a.getcode()
+            _r29a.read()
+            _c29a.close()
+            if _status29a != 401:
+                failures.append(f"WP-29 AC-1: /api/poll with a bad token did not 401: {_status29a}")
+
+            def _poll29a(token):
+                c = _hc29a.HTTPConnection("127.0.0.1", _dport29a, timeout=5)
+                c.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                             skip_host=True, skip_accept_encoding=True)
+                c.putheader("Host", "127.0.0.1")
+                c.putheader("X-Dashboard-Token", token)
+                c.endheaders()
+                r = c.getresponse()
+                d = json.loads(r.read())
+                c.close()
+                return d
+
+            _prev_tr29a = os.environ.get("TEAMMATE_TRANSCRIPT")
+            try:
+                os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+                _d_on29a = _poll29a(_dtok29a)
+                if _d_on29a.get("transcript_enabled") is not True:
+                    failures.append(f"WP-29 AC-1: transcript_enabled should be True by "
+                                     f"default: {_d_on29a.get('transcript_enabled')}")
+                os.environ["TEAMMATE_TRANSCRIPT"] = "0"
+                _d_off29a = _poll29a(_dtok29a)
+                if _d_off29a.get("transcript_enabled") is not False:
+                    failures.append(f"WP-29 AC-1: transcript_enabled should be False when "
+                                     f"TEAMMATE_TRANSCRIPT=0: {_d_off29a.get('transcript_enabled')}")
+            finally:
+                if _prev_tr29a is None:
+                    os.environ.pop("TEAMMATE_TRANSCRIPT", None)
+                else:
+                    os.environ["TEAMMATE_TRANSCRIPT"] = _prev_tr29a
+        finally:
+            _dash29a.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-29 AC-1 unit checks errored: {e}")
+
+    # ── WP-29 AC-2 (G4) — comms_root persisted at register; doctor flags a mismatch; send's NOTE hints whoami ──
+    try:
+        from teammate_comms import server as _srv29b
+        from teammate_comms import tools as _t29b
+        from teammate_comms.comms import read_agent_record as _rar29b, write_agent_record as _war29b
+
+        _root29b = tempfile.mkdtemp(prefix="tc-29-ac2-")
+        _srv29b.register_identity("agent29b", None, _root29b, {})
+        _a29b, _team29b, _rootactual29b, _ = _srv29b._identity.snapshot()
+        _rec29b = _rar29b(_rootactual29b, _team29b, "agent29b") or {}
+        if _rec29b.get("comms_root") != str(_rootactual29b):
+            failures.append(f"WP-29 AC-2: comms_root not persisted correctly at register: "
+                             f"{_rec29b.get('comms_root')!r} != {str(_rootactual29b)!r}")
+
+        _war29b(_rootactual29b, _team29b, "divergent29b", type="full", channel=False,
+               comms_root="/some/totally/different/root")
+        _doctor29b = _t29b._doctor_report(_rootactual29b, _team29b)
+        _mismatch_names29b = {m.get("agent") for m in _doctor29b.get("root_mismatches", [])}
+        if "divergent29b" not in _mismatch_names29b:
+            failures.append(f"WP-29 AC-2: doctor did not flag the divergent comms_root: "
+                             f"{_doctor29b.get('root_mismatches')}")
+        if "agent29b" in _mismatch_names29b:
+            failures.append(f"WP-29 AC-2: doctor wrongly flagged the caller's OWN root as a "
+                             f"mismatch: {_doctor29b.get('root_mismatches')}")
+
+        class _Ctx29b:
+            def snapshot(self):
+                return ("sender29b", _team29b, _rootactual29b, None)
+        _msg29b = _t29b._handle_send({"to": "ghost29b", "message": "hi"}, {"identity": _Ctx29b()})
+        if "comms_root" not in _msg29b or "teammate_whoami" not in _msg29b:
+            failures.append(f"WP-29 AC-2: unregistered-recipient NOTE missing the "
+                             f"comms_root/whoami hint: {_msg29b!r}")
+    except Exception as e:
+        failures.append(f"WP-29 AC-2 unit checks errored: {e}")
+
+    # ── WP-29 AC-3 (G3) — _project_label_from_remote unit matrix + auto-fill integration ──
+    try:
+        from teammate_comms import server as _srv29c
+        from teammate_comms.comms import read_agent_record as _rar29c
+
+        _matrix29c = [
+            ("https://github.com/owner/repo.git", "owner/repo"),
+            ("https://github.com/owner/repo", "owner/repo"),
+            ("git@github.com:owner/repo.git", "owner/repo"),
+            ("git@github.com:owner/repo", "owner/repo"),
+            ("https://github.com/", None),
+            ("not a url at all", None),
+            ("", None),
+        ]
+        for _url29c, _want29c in _matrix29c:
+            _got29c = _srv29c._project_label_from_remote(_url29c)
+            if _got29c != _want29c:
+                failures.append(f"WP-29 AC-3: _project_label_from_remote({_url29c!r}) = "
+                                 f"{_got29c!r}, want {_want29c!r}")
+
+        import shutil as _sh29c
+        _git29c = _sh29c.which("git")
+        if _git29c:
+            _repo_dir29c = tempfile.mkdtemp(prefix="tc-29-ac3-repo-")
+            subprocess.run([_git29c, "init", "-q"], cwd=_repo_dir29c, capture_output=True, timeout=10)
+            subprocess.run([_git29c, "remote", "add", "origin",
+                           "https://github.com/fakeowner29c/fakerepo29c.git"],
+                          cwd=_repo_dir29c, capture_output=True, timeout=10)
+            _root29c = tempfile.mkdtemp(prefix="tc-29-ac3-root-")
+            _prev_pd29c = os.environ.get("CLAUDE_PROJECT_DIR")
+            try:
+                os.environ["CLAUDE_PROJECT_DIR"] = _repo_dir29c
+                _srv29c.register_identity("gitagent29c", None, _root29c, {})
+                _a29c, _team29c, _rootactual29c, _ = _srv29c._identity.snapshot()
+                _rec29c = _rar29c(_rootactual29c, _team29c, "gitagent29c") or {}
+                if _rec29c.get("project") != "fakeowner29c/fakerepo29c":
+                    failures.append(f"WP-29 AC-3: git-repo auto-fill wrong: "
+                                     f"{_rec29c.get('project')!r}")
+            finally:
+                if _prev_pd29c is None:
+                    os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                else:
+                    os.environ["CLAUDE_PROJECT_DIR"] = _prev_pd29c
+
+        # Non-repo dir -> falls back to parent/name (the existing harness PROJECT assertion
+        # already covers this end-to-end since CLAUDE_PROJECT_DIR there is NOT a git repo;
+        # pinned here too as a hermetic, isolated check).
+        _nonrepo29c = tempfile.mkdtemp(prefix="tc-29-ac3-nonrepo-")
+        _root29c2 = tempfile.mkdtemp(prefix="tc-29-ac3-root2-")
+        _prev_pd29c2 = os.environ.get("CLAUDE_PROJECT_DIR")
+        try:
+            os.environ["CLAUDE_PROJECT_DIR"] = _nonrepo29c
+            _srv29c.register_identity("pathagent29c", None, _root29c2, {})
+            _a29c2, _team29c2, _rootactual29c2, _ = _srv29c._identity.snapshot()
+            _rec29c2 = _rar29c(_rootactual29c2, _team29c2, "pathagent29c") or {}
+            _expected29c2 = _srv29c._project_label(_nonrepo29c)
+            if _rec29c2.get("project") != _expected29c2:
+                failures.append(f"WP-29 AC-3: non-repo dir should fall back to the path "
+                                 f"label: {_rec29c2.get('project')!r} != {_expected29c2!r}")
+        finally:
+            if _prev_pd29c2 is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = _prev_pd29c2
+    except Exception as e:
+        failures.append(f"WP-29 AC-3 unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

@@ -349,9 +349,13 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 _off, _gen = 0, ""                    # malformed cursor → force a clean re-tail
             records, _new_off, _new_gen, _reset = read_transcript_after(_tpath, _off, _gen, limit=200)
             new_cursor = f"{_new_off}|{_new_gen}"
+            transcript_enabled = None   # only meaningful on a fresh load
         else:
             records, _off0, _gen0 = transcript_tail_and_cursor(_tpath, limit=200)   # fresh: tail + mint
             new_cursor = f"{_off0}|{_gen0}"
+            # B4: an empty transcript when TEAMMATE_TRANSCRIPT=0 is indistinguishable from a bug
+            # in the browser, which can't see the server's env — tell it explicitly.
+            transcript_enabled = os.environ.get("TEAMMATE_TRANSCRIPT", "1").strip() != "0"
         # Reaction events sub-stream (own cursor). The frontend folds add/remove into
         # per-message chips client-side. Ambient — never woke anyone.
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500,
@@ -399,9 +403,12 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         else:
             deletions = _window([e for e in jsonl if e.get("id", "") >= dcursor], 1000, True)
             new_dcursor = deletions[-1]["id"] if deletions else dcursor   # last RETURNED id (burst paging)
-        return self._json(200, {"records": records, "cursor": new_cursor,
-                                "reactions": reactions, "rcursor": new_rcursor,
-                                "deletions": deletions, "dcursor": new_dcursor})
+        result = {"records": records, "cursor": new_cursor,
+                 "reactions": reactions, "rcursor": new_rcursor,
+                 "deletions": deletions, "dcursor": new_dcursor}
+        if transcript_enabled is not None:
+            result["transcript_enabled"] = transcript_enabled
+        return self._json(200, result)
 
     def _api_react(self, payload):
         root, team, me = self.server.root, self.server.team, self.server.human_name
