@@ -50,6 +50,7 @@ from .comms import (
     read_deletions,
     read_deletions_set,
     read_group_meta,
+    read_reaction_state,
     read_reactions,
     read_transcript_after,
     register_human,
@@ -350,6 +351,22 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         # per-message chips client-side. Ambient — never woke anyone.
         reactions = read_reactions(root, team, since=(rcursor or None), limit=500,
                                    oldest_first=bool(rcursor))
+        if not rcursor:
+            # Fresh load (WP-27 C6): prepend SYNTHETIC add-events derived from the compacted
+            # reaction baseline, so a chip whose events are ENTIRELY in the baseline (folded
+            # away by compaction) still renders — the frontend's existing client-side fold
+            # treats these exactly like any other add event. Synthetic events carry id=""
+            # so they can NEVER become the cursor: ordered FIRST here, so reactions[-1] below
+            # picks a real tail id whenever the live tail is non-empty. If the tail is
+            # genuinely empty, new_rcursor correctly stays "" — this is a fresh load, so
+            # there was no established real cursor to regress FROM.
+            synthetic = [
+                {"target": target, "emoji": emoji, "from": reactor, "op": "add", "id": ""}
+                for target, emoji_map in read_reaction_state(root, team).items()
+                for emoji, reactors in (emoji_map or {}).items()
+                for reactor in reactors
+            ]
+            reactions = synthetic + reactions
         new_rcursor = reactions[-1]["id"] if reactions else rcursor
         # Deletions sub-stream (own cursor). The frontend folds these into a deleted-set and
         # re-renders affected messages/groups — the firehose is append-only and id-keyed, so an

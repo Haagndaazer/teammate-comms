@@ -1207,6 +1207,26 @@ def get_transcript_file(root, team=None):
     return base / "transcript.jsonl"
 
 
+# Size-gated rotation (C6): bounds the LIVE transcript file only. ``.1`` is a grace copy for
+# manual forensics, never read by any read path — resolve_message/react keep their 3-tier
+# fallbacks (group files + inboxes) for a rotated-away id, same as any other stale/disabled-
+# transcript scenario they already handle.
+TRANSCRIPT_ROTATE_BYTES = 16 * 1024 * 1024
+
+
+def _maybe_rotate_transcript(path):
+    """Cheap getsize gate → rotate. Never raises (observability must never affect delivery).
+    Call only with the transcript's lock held. The byte-cursor generation (a crc of the first
+    line) changes when the file is recreated after rotation, so a running dashboard poll
+    transparently re-tails — that machinery already exists for exactly this case."""
+    try:
+        if path.exists() and os.path.getsize(path) > TRANSCRIPT_ROTATE_BYTES:
+            rotated = path.with_name(path.name + ".1")
+            os.replace(path, rotated)  # clobbers any previous .1; next append recreates fresh
+    except Exception as e:
+        print(f"[teammate-comms] transcript rotation skipped: {e}", file=sys.stderr, flush=True)
+
+
 def append_transcript(root, team, record):
     """Best-effort tee of one message into the global NDJSON observability log.
 
@@ -1214,6 +1234,7 @@ def append_transcript(root, team, record):
     group posts in one ordered stream. NEVER raises and NEVER blocks delivery:
     disabled by ``TEAMMATE_TRANSCRIPT=0``, uses a short non-blocking lock, and
     swallows every error to stderr. This is observability, not a delivery guarantee.
+    Size-gated rotation (see ``_maybe_rotate_transcript``) keeps the live file bounded.
     """
     if os.environ.get("TEAMMATE_TRANSCRIPT", "1").strip() == "0":
         return
@@ -1225,6 +1246,7 @@ def append_transcript(root, team, record):
                 return
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            _maybe_rotate_transcript(path)   # under the lock, never raises (C6)
     except Exception as e:  # observability must never affect message delivery
         print(f"[teammate-comms] transcript tee skipped: {e}", file=sys.stderr, flush=True)
 
@@ -1498,6 +1520,7 @@ def append_reaction(root, team, record, timeout=5):
             record["id"] = new_message_id()
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            _maybe_compact_reactions(root, team)   # under the lock, never raises (C6)
     except CommsError:
         raise CommsError(
             f"Reaction not recorded: reactions.jsonl stayed locked for {timeout}s "
@@ -1534,10 +1557,46 @@ def read_reactions(root, team=None, since=None, limit=None, oldest_first=False):
     return _window(out, limit, oldest_first)
 
 
-def aggregate_reactions(events):
-    """Fold chronological add/remove events → ``{target: {emoji: [reactors sorted]}}``
-    (last op per (target, emoji, reactor) wins; empty sets dropped)."""
+# Compaction thresholds (C6, mirrors deletions' C-2 design — see _compact_deletions_locked).
+# RETAIN events stay in the live jsonl tail; older events fold into the state baseline. The
+# byte gate is a cheap getsize trip on append — it bounds the live-file SIZE only, it is NOT
+# a correctness input: every read path (inbox render, group history, dashboard fresh load)
+# reads baseline + the live tail together, so completeness holds no matter when the gate
+# fires. RETAIN MUST stay >= tools._REACTIONS_TAIL (asserted at import time in tools.py, and
+# in a test) so the read-side tail window always sits INSIDE the retained jsonl — no gap
+# between the compacted baseline and the tail read.
+REACTIONS_RETAIN = 2000
+REACTIONS_COMPACT_BYTES = 256 * 1024
+
+
+def get_reactions_state_file(root, team=None):
+    """``<root>/TeammateComms/[<team>/]reactions_state.json`` — the WP-27 compaction
+    baseline (``{target: {emoji: [reactors]}}``), mirroring ``deletions_set.json``'s role."""
+    base = Path(root) / "TeammateComms"
+    if team:
+        base = base / team
+    return base / "reactions_state.json"
+
+
+def read_reaction_state(root, team=None):
+    """Return the compacted reaction baseline dict (the WP-27 fold target), or ``{}`` on any
+    miss/corruption. Read-only and lock-free (``write_json_atomic`` gives the reader
+    old-or-new, never partial)."""
+    v = read_json_readonly(get_reactions_state_file(root, team))
+    return v if isinstance(v, dict) else {}
+
+
+def aggregate_reactions_with_baseline(baseline, events):
+    """Fold chronological add/remove ``events`` → ``{target: {emoji: [reactors sorted]}}``,
+    SEEDED from ``baseline`` (the WP-27 compaction state — same shape this function returns)
+    before folding. Reactions are STATEFUL (``op: remove`` exists), so compacting them is
+    NOT a naive append-only union like deletions — a union would resurrect a reactor that was
+    removed in an event the compaction folded away. Seeding the fold from the baseline and
+    then re-applying add/discard on top is what keeps a fold-then-fold-again idempotent."""
     state = {}  # (target, emoji) -> set of reactors
+    for target, emoji_map in (baseline or {}).items():
+        for emoji, reactors in (emoji_map or {}).items():
+            state[(target, emoji)] = set(reactors or [])
     for e in events:
         target, emoji, who = e.get("target"), e.get("emoji"), e.get("from")
         if not (target and emoji and who):
@@ -1552,6 +1611,81 @@ def aggregate_reactions(events):
         if reactors:
             out.setdefault(target, {})[emoji] = sorted(reactors)
     return out
+
+
+def aggregate_reactions(events):
+    """Fold chronological add/remove events → ``{target: {emoji: [reactors sorted]}}``
+    (last op per (target, emoji, reactor) wins; empty sets dropped). Equivalent to
+    ``aggregate_reactions_with_baseline({}, events)`` — a thin wrapper for callers that
+    don't have (or don't need) a WP-27 compaction baseline."""
+    return aggregate_reactions_with_baseline({}, events)
+
+
+def _compact_reactions_locked(root, team):
+    """Fold all-but-the-newest ``REACTIONS_RETAIN`` reaction events into the state baseline,
+    then trim the jsonl to that tail. MUST be called with the reactions.jsonl lock already
+    held (mirrors ``_compact_deletions_locked``'s contract and crash-ordering exactly).
+
+    UNLIKE deletions (an append-only union), reactions carry ``op: "remove"`` — the fold is
+    STATEFUL: ``aggregate_reactions_with_baseline`` seeds from the EXISTING baseline, then
+    folds the head events on top, so a remove in the head correctly discards a reactor the
+    OLD baseline already recorded as added. This is why deletions' simple per-target
+    last-event-wins union would be WRONG here — it would silently resurrect a removed
+    reactor if an add from an earlier compaction batch and its cancelling remove from a
+    later one were folded independently instead of into one running state.
+
+    Idempotence: re-running this fold over an OVERLAPPING event range yields an IDENTICAL
+    state — folding the same add/remove sequence into an already-folded baseline re-applies
+    each op's ``set.add``/``discard`` with the same net effect (add is idempotent; discard of
+    an already-absent member is a no-op). So state-first-then-trim is safe under a crash: a
+    crash between the two writes leaves the head events BOTH in the state file AND still in
+    the jsonl (the trim never ran) — re-running the compaction next time re-folds that same
+    head into the state and lands on the identical result, never a double-count.
+    """
+    path = get_reactions_file(root, team)
+    all_events = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    all_events.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except (FileNotFoundError, OSError):
+        return
+    if len(all_events) <= REACTIONS_RETAIN:
+        return
+    head, tail = all_events[:-REACTIONS_RETAIN], all_events[-REACTIONS_RETAIN:]
+    baseline = read_reaction_state(root, team)
+    folded = aggregate_reactions_with_baseline(baseline, head)
+    write_json_atomic(get_reactions_state_file(root, team), folded)   # STATE FIRST (atomic)
+    tmp = path.with_name(path.name + ".compact.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in tail:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)      # THEN trim (atomic; a lockless reader sees old-full or new-tail)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()       # orphan cleanup if os.replace raised (e.g. Windows read race)
+        except OSError:
+            pass
+
+
+def _maybe_compact_reactions(root, team):
+    """Cheap getsize gate → compact. FULLY self-contained: never raises (so append_reaction
+    can't mislabel a successful event append as failed), best-effort. Call only with the
+    reactions.jsonl lock held."""
+    try:
+        path = get_reactions_file(root, team)
+        if os.path.getsize(path) > REACTIONS_COMPACT_BYTES:
+            _compact_reactions_locked(root, team)
+    except Exception as e:
+        print(f"[teammate-comms] reactions compaction skipped: {e}", file=sys.stderr, flush=True)
 
 
 # ── Deletions sub-stream ──────────────────────────────────────────────────────────

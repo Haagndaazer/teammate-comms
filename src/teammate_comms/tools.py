@@ -24,8 +24,10 @@ from .comms import (
     PROJECT_FIELDS,
     PROJECT_STATUS,
     REACTION_EMOJI,
+    REACTIONS_RETAIN,
     CommsError,
     aggregate_reactions,
+    aggregate_reactions_with_baseline,
     append_deletion,
     append_group_message,
     append_reaction,
@@ -53,6 +55,7 @@ from .comms import (
     read_json_safe,
     read_jsonl_tail,
     read_project_record,
+    read_reaction_state,
     read_reactions,
     read_transcript,
     remove_agent,
@@ -103,6 +106,15 @@ _RESOLVE_TAIL = 500
 # call. A chip for an event older than this window stops rendering — the reaction itself is
 # never lost (reactions.jsonl is untouched; only the render window is capped).
 _REACTIONS_TAIL = 1000
+# WP-27 C6: REACTIONS_RETAIN (comms.py — events compaction keeps live) MUST stay >=
+# _REACTIONS_TAIL (the render window above), or the tail read could scroll past the retained
+# jsonl into a gap between it and the compacted baseline. A real (not assert-under--O) check
+# at import time so a future edit to either constant trips immediately, not just in a test.
+if REACTIONS_RETAIN < _REACTIONS_TAIL:
+    raise RuntimeError(
+        f"REACTIONS_RETAIN ({REACTIONS_RETAIN}) must be >= _REACTIONS_TAIL "
+        f"({_REACTIONS_TAIL}) — the render tail must sit inside the retained jsonl."
+    )
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -748,7 +760,10 @@ def _handle_inbox(args, ctx):
 
     render_msgs = messages if show_all else new_msgs
 
-    rx_all = aggregate_reactions(read_reactions(root, team, limit=_REACTIONS_TAIL))
+    # WP-27: baseline (compacted-away events) + the live tail together — completeness holds
+    # regardless of whether/when a compaction has run.
+    rx_all = aggregate_reactions_with_baseline(
+        read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
     header = f"=== {len(messages)} unread message(s) for {agent}"
     if len(messages) < len(all_unread):
         header += f" (showing {len(messages)} of {len(all_unread)}; page with since/limit)"
@@ -978,6 +993,7 @@ def _doctor_report(root, team):
     rep["agents"] = agents
     files = {}
     for label, fname in (("transcript", "transcript.jsonl"),
+                         ("transcript_rotated", "transcript.jsonl.1"),  # WP-27 C6 grace copy
                          ("reactions", "reactions.jsonl"), ("deletions", "deletions.jsonl")):
         try:
             files[label] = {"bytes": (base / fname).stat().st_size}
@@ -1417,7 +1433,10 @@ def _handle_group(args, ctx):
         return f"{sigil} has no messages{by} yet."
     total = len(messages)
     recent = messages[-limit:]
-    rx_all = aggregate_reactions(read_reactions(root, team, limit=_REACTIONS_TAIL))
+    # WP-27: baseline (compacted-away events) + the live tail together — completeness holds
+    # regardless of whether/when a compaction has run.
+    rx_all = aggregate_reactions_with_baseline(
+        read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
     out = [f"=== {sigil} transcript{by} ({len(recent)} of {total} message(s)) ==="]
     for msg in recent:
         urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""

@@ -4347,6 +4347,234 @@ def main():
     except Exception as e:
         failures.append(f"WP-26 AC-4 unit check errored: {e}")
 
+    # ── WP-27 AC-1/AC-2 (C6) — reactions.jsonl compaction is a STATEFUL fold, not a union; idempotent ──
+    try:
+        from teammate_comms import comms as _cp27
+        from teammate_comms import tools as _t27
+
+        _save_retain27, _save_bytes27 = _cp27.REACTIONS_RETAIN, _cp27.REACTIONS_COMPACT_BYTES
+        try:
+            _cp27.REACTIONS_RETAIN = 3
+            _cp27.REACTIONS_COMPACT_BYTES = 1   # trip the gate on every append
+
+            p27root = tempfile.mkdtemp(prefix="tc-27-ac1-")
+            # react() (WP-26) requires a RESOLVABLE target, so seed real DMs first.
+            _mid0_27 = _t27.send_dm(p27root, None, "sender27", "to27-0", "m0")["id"]
+            # alice adds fire, bob also adds fire, alice REMOVES hers — all three fold away.
+            # The peer-review resurrection case: bob's surviving add must NOT be lost, and
+            # alice's cancelled-out add must NOT reappear (a naive per-target union, unlike a
+            # stateful fold, could get either wrong).
+            _t27.react(p27root, None, "alice27", _mid0_27, "fire")
+            _t27.react(p27root, None, "bob27", _mid0_27, "fire")
+            _t27.react(p27root, None, "alice27", _mid0_27, "fire", remove=True)
+            for i in range(1, 6):
+                _mid_i_27 = _t27.send_dm(p27root, None, "sender27", f"to27-{i}", f"m{i}")["id"]
+                _t27.react(p27root, None, "carol27", _mid_i_27, "thumbsup")
+            _state27 = _cp27.read_reaction_state(p27root, None)
+            _live27 = _cp27.read_reactions(p27root, None, limit=None)
+            if len(_live27) != _cp27.REACTIONS_RETAIN:
+                failures.append(f"WP-27 AC-1: jsonl not trimmed to RETAIN: {len(_live27)}")
+            _msg0_27 = _state27.get(_mid0_27, {})
+            if "bob27" not in (_msg0_27.get("fire") or []):
+                failures.append(f"WP-27 AC-1: a surviving add was lost in the fold: {_state27}")
+            if "alice27" in (_msg0_27.get("fire") or []):
+                failures.append(f"WP-27 AC-1 [tautology: a REMOVED reactor reappeared in the "
+                                 f"folded baseline — a naive union would resurrect it]: {_state27}")
+
+            # AC-2: idempotence — re-running the fold over the same (overlapping) range yields
+            # an IDENTICAL state.
+            _rjsonl27 = _cp27.get_reactions_file(p27root, None)
+            with _cp27.file_lock(_rjsonl27, timeout=10):
+                _cp27._compact_reactions_locked(p27root, None)
+            _state27b = _cp27.read_reaction_state(p27root, None)
+            if _state27b != _state27:
+                failures.append(f"WP-27 AC-2: re-running compaction changed the state (not "
+                                 f"idempotent): {_state27} != {_state27b}")
+        finally:
+            _cp27.REACTIONS_RETAIN, _cp27.REACTIONS_COMPACT_BYTES = _save_retain27, _save_bytes27
+    except Exception as e:
+        failures.append(f"WP-27 AC-1/AC-2 unit checks errored: {e}")
+
+    # ── WP-27 AC-3 (C6) — a chip whose events are entirely folded away still renders everywhere ──
+    try:
+        from teammate_comms import comms as _cp27c
+        from teammate_comms import tools as _t27c
+        from teammate_comms import dashboard as _dash27c
+        import http.client as _hc27c
+
+        _save_retain27c, _save_bytes27c = _cp27c.REACTIONS_RETAIN, _cp27c.REACTIONS_COMPACT_BYTES
+        try:
+            _cp27c.REACTIONS_RETAIN = 1
+            _cp27c.REACTIONS_COMPACT_BYTES = 1
+
+            p27c_root = tempfile.mkdtemp(prefix="tc-27-ac3-")
+            _grp27c = "g27c"
+            _cp27c.write_group_meta(p27c_root, None, _grp27c,
+                                   {"name": _grp27c, "members": ["alice27c", "bob27c"],
+                                    "creator": "alice27c", "createdAt": _cp27c.now_timestamp()})
+            _gmid27c = _t27c.send_group(p27c_root, None, "alice27c", f"#{_grp27c}", "hi")["id"]
+            _unrelated_mid27c = _t27c.send_dm(p27c_root, None, "alice27c", "someone27c", "other")["id"]
+            _t27c.react(p27c_root, None, "bob27c", _gmid27c, "fire")
+            _t27c.react(p27c_root, None, "carol27c", _unrelated_mid27c, "thumbsup")  # pushes the fire event out
+            _live_targets27c = {e.get("target") for e in _cp27c.read_reactions(p27c_root, None, limit=None)}
+            if _gmid27c in _live_targets27c:
+                failures.append("WP-27 AC-3 setup: the reaction did not actually get folded away")
+
+            class _Id27c:
+                def __init__(self, agent, root):
+                    self.agent, self.root = agent, root
+                def snapshot(self):
+                    return (self.agent, None, self.root, None)
+                def get_last_seen(self):
+                    return None
+                def set_last_seen(self, v):
+                    pass
+
+            _inbox_text27c = _t27c._handle_inbox({}, {"identity": _Id27c("bob27c", p27c_root)})
+            if "🔥" not in _inbox_text27c:
+                failures.append(f"WP-27 AC-3: inbox did not render a chip for a fully-baselined "
+                                 f"message: {_inbox_text27c[:300]!r}")
+
+            _hist27c = _t27c._handle_group({"action": "history", "group": f"#{_grp27c}"},
+                                           {"identity": _Id27c("alice27c", p27c_root)})
+            if "🔥" not in _hist27c:
+                failures.append(f"WP-27 AC-3: group history did not render a chip for a "
+                                 f"fully-baselined message: {_hist27c[:300]!r}")
+
+            _dres27c = _dash27c.start_dashboard(p27c_root, None, "Operator27c", port=0, open_browser=False)
+            _dport27c, _dtok27c = _dres27c["port"], _dash27c._STATE.token
+            try:
+                _c27c = _hc27c.HTTPConnection("127.0.0.1", _dport27c, timeout=5)
+                _c27c.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                                 skip_host=True, skip_accept_encoding=True)
+                _c27c.putheader("Host", "127.0.0.1")
+                _c27c.putheader("X-Dashboard-Token", _dtok27c)
+                _c27c.endheaders()
+                _r27c = _c27c.getresponse()
+                _poll27c = json.loads(_r27c.read())
+                _c27c.close()
+                _synthetic_hits27c = [r for r in _poll27c.get("reactions", [])
+                                      if r.get("target") == _gmid27c and r.get("id") == ""]
+                if not _synthetic_hits27c:
+                    failures.append(f"WP-27 AC-3: dashboard fresh poll did not include a "
+                                     f"synthetic event for the fully-baselined reaction: "
+                                     f"{_poll27c.get('reactions')}")
+            finally:
+                _dash27c.shutdown_dashboard()
+
+            # Silvie's hunt item: if the live tail is EMPTY (baseline-only, no live reactions
+            # at all), new_rcursor must stay "" — this is a fresh load, so there's no
+            # established real cursor to regress FROM.
+            p27c2_root = tempfile.mkdtemp(prefix="tc-27-ac3-emptytail-")
+            _state_file27c2 = _cp27c.get_reactions_state_file(p27c2_root, None)
+            _state_file27c2.parent.mkdir(parents=True, exist_ok=True)
+            _cp27c.write_json_atomic(_state_file27c2, {"solo-msg": {"fire": ["dave27c"]}})
+            _dres27c2 = _dash27c.start_dashboard(p27c2_root, None, "Operator27c2", port=0, open_browser=False)
+            _dport27c2, _dtok27c2 = _dres27c2["port"], _dash27c._STATE.token
+            try:
+                _c27c2 = _hc27c.HTTPConnection("127.0.0.1", _dport27c2, timeout=5)
+                _c27c2.putrequest("GET", "/api/poll?cursor=&rcursor=&dcursor=",
+                                  skip_host=True, skip_accept_encoding=True)
+                _c27c2.putheader("Host", "127.0.0.1")
+                _c27c2.putheader("X-Dashboard-Token", _dtok27c2)
+                _c27c2.endheaders()
+                _r27c2 = _c27c2.getresponse()
+                _poll27c2 = json.loads(_r27c2.read())
+                _c27c2.close()
+                if _poll27c2.get("rcursor") != "":
+                    failures.append(f"WP-27 AC-3: empty live tail (baseline-only) should keep "
+                                     f"rcursor empty on a fresh load: {_poll27c2.get('rcursor')!r}")
+                if not any(r.get("target") == "solo-msg" for r in _poll27c2.get("reactions", [])):
+                    failures.append("WP-27 AC-3: baseline-only reaction missing from fresh poll "
+                                    "when the live tail is empty")
+            finally:
+                _dash27c.shutdown_dashboard()
+        finally:
+            _cp27c.REACTIONS_RETAIN, _cp27c.REACTIONS_COMPACT_BYTES = _save_retain27c, _save_bytes27c
+    except Exception as e:
+        failures.append(f"WP-27 AC-3 unit checks errored: {e}")
+
+    # ── WP-27 AC-4 (C6) — transcript size-gated rotation; running cursor re-tails; ids still resolve ──
+    try:
+        from teammate_comms import comms as _cp27d
+        from teammate_comms import tools as _t27d
+
+        _save_rotate27d = _cp27d.TRANSCRIPT_ROTATE_BYTES
+        try:
+            p27d_root = tempfile.mkdtemp(prefix="tc-27-ac4-")
+            _tpath27d = _cp27d.get_transcript_file(p27d_root, None)
+
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = 10**9   # disabled for the first append
+            _cp27d.append_transcript(p27d_root, None, {"id": "t27d-1", "kind": "dm", "message": "first"})
+            # Re-arm just above the first message's actual size — the SECOND append (below)
+            # then reliably trips it, without guessing a byte count for the JSON encoding.
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = os.path.getsize(_tpath27d) + 10
+
+            _recs1_27d, _off1_27d, _gen1_27d, _ = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)
+            if [r.get("id") for r in _recs1_27d] != ["t27d-1"]:
+                failures.append(f"WP-27 AC-4 setup: initial tail read wrong: {_recs1_27d}")
+
+            # This append pushes the file (now holding BOTH t27d-1 and t27d-2) past the gate —
+            # the WHOLE current file rotates to .1 and the live file is gone; a fresh append
+            # recreates it empty. Both messages are still readable in .1 (manual forensics).
+            _cp27d.append_transcript(p27d_root, None, {"id": "t27d-2", "kind": "dm", "message": "second"})
+            _rotated27d = _tpath27d.with_name(_tpath27d.name + ".1")
+            if not _rotated27d.exists():
+                failures.append("WP-27 AC-4: transcript was not rotated to .1 past the byte gate")
+            elif [json.loads(l).get("id") for l in _rotated27d.read_text(encoding="utf-8").splitlines()] \
+                    != ["t27d-1", "t27d-2"]:
+                failures.append(f"WP-27 AC-4: .1 grace copy missing/wrong content: "
+                                 f"{_rotated27d.read_text(encoding='utf-8')!r}")
+
+            # A running poll (using the offset/generation from BEFORE rotation) re-tails
+            # transparently: reset=True, no crash — the live file is CURRENTLY EMPTY (just
+            # rotated away, nothing new appended yet), so the re-tail correctly shows nothing
+            # rather than crashing or duplicate-flooding the moved content back in.
+            _recs2_27d, _, _, _rst2_27d = _cp27d.read_transcript_after(
+                _tpath27d, _off1_27d, _gen1_27d, 200)
+            if not _rst2_27d:
+                failures.append("WP-27 AC-4: a running poll across rotation did not reset/re-tail")
+            if _recs2_27d != []:
+                failures.append(f"WP-27 AC-4: post-rotation re-tail should show nothing (live "
+                                 f"file was just rotated away): {_recs2_27d}")
+
+            # A THIRD message lands in the fresh (post-rotation) live file correctly.
+            _cp27d.append_transcript(p27d_root, None, {"id": "t27d-3", "kind": "dm", "message": "third"})
+            _recs3_27d, _, _, _ = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)
+            if [r.get("id") for r in _recs3_27d] != ["t27d-3"]:
+                failures.append(f"WP-27 AC-4: post-rotation fresh file has the wrong content: "
+                                 f"{[r.get('id') for r in _recs3_27d]}")
+
+            # react/delete on a rotated-away id still resolve via the 3-tier fallback (a DM
+            # exercises the inbox tier).
+            _dmres27d = _t27d.send_dm(p27d_root, None, "s27d", "to27d", "will rotate away")
+            _mid27d = _dmres27d["id"]
+            _cp27d.append_transcript(p27d_root, None,
+                                     {"id": "filler27d", "kind": "dm", "message": "z" * 80})
+            _resolved27d = _t27d.resolve_message(p27d_root, None, _mid27d)
+            if not _resolved27d or _resolved27d.get("from") != "s27d":
+                failures.append(f"WP-27 AC-4: a rotated-away id did not resolve via the inbox "
+                                 f"fallback: {_resolved27d}")
+            _rx27d = _t27d.react(p27d_root, None, "reactor27d", _mid27d, "fire")
+            if _rx27d.get("target_from") != "s27d":
+                failures.append(f"WP-27 AC-4: react on a rotated-away id did not resolve "
+                                 f"target_from via the fallback: {_rx27d}")
+        finally:
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = _save_rotate27d
+    except Exception as e:
+        failures.append(f"WP-27 AC-4 unit checks errored: {e}")
+
+    # ── WP-27 AC-5 — REACTIONS_RETAIN >= _REACTIONS_TAIL relationship, asserted (not just at import) ──
+    try:
+        from teammate_comms.comms import REACTIONS_RETAIN as _RR27e
+        from teammate_comms.tools import _REACTIONS_TAIL as _RT27e
+        if _RR27e < _RT27e:
+            failures.append(f"WP-27 AC-5: REACTIONS_RETAIN ({_RR27e}) must be >= "
+                             f"_REACTIONS_TAIL ({_RT27e}) — the render tail must sit inside "
+                             f"the retained jsonl.")
+    except Exception as e:
+        failures.append(f"WP-27 AC-5 unit check errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
