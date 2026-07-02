@@ -41,8 +41,9 @@
 | WP-28 | b03c67387760, efbad7e5b2c1, a908cfa546cc | Avatars: self-only, lifecycle GC, installable extra | |
 | WP-29 | 7cb9fd8b88e3, c125b9d5d1b2, b111b11fd93a | Dashboard failure surfacing; root-divergence diagnostics; project identity from git remote | |
 | WP-30 | e4c5fd263296, d0e5caeb18fd, 54982be4879b, 2f7eff973722, 27fbaf6b8c96 | Harness contracts: first-install signal, reinject self-filter, version stamps, housekeeping | |
-| WP-31 | e8fa4a45a4fa, 21477b1b6530, 0461f5dfab9d | Tool-surface polish; shared renderer; group open-read description | |
-| WP-32 | 58262dd8a212, 2ec3a014b36f, d9af4a8af567, f194d7cfc1fa, 14f6b52fe059, 1d46603d1016, db4322e285a7, a96186336862, a8852f578a7d, 4b56f68ceab3, a3fa50c8c6c8 | Docs mega-pass + v0.12.0 bump + CHANGELOG + local tags | |
+| WP-31 | e8fa4a45a4fa, 21477b1b6530, 0461f5dfab9d | Tool-surface polish; shared renderer; group open-read description | WP-31-tool-surface.md |
+| WP-33 | d7791d327351 | Test gaps: avatars error paths (Q4); true multi-process lock contention (Q5) — runs AFTER WP-28 | WP-33-test-gaps.md |
+| WP-32 | 58262dd8a212, 2ec3a014b36f, d9af4a8af567, f194d7cfc1fa, 14f6b52fe059, 1d46603d1016, db4322e285a7, a96186336862, a8852f578a7d, 4b56f68ceab3, a3fa50c8c6c8 | Docs mega-pass + v0.12.0 bump + CHANGELOG + local tags — LAST | WP-32-docs-release.md |
 
 ## Standing Known-intentional list (binding, from AUDIT-v0.7.0.md — do not "fix")
 
