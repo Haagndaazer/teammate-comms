@@ -519,10 +519,15 @@ def _require_registered(ctx):
     """Return (agent, team, root) or raise CommsError if not yet registered."""
     agent, team, root, _ = ctx["identity"].snapshot()
     if agent is None or root is None:
-        raise CommsError(
-            "Not registered yet. Call teammate_register(agent=\"<your-name>\") "
-            "first to establish your identity and start your channel."
-        )
+        msg = ("Not registered yet. Call teammate_register(agent=\"<your-name>\") "
+               "first to establish your identity and start your channel.")
+        # S4: if $TEAMMATE_AGENT auto-register failed earlier, say so here — the agent looks
+        # "not registered" for a REASON, not just because it hasn't called teammate_register.
+        get_err = ctx.get("auto_register_error")
+        err = get_err() if get_err else None
+        if err:
+            msg += f" Note: auto-register from $TEAMMATE_AGENT failed earlier: {err}"
+        raise CommsError(msg)
     return agent, team, root
 
 
@@ -974,6 +979,10 @@ def _handle_whoami(args, ctx):
             "registered": False,
             "hint": "Call teammate_register(agent=\"<your-name>\") to establish identity.",
         }
+        get_err = ctx.get("auto_register_error")
+        err = get_err() if get_err else None
+        if err:
+            out["auto_register_error"] = err
         if verbose:
             out["doctor"] = {"note": "not registered — no comms root resolved yet."}
         return json.dumps(out, indent=2)
@@ -1581,6 +1590,11 @@ def _reincarnate_enabled():
     return bool(v) and v.strip().lower() not in ("", "0", "false", "no", "off")
 
 
+# W2: stderr-logged once per process (not once per call) — the return-text warning below still
+# fires on every reincarnate call while the gate stays durably set.
+_gate_durable_stderr_logged = False
+
+
 def _handle_reincarnate(args, ctx):
     # Gate first (cheap) — opt-in only; spawning OS processes from a tool is high-power.
     if not _reincarnate_enabled():
@@ -1589,6 +1603,18 @@ def _handle_reincarnate(args, ctx):
             "server's environment to enable it (it launches a new OS terminal + Claude "
             "instance)."
         )
+    global _gate_durable_stderr_logged
+    from . import spawn
+    durable_warning = ""
+    if spawn._gate_durably_set():
+        durable_warning = (
+            "⚠ TEAMMATE_REINCARNATE_ENABLED is set DURABLY (registry/user env) — this enables "
+            "process-spawning for every future session machine-wide. Recommended: remove the "
+            "durable setting and set it per-session instead (see README).\n\n"
+        )
+        if not _gate_durable_stderr_logged:
+            _gate_durable_stderr_logged = True
+            print(f"[teammate-comms] WARNING: {durable_warning.strip()}", file=sys.stderr, flush=True)
     agent, team, root = _require_registered(ctx)
     target = args.get("agent")
     validate_agent_name(target)
@@ -1617,7 +1643,6 @@ def _handle_reincarnate(args, ctx):
     team_arg = (args.get("team") or "").strip() or team
     comms_dir = args.get("comms_dir")
 
-    from . import spawn
     argv = spawn.build_claude_command(prompt)
     env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir,
                                 spawned_by=agent)  # provenance breadcrumb (F-5)
@@ -1639,7 +1664,7 @@ def _handle_reincarnate(args, ctx):
             f"different marketplace should set TEAMMATE_PLUGIN_MARKETPLACE or "
             f"TEAMMATE_LAUNCH_ARGS."
         )
-    return (
+    return durable_warning + (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
         f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "
         f"within ~10-20s (it will register with spawned_by={agent!r}). If the new window shows a "

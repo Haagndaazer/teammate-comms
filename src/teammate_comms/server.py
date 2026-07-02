@@ -304,6 +304,11 @@ def register_identity(agent, team, comms_dir, profile=None):
     # is race-free by construction (computed under the same lock as the write).
     _identity.set(agent, team, root, unread_file)
     _identity.set_epoch(effective.get("epoch"))
+    # S4: ANY successful register clears a stale auto-register failure — the agent is
+    # registered now (whether this call WAS the auto-register retry or a manual one), so the
+    # earlier failure note would be misleading noise from here on.
+    global _auto_register_error
+    _auto_register_error = None
     unread = read_json_readonly(unread_file) or []
     # M3 (WP-22): seed durable_seen from the persisted seen-file ∩ current unread — a wake that
     # fires before this session's first teammate_inbox read must not count a message WP-15
@@ -387,8 +392,21 @@ def handle_safely(msg, ctx):
                 pass
 
 
+# S4: a CommsError during $TEAMMATE_AGENT auto-register (the reincarnate-child path) used to
+# be a stderr-only log — the child looked alive to its parent but never appeared in the
+# roster, with nothing in-conversation ever saying why. Stored here so teammate_whoami and
+# _require_registered's error text can both surface it; cleared by ANY later successful
+# register (see register_identity).
+_auto_register_error = None
+
+
+def _get_auto_register_error():
+    return _auto_register_error
+
+
 def _maybe_auto_register():
     """Auto-register from $TEAMMATE_AGENT if it's set (best-effort convenience)."""
+    global _auto_register_error
     env_agent = os.environ.get("TEAMMATE_AGENT")
     if _looks_unset(env_agent):
         return
@@ -397,6 +415,7 @@ def _maybe_auto_register():
     try:
         register_identity(env_agent.strip(), team, None)
     except CommsError as e:
+        _auto_register_error = str(e)
         log(f"auto-register from $TEAMMATE_AGENT skipped: {e}")
 
 
@@ -466,7 +485,8 @@ def main():
         _avatar_subcommand(sys.argv[2:])
         return
 
-    ctx = {"identity": _identity, "register": register_identity}
+    ctx = {"identity": _identity, "register": register_identity,
+           "auto_register_error": _get_auto_register_error}
 
     watcher = threading.Thread(
         target=channel.run_watcher,

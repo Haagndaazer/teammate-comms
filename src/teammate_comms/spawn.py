@@ -23,6 +23,13 @@ from pathlib import Path
 
 from .comms import CommsError
 
+# Lazily-available on Windows only; imported at module level (not inside the function) so a
+# test can monkeypatch `spawn.winreg` with a fake registry (W2 AC-1's injection seam).
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 # The custom teammate-comms channel is not on Anthropic's built-in allowlist, so by default
 # it must be loaded with --dangerously-load-development-channels (which triggers a one-time
 # trust prompt the spawned, DEVNULL-stdio child can't answer). BUT if the operator has placed
@@ -67,6 +74,41 @@ def resolve_marketplace():
 def plugin_spec():
     """The ``plugin:<name>@<marketplace>`` spec for THIS install (resolved at call time)."""
     return f"plugin:{PLUGIN_NAME}@{resolve_marketplace()}"
+
+
+_GATE_ENV_VAR = "TEAMMATE_REINCARNATE_ENABLED"
+
+
+def _gate_durably_set():
+    """Detect whether the reincarnate gate is set DURABLY (registry/user env), not just for
+    this process (W2 — incident c1fa517c047d: the gate leaked machine-wide via a `setx` demo,
+    no code mitigation ever landed). A true session scope is impossible for an inherited env
+    var; the implementable mitigation is DETECTION, not enforcement (chosen policy: warn, not
+    refuse — a user who consciously chose durable enablement shouldn't be broken by it).
+
+    Windows: read ``HKCU\\Environment`` (per-user) and the machine-wide Session Manager key via
+    ``winreg``. Every call is guarded — a missing key, permission error, or winreg being
+    unavailable all mean False, never a raise (this is a courtesy warning, not a security
+    control). POSIX: always None (undetectable — grepping shell profiles is out of scope).
+    """
+    if os.name != "nt" or winreg is None:
+        return None
+    hives = [
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+    ]
+    for hive, subkey in hives:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _ = winreg.QueryValueEx(key, _GATE_ENV_VAR)
+                if value:
+                    return True
+        except OSError:
+            continue
+        except Exception:
+            continue  # never let a registry quirk raise out of a courtesy check
+    return False
 
 
 def dangerous_launch_args():

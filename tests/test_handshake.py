@@ -3936,6 +3936,168 @@ def main():
     except Exception as e:
         failures.append(f"WP-23 AC-5 unit check errored: {e}")
 
+    # ── WP-24 AC-1/AC-2 (W2) — gate durable-detection (fake winreg) + reincarnate warning text ──
+    try:
+        from teammate_comms import spawn as _sp24a
+        from teammate_comms import tools as _t24a
+
+        class _FakeWinreg24:
+            HKEY_CURRENT_USER = "HKCU"
+            HKEY_LOCAL_MACHINE = "HKLM"
+
+            class _Key:
+                def __init__(self, present):
+                    self._present = present
+                def __enter__(self):
+                    if not self._present:
+                        raise OSError("no such key")
+                    return self
+                def __exit__(self, *a):
+                    return False
+
+            def __init__(self, present_hives):
+                self._present_hives = present_hives  # set of hive names with the var present
+
+            def OpenKey(self, hive, subkey):
+                return _FakeWinreg24._Key(hive in self._present_hives)
+
+            def QueryValueEx(self, key, name):
+                return ("1", 1)
+
+        if os.name == "nt":
+            _real_winreg24 = _sp24a.winreg
+            try:
+                _sp24a.winreg = _FakeWinreg24({"HKCU"})  # (a) HKCU names it → True
+                if _sp24a._gate_durably_set() is not True:
+                    failures.append("WP-24 AC-1: HKCU durable var should read True")
+                _sp24a.winreg = _FakeWinreg24(set())  # (b) neither hive → False
+                if _sp24a._gate_durably_set() is not False:
+                    failures.append("WP-24 AC-1: absent from both hives should read False")
+                _sp24a.winreg = _FakeWinreg24({"HKLM"})  # (c) HKLM only → True
+                if _sp24a._gate_durably_set() is not True:
+                    failures.append("WP-24 AC-1: HKLM-only durable var should read True")
+
+                class _ExplodingWinreg24:
+                    HKEY_CURRENT_USER = "HKCU"
+                    HKEY_LOCAL_MACHINE = "HKLM"
+                    def OpenKey(self, hive, subkey):
+                        raise OSError("access denied")
+                _sp24a.winreg = _ExplodingWinreg24()  # (d) never raises out
+                if _sp24a._gate_durably_set() is not False:
+                    failures.append("WP-24 AC-1: a raising winreg should degrade to False, never raise")
+            finally:
+                _sp24a.winreg = _real_winreg24
+        else:
+            if _sp24a._gate_durably_set() is not None:
+                failures.append("WP-24 AC-1: non-Windows should be undetectable (None)")
+
+        # Reincarnate text carries the warning iff gate on + durably set (hermetic monkeypatch);
+        # Popen/shutil.which mocked so this never opens a real terminal window (G-2 pattern).
+        _real_gate_check24a = _sp24a._gate_durably_set
+        _real_reincarnate_enabled24a = os.environ.get("TEAMMATE_REINCARNATE_ENABLED")
+        _real_popen24a = _sp24a.subprocess.Popen
+        _real_which24a = _sp24a.shutil.which
+        try:
+            os.environ["TEAMMATE_REINCARNATE_ENABLED"] = "1"
+            _sp24a.shutil.which = lambda name: f"/fake/{name}"
+
+            class _FakePopen24a:
+                def __init__(self, *a, **k):
+                    pass
+            _sp24a.subprocess.Popen = _FakePopen24a
+
+            class _Ctx24a:
+                def snapshot(self):
+                    return ("caller24a", None, tempfile.mkdtemp(prefix="tc-24-ac1-"), None)
+            _ctx24a = {"identity": _Ctx24a()}
+
+            _sp24a._gate_durably_set = lambda: True
+            _t24a._gate_durable_stderr_logged = False  # reset the once-per-process log flag
+            _msg24a = _t24a._handle_reincarnate({"agent": "child24a", "project_dir": str(REPO)}, _ctx24a)
+            if "DURABLY" not in _msg24a:
+                failures.append(f"WP-24 AC-1: reincarnate text missing the durable-set warning: {_msg24a[:200]!r}")
+
+            _sp24a._gate_durably_set = lambda: False
+            _msg24a2 = _t24a._handle_reincarnate({"agent": "child24a2", "project_dir": str(REPO)}, _ctx24a)
+            if "DURABLY" in _msg24a2:
+                failures.append(f"WP-24 AC-1: reincarnate text wrongly warned when NOT durably set: {_msg24a2[:200]!r}")
+
+            # AC-2: gate-off stays byte-identical (unaffected by the durable check, which sits
+            # AFTER the cheap gate). The live pipe harness's id-52 probe already covers this
+            # end-to-end; confirmed here too for a hermetic pin.
+            os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+            try:
+                _t24a._handle_reincarnate({"agent": "child24a3", "project_dir": str(REPO)}, _ctx24a)
+                failures.append("WP-24 AC-2: reincarnate should still raise when gated off")
+            except Exception as _e24a:
+                if "disabled" not in str(_e24a):
+                    failures.append(f"WP-24 AC-2: gate-off text changed unexpectedly: {_e24a}")
+        finally:
+            _sp24a._gate_durably_set = _real_gate_check24a
+            _sp24a.subprocess.Popen = _real_popen24a
+            _sp24a.shutil.which = _real_which24a
+            if _real_reincarnate_enabled24a is None:
+                os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+            else:
+                os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _real_reincarnate_enabled24a
+    except Exception as e:
+        failures.append(f"WP-24 AC-1/AC-2 unit checks errored: {e}")
+
+    # ── WP-24 AC-3/AC-4 (S4) — auto-register failure surfaced in whoami + not-registered errors ──
+    # Tautology: on current main, whoami has no trace of the failure.
+    try:
+        from teammate_comms import server as _srv24c
+        from teammate_comms.tools import _handle_whoami as _hw24c, _handle_inbox as _hi24c
+
+        _prev_agent24c = os.environ.get("TEAMMATE_AGENT")
+        _prev_team24c = os.environ.get("TEAMMATE_TEAM")
+        try:
+            os.environ["TEAMMATE_AGENT"] = "../evil"  # invalid — register_identity will raise
+            os.environ.pop("TEAMMATE_TEAM", None)
+            _srv24c._maybe_auto_register()
+            if _srv24c._get_auto_register_error() is None:
+                failures.append("WP-24 AC-3: _maybe_auto_register did not record the failure")
+
+            class _FreshId24c:
+                def snapshot(self):
+                    return (None, None, None, None)
+
+            _ctx24c = {"identity": _FreshId24c(),
+                      "auto_register_error": _srv24c._get_auto_register_error}
+            _who24c = json.loads(_hw24c({}, _ctx24c))
+            if "auto_register_error" not in _who24c:
+                failures.append(f"WP-24 AC-4 [tautology: whoami has no trace of the "
+                                 f"auto-register failure]: {_who24c}")
+
+            try:
+                _hi24c({}, _ctx24c)
+                failures.append("WP-24 AC-3: a messaging tool should raise when never registered")
+            except Exception as _e24c:
+                if "auto-register" not in str(_e24c).lower():
+                    failures.append(f"WP-24 AC-3: not-registered error missing the "
+                                     f"auto-register note: {_e24c}")
+
+            # After a successful register, both surfaces go clean.
+            _t24c_root = tempfile.mkdtemp(prefix="tc-24-ac3-")
+            _srv24c.register_identity("cleanagent24c", None, _t24c_root, {})
+            if _srv24c._get_auto_register_error() is not None:
+                failures.append("WP-24 AC-3: a successful register did not clear the stale error")
+            _who24c2 = json.loads(_hw24c({}, {"identity": _srv24c._identity,
+                                              "auto_register_error": _srv24c._get_auto_register_error}))
+            if "auto_register_error" in _who24c2:
+                failures.append(f"WP-24 AC-3: whoami still shows a cleared auto-register error: {_who24c2}")
+        finally:
+            if _prev_agent24c is None:
+                os.environ.pop("TEAMMATE_AGENT", None)
+            else:
+                os.environ["TEAMMATE_AGENT"] = _prev_agent24c
+            if _prev_team24c is None:
+                os.environ.pop("TEAMMATE_TEAM", None)
+            else:
+                os.environ["TEAMMATE_TEAM"] = _prev_team24c
+    except Exception as e:
+        failures.append(f"WP-24 AC-3/AC-4 unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
