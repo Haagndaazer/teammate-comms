@@ -561,6 +561,12 @@ def main():
         _avatar_subcommand(sys.argv[2:])
         return
 
+    # H1: the running server's INSTRUCTIONS/serverInfo.version are spawn-frozen for this
+    # process's whole lifetime, while a mid-session plugin update changes what's on disk —
+    # this line is the diagnostic anchor for "was this session running stale code" in the
+    # debug log (~/.claude/debug/<session>.txt).
+    log(f"starting teammate-comms v{__version__}")
+
     ctx = {"identity": _identity, "register": register_identity,
            "auto_register_error": _get_auto_register_error}
 

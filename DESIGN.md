@@ -220,6 +220,37 @@ stdout lock (no CRLF, no cp1252); stdin is decoded with `utf-8-sig` to tolerate 
 leading BOM. No handler may `print` to stdout (that's the protocol stream);
 diagnostics go to stderr → `~/.claude/debug/<session-id>.txt`.
 
+**H5 — the standing-instructions contract (WP-30):** everything in this doc about
+`INSTRUCTIONS` reaching the agent rests on one UNVERIFIED assumption: that Claude Code's
+`initialize.instructions` field is actually surfaced to the model every session, not just
+accepted and discarded. There is no in-repo test for this (none is possible — it depends on
+CC's own prompt assembly, outside this process). **How to verify by hand:** after
+`teammate_register`, run `/mcp` — the `teammate-comms` server should be listed; the standing
+rules text ("Update your teammate-comms status as you work...") should be visible somewhere
+in the session's MCP instructions block. If it's ever NOT there, the whole
+`instructions`/reinject-after-compact design (this section + `reinject-instructions.sh`)
+needs re-examination — h1's version stamp (below) at least tells you WHICH build's text you
+were looking at when you checked.
+
+**H1 — version stamps (WP-30):** the running server's `INSTRUCTIONS` are spawn-frozen for
+the process's lifetime, while a mid-session plugin update changes what's on disk — nothing
+used to record which version produced which text. `server.py` now logs
+`starting teammate-comms v<version>` once at startup (stderr → the debug log), and
+`instructions.py`'s `_REINJECT_HEADER` (the block `reinject-instructions.sh` emits after a
+compact) is stamped `# teammate-comms v<version> - Standing Practices ...` — a
+stale-vs-current mismatch between the two is now visible instead of silent.
+
+**H7/H8 — housekeeping notes (WP-30):** the tool list is **static per process** — new tools
+only ever arrive via a full server respawn (a plugin update + Claude Code restart), so no
+`notifications/tools/list_changed` emitter is needed; nothing in this design changes tools
+at runtime. `${CLAUDE_PLUGIN_ROOT}` is expanded independently by **three** consumers —
+`plugin.json`'s `mcpServers` spawn, `hooks/session-start.sh`, and
+`hooks/reinject-instructions.sh` — the invariant all three rely on is that Claude Code
+expands it identically for all three within one session (same plugin install → same path);
+if that ever diverges (e.g. a mid-session plugin reinstall changing the resolved root), the
+hooks and the server would disagree about which venv/instructions are current — no code
+change follows from this today, it's recorded so a future divergence isn't a mystery.
+
 ---
 
 ## 7. `channel.py` — wake mechanics

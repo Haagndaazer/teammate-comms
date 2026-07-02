@@ -138,6 +138,16 @@ def managed_settings_paths():
     return ["/etc/claude-code/managed-settings.json"]
 
 
+# H2: the managed-settings.json SHAPE this module parses (channelsEnabled +
+# allowedChannelPlugins[].{plugin,marketplace}) is a schema GUESS, verified against exactly
+# ONE Claude Code build, with no recorded expiry — a future CC release could change the
+# schema silently and this parser would just never match (fail-safe toward the dangerous
+# flag, per channel_allowlisted's docstring, but still worth naming the assumption where it
+# acts). If channel loading breaks after a CC upgrade, check this vintage first;
+# TEAMMATE_LAUNCH_ARGS is the escape hatch that bypasses this detection entirely.
+MANAGED_SETTINGS_VERIFIED = "Claude Code 2.1.161 / Windows"
+
+
 def channel_allowlisted(plugin=PLUGIN_NAME, marketplace=None, settings_paths=None):
     """True iff a managed-settings file marks this channel trusted, so it loads with the
     plain --channels flag (no dangerous flag, no startup prompt).
@@ -152,6 +162,8 @@ def channel_allowlisted(plugin=PLUGIN_NAME, marketplace=None, settings_paths=Non
 
     Best-effort: a missing/unreadable/malformed file (incl. PermissionError reading a
     Program Files file as non-admin) is skipped → False. utf-8-sig tolerates a Notepad BOM.
+    The parsed schema is verified only against ``MANAGED_SETTINGS_VERIFIED`` (H2) — see that
+    constant's comment.
     """
     if marketplace is None:
         marketplace = resolve_marketplace()
@@ -188,8 +200,16 @@ def build_claude_command(prompt, extra_args=None, settings_paths=None):
     """
     base = os.environ.get("TEAMMATE_LAUNCH_ARGS")
     if not base:
-        base = (allowlisted_launch_args() if channel_allowlisted(settings_paths=settings_paths)
-                else dangerous_launch_args())
+        if channel_allowlisted(settings_paths=settings_paths):
+            base = allowlisted_launch_args()
+            # H2: name the schema's verification vintage + the escape hatch right where the
+            # assumption acts, so a future CC schema change is diagnosable from the debug log
+            # instead of a mysterious channel-loading failure.
+            print(f"[teammate-comms] managed-settings allowlist matched (schema verified "
+                  f"against {MANAGED_SETTINGS_VERIFIED}); set TEAMMATE_LAUNCH_ARGS to override.",
+                  file=sys.stderr, flush=True)
+        else:
+            base = dangerous_launch_args()
     argv = shlex.split(base, posix=(os.name != "nt"))
     argv += ["--permission-mode", "bypassPermissions"]
     if extra_args:

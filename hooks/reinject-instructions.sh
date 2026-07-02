@@ -8,6 +8,21 @@
 # hookSpecificOutput JSON, or '{}' on any failure.
 set -euo pipefail
 
+# P5: mirror session-start.sh's stdin self-filter, inverted — this hook (matcher: compact)
+# should fire ONLY on a compact source. If a "source" key is present and its value is NOT
+# "compact", emit '{}' and exit 0. Defense-in-depth: the hooks.json matcher is the primary
+# gate, which the audit flagged as unverified against any recorded Claude Code contract;
+# absent/unknown source falls through and PROCEEDS (the matcher already gated the normal
+# case). Only read stdin when it's NOT a tty so a manual run can never block on `cat`.
+if [ ! -t 0 ]; then
+    HOOK_INPUT="$(cat || true)"
+    if printf '%s' "$HOOK_INPUT" | grep -q '"source"[[:space:]]*:[[:space:]]*"' \
+       && ! printf '%s' "$HOOK_INPUT" | grep -q '"source"[[:space:]]*:[[:space:]]*"compact"'; then
+        echo '{}'
+        exit 0
+    fi
+fi
+
 # Fail closed but VISIBLE: an unset CLAUDE_PLUGIN_ROOT under `set -u` would abort at the bare
 # ref below before any JSON is emitted (a silent dead hook); emit '{}' and exit 0 instead.
 if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then

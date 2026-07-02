@@ -14,6 +14,8 @@ non-ASCII in the text is escaped). Mirrors the approach vibe-cognition uses.
 import json
 import sys
 
+from . import __version__
+
 # Surfaced to the agent every session as "MCP Server Instructions" (server.py passes this
 # to the initialize response) AND re-injected after a compact (see main()).
 INSTRUCTIONS = (
@@ -37,8 +39,11 @@ INSTRUCTIONS = (
 )
 
 # Header so the re-injected (post-compact) block is self-explaining when it sits next to
-# any MCP instructions that may have survived the compaction.
-_REINJECT_HEADER = "# teammate-comms - Standing Practices (re-injected after compaction)"
+# any MCP instructions that may have survived the compaction. H1: stamped with the package
+# version — a mid-session plugin update splits provenance (the running server's INSTRUCTIONS
+# are spawn-frozen; this hook re-execs from disk), so a stale-vs-current-version mismatch
+# between the two is now visible instead of silent.
+_REINJECT_HEADER = f"# teammate-comms v{__version__} - Standing Practices (re-injected after compaction)"
 
 
 def main():

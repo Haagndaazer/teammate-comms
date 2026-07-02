@@ -929,6 +929,19 @@ def main():
         argv_allow = _spawn.build_claude_command("p", settings_paths=[_ms])
         if "--channels" not in argv_allow or "--dangerously-load-development-channels" in argv_allow:
             failures.append(f"allowlisted should use --channels, not the dangerous flag: {argv_allow}")
+        # (b2) WP-30 AC-3 (H2): choosing the allowlisted path stderr-logs the verification
+        # vintage + the TEAMMATE_LAUNCH_ARGS escape hatch, so a future managed-settings schema
+        # change is diagnosable from the debug log instead of a mysterious channel-loading failure.
+        import io as _io30c, contextlib as _ctxlib30c
+        _stderr_capture30c = _io30c.StringIO()
+        with _ctxlib30c.redirect_stderr(_stderr_capture30c):
+            _spawn.build_claude_command("p", settings_paths=[_ms])
+        _stderr_text30c = _stderr_capture30c.getvalue()
+        if (_spawn.MANAGED_SETTINGS_VERIFIED not in _stderr_text30c
+                or "TEAMMATE_LAUNCH_ARGS" not in _stderr_text30c):
+            failures.append(f"WP-30 AC-3 [tautology: choosing the allowlisted path must "
+                             f"stderr-log the verification vintage + escape hatch]: "
+                             f"{_stderr_text30c!r}")
         # (c) channelsEnabled false → NOT trusted → fall back to the dangerous flag
         with open(_ms, "w", encoding="utf-8") as _f:
             json.dump({"channelsEnabled": False,
@@ -4927,6 +4940,85 @@ def main():
                 os.environ["CLAUDE_PROJECT_DIR"] = _prev_pd29c2
     except Exception as e:
         failures.append(f"WP-29 AC-3 unit checks errored: {e}")
+
+    # ── WP-30 AC-1 (H3) — session-start.sh first-install signal ──
+    try:
+        import shutil as _sh30a
+        _bash30a = _sh30a.which("bash")
+        if _bash30a:
+            _plugin_root30a = tempfile.mkdtemp(prefix="tc-30-ac1-root-")
+            (Path(_plugin_root30a) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+            (Path(_plugin_root30a) / "uv.lock").write_text("fake-lock\n", encoding="utf-8")
+
+            # A fake `uv` on PATH that always "succeeds" instantly — same isolation trick as
+            # WP-28 AC-4, avoids a real network sync while exercising the real script.
+            _fakebin30a = tempfile.mkdtemp(prefix="tc-30-ac1-bin-")
+            _fake_uv30a = Path(_fakebin30a) / "uv"
+            _fake_uv30a.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            _fake_uv30a.chmod(0o755)
+
+            _env30a = dict(os.environ)
+            _env30a["CLAUDE_PLUGIN_ROOT"] = _plugin_root30a
+            _env30a["PATH"] = _fakebin30a + os.pathsep + _env30a.get("PATH", "")
+            _env30a.pop("TEAMMATE_AVATARS_ENABLED", None)
+
+            _script30a = str(REPO / "hooks" / "session-start.sh")
+            _p1_30a = subprocess.run([_bash30a, _script30a], env=_env30a, input=b"",
+                                     capture_output=True, timeout=30)
+            _out1_30a = _p1_30a.stdout.decode("utf-8", "replace").strip()
+            if "first time" not in _out1_30a or "restart" not in _out1_30a.lower():
+                failures.append(f"WP-30 AC-1 [tautology: first run (no stamp) must emit the "
+                                 f"restart additionalContext]: {_out1_30a!r}")
+
+            _p2_30a = subprocess.run([_bash30a, _script30a], env=_env30a, input=b"",
+                                     capture_output=True, timeout=30)
+            _out2_30a = _p2_30a.stdout.decode("utf-8", "replace").strip()
+            if _out2_30a != "{}":
+                failures.append(f"WP-30 AC-1: second run (stamp present, hash match) should "
+                                 f"emit '{{}}' (silent — not a repeat first-install notice): "
+                                 f"{_out2_30a!r}")
+    except Exception as e:
+        failures.append(f"WP-30 AC-1 unit checks errored: {e}")
+
+    # ── WP-30 AC-2 (P5/H1) — reinject-instructions.sh self-filter + version stamp ──
+    try:
+        import shutil as _sh30b
+        _bash30b = _sh30b.which("bash")
+        if _bash30b:
+            _script30b = str(REPO / "hooks" / "reinject-instructions.sh")
+            _env30b = dict(os.environ)
+            _env30b["CLAUDE_PLUGIN_ROOT"] = str(REPO)
+
+            _p1_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
+                                     input=b'{"source":"startup"}', capture_output=True, timeout=30)
+            _out1_30b = _p1_30b.stdout.decode("utf-8", "replace").strip()
+            if _out1_30b != "{}":
+                failures.append(f"WP-30 AC-2 [tautology: source=startup must self-filter to "
+                                 f"'{{}}' without ever exec'ing the instructions module]: "
+                                 f"{_out1_30b!r}")
+
+            _p2_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
+                                     input=b'{"source":"compact"}', capture_output=True, timeout=45)
+            _out2_30b = _p2_30b.stdout.decode("utf-8", "replace").strip()
+            from teammate_comms import __version__ as _ver30b
+            if "Update your teammate-comms status" not in _out2_30b:
+                failures.append(f"WP-30 AC-2: source=compact should emit the standing-rules "
+                                 f"payload: {_out2_30b!r}")
+            if f"v{_ver30b}" not in _out2_30b:
+                failures.append(f"WP-30 AC-2: source=compact payload missing the H1 version "
+                                 f"stamp v{_ver30b}: {_out2_30b!r}")
+    except Exception as e:
+        failures.append(f"WP-30 AC-2 unit checks errored: {e}")
+
+    # ── WP-30 AC-4 (H5/H7/H8) — DESIGN.md carries the new notes (source grep) ──
+    try:
+        _design_src30d = (REPO / "DESIGN.md").read_text(encoding="utf-8")
+        for _needle30d in ("H5 — the standing-instructions contract", "H1 — version stamps",
+                          "H7/H8 — housekeeping notes", "tools/list_changed"):
+            if _needle30d not in _design_src30d:
+                failures.append(f"WP-30 AC-4: DESIGN.md missing expected note {_needle30d!r}")
+    except Exception as e:
+        failures.append(f"WP-30 AC-4 unit check errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

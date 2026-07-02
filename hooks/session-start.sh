@@ -45,7 +45,7 @@ EOF
 
 # ── Step 1: require uv ───────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
-    emit_context "WARNING: the teammate-comms plugin requires 'uv' (Python package manager) but it was not found on PATH. Install it: https://docs.astral.sh/uv/getting-started/installation/"
+    emit_context "WARNING: the teammate-comms plugin requires 'uv' (Python package manager) but it was not found on PATH. Install it: https://docs.astral.sh/uv/getting-started/installation/ — after installing, restart Claude Code once and check with /mcp."
     exit 0
 fi
 
@@ -62,6 +62,15 @@ else
     HASH="no-hash-tool"
 fi
 
+# H3: a first install can't have the venv built before the FIRST MCP spawn tries to use it —
+# capture "no stamp at all yet" BEFORE the sync attempt below, so a successful first sync can
+# tell the agent to restart once (the prior fix was prose-only in README/DESIGN, invisible
+# in-session; missing uv/bash otherwise present as the identical silent "no teammate_* tools").
+FIRST_INSTALL=0
+if [ ! -f "$STAMP" ]; then
+    FIRST_INSTALL=1
+fi
+
 if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
     # Stamp ONLY on a successful sync. A failed sync must NOT write the stamp — else the
     # half-built venv is recorded as done, the next session's hash matches and SKIPS the sync,
@@ -74,6 +83,10 @@ if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
     if UV_PROJECT_ENVIRONMENT="${VENV_DIR}" uv sync "${SYNC_ARGS[@]}" 2>/dev/null; then
         mkdir -p "${VENV_DIR}"
         echo "$HASH" > "$STAMP"
+        if [ "$FIRST_INSTALL" = "1" ]; then
+            emit_context "teammate-comms just built its environment for the first time. If the teammate_* tools are not available in this session, restart Claude Code once (check with /mcp)."
+            exit 0
+        fi
     fi
 fi
 
