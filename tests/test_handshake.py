@@ -5223,6 +5223,77 @@ def main():
     except Exception as e:
         failures.append(f"WP-31 AC-3 unit checks errored: {e}")
 
+    # ── WP-33 Q5 — true multi-process lock contention (N processes × M appends, one file) ──
+    # All prior concurrency coverage in this harness is thread-based in ONE interpreter; the
+    # product's actual shape (separate teammate-comms server PROCESSES contending on the mkdir
+    # lock across separate inboxes/records) was inferred, never proven. This drives N=4 real
+    # OS processes each appending M=25 records to the SAME file via file_lock's
+    # read-modify-write, and asserts the union is complete and duplicate-free.
+    try:
+        _N33, _M33 = 4, 25
+        _probe_dir33 = tempfile.mkdtemp(prefix="tc-33-q5-")
+        _probe_path33 = str(Path(_probe_dir33) / "probe_unread.json")
+
+        _env33 = dict(os.environ)
+        _env33["PYTHONPATH"] = str(SRC) + os.pathsep + _env33.get("PYTHONPATH", "")
+
+        _worker_src33 = (
+            "import sys\n"
+            "from teammate_comms.comms import file_lock, read_json_safe, write_json_atomic\n"
+            f"path = {_probe_path33!r}\n"
+            "wid = int(sys.argv[1])\n"
+            f"for seq in range({_M33}):\n"
+            "    with file_lock(path, timeout=10):\n"
+            "        data = read_json_safe(path)\n"
+            "        if not isinstance(data, list):\n"
+            "            data = []\n"
+            "        data.append({'worker': wid, 'seq': seq})\n"
+            "        write_json_atomic(path, data)\n"
+        )
+
+        _procs33 = [
+            subprocess.Popen([sys.executable, "-c", _worker_src33, str(_wid33)],
+                             env=_env33, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            for _wid33 in range(_N33)
+        ]
+
+        _deadline33 = time.time() + 20   # generous but bounded — no fixed sleeps, deadline-poll via communicate
+        _worker_errs33 = []
+        for _p33 in _procs33:
+            _remaining33 = max(0.1, _deadline33 - time.time())
+            try:
+                _out33, _err33 = _p33.communicate(timeout=_remaining33)
+                if _p33.returncode != 0:
+                    _worker_errs33.append(_err33.decode("utf-8", "replace"))
+            except subprocess.TimeoutExpired:
+                _p33.kill()
+                _p33.communicate()
+                _worker_errs33.append("TIMEOUT waiting for a Q5 worker process")
+
+        if _worker_errs33:
+            failures.append(f"WP-33 Q5: {len(_worker_errs33)} worker process(es) failed/timed "
+                             f"out: {_worker_errs33}")
+        else:
+            _expected33 = _N33 * _M33
+            _final33 = json.loads(Path(_probe_path33).read_text(encoding="utf-8"))
+            _pairs33 = [(r.get("worker"), r.get("seq")) for r in _final33]
+            _distinct33 = set(_pairs33)
+            if len(_final33) != _expected33:
+                failures.append(f"WP-33 Q5 [tautology: {_N33} processes × {_M33} appends under "
+                                 f"file_lock must yield EXACTLY {_expected33} records if the "
+                                 f"mkdir lock truly excludes across PROCESSES]: got "
+                                 f"{len(_final33)} records")
+            if len(_pairs33) != len(_distinct33):
+                failures.append(f"WP-33 Q5: {len(_pairs33) - len(_distinct33)} duplicate "
+                                 f"(worker,seq) record(s) — a racing read-modify-write clobbered "
+                                 f"another worker's append instead of being excluded by the lock")
+            if len(_distinct33) != _expected33:
+                failures.append(f"WP-33 Q5: expected {_expected33} distinct (worker,seq) pairs, "
+                                 f"got {len(_distinct33)} — some appends were LOST under "
+                                 f"cross-process contention")
+    except Exception as e:
+        failures.append(f"WP-33 Q5 unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
