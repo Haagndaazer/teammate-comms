@@ -918,9 +918,13 @@ def remove_agent(root, team, name, timeout=2):
     unread file's lock, same as ``tombstone_in_inbox``. A short ``timeout`` (not the 10s
     default) keeps a genuinely-contended delete from hanging — a real delete should acquire
     near-instantly; a held lock past that IS the reportable failure.
+    D2: also unlinks avatar sidecars (``avatars/<name>.{png,ansi,txt}``) — they must not
+    survive teammate removal, or a name-reuser would inherit a stranger's image via a direct
+    ``/avatar`` URL.
     """
     agents_dir = get_agents_dir(root, team)
     inboxes_dir = get_inboxes_dir(root, team)
+    avatars_dir = get_avatars_dir(root, team)
     record_path = agents_dir / f"{name}.json"
     unread_file = inboxes_dir / f"{name}_unread.json"
     read_file = inboxes_dir / f"{name}_read.json"
@@ -947,6 +951,12 @@ def remove_agent(root, team, name, timeout=2):
     except CommsError:
         failed.append(str(unread_file))
         failed.append(str(read_file))
+
+    # D2: no dedicated lock exists for avatar sidecars (ingest_avatar's own clear path unlinks
+    # them unlocked too) — best-effort, reported like every other path here rather than
+    # swallowed.
+    for ext in ("png", "ansi", "txt"):
+        _unlink(avatars_dir / f"{name}.{ext}")
 
     return failed
 
@@ -1216,9 +1226,14 @@ TRANSCRIPT_ROTATE_BYTES = 16 * 1024 * 1024
 
 def _maybe_rotate_transcript(path):
     """Cheap getsize gate → rotate. Never raises (observability must never affect delivery).
-    Call only with the transcript's lock held. The byte-cursor generation (a crc of the first
-    line) changes when the file is recreated after rotation, so a running dashboard poll
-    transparently re-tails — that machinery already exists for exactly this case."""
+    Call only with the transcript's lock held, and call it BEFORE appending the new record
+    (gate-then-append — WP-27 gate CR): rotating AFTER the append would put the
+    gate-triggering record straight into ``.1``, which no read path ever touches — a
+    deterministic once-per-``TRANSCRIPT_ROTATE_BYTES`` drop, not contention-luck. Gating first
+    means the triggering record always lands in the FRESH file instead. The byte-cursor
+    generation (a crc of the first line) changes when the file is recreated after rotation, so
+    a running dashboard poll transparently re-tails — that machinery already exists for
+    exactly this case."""
     try:
         if path.exists() and os.path.getsize(path) > TRANSCRIPT_ROTATE_BYTES:
             rotated = path.with_name(path.name + ".1")
@@ -1234,7 +1249,9 @@ def append_transcript(root, team, record):
     group posts in one ordered stream. NEVER raises and NEVER blocks delivery:
     disabled by ``TEAMMATE_TRANSCRIPT=0``, uses a short non-blocking lock, and
     swallows every error to stderr. This is observability, not a delivery guarantee.
-    Size-gated rotation (see ``_maybe_rotate_transcript``) keeps the live file bounded.
+    Size-gated rotation (see ``_maybe_rotate_transcript``) keeps the live file bounded —
+    checked BEFORE this call's own append, so ``record`` always lands in the file that
+    survives (never the one that just rotated away).
     """
     if os.environ.get("TEAMMATE_TRANSCRIPT", "1").strip() == "0":
         return
@@ -1244,9 +1261,9 @@ def append_transcript(root, team, record):
         with file_lock_optional(path, timeout=2) as acquired:
             if not acquired:
                 return
+            _maybe_rotate_transcript(path)   # gate-then-append: rotate BEFORE writing (C6 CR)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            _maybe_rotate_transcript(path)   # under the lock, never raises (C6)
     except Exception as e:  # observability must never affect message delivery
         print(f"[teammate-comms] transcript tee skipped: {e}", file=sys.stderr, flush=True)
 

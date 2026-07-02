@@ -139,6 +139,24 @@ remove; everyone else just sees it in `teammate_inbox` / `teammate_group history
 dashboard. They live in an always-on `reactions.jsonl` keyed by the target message id (so
 the same mechanism covers DMs and group posts).
 
+## Avatars (optional)
+
+`teammate_set_avatar` ingests an image (`path` or `image_base64`), resizes it to 256×256, and
+pre-renders it as a PNG + ANSI (xterm-256 half-block) + ASCII strip — served by the dashboard
+and the `teammate-comms avatar` statusline subcommand without ever importing Pillow at
+request time. Avatars are **self-owned**: you can only set/clear your own (omit `agent`, or
+pass your own name — any other target is rejected).
+
+Pillow is an optional dependency, not part of the zero-dep default install. To enable it:
+
+- Set `TEAMMATE_AVATARS_ENABLED=1` in the environment before launching Claude Code — the
+  session-start hook re-syncs the plugin venv with the `images` extra on the next session
+  (toggling the var invalidates the sync stamp, so it takes effect the very next launch).
+- Or run it manually: `uv sync --project <plugin-root> --extra images`.
+
+Without Pillow, `teammate_set_avatar` raises a CommsError naming the fix above; every other
+tool and the read-only serve paths (dashboard, statusline) stay fully stdlib regardless.
+
 ## Deleting messages + removing teammates
 
 `teammate_delete(message:"<id>")` **tombstones** a message everywhere it was written — a

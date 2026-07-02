@@ -4506,42 +4506,53 @@ def main():
 
             _cp27d.TRANSCRIPT_ROTATE_BYTES = 10**9   # disabled for the first append
             _cp27d.append_transcript(p27d_root, None, {"id": "t27d-1", "kind": "dm", "message": "first"})
-            # Re-arm just above the first message's actual size — the SECOND append (below)
-            # then reliably trips it, without guessing a byte count for the JSON encoding.
-            _cp27d.TRANSCRIPT_ROTATE_BYTES = os.path.getsize(_tpath27d) + 10
+            _first_size27d = os.path.getsize(_tpath27d)
+            # WP-27 gate CR: the check now runs BEFORE the write (gate-then-append) — re-arm
+            # just BELOW the current size so the SECOND append's gate (seeing only t27d-1)
+            # trips FIRST, rotating t27d-1 away, and t27d-2 then lands in the fresh file.
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = _first_size27d - 1
 
             _recs1_27d, _off1_27d, _gen1_27d, _ = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)
             if [r.get("id") for r in _recs1_27d] != ["t27d-1"]:
                 failures.append(f"WP-27 AC-4 setup: initial tail read wrong: {_recs1_27d}")
 
-            # This append pushes the file (now holding BOTH t27d-1 and t27d-2) past the gate —
-            # the WHOLE current file rotates to .1 and the live file is gone; a fresh append
-            # recreates it empty. Both messages are still readable in .1 (manual forensics).
             _cp27d.append_transcript(p27d_root, None, {"id": "t27d-2", "kind": "dm", "message": "second"})
             _rotated27d = _tpath27d.with_name(_tpath27d.name + ".1")
             if not _rotated27d.exists():
                 failures.append("WP-27 AC-4: transcript was not rotated to .1 past the byte gate")
             elif [json.loads(l).get("id") for l in _rotated27d.read_text(encoding="utf-8").splitlines()] \
-                    != ["t27d-1", "t27d-2"]:
+                    != ["t27d-1"]:
                 failures.append(f"WP-27 AC-4: .1 grace copy missing/wrong content: "
                                  f"{_rotated27d.read_text(encoding='utf-8')!r}")
 
+            # WP-27 gate CR — the exact tautology this fix needs: the TRIGGERING record
+            # (t27d-2) must be readable from the LIVE (post-rotation) file, not silently
+            # dropped into .1 alongside the record that tripped the gate. This test would have
+            # passed under EITHER ordering before the CR (rotate-after-append vs
+            # gate-then-append) — asserting the live file's content is what actually pins it.
+            _live_after27d = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)[0]
+            if [r.get("id") for r in _live_after27d] != ["t27d-2"]:
+                failures.append(f"WP-27 gate CR [tautology: the triggering record must land "
+                                 f"in the FRESH file, never the one that rotated away]: "
+                                 f"{[r.get('id') for r in _live_after27d]}")
+
             # A running poll (using the offset/generation from BEFORE rotation) re-tails
-            # transparently: reset=True, no crash — the live file is CURRENTLY EMPTY (just
-            # rotated away, nothing new appended yet), so the re-tail correctly shows nothing
-            # rather than crashing or duplicate-flooding the moved content back in.
+            # transparently: reset=True, no crash, and now correctly SHOWS the triggering
+            # record (not a drop).
             _recs2_27d, _, _, _rst2_27d = _cp27d.read_transcript_after(
                 _tpath27d, _off1_27d, _gen1_27d, 200)
             if not _rst2_27d:
                 failures.append("WP-27 AC-4: a running poll across rotation did not reset/re-tail")
-            if _recs2_27d != []:
-                failures.append(f"WP-27 AC-4: post-rotation re-tail should show nothing (live "
-                                 f"file was just rotated away): {_recs2_27d}")
+            if [r.get("id") for r in _recs2_27d] != ["t27d-2"]:
+                failures.append(f"WP-27 AC-4: post-rotation re-tail should show the triggering "
+                                 f"record: {[r.get('id') for r in _recs2_27d]}")
 
-            # A THIRD message lands in the fresh (post-rotation) live file correctly.
+            # A THIRD message lands in the fresh (post-rotation) live file alongside t27d-2 —
+            # disarm rotation first so this append doesn't ALSO trip the (now tiny) gate.
+            _cp27d.TRANSCRIPT_ROTATE_BYTES = 10**9
             _cp27d.append_transcript(p27d_root, None, {"id": "t27d-3", "kind": "dm", "message": "third"})
             _recs3_27d, _, _, _ = _cp27d.read_transcript_after(_tpath27d, 0, "", 200)
-            if [r.get("id") for r in _recs3_27d] != ["t27d-3"]:
+            if [r.get("id") for r in _recs3_27d] != ["t27d-2", "t27d-3"]:
                 failures.append(f"WP-27 AC-4: post-rotation fresh file has the wrong content: "
                                  f"{[r.get('id') for r in _recs3_27d]}")
 
@@ -4574,6 +4585,183 @@ def main():
                              f"the retained jsonl.")
     except Exception as e:
         failures.append(f"WP-27 AC-5 unit check errored: {e}")
+
+    # ── WP-28 AC-1 (T1) — avatars are self-owned; targeting another agent raises ──
+    # Tautology: current main happily targets another agent.
+    try:
+        from teammate_comms.tools import _handle_set_avatar as _hsa28a
+        from teammate_comms.comms import CommsError as _CE28a, write_agent_record as _war28a
+
+        class _Ctx28a:
+            def __init__(self, agent, root):
+                self._agent, self._root = agent, root
+            def snapshot(self):
+                return (self._agent, None, self._root, None)
+
+        _root28a = tempfile.mkdtemp(prefix="tc-28-ac1-")
+        _war28a(_root28a, None, "me28a", type="full")  # agents_dir must exist for the clear-lock
+        try:
+            _hsa28a({"agent": "someone-else-28a", "clear": True},
+                   {"identity": _Ctx28a("me28a", _root28a)})
+            failures.append("WP-28 AC-1 [tautology: set_avatar must raise when targeting "
+                             "another agent — reverted code happily proceeds]")
+        except _CE28a as _e28a:
+            if "me28a" not in str(_e28a):
+                failures.append(f"WP-28 AC-1: error text should name the caller: {_e28a}")
+
+        # agent omitted or ==caller proceeds — clear=True never touches Pillow, so this also
+        # proves the authz check runs BEFORE ingest_avatar's lazy Pillow import.
+        try:
+            _hsa28a({"clear": True}, {"identity": _Ctx28a("me28a", _root28a)})
+        except Exception as _e28a2:
+            failures.append(f"WP-28 AC-1: omitted agent (defaults to self) should proceed: {_e28a2}")
+        try:
+            _hsa28a({"agent": "me28a", "clear": True}, {"identity": _Ctx28a("me28a", _root28a)})
+        except Exception as _e28a3:
+            failures.append(f"WP-28 AC-1: agent==caller should proceed: {_e28a3}")
+    except Exception as e:
+        failures.append(f"WP-28 AC-1 unit checks errored: {e}")
+
+    # ── WP-28 AC-2 (D2) — sidecars removed on teammate removal; /avatar 404s an unregistered name ──
+    try:
+        from teammate_comms import comms as _cp28b
+        from teammate_comms import tools as _t28b
+        from teammate_comms import dashboard as _dash28b
+        import http.client as _hc28b
+
+        _root28b = tempfile.mkdtemp(prefix="tc-28-ac2-")
+        _cp28b.write_agent_record(_root28b, None, "victim28b", type="full", channel=False,
+                                  pid=1, host="wherever", instance_id="v28b", epoch=1)
+        _cp28b.ensure_inbox(_cp28b.get_inboxes_dir(_root28b, None), "victim28b")
+        _avdir28b = _cp28b.get_avatars_dir(_root28b, None)
+        _avdir28b.mkdir(parents=True, exist_ok=True)
+        for _ext28b in ("png", "ansi", "txt"):
+            (_avdir28b / f"victim28b.{_ext28b}").write_text("stub", encoding="utf-8")
+
+        _t28b.remove_teammate(_root28b, None, "caller28b", "victim28b")
+        for _ext28b in ("png", "ansi", "txt"):
+            if (_avdir28b / f"victim28b.{_ext28b}").exists():
+                failures.append(f"WP-28 AC-2: avatar sidecar .{_ext28b} survived teammate removal")
+
+        # /avatar for an unregistered name -> 404 even with a stale PNG present on disk.
+        (_avdir28b / "ghost28b.png").write_bytes(b"stale-png-bytes")
+        _dres28b = _dash28b.start_dashboard(_root28b, None, "Operator28b", port=0, open_browser=False)
+        _dport28b, _dtok28b = _dres28b["port"], _dash28b._STATE.token
+        try:
+            _c28b = _hc28b.HTTPConnection("127.0.0.1", _dport28b, timeout=5)
+            _c28b.putrequest("GET", f"/avatar?name=ghost28b&token={_dtok28b}",
+                             skip_host=True, skip_accept_encoding=True)
+            _c28b.putheader("Host", "127.0.0.1")
+            _c28b.endheaders()
+            _r28b = _c28b.getresponse()
+            _status28b = _r28b.getcode()
+            _r28b.read()
+            _c28b.close()
+            if _status28b != 404:
+                failures.append(f"WP-28 AC-2 [tautology: /avatar for an unregistered name with "
+                                 f"a stale file present must 404 — reverted code serves it]: "
+                                 f"got {_status28b}")
+        finally:
+            _dash28b.shutdown_dashboard()
+    except Exception as e:
+        failures.append(f"WP-28 AC-2 unit checks errored: {e}")
+
+    # ── WP-28 AC-3 (D3) — over-long base64 raises the cap WITHOUT decoding ──
+    try:
+        from teammate_comms import avatars as _av28c
+        from teammate_comms.comms import CommsError as _CE28c
+
+        _real_b64decode28c = _av28c.base64.b64decode
+
+        def _forbidden_decode28c(*a, **k):
+            raise AssertionError("b64decode must not be called past the pre-decode byte cap")
+
+        _av28c.base64.b64decode = _forbidden_decode28c
+        try:
+            _huge28c = "A" * (_av28c._MAX_SRC_BYTES * 4 // 3 + 100)  # comfortably over the cap
+            _root28c = tempfile.mkdtemp(prefix="tc-28-ac3-")
+            try:
+                _av28c.ingest_avatar(_root28c, None, "someone28c", image_base64=_huge28c)
+                failures.append("WP-28 AC-3: an over-cap base64 string should raise")
+            except AssertionError as _e28c2:
+                failures.append(f"WP-28 AC-3 [tautology: {_e28c2}]")
+            except _CE28c as _e28c:
+                if "50 MB" not in str(_e28c):
+                    failures.append(f"WP-28 AC-3: error text should mention the 50 MB cap: {_e28c}")
+        finally:
+            _av28c.base64.b64decode = _real_b64decode28c
+    except Exception as e:
+        failures.append(f"WP-28 AC-3 unit checks errored: {e}")
+
+    # ── WP-28 AC-4 (P2) — session-start.sh stamp hash includes the avatars flag; ImportError text ──
+    try:
+        import shutil as _sh28d
+        _bash28d = _sh28d.which("bash")
+        if _bash28d:
+            _plugin_root28d = tempfile.mkdtemp(prefix="tc-28-ac4-root-")
+            (Path(_plugin_root28d) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+            (Path(_plugin_root28d) / "uv.lock").write_text("fake-lock\n", encoding="utf-8")
+
+            # A fake `uv` on PATH that always "succeeds" instantly — isolates this test from a
+            # real network sync while still exercising the REAL session-start.sh script.
+            _fakebin28d = tempfile.mkdtemp(prefix="tc-28-ac4-bin-")
+            _fake_uv28d = Path(_fakebin28d) / "uv"
+            _fake_uv28d.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            _fake_uv28d.chmod(0o755)
+
+            _env28d = dict(os.environ)
+            _env28d["CLAUDE_PLUGIN_ROOT"] = _plugin_root28d
+            _env28d["PATH"] = _fakebin28d + os.pathsep + _env28d.get("PATH", "")
+            _env28d.pop("TEAMMATE_AVATARS_ENABLED", None)
+
+            _script28d = str(REPO / "hooks" / "session-start.sh")
+            _stamp_path28d = Path(_plugin_root28d) / ".venv" / ".uv-sync-stamp"
+
+            subprocess.run([_bash28d, _script28d], env=_env28d, input=b"",
+                          capture_output=True, timeout=30)
+            _stamp_off28d = _stamp_path28d.read_text(encoding="utf-8").strip() if _stamp_path28d.exists() else None
+            if not _stamp_off28d:
+                failures.append("WP-28 AC-4 setup: stamp file was not written with the fake uv "
+                                "(check PATH/exec-bit resolution for the fake binary on this OS)")
+            else:
+                _env28d["TEAMMATE_AVATARS_ENABLED"] = "1"
+                subprocess.run([_bash28d, _script28d], env=_env28d, input=b"",
+                              capture_output=True, timeout=30)
+                _stamp_on28d = _stamp_path28d.read_text(encoding="utf-8").strip() if _stamp_path28d.exists() else None
+                if _stamp_on28d == _stamp_off28d:
+                    failures.append(f"WP-28 AC-4 [tautology: toggling TEAMMATE_AVATARS_ENABLED "
+                                     f"must change the stamp hash (and re-trigger sync) — "
+                                     f"reverted script hashes only pyproject.toml+uv.lock]: "
+                                     f"{_stamp_off28d!r} == {_stamp_on28d!r}")
+
+        # ImportError text is actionable + truthful (no "pip install", names the env var).
+        import base64 as _b64_28d2
+        from teammate_comms import avatars as _av28d2
+        import sys as _sys28d2
+
+        _real_pil28d2 = _sys28d2.modules.get("PIL")
+        _real_pil_image28d2 = _sys28d2.modules.get("PIL.Image")
+        _sys28d2.modules["PIL"] = None
+        try:
+            try:
+                _av28d2.ingest_avatar(tempfile.mkdtemp(prefix="tc-28-ac4-imp-"), None, "x28d2",
+                                     image_base64=_b64_28d2.b64encode(b"tiny").decode())
+                failures.append("WP-28 AC-4: ingest_avatar should raise when Pillow is absent")
+            except Exception as _e28d2:
+                _msg28d2 = str(_e28d2)
+                if "TEAMMATE_AVATARS_ENABLED" not in _msg28d2:
+                    failures.append(f"WP-28 AC-4: ImportError text missing TEAMMATE_AVATARS_ENABLED: {_msg28d2}")
+                if "pip install" in _msg28d2:
+                    failures.append(f"WP-28 AC-4: ImportError text still mentions pip install: {_msg28d2}")
+        finally:
+            if _real_pil28d2 is None:
+                _sys28d2.modules.pop("PIL", None)
+            else:
+                _sys28d2.modules["PIL"] = _real_pil28d2
+            if _real_pil_image28d2 is not None:
+                _sys28d2.modules["PIL.Image"] = _real_pil_image28d2
+    except Exception as e:
+        failures.append(f"WP-28 AC-4 unit checks errored: {e}")
 
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',

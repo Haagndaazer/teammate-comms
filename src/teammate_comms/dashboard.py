@@ -235,6 +235,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             validate_agent_name(name)
         except CommsError:
             return self._json(422, {"error": "invalid agent name"})
+        # D2: an unregistered name gets the SAME 404 body as no-file — a stale sidecar left
+        # behind by a removed teammate (or one crafted directly on disk) must never be
+        # servable to a name-reuser just because the file happens to still exist.
+        if read_agent_record(self.server.root, self.server.team, name) is None:
+            return self._json(404, {"error": "no avatar for this agent"})
         png_path = get_avatars_dir(self.server.root, self.server.team) / f"{name}.png"
         try:
             data = png_path.read_bytes()

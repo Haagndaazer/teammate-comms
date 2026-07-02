@@ -513,7 +513,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "agent": {
                     "type": "string",
-                    "description": "Name of the agent whose avatar to set. Defaults to yourself.",
+                    "description": "Defaults to yourself; only your own avatar can be set.",
                 },
                 "path": {
                     "type": "string",
@@ -1113,6 +1113,15 @@ def _handle_set_avatar(args, ctx):
     target = args.get("agent")
     if target is not None:
         validate_agent_name(target)
+        # T1: avatars are self-owned (mirrors teammate_update's self-only semantics) — any
+        # OTHER target is a silent-griefing vector (one teammate overwriting or clearing
+        # another's avatar). Checked BEFORE ingest_avatar's lazy Pillow import (below), so
+        # this guard — and its test — works even without Pillow installed.
+        if target != agent:
+            raise CommsError(
+                f"Avatars are self-owned — only {agent!r} can change {agent!r}'s avatar "
+                f"(got agent={target!r})."
+            )
     else:
         target = agent
     clear = bool(args.get("clear", False))
