@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import socket
+import socketserver
 import sys
 import threading
 import time
@@ -112,6 +113,16 @@ class _DashboardServer(ThreadingHTTPServer):
         # B1: monotonic time of the last presenceAt write, throttling refreshes to >=15s apart
         # (the browser polls every ~1.5s — without this we'd write on every single poll).
         self.last_presence_refresh = 0.0
+
+    def server_bind(self):
+        # WP-35: the base class's reverse-DNS FQDN lookup can hang for minutes on
+        # misconfigured-DNS runners (macOS CI is the classic case; seen wedging the whole
+        # process, since server construction runs inside a tool dispatch on the single
+        # JSON-RPC dispatch thread). We only ever bind to loopback, which needs no FQDN,
+        # so skip that lookup entirely and go straight to the plain socket bind.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
 
     def handle_error(self, request, client_address):  # never dump to stdout
         _log(f"request error from {client_address}")

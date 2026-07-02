@@ -1788,6 +1788,19 @@ def main():
         _dres = _dash.start_dashboard(ddroot, None, "Operator", port=0, open_browser=False)
         _dport, _dtok = _dres["port"], _dash._STATE.token
 
+        # ── WP-35 — source tripwire: HTTPServer.server_bind() calls socket.getfqdn(host), a
+        #    reverse-DNS lookup that hangs for minutes on misconfigured-DNS runners (bit us on
+        #    macOS CI, wedging the whole process — server construction runs inside a tool
+        #    dispatch on the single JSON-RPC dispatch thread). A slow-DNS hang isn't
+        #    hermetically reproducible, so assert instead that the override exists and its
+        #    source never reaches getfqdn. The real bind above already exercised the override.
+        import http.server as _hs
+        import inspect as _insp
+        if _dash._DashboardServer.server_bind is _hs.HTTPServer.server_bind:
+            failures.append("WP-35: _DashboardServer does not override server_bind (getfqdn hang risk)")
+        elif "getfqdn" in _insp.getsource(_dash._DashboardServer.server_bind):
+            failures.append("WP-35: _DashboardServer.server_bind still reaches socket.getfqdn")
+
         def _dreq(method, path, token=None, host="127.0.0.1", body=None):
             conn = _hc.HTTPConnection("127.0.0.1", _dport, timeout=5)
             raw = json.dumps(body).encode("utf-8") if body is not None else None
