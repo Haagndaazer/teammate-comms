@@ -90,6 +90,11 @@ _READ_CAP = 1000
 # C-1) and only full-scan the whole stream if that window is saturated and missed (an older
 # target, or a log longer than the window).
 _RESOLVE_TAIL = 500
+# Cap on the reactions read for inbox render + group history (audit C2): those two call sites
+# are the hottest reaction readers and were parsing the ENTIRE global reactions.jsonl on every
+# call. A chip for an event older than this window stops rendering — the reaction itself is
+# never lost (reactions.jsonl is untouched; only the render window is capped).
+_REACTIONS_TAIL = 1000
 
 
 def _reaction_summary(reactions_by_emoji):
@@ -664,7 +669,13 @@ def _handle_inbox(args, ctx):
     agent, team, root = _require_registered(ctx)
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, agent)
-    all_unread = read_json_safe(inboxes_dir / f"{agent}_unread.json")
+    unread_file = inboxes_dir / f"{agent}_unread.json"
+    # Locked (C1): unread.json is the highest-contention multi-writer file. Under the lock no
+    # writer can be mid-write, so a parse failure here is REAL corruption — read_json_safe's
+    # destructive reset-to-[] is then the correct self-heal, not a false-positive on a torn
+    # partial write. Scope covers ONLY this read (not the reactions read below).
+    with file_lock(unread_file):
+        all_unread = read_json_safe(unread_file)
     seen_file = inboxes_dir / f"{agent}_seen.json"
 
     if args.get("count_only"):
@@ -723,7 +734,7 @@ def _handle_inbox(args, ctx):
 
     render_msgs = messages if show_all else new_msgs
 
-    rx_all = aggregate_reactions(read_reactions(root, team))
+    rx_all = aggregate_reactions(read_reactions(root, team, limit=_REACTIONS_TAIL))
     header = f"=== {len(messages)} unread message(s) for {agent}"
     if len(messages) < len(all_unread):
         header += f" (showing {len(messages)} of {len(all_unread)}; page with since/limit)"
@@ -806,6 +817,18 @@ def _handle_ack(args, ctx):
     return result
 
 
+def _norm_project_label(raw):
+    """Normalize a project label for CROSS-OS comparison (G1) via ``validate_project_key``.
+    Returns None on empty/unparseable input so the caller falls back to raw equality — an odd
+    label that fails normalization still matches itself, never a false split."""
+    if not raw:
+        return None
+    try:
+        return validate_project_key(raw)
+    except CommsError:
+        return None
+
+
 def _handle_list(args, ctx):
     _agent, team, root = _require_registered(ctx)
     show_all = bool(args.get("all"))
@@ -814,6 +837,7 @@ def _handle_list(args, ctx):
     # re-registering, my_project may lag behind; pass all=True to see everyone.
     my_record = read_agent_record(root, team, _agent) or {}
     my_project = my_record.get("project") or ""
+    my_project_norm = _norm_project_label(my_project)
 
     agents_dir = get_agents_dir(root, team)
     if not agents_dir.exists():
@@ -829,9 +853,18 @@ def _handle_list(args, ctx):
         # Agents with no project set (human operator, legacy) are never filtered out.
         if not show_all and path.stem != _agent and my_project:
             agent_project = record.get("project") or ""
-            if agent_project and agent_project != my_project:
-                filtered_count += 1
-                continue
+            if agent_project:
+                # Compare NORMALIZED keys (G1) so e.g. "Projects\Foo" (Windows auto-fill) and
+                # "projects/foo" (Unix) match. Fall back to raw equality when either side is
+                # unparseable — never a false split from an odd label.
+                agent_project_norm = _norm_project_label(agent_project)
+                if my_project_norm is not None and agent_project_norm is not None:
+                    mismatch = agent_project_norm != my_project_norm
+                else:
+                    mismatch = agent_project != my_project
+                if mismatch:
+                    filtered_count += 1
+                    continue
         kind = record.get("type", "unknown")
         me = " (you)" if path.stem == _agent else ""
         if kind == "human":
@@ -1307,7 +1340,7 @@ def _handle_group(args, ctx):
         return f"{sigil} has no messages{by} yet."
     total = len(messages)
     recent = messages[-limit:]
-    rx_all = aggregate_reactions(read_reactions(root, team))
+    rx_all = aggregate_reactions(read_reactions(root, team, limit=_REACTIONS_TAIL))
     out = [f"=== {sigil} transcript{by} ({len(recent)} of {total} message(s)) ==="]
     for msg in recent:
         urgent = " [URGENT]" if msg.get("priority") == "urgent" else ""

@@ -2962,6 +2962,88 @@ def main():
     except Exception as e:
         failures.append(f"WP-16 AC-4 unit check errored: {e}")
 
+    # ── WP-17 AC-1/AC-2 (G1) — teammate_list project comparison is cross-OS normalized ──
+    # Tautology guard: this MUST fail against current main (raw string compare splits the two
+    # spellings) — the assertions below check the SPECIFIC symptom (peer missing from default
+    # list), not just "an exception was raised".
+    try:
+        from teammate_comms.tools import _handle_list as _hl17
+        from teammate_comms import comms as _c17
+
+        class _Id17:
+            def __init__(self, agent, root, team=None):
+                self._agent, self._root, self._team = agent, root, team
+            def snapshot(self):
+                return (self._agent, self._team, self._root, None)
+
+        _t17_root = tempfile.mkdtemp(prefix="tc-17-g1-")
+        _ag17 = _c17.get_agents_dir(_t17_root, None)
+        _ag17.mkdir(parents=True, exist_ok=True)
+        _hb17 = "2026-01-01T00:00:00.000000"
+        _records17 = {
+            "caller17":   {"type": "full", "project": "Projects\\Foo", "lastHeartbeat": _hb17},
+            "peer17":     {"type": "full", "project": "projects/foo", "lastHeartbeat": _hb17},
+            "outsider17": {"type": "full", "project": "other/bar", "lastHeartbeat": _hb17},
+        }
+        for _n17, _rec17 in _records17.items():
+            _c17.write_json_atomic(_ag17 / f"{_n17}.json", _rec17)
+        _ctx17 = {"identity": _Id17("caller17", _t17_root)}
+        _default17 = _hl17({}, _ctx17)
+        if "peer17" not in _default17:
+            failures.append(f"WP-17 G1: default list dropped a same-project peer with a "
+                             f"different-OS spelling (Windows vs Unix): {_default17[:200]!r}")
+        if "outsider17" in _default17:
+            failures.append(f"WP-17 G1: default list wrongly showed a different-project outsider: {_default17[:200]!r}")
+        _all17 = _hl17({"all": True}, _ctx17)
+        if "peer17" not in _all17 or "outsider17" not in _all17:
+            failures.append(f"WP-17 G1: all=True did not show every teammate: {_all17[:200]!r}")
+    except Exception as e:
+        failures.append(f"WP-17 G1 unit checks errored: {e}")
+
+    # ── WP-17 AC-3 (C1) — _handle_inbox locks the unread read; corrupt file still self-heals ──
+    try:
+        import inspect
+        from teammate_comms.tools import _handle_inbox as _hi17c1
+        from teammate_comms import comms as _c17c1
+
+        _src17c1 = inspect.getsource(_hi17c1)
+        if "file_lock(unread_file)" not in _src17c1:
+            failures.append("WP-17 AC-3: _handle_inbox source missing the file_lock(unread_file) tripwire")
+
+        class _Id17c1:
+            def __init__(self, agent, root, team=None):
+                self._agent, self._root, self._team = agent, root, team
+                self._ls = None
+            def snapshot(self):
+                return (self._agent, self._team, self._root, None)
+            def get_last_seen(self):
+                return self._ls
+            def set_last_seen(self, v):
+                self._ls = v
+
+        _t17c1_root = tempfile.mkdtemp(prefix="tc-17-c1-")
+        _ix17c1 = _c17c1.get_inboxes_dir(_t17c1_root, None)
+        _c17c1.ensure_inbox(_ix17c1, "probe17c1")
+        (_ix17c1 / "probe17c1_unread.json").write_text("{torn", encoding="utf-8")
+        _ctx17c1 = {"identity": _Id17c1("probe17c1", _t17c1_root)}
+        _res17c1 = _hi17c1({}, _ctx17c1)
+        if "No unread messages" not in _res17c1:
+            failures.append(f"WP-17 AC-3: a really-corrupt unread file did not self-heal to an empty inbox: {_res17c1[:120]!r}")
+        _healed17c1 = json.loads((_ix17c1 / "probe17c1_unread.json").read_text(encoding="utf-8"))
+        if _healed17c1 != []:
+            failures.append(f"WP-17 AC-3: unread file not reset to [] after corruption: {_healed17c1!r}")
+    except Exception as e:
+        failures.append(f"WP-17 AC-3 unit checks errored: {e}")
+
+    # ── WP-17 AC-4 (C2) — no unbounded read_reactions(root, team) call remains in tools.py ──
+    try:
+        _tools_src17 = (SRC / "teammate_comms" / "tools.py").read_text(encoding="utf-8")
+        _unbounded17 = re.findall(r"read_reactions\(\s*root,\s*team\s*\)", _tools_src17)
+        if _unbounded17:
+            failures.append(f"WP-17 AC-4: unbounded read_reactions(root, team) call(s) remain in tools.py: {len(_unbounded17)}")
+    except Exception as e:
+        failures.append(f"WP-17 AC-4 unit check errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)
