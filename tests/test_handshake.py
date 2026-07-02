@@ -5294,6 +5294,45 @@ def main():
     except Exception as e:
         failures.append(f"WP-33 Q5 unit checks errored: {e}")
 
+    # ── WP-32 AC-2/AC-5 — doc-drift guards (grep-level, durable regression protection) ──
+    try:
+        from teammate_comms.tools import TOOL_DEFINITIONS as _TD32
+        _actual_tool_count32 = len(_TD32)
+
+        _readme32 = (REPO / "README.md").read_text(encoding="utf-8")
+        _skill32 = (REPO / "skills" / "teammate-comms" / "SKILL.md").read_text(encoding="utf-8")
+        _design32 = (REPO / "DESIGN.md").read_text(encoding="utf-8")
+
+        # AC-2: SKILL.md must not contradict DESIGN §7's honest reliability contract.
+        for _stale32 in ("never loses a message", "is read on the next"):
+            if _stale32 in _skill32:
+                failures.append(f"WP-32 AC-2 [tautology: SKILL.md must not contradict the "
+                                 f"honest reliability contract]: found {_stale32!r}")
+
+        # AC-5: no stale tool-count strings, no per-WP-branch references, anywhere current-state.
+        import re as _re32
+        for _fname32, _text32 in (("README.md", _readme32), ("SKILL.md", _skill32),
+                                  ("DESIGN.md", _design32)):
+            for _m32 in _re32.finditer(r"(\d+)\s+tools\b", _text32):
+                _n32 = int(_m32.group(1))
+                if _n32 != _actual_tool_count32:
+                    failures.append(f"WP-32 AC-5: {_fname32} claims {_n32} tools but "
+                                     f"TOOL_DEFINITIONS has {_actual_tool_count32}: "
+                                     f"{_text32[max(0, _m32.start() - 40):_m32.end() + 10]!r}")
+            for _needle32 in ("per-WP branch", "per-wp branch"):
+                if _needle32 in _text32:
+                    failures.append(f"WP-32 AC-5: {_fname32} references {_needle32!r} — this "
+                                     f"epic is single-branch, fix-forward")
+
+        # teammate_set_avatar must appear in both README's and SKILL's tool tables (it was
+        # missing from both since v0.10.0 until this WP).
+        for _fname32b, _text32b in (("README.md", _readme32), ("SKILL.md", _skill32)):
+            if "teammate_set_avatar" not in _text32b:
+                failures.append(f"WP-32 AC-1: {_fname32b}'s tool table is missing "
+                                 f"teammate_set_avatar")
+    except Exception as e:
+        failures.append(f"WP-32 doc-drift guard unit checks errored: {e}")
+
     # version sync
     pkg = re.search(r'__version__\s*=\s*"([^"]+)"',
                     (SRC / "teammate_comms" / "__init__.py").read_text(encoding="utf-8")).group(1)

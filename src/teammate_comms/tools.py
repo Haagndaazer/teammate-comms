@@ -531,8 +531,10 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_set_avatar",
         "description": (
-            "Set or clear a profile avatar image for a registered teammate. "
-            "Requires Pillow (install teammate-comms[images]). "
+            "Set or clear your own avatar image (self-owned — see 'agent' below). "
+            "Requires Pillow: set TEAMMATE_AVATARS_ENABLED=1 before launching Claude Code "
+            "(re-syncs the plugin venv with the images extra), or run "
+            "`uv sync --project <plugin-root> --extra images`. "
             "Provide 'path' (local filesystem path to an image) OR 'image_base64' (base64-encoded bytes). "
             "Supported formats: PNG, JPEG, GIF, WEBP, and any format Pillow can open. "
             "Images are automatically resized to 256×256, centred on a black canvas. "

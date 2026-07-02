@@ -14,15 +14,37 @@ The server is **pure stdlib** (zero third-party runtime dependencies). It speaks
 MCP over newline-delimited JSON-RPC on stdio directly: it serves the `teammate_*`
 tools and pushes `notifications/claude/channel` events.
 
+## Quickstart
+
+Two full instances (each launched per [Install & launch](#install--launch) below),
+messaging each other:
+
+```
+# Instance A (in its own terminal):
+teammate_register(agent: "alice")
+
+# Instance B (in its own terminal):
+teammate_register(agent: "bob")
+teammate_send(to: "alice", message: "hey, ready when you are")
+
+# Back on instance A — its channel wakes it automatically (no polling); it then:
+teammate_inbox()             # → shows bob's message
+teammate_ack("all")
+teammate_send(to: "bob", message: "got it, starting now")
+```
+
+That's the whole loop: register once each, then `teammate_send`/`teammate_inbox`/
+`teammate_ack` from there. A's wake is automatic — B's message *is* the nudge.
+
 ## Tools
 
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once at session start to establish identity, register your inbox, and arm the channel. Optionally set your profile (`project` is auto-filled). |
 | `teammate_send` | `to`, `message`, `priority?`, `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (fans out to all members); `@name` (a member) flags a mention; `post_type` builds a decision trail. |
-| `teammate_inbox` | `count_only?` | Read your unread messages (or count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. A live unread queue is capped at 1000 — beyond that, the oldest overflow moves to your read history (never dropped) and stops appearing here. |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read your unread messages (or count). `since`/`limit` page a large inbox (id cursor + most-recent-N). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies already shown are suppressed by default, durably across sessions — pass `show_all:true` to re-read them. A live unread queue is capped at 1000 — beyond that, the oldest overflow moves to your read history (never dropped) and stops appearing here. |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. `"all"` clears only what you've **seen** (messages that arrived since your last `teammate_inbox` read are kept). |
-| `teammate_list` | — | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. The human operator shows as `🧑 (operator)`. |
+| `teammate_list` | `all?` | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. Comms are global by default, but this **list view defaults to your project only** — pass `all:true` for every teammate across every project. The human operator shows as `🧑 (operator)`. |
 | `teammate_whoami` | `verbose?` | Registration state, identity, team, comms dir, and your own profile (diagnostics). `verbose:true` adds a read-only **doctor** report — comms root, per-agent heartbeat liveness, sub-stream file sizes, unread counts, and any leftover lock dirs (use it when comms seem stuck). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
@@ -30,6 +52,7 @@ tools and pushes `notifications/claude/channel` events.
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (shown in inbox/history/dashboard). Wakes only the **author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED` (default off); confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) and register the human operator as a first-class teammate. |
+| `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set (or clear) your avatar image — resized to 256×256 and pre-rendered as PNG/ANSI/ASCII. **Self-owned**: always targets you (omit `agent`, or pass your own name; any other target is rejected). Requires Pillow (see [Avatars](#avatars-optional)). |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive (citations still resolve). Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. |
 | `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile. `key` defaults to your normalized project label. By convention: only register your own project's profile unless asked. |
 | `list_projects` | — | List all registered project profiles: display name + live teammate roster + summary. Trailing aggregate shows undocumented project labels and near-miss agents. |
@@ -194,6 +217,12 @@ opt out of **that firehose only** — `reactions.jsonl` and `deletions.jsonl` ar
 written, since they're features rather than observability, and with the firehose off a
 reaction (DM or group post) can't resolve its target's author so its wake is skipped.)
 
+**Lifecycle:** the dashboard lives inside the instance that launched it and **dies when
+that instance exits** — there's no standalone server to restart. Each launch mints a
+fresh token, so a bookmarked URL from a previous instance will 403 (expected, not a
+bug); just re-run `teammate_dashboard()` to get a live URL (idempotent while the same
+instance keeps running — a second call in the same session returns the same URL).
+
 ## Reincarnate — spawn a teammate
 
 `teammate_reincarnate(agent:"Echo", project_dir:"…")` launches a **new Claude Code
@@ -206,6 +235,23 @@ channel, and is reachable on the shared comms. It is **opt-in**: disabled unless
 custom channel — **unless** you've installed the managed-settings allowlist
 ([Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)), which reincarnate
 auto-detects to launch the child with `--channels` (no prompt).
+
+### Enabling reincarnate safely (per-OS)
+
+`TEAMMATE_REINCARNATE_ENABLED` must exist **before** Claude Code launches — it's read
+once at process start, so setting it *inside* a running session has no effect. Set it
+for **one session only**, never durably:
+
+- **PowerShell:** `$env:TEAMMATE_REINCARNATE_ENABLED = "1"; claude ...`
+- **bash / git-bash:** `TEAMMATE_REINCARNATE_ENABLED=1 claude ...`
+
+**Do not** use `setx` (Windows) or export it from a shell profile (`.bashrc`/`.zshrc`) —
+that sets it **durably** (registry or user-profile scope), silently enabling
+process-spawning for *every future session on this machine*, forever, until manually
+unset — this happened once via a `setx` demo, which is exactly why this warning exists.
+If the gate ends up durably set anyway, `teammate_reincarnate` detects it (Windows-only,
+best-effort via the registry) and warns on every call naming the fix — but detection
+isn't prevention, so the safe habit is: set it per-launch, never durably.
 
 ## Two wake regimes
 
@@ -298,6 +344,22 @@ Notes:
   reincarnated windows arm silently once the allowlist is in place. (Override the whole
   spawn line with `$TEAMMATE_LAUNCH_ARGS` if you need to.)
 
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `teammate_*` tools not available at all | `uv` isn't on PATH | Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/), then restart Claude Code. The SessionStart hook warns for this case. |
+| `teammate_*` tools not available, Windows | git-bash isn't on PATH | The SessionStart hook runs under `bash`; install Git for Windows (most dev boxes already have it for other bash-hooked plugins) and restart. |
+| `teammate_*` tools not available, first session only | First install just built the plugin venv, before the server could use it | Expected — restart Claude Code once and check `/mcp` (the hook's `additionalContext` says so explicitly on that first build). Every session after is instant. |
+| A teammate never receives your messages | **Comms-root divergence** — you and they resolved *different* comms roots (different files on disk; they can never exchange a message, and it looks identical to a genuinely offline recipient) | Compare `comms_root` in **both sides'** `teammate_whoami`. Also check `teammate_list` for their liveness, and the debug log at `~/.claude/debug/<session-id>.txt`. |
+| Dashboard shows "message history disabled" or a suspiciously empty conversation | `TEAMMATE_TRANSCRIPT=0` — the observability firehose is off | Expected; live tombstones/reactions still work, just no browsable history. Unset the env var for full history in the console. |
+| Dashboard stops updating / shows "connection lost" or "session token expired" | The hosting instance restarted — its per-launch token died with it (a bookmarked URL 403s, by design) | Re-run `teammate_dashboard()` for a fresh URL while the (new) instance is running. |
+| A `teammate_reincarnate`'d window never registers | It's waiting on a one-time trust prompt for the custom channel (a headless/no-click context may never get it — confirming *launch*, not registration, looks identical to success) | Check the new window for a prompt; or pre-trust the channel (see [Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)) so children launch with `--channels` and no prompt. `teammate_whoami` reports `launch_args_override` if `$TEAMMATE_LAUNCH_ARGS` is overriding the spawn line entirely. |
+
+See also: [SKILL.md](skills/teammate-comms/SKILL.md)'s Reliability contract, for the honest
+wake-delivery guarantee (a dropped push is not silently lost — but it's not silently
+recovered either, past a capped number of retries).
+
 ## Identity & storage
 
 - **Identity** is set at runtime via `teammate_register(agent: …)` — once per
@@ -318,6 +380,23 @@ Notes:
   > project root won't be seen at the new global root — re-register, or set
   > `$TEAMMATE_COMMS_DIR` to keep the old per-project location.
 
+### Cross-host transports
+
+teammate-comms needs its comms root on a **real shared filesystem that honors atomic
+rename** (`os.replace`) — every write (registry records, inboxes, locks) depends on
+that atomicity for correctness.
+
+- **Supported:** one machine (the common case), or multiple NTP-synced hosts sharing a
+  root over a real network filesystem (SMB/NFS), with the caveat that cross-host message
+  *ordering* is only as good as clock sync between hosts (each writer mints ids from its
+  own local clock — see `DESIGN.md`'s message-id note).
+- **Unsupported — a documented data-loss mode:** cloud-sync-backed roots (OneDrive,
+  Dropbox, and similar). Those clients resolve concurrent writes with **conflicted-copy
+  siblings** (e.g. `agents.json` next to `agents (conflicted copy — DESKTOP-X
+  2026-01-01).json`), which teammate-comms never reads — a write from one machine can
+  silently vanish from the other's point of view. Don't point `$TEAMMATE_COMMS_DIR` at a
+  cloud-sync folder for a multi-machine setup.
+
 ## Marketplace
 
 This plugin is published through the consolidated **`coltondyck`** marketplace at
@@ -334,6 +413,30 @@ commit SHA):
 > `colton-comms`) for direct `--plugin-dir` development, but the `coltondyck`
 > marketplace above is the canonical install path. Both are re-pinned to the same
 > release commit on each version bump.
+
+## Uninstall & upgrade
+
+`/plugin uninstall` removes the plugin code but **does not touch your comms data** —
+everything teammate-comms wrote lives under `~/.claude/TeammateComms/` (or wherever
+`$TEAMMATE_COMMS_DIR` pointed) and stays behind:
+
+- `[<team>/]inboxes/` — every agent's unread/read message queues.
+- `[<team>/]agents/` — registry records (identity, profile, heartbeat).
+- `[<team>/]groups/` — group metadata + shared transcripts.
+- `transcript.jsonl` / `reactions.jsonl` / `deletions.jsonl` (+ their compacted state
+  files) — the observability firehose and the reactions/deletions event streams.
+- `[<team>/]avatars/` — pre-rendered avatar sidecars.
+- `[<team>/]projects/` — project profiles.
+
+To fully clean up, delete that `TeammateComms/` directory yourself after uninstalling.
+
+**Upgrading:** `/plugin update` (or reinstalling) picks up the new plugin version —
+**restart Claude Code** afterward so the SessionStart hook's venv build runs against the
+new code and the MCP server respawns on it (a mid-session plugin update does NOT
+hot-swap the already-running server). The marketplace
+(`Haagndaazer/colton-claude-plugins`) is re-pinned to the release commit on every
+version bump, so a fresh `/plugin marketplace add` + `/plugin install` always lands on
+the latest tagged release.
 
 ## Development
 

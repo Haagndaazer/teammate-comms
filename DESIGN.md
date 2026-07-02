@@ -5,9 +5,16 @@
 > **Pure-stdlib** Python (zero runtime dependencies), shipped as a marketplace plugin.
 
 This document began as a pre-build blueprint; it has been **reconciled to the
-as-built implementation (v0.7.1)**. Where a design decision reversed during the
+as-built implementation (v0.12.0)**. Where a design decision reversed during the
 build, an *“Originally planned … shipped … because …”* note preserves the lineage —
 the rationale is the valuable part, even when the choice flipped.
+
+**Release doc-checklist (WP-32).** This document, README.md, and SKILL.md have drifted
+from the code before (the recurring fable-audit finding this WP fixes) — the enforcement
+that was always missing: every tool/behavior change touches all three docs in the SAME
+PR/commit as the code change, and this header's version framing bumps with every release
+(not just when someone remembers). If you're adding a tool or changing a documented
+behavior and you haven't touched README.md + SKILL.md + this file, the change isn't done.
 
 ---
 
@@ -48,8 +55,10 @@ teammate-comms/
 │   ├── comms.py                # storage / registry / liveness / transcript (§8)
 │   ├── channel.py              # background inbox watcher + push (§7)
 │   ├── tools.py                # MCP tool definitions + handlers (§9)
+│   ├── instructions.py         # standing-instructions text + SessionStart reinject entry point (§6)
 │   ├── spawn.py                # teammate_reincarnate launcher (argv/env builders + spawn)
 │   ├── dashboard.py            # stdlib web console server (§9, teammate_dashboard)
+│   ├── avatars.py              # teammate_set_avatar ingest/render pipeline (§9, lazy Pillow import)
 │   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
 ├── hooks/
 │   ├── hooks.json
@@ -110,7 +119,7 @@ the plugin is self-contained and does not write into a project's `.mcp.json`.
 ```json
 {
   "name": "teammate-comms",
-  "version": "0.7.1",
+  "version": "0.12.0",
   "description": "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances.",
   "author": { "name": "ColtonDyck" },
   "license": "MIT",
@@ -367,7 +376,8 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **17 tools (13 original + 4 project-profile tools added v0.9.0):**
+long-lived server. **18 tools (13 original + 4 project-profile tools v0.9.0 + 1 avatar
+tool v0.10.0):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -383,6 +393,7 @@ long-lived server. **17 tools (13 original + 4 project-profile tools added v0.9.
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (recorded in `reactions.jsonl`, shown in inbox/history/dashboard). **Wakes only the author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
+| `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set/clear a profile avatar (see §9b below). **Self-only** (WP-28 T1): `agent`, if given, must equal the caller — any other target raises. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one (XOR, enforced in the handler) | Delete a message (**tombstone**) or remove an **offline** teammate (see below). |
 | `project_register` | `key?`, `summary?`, `description?`, `tech_stack?`, `repo_url?`, `name?`, `status?`, `path?` | Create or update a project profile (merge-upsert under blocking lock). `key` defaults to caller's normalized `project` label. `path` auto-fills from `$CLAUDE_PROJECT_DIR` on first create. |
 | `list_projects` | — | Concise directory: display name + live roster + summary per project. Trailing aggregate: undocumented project labels + near-miss agents. |
@@ -518,6 +529,10 @@ watcher with **no `channel.py` change**.
 - **Lifecycle:** idempotent **per process** (a second call returns the same URL; two
   instances = two consoles); the server dies when the instance exits — `server.py`'s stdio
   `finally` calls `dashboard.shutdown_dashboard()` (marks the human `away`, frees the port).
+  A fresh `secrets.token_urlsafe(32)` is minted **per launch** (never persisted), so a
+  bookmarked URL from a prior instance 403s after that instance exits and a new one starts —
+  expected, not a bug; the relaunch affordance is simply to re-run `teammate_dashboard()`
+  (same URL, reused, while the current instance keeps running).
 
 **Group polish + reactions + reincarnate (added 0.6.0).**
 - **Typed posts:** an optional `post_type` (`decision`/`blocker`/`fyi`/`chatter`) on a
@@ -664,6 +679,33 @@ own profile is echoed in the `teammate_register` return, and the channel wake ev
 leads with `You are <name>: <personality>`, so it stays reminded of who it is across
 waking.
 
+**Avatars (added 0.10.0, hardened WP-28).** `teammate_set_avatar` (`avatars.py`) ingests an
+image (`path` or `image_base64`), fits it to a 256×256 black canvas, and pre-renders three
+sidecars under `TeammateComms/[<team>/]avatars/<name>.{png,ansi,txt}` (PNG; xterm-256
+half-block ANSI 8×8; monochrome ASCII 8×8) — so the dashboard and the `teammate-comms
+avatar` statusline subcommand pay **zero render cost** and never import Pillow at read
+time. Pillow is imported lazily, ONLY inside `ingest_avatar` — the module top level and
+every read path stay pure stdlib.
+- **Self-only (WP-28 T1).** `agent`, if given, must equal the caller — any other target
+  raises, checked BEFORE the lazy Pillow import (so the guard works even without Pillow
+  installed). Mirrors `teammate_update`'s self-only semantics.
+- **Lifecycle GC (WP-28 D2).** `remove_teammate` also unlinks the three sidecars (best-effort,
+  reported like every other path there) — a name-reuser must not inherit a stranger's
+  image via a stale `/avatar` URL. The dashboard's `/avatar` route checks
+  `read_agent_record` after name validation: an unregistered name 404s even if a stale
+  sidecar file happens to still exist on disk.
+- **Pre-decode byte cap (WP-28 D3).** `image_base64`'s ENCODED length is checked (the
+  base64 expansion formula, `raw_cap * 4/3 + 4`) before `base64.b64decode` is ever called
+  — an over-cap payload is rejected before burning CPU/memory on a decode that would just
+  fail the post-decode cap anyway.
+- **Installable extra (WP-28 P2).** Pillow sits behind the `images` extra, not the default
+  zero-dep install. `TEAMMATE_AVATARS_ENABLED=1` (set before Claude Code launches) makes
+  `session-start.sh` run `uv sync --extra images`; the flag's value is part of the venv
+  stamp-hash INPUT, so toggling it alone invalidates the stamp and re-triggers the sync on
+  the next launch — not just when `pyproject.toml`/`uv.lock` happen to change. Without
+  Pillow, `teammate_set_avatar` raises a `CommsError` naming the env var and the manual
+  `uv sync --project <plugin-root> --extra images` fallback.
+
 ---
 
 ## 10. Identity
@@ -703,6 +745,15 @@ so no future feature mistakes a convenience for a boundary:
   directory tree (global by default — decision `ef4af8135c03`) with default OS-user file
   permissions; there is no per-agent secret. The trust domain is *all processes of this OS
   user*, full stop.
+- **Which tools are convention-gated, not access-controlled (WP-31/WP-32, T3/D1-doc):**
+  `project_register`/`project_delete` are **open-by-convention** — any caller CAN edit any
+  project's profile; the "only your own project" rule is a tool-description convention, not
+  an enforced check. `teammate_delete(teammate:...)` is **open-for-offline** — any caller can
+  remove any OFFLINE teammate (the only enforced gates are: not yourself, not the human
+  operator, not a currently-live teammate). `teammate_update` and `teammate_set_avatar` are
+  the exceptions that ARE enforced: both are **self-only** by code, not just convention
+  (`teammate_update`'s field-merge only ever writes the caller's own record;
+  `teammate_set_avatar`'s WP-28 T1 guard raises if `agent` != the caller).
 
 This is **correct and intentional** for the threat model — your own agents, on your own
 machine, cooperating. The hard rule: a future cross-host / multi-user feature must **NOT**
@@ -803,6 +854,16 @@ subheads with the profile `summary`/`status`. No second grouping structure.
 13. Project profiles + cross-OS roster fix + 4 new tools (0.9.0 WP-13).
 14. Teammate profile avatar images + statusline subcommand + zero-dep preserved (0.10.0 WP-14).
 15. Durable cross-session inbox body-suppression via `{agent}_seen.json` (0.11.0 WP-15).
+16. **Fable-audit hardening pass** (0.12.0, WP-16–WP-33): a full internal audit across
+    protocol core, identity/epoch races, group/reaction/deletion compaction correctness,
+    avatars lifecycle + installability, spawn/marketplace/managed-settings detection,
+    dashboard failure surfacing, comms-root divergence diagnostics, stable git-remote-derived
+    project identity, tool-surface polish (shared message renderer, param-aware errors),
+    harness/hook contract guards (first-install signal, reinject self-filter, version
+    stamps), and test-gap closure (avatars error paths, true multi-process lock contention).
+    Single branch (`fix/fable-audit-260701`), fix-forward, fix+proof in the same commit
+    throughout. This doc mega-pass (README/SKILL/DESIGN + version bump + CHANGELOG + local
+    tags) is WP-32, the last WP in the epic.
 
 **Remaining:**
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.

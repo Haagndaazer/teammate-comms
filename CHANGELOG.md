@@ -1,5 +1,132 @@
 # Changelog
 
+## v0.12.0
+
+**Fable-audit hardening pass.** A full internal audit across protocol correctness,
+identity/registration races, compaction correctness (reactions/deletions/transcript),
+avatars lifecycle, spawn/marketplace detection, dashboard diagnostics, tool-surface
+consistency, harness/hook contracts, and test-gap closure — 18 work packages
+(WP-16–WP-33) fixed on a single branch, fix-forward, fix+proof in the same commit
+throughout. **No breaking changes to the tool surface** (still 18 tools); two internal
+correctness fixes cause one-time, one-way behavior shifts for existing installs — see
+the "Changed" notes below.
+
+### Fixed / hardened, by area
+- **Protocol core (WP-16).** Malformed stdin no longer crashes the server (an envelope
+  guard rejects non-object JSON-RPC frames before dispatch); `initialize` always answers
+  with the server's OWN supported `protocolVersion` instead of echoing back whatever the
+  client requested; notification-vs-request dispatch discipline tightened.
+- **Storage & scale (WP-17, WP-25).** `teammate_list`'s project-scoping comparison is
+  normalized (was comparing raw strings); the inbox unread read is now lock-protected;
+  bounded reaction reads; the 1000-message unread cap now tags overflow with
+  `acked_unseen` instead of silently dropping it; ack-without-a-prior-read receipts
+  fixed; group storage moved to an NDJSON dual-store (matching the transcript's
+  append-only design).
+- **Test-suite integrity (WP-18).** CI now runs the harness on a 3-OS matrix
+  (ubuntu/macos/windows); the harness's own crash-tolerance was hardened (a deliberately
+  induced crash no longer silently passes).
+- **Identity ownership (WP-19).** A new `instance_id` + monotonic `epoch` model closes a
+  registration TOCTOU race between two processes claiming the same agent name; a
+  same-name flap (rapid re-register) now kills the stale channel instead of both
+  competing; a guard prevents an agent's auto-register from clobbering a human operator
+  record of the same name.
+- **Deletion correctness (WP-20).** `remove_agent` is now locked and VERIFIED — it
+  reports which files failed to delete instead of silently claiming success on a
+  Windows sharing-violation no-op; `teammate_reincarnate` carves out the human operator
+  as never-reincarnate-able.
+- **Presence & naming (WP-21).** Human dashboard presence now detects staleness (killing
+  the terminal no longer leaves you "online" forever); **agent/group names are now
+  case-folded at register/create (G2 — see Changed, below)**; Windows reserved device
+  names (`con`, `prn`, `nul`, `com1-9`, `lpt1-9`) are now rejected on every OS.
+- **Watcher robustness (WP-22).** Atomic identity+generation snapshot (closes a window
+  where a mid-tick re-register used half-old/half-new state); heartbeat-failure retry;
+  durable-seen seeding survives a restart; a recovery lane for fan-out messages that
+  landed while the recipient's inbox was locked.
+- **Spawn platform hardening (WP-23).** Fixed a Windows `shlex` quoting bug that
+  corrupted paths in `$TEAMMATE_LAUNCH_ARGS`; spawned child processes are now reaped
+  (no zombie accumulation); marketplace resolution and launch-args overrides are now
+  named in the reincarnate response.
+- **Reincarnate gate (WP-24).** Detects when `TEAMMATE_REINCARNATE_ENABLED` is set
+  DURABLY (registry/user env, Windows-only, best-effort) and warns on every call, naming
+  the fix; an auto-register failure is now surfaced through `teammate_whoami` instead of
+  looking like plain non-registration.
+- **Message ids & react (WP-26).** Message ids gained a collision-proof disambiguator
+  (pid + a per-process counter) — a bare microsecond timestamp could collide across
+  writers, silently merging two distinct messages under one id; `teammate_react` now
+  uses the same 3-tier resolution (transcript → group files → inboxes) as
+  `teammate_delete`, instead of only scanning the transcript.
+- **Compaction & unbounded growth (WP-27).** `reactions.jsonl` and `transcript.jsonl` no
+  longer grow forever — reactions gain a stateful compacted baseline (correctly folds a
+  removed reaction, unlike a naive append-only union) and the transcript gets size-gated
+  rotation. A gate-review fix (folded into the WP-31 commit) reordered the rotation to
+  gate-THEN-append, so the record that triggers rotation always lands in the file that
+  survives — it no longer risks silently dropping into the unread `.1` grace copy.
+- **Avatars (WP-28).** `teammate_set_avatar` is now self-only (any other target is
+  rejected); `teammate_delete(teammate:...)` now also removes the offline teammate's
+  avatar sidecars (a name-reuser could otherwise inherit a stranger's image); an
+  over-cap base64 payload is now rejected before decoding, not after; Pillow is now
+  installable via `TEAMMATE_AVATARS_ENABLED=1` (auto re-syncs the plugin venv with the
+  `images` extra) instead of a stale, non-working `pip install` instruction.
+- **Dashboard diagnostics (WP-29).** A connection-status banner now distinguishes a
+  dead session token (restart required) from a transient network hiccup (auto-retries);
+  an empty transcript with `TEAMMATE_TRANSCRIPT=0` now says so instead of looking like a
+  bug; `teammate_whoami(verbose:true)`'s doctor report gains `root_mismatches` (peers
+  who resolved a different comms root — previously indistinguishable from "just
+  offline"); **the default project label now prefers a git remote over the path (G3 —
+  see Changed, below)**.
+- **Harness/hook contracts (WP-30).** A first-time install now tells you to restart once
+  (previously prose-only, invisible in-session); `reinject-instructions.sh` gained the
+  same defensive stdin self-filter its sibling hook already had; the server and the
+  reinjected instructions are now both version-stamped, so a stale-vs-current mismatch
+  after a mid-session plugin update is diagnosable; the managed-settings schema's
+  verification vintage is now logged when the allowlisted launch path is chosen.
+- **Tool-surface polish (WP-31).** `teammate_inbox` and `teammate_group(history)` now
+  share one message-block renderer (was two near-identical, drifting grammars);
+  required-argument errors now say `'<param>' is required` instead of a confusing
+  generic "Invalid ... None"; the 64 KB message cap and the `@mention` behavior are now
+  disclosed in the tool schemas (previously SKILL.md only); all 10 `teammate_group`
+  actions are now named in its description (was 7); groups are now documented as open
+  (no privacy) instead of implying Slack-style membership secrecy.
+- **Test coverage (WP-33, test-only).** `avatars.py`'s error paths (oversize source,
+  invalid base64, corrupt image bytes, a decompression bomb) now have dedicated
+  coverage with specific-reason assertions; a new multi-PROCESS lock-contention test
+  proves cross-process exclusion (all prior concurrency coverage was thread-based in
+  one interpreter).
+
+### Changed — one-time, one-way shifts for existing installs
+- **Case-variant names are now rejected at register/create (G2, WP-21).** Existing
+  records that already differ only by case (e.g. two teammates named "Bob" and "bob"
+  from different OSes) are NOT retroactively merged, but a *new* register/create using a
+  case-variant of an existing name is now rejected (the error names the existing
+  spelling) instead of silently creating a divergent duplicate. Re-registering the exact
+  existing spelling is unaffected.
+- **Default project label now prefers the git remote (G3, WP-29).** An agent
+  re-registering inside a git repo with an `origin` remote gets a *new* default project
+  label (`owner/repo`, from the remote URL) instead of the old path-derived
+  `parent/name` label — a one-time roster shift the first time each agent re-registers
+  after upgrading. `list_projects`' near-miss section surfaces any resulting stray;
+  re-key an existing project profile with `project_register(key:...)` if needed.
+  Explicit `project` args at register time always win and are unaffected.
+
+### Housekeeping
+- **DESIGN.md:** version framing bumped to v0.12.0; a new "Release doc-checklist" note
+  (the enforcement that was always missing — every tool/behavior change touches
+  README+SKILL+DESIGN in the same commit); the trust model section gains the
+  convention-gated-tools enumeration (which tools are self-only vs. open-by-convention);
+  a proper Avatars design section; a dashboard bookmark-403 lifecycle clarification;
+  `avatars.py`/`instructions.py` added to the repo-layout tree.
+- **README.md:** new Quickstart (a copy-pasteable two-instance walkthrough),
+  Troubleshooting table (symptom → cause → fix), per-OS reincarnate-enablement
+  guidance, an Uninstall & upgrade section, and a Cross-host transports section
+  (supported: NTP-synced hosts on a real shared filesystem; unsupported: OneDrive/
+  Dropbox-style cloud sync — a documented data-loss mode). `teammate_set_avatar` added
+  to the tool table (missing since v0.10.0).
+- **SKILL.md:** the reliability contract is rewritten to the honest wake-delivery
+  guarantee — channel drops are real (known upstream Claude Code issues), re-nudge
+  recovery is capped not guaranteed, matching `DESIGN.md` §7 instead of the previous
+  "never loses a message" overclaim. Cross-linked with README in both directions.
+  `teammate_set_avatar` added to the tool table (also missing since v0.10.0).
+
 ## v0.11.0
 
 **Durable cross-session inbox body-suppression.** `teammate_inbox` now persists the
