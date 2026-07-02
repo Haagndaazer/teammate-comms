@@ -17,10 +17,10 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** — fans out to every member; `@name` (a member) flags a mention; `post_type` builds a decision trail. |
-| `teammate_inbox` | `count_only?`, `show_all?` | Read *your* unread messages (or just the count). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies of messages already delivered are suppressed by default (durable across sessions) — pass `show_all=True` to re-read them (useful after context compaction). |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read *your* unread messages (or just the count). `since`/`limit` page a large inbox (id cursor + most-recent-N). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies of messages already delivered are suppressed by default (durable across sessions) — pass `show_all=True` to re-read them (useful after context compaction). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. `"all"` clears only what you've **seen** as of your last `teammate_inbox` read — arrivals since then are kept. |
 | `teammate_list` | `all?` | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`, `role` when set**), plus a **Groups** section. Defaults to your project only — pass `all=True` for a global view (cross-project authority owners are hidden in the default view). The human operator shows as `🧑 (operator)`. Use `teammate_profile` for full details including personality. |
-| `teammate_whoami` | — | Your registration state, identity, team, comms dir, and your own profile (diagnostics). |
+| `teammate_whoami` | `verbose?` | Your registration state, identity, team, comms dir, and your own profile (diagnostics). `verbose:true` adds a read-only **doctor** report — comms root, per-agent heartbeat liveness, sub-stream file sizes, unread counts, leftover lock dirs. |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile (keep `status` fresh as you switch tasks). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. Post with `teammate_send(to="#<group>")`; `history` reads the shared transcript (filterable into a decision trail). `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's acked up to where. |
@@ -126,8 +126,11 @@ a teammate name.
 - `teammate_send` **warns** when the recipient's channel is offline (message
   queued, seen on their next start) — never a silent no-op.
 - Exactly **one live channel per agent name per machine**. Launching two instances
-  with the same `TEAMMATE_AGENT` makes both bind the same inbox; the server logs a
-  loud stderr collision warning.
+  with the same `TEAMMATE_AGENT` makes both bind the same inbox — the newer
+  registration wins and its **`teammate_register` response itself carries the
+  collision warning**, in-band (not a stderr log); the older, now-superseded instance
+  separately logs its own stderr "superseded by a newer claimant" line once its
+  heartbeat starts being skipped.
 - Diagnostics (resolved identity, comms root, warnings) go to stderr →
   `~/.claude/debug/<session-id>.txt`. Check `/mcp` for connection status. If a
   teammate never seems to receive your messages, compare `comms_root` in **both

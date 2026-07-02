@@ -289,10 +289,12 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   `ack("all")` startup-drain (drains the whole inbox when never-read-this-session) and
   the watcher's unseen filter. **Do not persist `_last_seen` itself** — only the
   separate `seen_file` is persisted, so the sentinel semantics are preserved intact.
-- Emits `notifications/claude/channel` with `meta = {count, agent}` and content that
-  references the MCP tools. If the agent has a `personality` set, the content **leads
-  with `You are <name>: <personality>`** so a woken idle instance is reminded who it
-  is (personality is read from the registry only at nudge time, not every poll).
+- Emits `notifications/claude/channel` with `meta = {count, agent}` and **signal-only**
+  content naming WHERE the messages came from (senders / `#groups`) plus a 🔔 @mention
+  note and the group reply target when applicable (`emit_channel_event`,
+  `channel.py`). The v0.6 `You are <name>: <personality>` owner-reminder was **removed
+  in WP-11a** — the persona is durable in the agent's own session context from
+  registration, so repeating it on every wake was redundant token cost.
 - **Group reply target (v0.4.3, broadened v0.4.4):** when there's any **unseen**
   (unread, not-yet-read) group message, the content **names the group reply target** —
   *"reply to the group with `teammate_send to:'#<group>'`"* (distinct unseen groups,
@@ -383,9 +385,9 @@ tool v0.10.0):**
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, profile? (`project`/`role`/`personality`/`status`/`authority`) | Establish identity, register the inbox, arm the channel. Optionally set a profile (`project` is auto-filled). Re-registering only re-establishes identity + channel and **preserves** the existing profile. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. **A `#`-prefixed `to` posts to a group** (fan-out); `@name` tokens to group members become `mentions`. |
-| `teammate_inbox` | `count_only?` | Read this agent's unread messages (or just the count). Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read this agent's unread messages (or just the count). `since`/`limit` page a large inbox; bodies already shown are suppressed by default (durable across sessions) — `show_all:true` re-reads them. Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
 | `teammate_ack` | `id` (or `"all"`) | Move a message from unread → read. |
-| `teammate_list` | — | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Humans show `🧑 (operator)` + `presence`. |
+| `teammate_list` | `all?` | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Defaults to your project only; `all:true` shows every project. Humans show `🧑 (operator)` + `presence`. |
 | `teammate_whoami` | `verbose?` | Resolved identity, team, comms dir, and own profile (diagnostics). `verbose:true` adds a read-only **doctor** section — comms root, per-agent heartbeat freshness/liveness, sub-stream file sizes, unread counts, leftover lock dirs (G-5). |
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
@@ -407,8 +409,10 @@ that is otherwise append-only:
 - **Message = tombstone, not erase.** `tombstone_fields()` rewrites a record in place —
   body → `"— message deleted —"`, `deleted:true`, `deleted_by` — while keeping `id`,
   `from`, `to`/`group`, `reply_to`, `post_type`. A group post shares ONE id across the
-  group `messages.json`, every member's inbox copy, and the transcript, so the tombstone is
-  applied to each durable store (the inbox helper locks the **unread** file and rewrites
+  group's message store (`tombstone_in_group_messages` rewrites BOTH the legacy
+  `messages.json` and `messages.jsonl` — WP-25's dual-store), every member's inbox copy,
+  and the transcript, so the tombstone is applied to each durable store (the inbox helper
+  locks the **unread** file and rewrites
   both `_unread`/`_read` under it — same lock discipline as `teammate_ack`). Keeping the id
   + `reply_to` means citations and thread/group continuity survive. Permission is
   **author-or-operator** (`is_operator=True` only on the dashboard path).
@@ -490,11 +494,19 @@ that is otherwise append-only:
   the cross-store atomicity deliberately not built. The MCP inbox read is the only surface that
   briefly shows the orphan, until it's acked.
 
-**Group chat (added 0.4.0).** Named group chats addressed with a `#` sigil
-(`teammate_send(to="#design")`) — a separate namespace from agents, so names can't
-collide. A group is a per-group subdir under `groups/`: `meta.json` (`name`, `members`,
-`creator`, `createdAt`) + an append-only `messages.json` transcript (the canonical
-ordered history; read via `teammate_group action=history`). Posting **fans the message
+**Group chat (added 0.4.0, storage changed WP-25/C3).** Named group chats addressed with
+a `#` sigil (`teammate_send(to="#design")`) — a separate namespace from agents, so names
+can't collide. A group is a per-group subdir under `groups/`: `meta.json` (`name`,
+`members`, `creator`, `createdAt`) + the message transcript (the canonical ordered
+history; read via `teammate_group action=history`). **Dual-store (WP-25):** new posts
+append to `messages.jsonl` (NDJSON, one line per post, O(1) — replacing the old
+`messages.json` full-array file, which rewrote its ENTIRE contents on every single post).
+`messages.json` is kept as a **legacy, read-only** store: `read_group_messages` reads it
+FIRST (strictly older, so ordering is preserved), then the jsonl lines appended after it —
+both under the same lock (keyed on the `messages.json` path, unchanged, so writers of
+either format still serialize against each other). No migration: a group created before
+WP-25 keeps its legacy file forever, read indefinitely, never rewritten to jsonl. Posting
+**fans the message
 out** into each member's `_unread.json` (group-tagged), so the **existing channel wake
 delivers it with no `channel.py` change** — the transcript is written first
 (authoritative), then fan-out is best-effort (a locked member inbox is non-fatal; they
@@ -573,6 +585,8 @@ watcher with **no `channel.py` change**.
 - **Channel wake (changed):** the wake now names WHERE messages came from (DM senders +
   `#groups`); the personality reminder fires only every ~10 received messages (the
   registration return still echoes it), not every wake — cuts per-message token waste.
+  (Superseded in WP-11a: the reminder was removed from the wake entirely, not just
+  throttled — see §7's signal-only wake.)
 - **`teammate_reincarnate` + `spawn.py`:** spawns a new `claude` in a terminal with
   `TEAMMATE_AGENT` + `CLAUDE_PROJECT_DIR` in the child env (auto-register handoff).
   Default-off gate `TEAMMATE_REINCARNATE_ENABLED`; list-form exec only (the `prompt` is a
@@ -587,7 +601,13 @@ watcher with **no `channel.py` change**.
   `TEAMMATE_SPAWNED_BY` to the parent **unconditionally** (never inherited — a grand-child gets
   its immediate parent, the same never-inherit discipline as the stripped reincarnate gate, F-1),
   read at register and stored as a registry-record field (not a profile field) that survives the
-  heartbeat merge.
+  heartbeat merge. **Marketplace resolution (W1):** `resolve_marketplace()` picks the plugin
+  spec used for the child's launch line, in order: `$TEAMMATE_PLUGIN_MARKETPLACE` (explicit
+  override, always wins) → a best-effort parse of `$CLAUDE_PLUGIN_ROOT`'s
+  `marketplaces/<name>/...` path segment (defensive — any doubt falls through) → the fallback
+  `coltondyck` (this plugin's original marketplace). A hardcoded marketplace would make every
+  spawn on a fork/rehost load a nonexistent plugin ref, invisibly (the DEVNULL child hides the
+  failure) — this makes it configurable and self-detecting instead.
 - **Dashboard upgrades:** dropped the redundant "Direct messages" section (Teammates is
   the DM entry + shows presence); added an "Observed (read-only)" section (agent↔agent
   DMs) directly under Teammates; a right-hand live activity firehose (FIFO, newly-seen
@@ -675,9 +695,9 @@ registration (F-4 — so two repos sharing a basename like `api` are distinguish
 `teammate_list`; falls back to the bare name at a drive/UNC root, and is pre-truncated to the
 field cap so a deep path can never raise out of validation and break registration), overridable,
 so peers see who is working where now that comms are global. An agent's
-own profile is echoed in the `teammate_register` return, and the channel wake event
-leads with `You are <name>: <personality>`, so it stays reminded of who it is across
-waking.
+own profile is echoed in the `teammate_register` return; the persona then stays durable
+in the agent's own session context — the channel wake itself is signal-only (WP-11a; see
+§7) and carries no personality reminder.
 
 **Avatars (added 0.10.0, hardened WP-28).** `teammate_set_avatar` (`avatars.py`) ingests an
 image (`path` or `image_base64`), fits it to a 256×256 black canvas, and pre-renders three

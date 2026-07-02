@@ -29,7 +29,7 @@ teammate_send(to: "alice", message: "hey, ready when you are")
 
 # Back on instance A — its channel wakes it automatically (no polling); it then:
 teammate_inbox()             # → shows bob's message
-teammate_ack("all")
+teammate_ack(id: "all")
 teammate_send(to: "bob", message: "got it, starting now")
 ```
 
@@ -85,9 +85,10 @@ teammate (and shows `role`/`personality` when set); `teammate_profile` returns t
 full set. All fields are optional and single-line.
 
 Your own profile is surfaced back to you so you stay in character: the
-`teammate_register` return echoes it, and the channel wake event leads with
-`You are <name>: <personality>` so a woken idle instance is reminded who it is. You
-can always re-read it with `teammate_whoami` or `teammate_profile`.
+`teammate_register` return echoes it. The channel wake event itself is **signal-only**
+(no personality reminder — dropped in WP-11a as redundant token cost; the persona stays
+durable in your session context from registration). You can always re-read your
+profile with `teammate_whoami` or `teammate_profile`.
 
 `personality` is a persona to inhabit, not a property list — write a *person*
 (concrete detail, a temperament, voice cues), never the agent's job/owned-areas/task.
@@ -234,7 +235,10 @@ channel, and is reachable on the shared comms. It is **opt-in**: disabled unless
 `teammate_list` a few seconds later. The new window may need one human approval to arm the
 custom channel — **unless** you've installed the managed-settings allowlist
 ([Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)), which reincarnate
-auto-detects to launch the child with `--channels` (no prompt).
+auto-detects to launch the child with `--channels` (no prompt). A fork/rehost published
+under a different marketplace should set `$TEAMMATE_PLUGIN_MARKETPLACE` so the child's
+plugin spec resolves correctly (or override the whole spawn line with
+`$TEAMMATE_LAUNCH_ARGS`).
 
 ### Enabling reincarnate safely (per-OS)
 
@@ -380,6 +384,21 @@ recovered either, past a capped number of retries).
   > project root won't be seen at the new global root — re-register, or set
   > `$TEAMMATE_COMMS_DIR` to keep the old per-project location.
 
+### Environment variables (reference)
+
+| Variable | Purpose |
+|---|---|
+| `TEAMMATE_AGENT` (+ `TEAMMATE_TEAM`) | Power-user shortcut: auto-registers at startup instead of calling `teammate_register` explicitly. |
+| `TEAMMATE_COMMS_DIR` | Overrides the resolved comms root (see precedence above) — the per-project-isolation knob. |
+| `TEAMMATE_HUMAN_NAME` | Default display name for the dashboard's human operator when `human_name` isn't passed to `teammate_dashboard`. |
+| `TEAMMATE_TRANSCRIPT=0` | Disables the observability firehose (`transcript.jsonl`) only — reactions/deletions keep recording. |
+| `TEAMMATE_REINCARNATE_ENABLED` | Opt-in gate for `teammate_reincarnate` (spawns OS processes) — set **per-session**, never durably; see [Enabling reincarnate safely](#enabling-reincarnate-safely-per-os). |
+| `TEAMMATE_LAUNCH_ARGS` | Overrides the ENTIRE `claude` spawn line `teammate_reincarnate` uses for a child, verbatim — bypasses managed-settings/allowlist auto-detection. |
+| `TEAMMATE_PLUGIN_MARKETPLACE` | Overrides the marketplace name `teammate_reincarnate` uses when building a child's plugin spec (`plugin:teammate-comms@<marketplace>`) — for a fork/rehost published under a different marketplace than `coltondyck`. Falls back to a best-effort guess from `$CLAUDE_PLUGIN_ROOT`, then to `coltondyck`. |
+| `TEAMMATE_AVATARS_ENABLED=1` | Set before Claude Code launches to sync Pillow (the `images` extra) so `teammate_set_avatar` works — see [Avatars](#avatars-optional). |
+| `CLAUDE_CONFIG_DIR` | If your Claude config lives somewhere non-default, the comms root follows it (see precedence above). |
+| `CLAUDE_PROJECT_DIR` | Set by Claude Code itself; auto-fills the `project` profile field at registration (no longer the storage root, since 0.3.0). |
+
 ### Cross-host transports
 
 teammate-comms needs its comms root on a **real shared filesystem that honors atomic
@@ -420,11 +439,16 @@ commit SHA):
 everything teammate-comms wrote lives under `~/.claude/TeammateComms/` (or wherever
 `$TEAMMATE_COMMS_DIR` pointed) and stays behind:
 
-- `[<team>/]inboxes/` — every agent's unread/read message queues.
+- `[<team>/]inboxes/` — every agent's `_unread.json`/`_read.json` message queues, plus
+  per-agent `_pending.json` (fan-out recovery lane) and `_seen.json` (durable
+  cross-session body-suppression state).
 - `[<team>/]agents/` — registry records (identity, profile, heartbeat).
-- `[<team>/]groups/` — group metadata + shared transcripts.
-- `transcript.jsonl` / `reactions.jsonl` / `deletions.jsonl` (+ their compacted state
-  files) — the observability firehose and the reactions/deletions event streams.
+- `[<team>/]groups/` — group metadata + shared transcripts (`messages.json` legacy +
+  `messages.jsonl`).
+- `transcript.jsonl` (+ its rotated `transcript.jsonl.1` grace copy) / `reactions.jsonl`
+  (+ compacted `reactions_state.json`) / `deletions.jsonl` (+ compacted
+  `deletions_set.json`) — the observability firehose and the reactions/deletions event
+  streams, with their compaction baseline files.
 - `[<team>/]avatars/` — pre-rendered avatar sidecars.
 - `[<team>/]projects/` — project profiles.
 
