@@ -31,6 +31,11 @@ from pathlib import Path
 # Valid agent name: alphanumeric, hyphens, underscores, dots (no traversal).
 AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 
+# WP-37/WP-38: the compaction-broker's sender label for audit DMs and completion/expiry
+# notices — a SENDER LABEL, never a registrable identity (register_identity rejects it,
+# case-insensitively, so nobody can forge broker notices in-band).
+COMPACT_BROKER_SENDER = "compact-broker"
+
 # Single timestamp format shared by message IDs, registry records, and liveness
 # checks. Naive local time — writer and reader are always co-located.
 TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S.%f"
@@ -384,6 +389,13 @@ def get_avatars_dir(root, team=None):
     if team:
         base = base / team
     return base / "avatars"
+
+
+def get_compact_requests_dir(root):
+    """``<root>/TeammateComms/compact-requests`` (WP-37) — deliberately NOT team-namespaced
+    (unlike inboxes/groups/avatars): the broker watches ONE dir, and agent names are globally
+    unique by constraint. Callers ``mkdir(parents=True, exist_ok=True)`` on first use."""
+    return Path(root) / "TeammateComms" / "compact-requests"
 
 
 def get_groups_dir(root, team=None):

@@ -13,14 +13,27 @@ WP-36 (this pass): registration auto-capture — pane_id, wezterm_socket, manage
         the added lines only when set.
   AC-6: this suite is wired into ci.yml as a 4th step (see .github/workflows/ci.yml).
 
-WP-37 tests land in a later commit, appended to this same suite.
+WP-37: teammate_request_compact — write-time authz + atomic v1 request-file drop.
+  AC-1 (self): file appears with exactly the six v1 keys; requester stamped correctly.
+  AC-2 (manager): a manager may request for their subordinate; an unrelated caller is
+        denied, no file written, and an audit DM from 'compact-broker' lands in their inbox.
+  AC-3 (anti-spoof): a stray `requester` arg is dead — the server-stamped caller always wins.
+  AC-4: unregistered target -> CommsError, no file; unregistered caller -> the standard
+        not-registered error.
+  AC-5 (atomicity): the request dir holds only the final .json, zero .tmp residue.
+  AC-6 (reservation): registering as 'compact-broker' (any case) is rejected.
+  AC-7: all four suites green on Windows (this file's own presence + ci.yml wiring).
+
+WP-38 tests land in a later commit, appended to this same suite.
 
 Run: uv run --no-sync python tests/test_compact.py
 """
 import contextlib
+import json
 import os
 import sys
 import tempfile
+import uuid as uuid_mod
 from pathlib import Path
 
 # WP-21 gate micro-CR: an emoji in a FAIL message crashes the harness's own report with
@@ -33,7 +46,13 @@ REPO = Path(__file__).resolve().parents[1]
 SRC = REPO / "src"
 sys.path.insert(0, str(SRC))
 
-from teammate_comms.comms import CommsError, read_agent_record, write_agent_record
+from teammate_comms.comms import (
+    COMPACT_BROKER_SENDER,
+    CommsError,
+    get_compact_requests_dir,
+    read_agent_record,
+    write_agent_record,
+)
 from teammate_comms import server as server_mod
 from teammate_comms import tools as tools_mod
 
@@ -90,15 +109,22 @@ def _profile_field_map(text):
 
 
 class FakeIdentity:
-    """Minimal stand-in for server.Identity — only .snapshot() is needed by
-    _require_registered / the _handle_* tool functions, so tool-handler unit tests don't
+    """Minimal stand-in for server.Identity — .snapshot() (needed by _require_registered)
+    plus the last-seen tracking _handle_inbox reads/writes, so tool-handler unit tests don't
     need to exercise register_identity's full side-effect chain (channel arming etc.)."""
 
     def __init__(self, agent, team, root):
         self._agent, self._team, self._root = agent, team, root
+        self._last_seen = None
 
     def snapshot(self):
         return (self._agent, self._team, self._root, None)
+
+    def get_last_seen(self):
+        return None if self._last_seen is None else set(self._last_seen)
+
+    def set_last_seen(self, ids):
+        self._last_seen = set(ids)
 
 
 def _ctx_for(agent, team, root):
@@ -299,6 +325,134 @@ def test_register_tool_wiring():
               "tautology[wiring]: teammate_register must also capture pane fields via the tool path")
 
 
+# ── WP-37 AC-1 (self) + AC-5 (atomicity) ───────────────────────────────────────────────
+
+def test_wp37_ac1_self_and_ac5_atomicity():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "A", type="full", channel=True)
+        ctx_a = _ctx_for("A", None, root)
+
+        result = tools_mod._handle_request_compact({"target": "A"}, ctx_a)
+        check(isinstance(result, str) and "A" in result,
+              "AC-1: a successful self-compact request must return a confirmation string")
+
+        reqs_dir = get_compact_requests_dir(root)
+        files = list(reqs_dir.glob("*.json"))
+        check(len(files) == 1, f"AC-1: exactly one request file must be written, got {len(files)}")
+        tmp_files = [p for p in reqs_dir.iterdir() if p.suffix == ".tmp"]
+        check(not tmp_files,
+              "tautology[AC-5]: the request dir must hold only the final .json — zero .tmp "
+              "residue proves write_json_atomic (temp sibling + os.replace) was actually used")
+
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+        check(set(data.keys()) == {"v", "id", "requester", "target", "created_at", "ttl_seconds"},
+              f"tautology[AC-1]: the v1 schema is EXACTLY six keys, no extras — got {sorted(data.keys())}")
+        check(data.get("v") == 1, "AC-1: v must be 1")
+        check(data.get("ttl_seconds") == 900, "AC-1: ttl_seconds must be 900")
+        check(data.get("requester") == "A", "AC-1: requester must be the server-stamped caller")
+        check(data.get("target") == "A", "AC-1: target must be the requested agent")
+        try:
+            uuid_mod.UUID(data.get("id"))
+            valid_uuid = True
+        except (ValueError, TypeError, AttributeError):
+            valid_uuid = False
+        check(valid_uuid, "AC-1: id must be a valid uuid4")
+        check(files[0].name == f"{files[0].name.split('-')[0]}-{data['id'][:8]}.json"
+              and files[0].name.endswith(f"-{data['id'][:8]}.json"),
+              "AC-1: filename must embed id[:8] and match the created_at-derived stamp")
+
+
+# ── WP-37 AC-2 (manager) ────────────────────────────────────────────────────────────────
+
+def test_wp37_ac2_manager():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "A", type="full", channel=True)
+        write_agent_record(root, None, "B", type="full", channel=True, manager="A")
+        write_agent_record(root, None, "C", type="full", channel=True)  # unrelated
+
+        ctx_a = _ctx_for("A", None, root)
+        tools_mod._handle_request_compact({"target": "B"}, ctx_a)
+        reqs_dir = get_compact_requests_dir(root)
+        after_manager_request = len(list(reqs_dir.glob("*.json")))
+        check(after_manager_request == 1,
+              "AC-2: A (B's manager) requesting target=B must succeed and write a file")
+
+        ctx_c = _ctx_for("C", None, root)
+        check_raises(
+            lambda: tools_mod._handle_request_compact({"target": "B"}, ctx_c),
+            "AC-2: an unrelated caller C requesting target=B must be denied (CommsError)"
+        )
+        check(len(list(reqs_dir.glob("*.json"))) == after_manager_request,
+              "tautology[AC-2]: a denied request must write NO file — count must stay unchanged")
+
+        inbox_text = tools_mod._handle_inbox({"show_all": True}, ctx_c)
+        check(COMPACT_BROKER_SENDER in inbox_text,
+              "AC-2: the denial audit DM must land in C's own inbox, from 'compact-broker'")
+        check("B" in inbox_text,
+              "AC-2: the audit DM must name the target teammate the denied request was for")
+
+
+# ── WP-37 AC-3 (anti-spoof) ─────────────────────────────────────────────────────────────
+
+def test_wp37_ac3_anti_spoof():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "C", type="full", channel=True)
+        ctx_c = _ctx_for("C", None, root)
+        tools_mod._handle_request_compact({"target": "C", "requester": "A"}, ctx_c)
+        reqs_dir = get_compact_requests_dir(root)
+        files = list(reqs_dir.glob("*.json"))
+        check(len(files) == 1, "AC-3 setup: the self-compact call must still write exactly one file")
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+        check(data.get("requester") == "C",
+              "tautology[AC-3]: a stray requester='A' arg must be DEAD — the file must still "
+              "stamp the server-resolved caller (C), never the caller-supplied value")
+
+
+# ── WP-37 AC-4: unregistered target / unregistered caller ──────────────────────────────
+
+def test_wp37_ac4_unregistered():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "A", type="full", channel=True)
+        ctx_a = _ctx_for("A", None, root)
+        check_raises(
+            lambda: tools_mod._handle_request_compact({"target": "NoSuchAgent"}, ctx_a),
+            "AC-4: an unregistered target must raise CommsError"
+        )
+        reqs_dir = get_compact_requests_dir(root)
+        check(not reqs_dir.exists() or not list(reqs_dir.glob("*.json")),
+              "tautology[AC-4]: an unregistered target must write NO file")
+
+        ctx_unregistered = _ctx_for(None, None, None)
+        check_raises(
+            lambda: tools_mod._handle_request_compact({"target": "A"}, ctx_unregistered),
+            "AC-4: an unregistered CALLER must raise the standard not-registered error"
+        )
+
+
+# ── WP-37 AC-6: sentinel-name registration reservation ─────────────────────────────────
+
+def test_wp37_ac6_reservation():
+    td, root = _make_root()
+    with td:
+        check_raises(
+            lambda: server_mod.register_identity("compact-broker", None, str(root)),
+            "tautology[AC-6]: registering as 'compact-broker' must raise CommsError"
+        )
+        check_raises(
+            lambda: server_mod.register_identity("Compact-Broker", None, str(root)),
+            "tautology[AC-6]: registering as 'Compact-Broker' (case variant) must also raise "
+            "CommsError — the reservation is case-insensitive"
+        )
+        # Existing agents unaffected: an ordinary name must still register normally.
+        result = server_mod.register_identity("Zed", None, str(root))
+        check(isinstance(result, str) and "Registered" in result,
+              "AC-6: the reservation must not affect registration of an ordinary agent name")
+
+
 def main():
     print("Compaction-broker (WP-36/WP-37) — acceptance tests")
     print("=" * 55)
@@ -309,6 +463,11 @@ def main():
         ("WP-36 AC-4: manager precedence + clear", test_ac4_manager_precedence_and_clear),
         ("WP-36 AC-5: profile + list rendering", test_ac5_profile_and_list_rendering),
         ("WP-36 tool-wiring: teammate_register(manager=...)", test_register_tool_wiring),
+        ("WP-37 AC-1/AC-5: self-compact + atomicity", test_wp37_ac1_self_and_ac5_atomicity),
+        ("WP-37 AC-2: manager authz + audit DM", test_wp37_ac2_manager),
+        ("WP-37 AC-3: anti-spoof (requester stamped, not passed)", test_wp37_ac3_anti_spoof),
+        ("WP-37 AC-4: unregistered target/caller", test_wp37_ac4_unregistered),
+        ("WP-37 AC-6: sentinel-name reservation", test_wp37_ac6_reservation),
     ]
 
     for label, fn in sections:

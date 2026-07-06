@@ -30,6 +30,7 @@ from . import __version__, channel
 from . import tools as tools_mod
 from .instructions import INSTRUCTIONS
 from .comms import (
+    COMPACT_BROKER_SENDER,
     PROFILE_FIELDS,
     CommsError,
     _looks_unset,
@@ -262,6 +263,15 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
     Returns a human-readable status string.
     """
     validate_agent_name(agent)
+    # WP-37 item 6: reserve the broker's sender label — same shape as the human-operator
+    # rejection below, case-insensitively (the G2 case-variant lesson applies). Without this,
+    # any agent could register as "compact-broker" (or "Compact-Broker") and forge the audit
+    # DMs / completion notices that name identifies. Checked before any side effect.
+    if agent.lower() == COMPACT_BROKER_SENDER:
+        raise CommsError(
+            f"Cannot register as {agent!r}: that name is reserved for the compaction-broker's "
+            f"sender label (audit DMs, completion/expiry notices) — an agent may not claim it."
+        )
     profile = dict(profile or {})
     # Auto-fill `project` from the current project dir (Claude Code injects
     # CLAUDE_PROJECT_DIR) unless the agent set it explicitly. With a global-by-

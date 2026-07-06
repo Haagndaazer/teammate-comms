@@ -58,6 +58,7 @@ That's the whole loop: register once each, then `teammate_send`/`teammate_inbox`
 | `list_projects` | — | List all registered project profiles: display name + live teammate roster + summary. Trailing aggregate shows undocumented project labels and near-miss agents. |
 | `project_profile` | `key?` | Full detail for one project: all fields, provenance, live roster with liveness. `key` defaults to your project. |
 | `project_delete` | `key?` | Remove a project profile. |
+| `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
