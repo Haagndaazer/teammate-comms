@@ -47,6 +47,7 @@ from .comms import (
     validate_agent_name,
     validate_profile_field,
     write_agent_record,
+    write_json_atomic,
 )
 
 SERVER_NAME = "teammate-comms"
@@ -612,6 +613,34 @@ def _avatar_subcommand(argv):
     print(content)
 
 
+def _write_plugin_runtime_pointer():
+    """WP-38: a broker daemon launched outside the plugin's own tooling (Task Scheduler,
+    bare PowerShell) cannot derive the plugin's versioned cache path, and bare
+    ``python -m teammate_comms.deliver`` is a ``ModuleNotFoundError`` on any system Python.
+    Drop a pointer file the broker reads FRESH per invocation, then runs
+    ``<python> -m teammate_comms.deliver ...`` — ``sys.executable`` is the venv interpreter
+    THIS live server imports the package from, so ``-m`` resolves; the file self-heals
+    across plugin version bumps because every server start rewrites it. Uses the DEFAULT
+    root resolution (no explicit comms_dir — identity isn't established yet at this point
+    in startup), same as the auto-register path below. Best-effort: a failure here (an
+    unwritable dir, e.g.) must NEVER block server boot."""
+    try:
+        root, _source = resolve_comms_root(None)
+        plugin_root = Path(__file__).resolve().parent.parent  # the package's PARENT dir
+        pointer = {
+            "v": 1,
+            "python": sys.executable,
+            "plugin_root": str(plugin_root),
+            "version": __version__,
+            "written_at": now_timestamp(),
+        }
+        pointer_path = Path(root) / "TeammateComms" / "plugin-runtime.json"
+        pointer_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(pointer_path, pointer)
+    except Exception as e:
+        log(f"plugin-runtime.json pointer write skipped: {e}")
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "avatar":
         _avatar_subcommand(sys.argv[2:])
@@ -622,6 +651,7 @@ def main():
     # this line is the diagnostic anchor for "was this session running stale code" in the
     # debug log (~/.claude/debug/<session>.txt).
     log(f"starting teammate-comms v{__version__}")
+    _write_plugin_runtime_pointer()
 
     ctx = {"identity": _identity, "register": register_identity,
            "auto_register_error": _get_auto_register_error}
