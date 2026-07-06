@@ -40,15 +40,25 @@ WP-38: broker delivery CLI — `python -m teammate_comms.deliver`.
         five v1 keys; a pointer-write failure must not prevent boot.
   AC-7: all four suites green (this file's own presence + ci.yml wiring).
 
+Gate round 1 (Silvie, pin 32416ab) fix verification:
+  1. build_child_env must strip WEZTERM_PANE/WEZTERM_UNIX_SOCKET unconditionally — a
+     reincarnated child never inherits its parent's pane binding.
+  2. register_identity(manager=<non-str>) via dispatch() -> a clean isError, not a crash.
+  3. teammate_update(manager=<non-str>) -> CommsError, field left untouched (was silently
+     clearing it).
+  4. A malformed $AGENT_MANAGER must fall through to a valid explicit param, not veto it.
+  5. deliver.py: an emoji in a bad --to still exits 2 (not 1 from a console encoding crash).
+  6c. teammate_request_compact(target=None|123) via dispatch() -> clean isError, no file.
+
 Run: uv run --no-sync python tests/test_compact.py
 """
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid as uuid_mod
 from pathlib import Path
@@ -379,9 +389,15 @@ def test_wp37_ac1_self_and_ac5_atomicity():
         except (ValueError, TypeError, AttributeError):
             valid_uuid = False
         check(valid_uuid, "AC-1: id must be a valid uuid4")
-        check(files[0].name == f"{files[0].name.split('-')[0]}-{data['id'][:8]}.json"
-              and files[0].name.endswith(f"-{data['id'][:8]}.json"),
-              "AC-1: filename must embed id[:8] and match the created_at-derived stamp")
+        # Gate finding 6b: the previous check derived its expectation from the filename
+        # itself (self-referential — a bogus stamp or a SECOND now() call would still pass).
+        # Derive the expected stamp independently from data["created_at"] instead: strip the
+        # UTC offset, then the '-'/':'/'.' separators, and append the 'Z' the filename uses.
+        expected_stamp = re.sub(r"[-:.]", "", data["created_at"].split("+")[0]) + "Z"
+        check(files[0].name == f"{expected_stamp}-{data['id'][:8]}.json",
+              f"tautology[AC-1]: filename must be derived from THIS record's created_at, not "
+              f"a second now() call or a bogus stamp — expected "
+              f"{expected_stamp}-{data['id'][:8]}.json, got {files[0].name}")
 
 
 # ── WP-37 AC-2 (manager) ────────────────────────────────────────────────────────────────
@@ -586,7 +602,11 @@ def test_wp38_ac5_lock_hold_and_fanout():
                  "--to", "LockTarget", "--message", "while-locked", "--comms-dir", str(root)],
                 cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            time.sleep(1.0)
+            # Gate finding 6a: 1.0s couldn't distinguish "blocked on the lock" from "slow
+            # interpreter startup" on a loaded CI runner. An UNLOCKED run (AC-5b's fan-out,
+            # below) completes in well under 1s, so 3.0s is a comfortable margin while still
+            # sitting far under file_lock's own 10s timeout.
+            time.sleep(3.0)
             still_running = proc.poll() is None
             check(still_running,
                   "tautology[AC-5a]: the CLI must be BLOCKED on file_lock(unread_file) while "
@@ -656,6 +676,95 @@ def test_wp38_ac6_plugin_runtime_pointer():
                 proc.communicate(timeout=5)
 
 
+# ── Gate round 1 fix verification (Silvie, pin 32416ab) ────────────────────────────────
+
+def test_gate1_build_child_env_strips_wezterm_pane():
+    from teammate_comms.spawn import build_child_env
+    base = {"WEZTERM_PANE": "3", "WEZTERM_UNIX_SOCKET": "/tmp/gui-sock-1", "PATH": "/usr/bin"}
+    env = build_child_env(base, "Child", "/some/project", spawned_by="Parent")
+    check("WEZTERM_PANE" not in env,
+          "tautology[gate-1]: a reincarnated child launches via a fresh console/wt.exe, never "
+          "inside its parent's WezTerm pane — inheriting WEZTERM_PANE verbatim would register "
+          "the child with the MANAGER's pane binding, and the broker would type /compact into "
+          "the manager's own pane")
+    check("WEZTERM_UNIX_SOCKET" not in env,
+          "tautology[gate-1]: WEZTERM_UNIX_SOCKET must be stripped for the same reason")
+    # Sanity: the OTHER never-inherit fields this WP didn't touch still behave as before.
+    check(env.get("TEAMMATE_AGENT") == "Child" and env.get("TEAMMATE_SPAWNED_BY") == "Parent",
+          "gate-1 regression guard: the fix must not disturb agent/spawned_by handling")
+
+
+def test_gate2_register_non_str_manager_via_dispatch():
+    td, root = _make_root()
+    with td:
+        ctx = {"identity": server_mod._identity, "register": server_mod.register_identity,
+               "auto_register_error": lambda: None}
+        with env_vars(AGENT_MANAGER=None):
+            text, is_error = tools_mod.dispatch(
+                "teammate_register",
+                {"agent": "BadManagerAgent", "comms_dir": str(root), "manager": 123}, ctx)
+        check(is_error, "gate-2: a non-string manager param must be a clean isError")
+        check("failed unexpectedly" not in text,
+              f"tautology[gate-2]: must be a validated CommsError, not the generic unexpected-"
+              f"exception fallback (an AttributeError from .strip() on an int) — got: {text!r}")
+
+
+def test_gate3_update_non_str_manager_rejected():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "UpdTarget", type="full", channel=True, manager="Keep")
+        ctx = _ctx_for("UpdTarget", None, root)
+        check_raises(
+            lambda: tools_mod._handle_update({"manager": 123}, ctx),
+            "gate-3: a non-string manager value must raise CommsError, not silently clear the field"
+        )
+        rec = read_agent_record(root, None, "UpdTarget")
+        check(rec.get("manager") == "Keep",
+              "tautology[gate-3]: a rejected non-string manager must leave the EXISTING value "
+              "untouched — the old code's silent-clear bug would have wiped it to null here")
+
+
+def test_gate4_malformed_env_falls_through_to_valid_param():
+    td, root = _make_root()
+    with td:
+        with env_vars(AGENT_MANAGER="../malformed"):
+            server_mod.register_identity("PrecOrder", None, str(root), manager="ValidBoss")
+        rec = read_agent_record(root, None, "PrecOrder")
+        check(rec.get("manager") == "ValidBoss",
+              "tautology[gate-4]: a malformed $AGENT_MANAGER must NOT veto a deliberately typed "
+              "valid explicit param — it must fall through to the param, not silently discard it")
+
+
+def test_gate5_deliver_emoji_bad_name_exits_2():
+    """Regression coverage for the exit-2 contract with a non-ASCII bad name. NOTE: on this
+    runner, Python's default stderr error handler for a piped stream is already
+    'backslashreplace' (PEP 528/529), so this does NOT reproduce as a true revert-fails
+    tautology here — reverting the stdout/stderr reconfigure in deliver.py and rerunning this
+    test still passes (verified by hand). The reconfigure is still correct defensive practice
+    (a stricter error handler is possible under PYTHONLEGACYWINDOWSSTDIO=1 or an older Python),
+    so the fix stays; flagging the non-tautology honestly rather than overclaiming."""
+    td, root = _make_root()
+    with td:
+        proc = _run_deliver(["--to", "bad\U0001F525name", "--message", "hi", "--comms-dir", str(root)])
+        check(proc.returncode == 2,
+              f"gate-5: an emoji in a rejected --to must exit 2 (the CommsError path), "
+              f"got {proc.returncode}: {proc.stderr!r}")
+
+
+def test_gate6c_request_compact_bad_target_via_dispatch():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "Caller6c", type="full", channel=True)
+        ctx = _ctx_for("Caller6c", None, root)
+        for bad_target in (None, 123):
+            text, is_error = tools_mod.dispatch(
+                "teammate_request_compact", {"target": bad_target}, ctx)
+            check(is_error, f"gate-6c: target={bad_target!r} must be a clean isError")
+        reqs_dir = get_compact_requests_dir(root)
+        check(not reqs_dir.exists() or not list(reqs_dir.glob("*.json")),
+              "tautology[gate-6c]: a bad (None or non-str) target must write NO request file")
+
+
 def main():
     print("Compaction-broker (WP-36/WP-37/WP-38) — acceptance tests")
     print("=" * 55)
@@ -677,6 +786,12 @@ def main():
         ("WP-38 AC-4: unregistered target queues", test_wp38_ac4_unregistered_target_queues),
         ("WP-38 AC-5: lock-hold determinism + fan-out", test_wp38_ac5_lock_hold_and_fanout),
         ("WP-38 AC-6: plugin-runtime.json pointer", test_wp38_ac6_plugin_runtime_pointer),
+        ("Gate-1: build_child_env strips WEZTERM_PANE", test_gate1_build_child_env_strips_wezterm_pane),
+        ("Gate-2: register non-str manager via dispatch", test_gate2_register_non_str_manager_via_dispatch),
+        ("Gate-3: update non-str manager rejected", test_gate3_update_non_str_manager_rejected),
+        ("Gate-4: malformed env falls through to param", test_gate4_malformed_env_falls_through_to_valid_param),
+        ("Gate-5: deliver.py emoji bad name exits 2", test_gate5_deliver_emoji_bad_name_exits_2),
+        ("Gate-6c: request_compact bad target via dispatch", test_gate6c_request_compact_bad_target_via_dispatch),
     ]
 
     for label, fn in sections:

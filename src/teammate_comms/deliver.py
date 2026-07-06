@@ -69,6 +69,14 @@ def build_parser():
 
 
 def main(argv=None):
+    # Gate finding, item 5: a CommsError echoing a non-ASCII bad name (e.g. an emoji) would
+    # otherwise die with UnicodeEncodeError under a cp1252 Windows console, surfacing as exit 1
+    # + a traceback instead of the exit-2 contract the broker relies on (same trap/fix as
+    # test_compact.py's own harness — WP-21 gate micro-CR).
+    for _s in (sys.stdout, sys.stderr):
+        if hasattr(_s, "reconfigure"):
+            _s.reconfigure(encoding="utf-8", errors="replace")
+
     parser = build_parser()
     # argparse itself exits 2 (with its own multi-line usage text) on a parsing error —
     # deliberately NOT overridden (ArgumentParser.error is left alone; do not promise a

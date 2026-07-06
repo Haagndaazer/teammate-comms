@@ -1156,9 +1156,16 @@ def _handle_update(args, ctx):
     fields = {k: validate_profile_field(k, v) for k, v in raw.items()}
     if manager_given:
         raw_manager = args.get("manager")
+        # Gate finding, item 3: a non-string value (e.g. an int) must raise a clean
+        # CommsError, NOT silently take the clear-sentinel branch below — only a str routes
+        # to the clear/validate paths at all.
+        if not isinstance(raw_manager, str):
+            raise CommsError(
+                f"'manager' must be a string agent name, got {type(raw_manager).__name__}."
+            )
         # CLEAR MECHANICS (WP-36): validate_agent_name("") always raises, so an empty/
         # whitespace value is the clear sentinel handled BEFORE validation ever runs.
-        if not isinstance(raw_manager, str) or not raw_manager.strip():
+        if not raw_manager.strip():
             fields["manager"] = None
         else:
             validate_agent_name(raw_manager.strip())

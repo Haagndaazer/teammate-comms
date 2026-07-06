@@ -306,20 +306,32 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
             spawned_by = None
 
     # Manager field (WP-36, command authority — NOT provenance; see spawned_by above for the
-    # different fact). Precedence: $AGENT_MANAGER env (Wellington's launcher sets it for
-    # subordinates; a malformed value is DROPPED like spawned_by) > explicit `manager` param
-    # (a malformed value RAISES — the caller typed it) > neither given → omit the key entirely
-    # so write_agent_record's field-merge preserves whatever is already on disk.
+    # different fact). Precedence (gate finding, item 4 — revised from the first pass): a
+    # VALID $AGENT_MANAGER env wins outright; env ABSENT *or* MALFORMED falls through to the
+    # explicit `manager` param (a malformed value RAISES — the caller typed it, unlike a
+    # garbled env var, which is dropped like spawned_by). A malformed env value must never
+    # VETO a deliberately typed valid param — that would silently discard real intent.
+    # Neither given → omit the key so write_agent_record's field-merge preserves the existing
+    # value on disk.
     manager_fields = {}
     env_manager = os.environ.get("AGENT_MANAGER")
+    env_valid = False
     if not _looks_unset(env_manager):
         candidate = env_manager.strip()
         try:
             validate_agent_name(candidate)
             manager_fields["manager"] = candidate
+            env_valid = True
         except CommsError:
-            pass
-    elif manager is not None:
+            pass  # malformed env: dropped, falls through to the explicit param below
+
+    if not env_valid and manager is not None:
+        # Gate finding, item 2: a non-string explicit param (e.g. an int) must raise a clean
+        # CommsError, not an AttributeError from .strip() surfacing as "failed unexpectedly".
+        if not isinstance(manager, str):
+            raise CommsError(
+                f"'manager' must be a string agent name, got {type(manager).__name__}."
+            )
         # CLEAR MECHANICS (peer-review finding): validate_agent_name("") always RAISES, so an
         # empty/whitespace explicit value is handled as the clear sentinel BEFORE validation
         # ever runs — only a non-empty explicit value goes through validate_agent_name.
