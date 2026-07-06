@@ -30,6 +30,7 @@ from . import __version__, channel
 from . import tools as tools_mod
 from .instructions import INSTRUCTIONS
 from .comms import (
+    COMPACT_BROKER_SENDER,
     PROFILE_FIELDS,
     CommsError,
     _looks_unset,
@@ -46,6 +47,7 @@ from .comms import (
     validate_agent_name,
     validate_profile_field,
     write_agent_record,
+    write_json_atomic,
 )
 
 SERVER_NAME = "teammate-comms"
@@ -251,15 +253,26 @@ def _project_label_from_git_remote(proj_dir):
     return _project_label_from_remote(result.stdout.strip())
 
 
-def register_identity(agent, team, comms_dir, profile=None):
+def register_identity(agent, team, comms_dir, profile=None, manager=None):
     """Establish identity + start watching. Raises CommsError on bad input.
 
     Used by the teammate_register tool and by the optional env auto-register.
     ``profile`` is an optional dict of free-text profile fields (role/personality/
-    status/authority) validated and written onto the registry record. Returns a
-    human-readable status string.
+    status/authority) validated and written onto the registry record. ``manager``
+    is the explicit teammate_register param (WP-36) — see the precedence note
+    below; None means "not given" (distinct from an explicit empty-string clear).
+    Returns a human-readable status string.
     """
     validate_agent_name(agent)
+    # WP-37 item 6: reserve the broker's sender label — same shape as the human-operator
+    # rejection below, case-insensitively (the G2 case-variant lesson applies). Without this,
+    # any agent could register as "compact-broker" (or "Compact-Broker") and forge the audit
+    # DMs / completion notices that name identifies. Checked before any side effect.
+    if agent.lower() == COMPACT_BROKER_SENDER:
+        raise CommsError(
+            f"Cannot register as {agent!r}: that name is reserved for the compaction-broker's "
+            f"sender label (audit DMs, completion/expiry notices) — an agent may not claim it."
+        )
     profile = dict(profile or {})
     # Auto-fill `project` from the current project dir (Claude Code injects
     # CLAUDE_PROJECT_DIR) unless the agent set it explicitly. With a global-by-
@@ -291,6 +304,60 @@ def register_identity(agent, team, comms_dir, profile=None):
             validate_agent_name(spawned_by)
         except CommsError:
             spawned_by = None
+
+    # Manager field (WP-36, command authority — NOT provenance; see spawned_by above for the
+    # different fact). Precedence (gate finding, item 4 — revised from the first pass): a
+    # VALID $AGENT_MANAGER env wins outright; env ABSENT *or* MALFORMED falls through to the
+    # explicit `manager` param (a malformed value RAISES — the caller typed it, unlike a
+    # garbled env var, which is dropped like spawned_by). A malformed env value must never
+    # VETO a deliberately typed valid param — that would silently discard real intent.
+    # Neither given → omit the key so write_agent_record's field-merge preserves the existing
+    # value on disk.
+    manager_fields = {}
+    env_manager = os.environ.get("AGENT_MANAGER")
+    env_valid = False
+    if not _looks_unset(env_manager):
+        candidate = env_manager.strip()
+        try:
+            validate_agent_name(candidate)
+            manager_fields["manager"] = candidate
+            env_valid = True
+        except CommsError:
+            pass  # malformed env: dropped, falls through to the explicit param below
+
+    if not env_valid and manager is not None:
+        # Gate finding, item 2: a non-string explicit param (e.g. an int) must raise a clean
+        # CommsError, not an AttributeError from .strip() surfacing as "failed unexpectedly".
+        if not isinstance(manager, str):
+            raise CommsError(
+                f"'manager' must be a string agent name, got {type(manager).__name__}."
+            )
+        # CLEAR MECHANICS (peer-review finding): validate_agent_name("") always RAISES, so an
+        # empty/whitespace explicit value is handled as the clear sentinel BEFORE validation
+        # ever runs — only a non-empty explicit value goes through validate_agent_name.
+        if not manager.strip():
+            manager_fields["manager"] = None
+        else:
+            validate_agent_name(manager.strip())
+            manager_fields["manager"] = manager.strip()
+
+    # WezTerm pane binding (WP-36) — captured at register only, no heartbeat refresh. Always
+    # computed (even to None) so it's always PASSED to write_agent_record below: a re-register
+    # outside WezTerm must overwrite a stale binding with None, not silently keep it (the field-
+    # merge otherwise preserves an omitted key, which here would mean the broker keeps typing
+    # into a pane this agent no longer owns).
+    pane_id = None
+    pane_env = os.environ.get("WEZTERM_PANE")
+    if not _looks_unset(pane_env):
+        try:
+            pane_id = int(pane_env.strip())
+        except ValueError:
+            pane_id = None  # malformed value never fails registration
+    wezterm_socket = None
+    socket_env = os.environ.get("WEZTERM_UNIX_SOCKET")
+    if not _looks_unset(socket_env):
+        wezterm_socket = Path(socket_env.strip()).name or None
+
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
     my_instance_id = _identity.get_instance_id()
@@ -369,7 +436,9 @@ def register_identity(agent, team, comms_dir, profile=None):
         # looking textually identical to a genuinely-offline recipient.
         comms_root=str(root),
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
+        pane_id=pane_id, wezterm_socket=wezterm_socket,
         **profile_fields,
+        **manager_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),
     ) or {}
     # Take the epoch straight off THIS call's return (WP-19 gate CR) — NEVER from a
@@ -556,6 +625,34 @@ def _avatar_subcommand(argv):
     print(content)
 
 
+def _write_plugin_runtime_pointer():
+    """WP-38: a broker daemon launched outside the plugin's own tooling (Task Scheduler,
+    bare PowerShell) cannot derive the plugin's versioned cache path, and bare
+    ``python -m teammate_comms.deliver`` is a ``ModuleNotFoundError`` on any system Python.
+    Drop a pointer file the broker reads FRESH per invocation, then runs
+    ``<python> -m teammate_comms.deliver ...`` — ``sys.executable`` is the venv interpreter
+    THIS live server imports the package from, so ``-m`` resolves; the file self-heals
+    across plugin version bumps because every server start rewrites it. Uses the DEFAULT
+    root resolution (no explicit comms_dir — identity isn't established yet at this point
+    in startup), same as the auto-register path below. Best-effort: a failure here (an
+    unwritable dir, e.g.) must NEVER block server boot."""
+    try:
+        root, _source = resolve_comms_root(None)
+        plugin_root = Path(__file__).resolve().parent.parent  # the package's PARENT dir
+        pointer = {
+            "v": 1,
+            "python": sys.executable,
+            "plugin_root": str(plugin_root),
+            "version": __version__,
+            "written_at": now_timestamp(),
+        }
+        pointer_path = Path(root) / "TeammateComms" / "plugin-runtime.json"
+        pointer_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(pointer_path, pointer)
+    except Exception as e:
+        log(f"plugin-runtime.json pointer write skipped: {e}")
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "avatar":
         _avatar_subcommand(sys.argv[2:])
@@ -566,6 +663,7 @@ def main():
     # this line is the diagnostic anchor for "was this session running stale code" in the
     # debug log (~/.claude/debug/<session>.txt).
     log(f"starting teammate-comms v{__version__}")
+    _write_plugin_runtime_pointer()
 
     ctx = {"identity": _identity, "register": register_identity,
            "auto_register_error": _get_auto_register_error}

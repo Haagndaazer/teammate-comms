@@ -375,8 +375,8 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **18 tools (13 original + 4 project-profile tools v0.9.0 + 1 avatar
-tool v0.10.0):**
+long-lived server. **19 tools (13 original + 4 project-profile tools v0.9.0 + 1 avatar
+tool v0.10.0 + 1 compact-request tool WP-37):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -398,6 +398,7 @@ tool v0.10.0):**
 | `list_projects` | — | Concise directory: display name + live roster + summary per project. Trailing aggregate: undocumented project labels + near-miss agents. |
 | `project_profile` | `key?` | Full project detail: all fields, provenance, live roster (liveness per member). |
 | `project_delete` | `key?` | Remove a project profile file. |
+| `teammate_request_compact` | `target` (agent name) | Authorize (self, or a subordinate of the caller via WP-36's `manager` field) then atomically drop a v1 request file the compaction-broker daemon consumes; a denial best-effort DMs an audit line from `compact-broker` to the requester. No TTL expiry, exec-time re-authz, or injection here — that's the broker's half. |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
 

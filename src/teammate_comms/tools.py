@@ -17,8 +17,11 @@ import os
 import re
 import sys
 import traceback
+import uuid
+from datetime import datetime, timezone
 
 from .comms import (
+    COMPACT_BROKER_SENDER,
     DELETED_MARKER,
     PROFILE_FIELDS,
     PROJECT_FIELDS,
@@ -37,6 +40,7 @@ from .comms import (
     file_lock,
     find_group_case_variant,
     get_agents_dir,
+    get_compact_requests_dir,
     get_group_dir,
     get_groups_dir,
     get_inboxes_dir,
@@ -188,6 +192,21 @@ def _collect_profile_args(args):
     return {name: args[name] for name in PROFILE_FIELDS if name in args}
 
 
+# WP-36: `manager` is a registry-record field (an authz key for teammate_request_compact), NOT
+# a PROFILE_FIELDS entry — it gets agent-name validation, not a free-text length cap. Shared
+# schema property for both teammate_register and teammate_update.
+_MANAGER_PROPERTY = {
+    "manager": {
+        "type": "string",
+        "description": (
+            "The teammate this agent reports to (command authority, e.g. for compact "
+            "requests) — auto-filled from $AGENT_MANAGER if set, else pass explicitly. "
+            "Pass an empty string to clear it. Omit to leave unchanged."
+        ),
+    },
+}
+
+
 _PROJECT_DESCRIPTIONS = {
     "summary":     "One-liner shown in list_projects — keep terse.",
     "description": "Short paragraph describing the project.",
@@ -241,6 +260,7 @@ TOOL_DEFINITIONS = [
                     "description": "Optional comms root override (else $TEAMMATE_COMMS_DIR or the project dir).",
                 },
                 **_profile_schema_properties(),
+                **_MANAGER_PROPERTY,
             },
             "required": ["agent"],
         },
@@ -331,14 +351,14 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_update",
         "description": (
-            "Update your own profile fields (role, personality, status, authority). "
-            "Use this to keep your status fresh as you move between tasks so "
-            "teammates can see what you're doing without interrupting you. Updates "
-            "only your own record; pass an empty string to clear a field."
+            "Update your own profile fields (role, personality, status, authority) "
+            "or your manager. Use this to keep your status fresh as you move between "
+            "tasks so teammates can see what you're doing without interrupting you. "
+            "Updates only your own record; pass an empty string to clear a field."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": _profile_schema_properties(),
+            "properties": {**_profile_schema_properties(), **_MANAGER_PROPERTY},
         },
     },
     {
@@ -563,6 +583,28 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "name": "teammate_request_compact",
+        "description": (
+            "Request a /compact for a teammate via the compaction-broker daemon: this tool "
+            "only authorizes and atomically drops a request file — the broker validates "
+            "again and does the actual injection at a safe point. Agents self-compact at a "
+            "safe boundary (subordinate: on handing work back for gate check; manager: "
+            "before blocking on subordinates); a manager may also request one for their own "
+            "subordinate. Completion or expiry (TTL 900s) arrives later as a teammate-comms "
+            "message from 'compact-broker'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Teammate to request a compact for — yourself, or a subordinate you manage.",
+                },
+            },
+            "required": ["target"],
+        },
+    },
 ]
 
 
@@ -592,9 +634,11 @@ def _handle_register(args, ctx):
         team = None
     comms_dir = args.get("comms_dir")
     profile = _collect_profile_args(args)  # validated inside register_identity
+    manager = args.get("manager")  # WP-36: None (absent) preserves; "" clears; validated inside
     # ctx["register"] does the side effects (resolve root, inbox, registry,
     # start watching) and returns a human-readable status string.
-    return ctx["register"](agent, team.strip() if team else None, comms_dir, profile)
+    return ctx["register"](agent, team.strip() if team else None, comms_dir, profile,
+                            manager=manager)
 
 
 def _clean_message(message):
@@ -967,6 +1011,14 @@ def _handle_list(args, ctx):
         if role:
             rows.append(f"      role:      {role}")
         # personality intentionally excluded from list — use teammate_profile for full details
+        # WP-36: only when set — keep the list lean for agents outside WezTerm / with no manager.
+        manager = record.get("manager")
+        if manager:
+            rows.append(f"      manager:   {manager}")
+        pane_id = record.get("pane_id")
+        wezterm_socket = record.get("wezterm_socket")
+        if pane_id is not None or wezterm_socket:
+            rows.append(f"      pane:      {wezterm_socket or '?'}#{pane_id if pane_id is not None else '?'}")
     teammates = "Registered teammates:\n" + "\n".join(rows) if rows else "No registered teammates yet."
     if filtered_count:
         teammates += (
@@ -1096,9 +1148,28 @@ def _handle_whoami(args, ctx):
 def _handle_update(args, ctx):
     agent, team, root = _require_registered(ctx)
     raw = _collect_profile_args(args)
-    if not raw:
-        raise CommsError(f"Provide at least one profile field to update: {sorted(PROFILE_FIELDS)}.")
+    manager_given = "manager" in args
+    if not raw and not manager_given:
+        raise CommsError(
+            f"Provide at least one profile field to update: {sorted(PROFILE_FIELDS)}, or manager."
+        )
     fields = {k: validate_profile_field(k, v) for k, v in raw.items()}
+    if manager_given:
+        raw_manager = args.get("manager")
+        # Gate finding, item 3: a non-string value (e.g. an int) must raise a clean
+        # CommsError, NOT silently take the clear-sentinel branch below — only a str routes
+        # to the clear/validate paths at all.
+        if not isinstance(raw_manager, str):
+            raise CommsError(
+                f"'manager' must be a string agent name, got {type(raw_manager).__name__}."
+            )
+        # CLEAR MECHANICS (WP-36): validate_agent_name("") always raises, so an empty/
+        # whitespace value is the clear sentinel handled BEFORE validation ever runs.
+        if not raw_manager.strip():
+            fields["manager"] = None
+        else:
+            validate_agent_name(raw_manager.strip())
+            fields["manager"] = raw_manager.strip()
     # Best-effort lock: a False return means the write was dropped (e.g. heartbeat
     # contention) — surface that instead of falsely reporting success.
     if not write_agent_record(root, team, agent, timeout=5, **fields):
@@ -1121,6 +1192,15 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     for field in PROFILE_FIELDS:
         value = record.get(field)
         lines.append(f"  {field + ':':<13}{value if value else '(not set)'}")
+    # WP-36: always render all three broker-registration fields, `(not set)` when null.
+    # pane_id uses `is not None` (NOT truthiness) — WezTerm panes are 0-indexed, and pane 0
+    # is the ordinary single-pane value, not an absence.
+    manager = record.get("manager")
+    lines.append(f"  {'manager:':<13}{manager if manager else '(not set)'}")
+    wezterm_socket = record.get("wezterm_socket")
+    lines.append(f"  {'wezterm_socket:':<13}{wezterm_socket if wezterm_socket else '(not set)'}")
+    pane_id = record.get("pane_id")
+    lines.append(f"  {'pane_id:':<13}{pane_id if pane_id is not None else '(not set)'}")
     avatar_meta = record.get("avatar")
     if isinstance(avatar_meta, dict) and root is not None:
         from . import avatars as _avatars_mod
@@ -2007,6 +2087,58 @@ def _handle_project_delete(args, ctx):
     return f"Deleted project profile for {key!r}."
 
 
+# ── Compaction-broker request (WP-37) ─────────────────────────────────────────
+
+def _handle_request_compact(args, ctx):
+    """Authorize, then atomically drop a v1 compact-request file. The BROKER owns everything
+    downstream (TTL expiry, exec-time re-authz, pane-safety gates, injection, completion/
+    expiry notices) — none of that lands in this plugin. `requester` is ALWAYS the
+    server-stamped caller from `_require_registered` — a stray `requester` arg in `args` is
+    never read (anti-spoof, WP-37 AC-3)."""
+    requester, team, root = _require_registered(ctx)
+    target = args.get("target")
+    validate_agent_name(target, param="target")
+
+    target_record = read_agent_record(root, team, target)
+    if target_record is None:
+        raise CommsError(f"No registered teammate named {target!r}.")
+
+    manager = target_record.get("manager")
+    if not (target == requester or manager == requester):
+        reason = f"you are not {target!r}'s manager ({target!r}'s manager: {manager or 'not set'})"
+        # Best-effort audit DM: a send failure must not mask the denial error below. Sender is
+        # the sentinel COMPACT_BROKER_SENDER (not `requester`) — send_dm hard-blocks self-sends
+        # (to == sender raises), so sending as the requester to themselves would always fail.
+        try:
+            send_dm(root, team, COMPACT_BROKER_SENDER, requester,
+                    f"Compact request for {target!r} denied: {reason}.")
+        except Exception:
+            pass
+        raise CommsError(f"Compact request for {target!r} denied: {reason}.")
+
+    requests_dir = get_compact_requests_dir(root)
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    # Explicit strftime (NOT isoformat(), which drops the fractional segment entirely when
+    # microsecond == 0) so created_at is always fixed-width — the broker contract. ONE
+    # datetime.now(timezone.utc) call, rendered two ways, so the filename and body always agree.
+    created_at = now.strftime("%Y-%m-%dT%H:%M:%S.%f") + "+00:00"
+    fname_stamp = now.strftime("%Y%m%dT%H%M%S%f") + "Z"  # no colons — Windows filenames
+    req_id = str(uuid.uuid4())
+    record = {
+        "v": 1,
+        "id": req_id,
+        "requester": requester,
+        "target": target,
+        "created_at": created_at,
+        "ttl_seconds": 900,
+    }
+    write_json_atomic(requests_dir / f"{fname_stamp}-{req_id[:8]}.json", record)
+    return (f"Compact requested for {target!r} (request id: {req_id}). The broker validates "
+            f"again and injects at a safe point; completion or expiry (TTL 900s) comes back "
+            f"as a teammate-comms message.")
+
+
 _HANDLERS = {
     "teammate_register": _handle_register,
     "teammate_send": _handle_send,
@@ -2026,6 +2158,7 @@ _HANDLERS = {
     "project_profile": _handle_project_profile,
     "project_delete": _handle_project_delete,
     "teammate_set_avatar": _handle_set_avatar,
+    "teammate_request_compact": _handle_request_compact,
 }
 
 

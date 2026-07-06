@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.13.0
+
+**Compaction-broker plugin support.** Three work packages (WP-36–WP-38) add the
+plugin-side hooks a non-MCP compaction-broker daemon needs, fix-forward on a single
+branch, fix+proof in the same commit throughout.
+
+- **WP-36 — registration capture.** `register_identity` now captures `pane_id` /
+  `wezterm_socket` from the WezTerm pane environment and an optional `manager` field
+  (an explicit env var takes precedence over the param when the env value is valid;
+  a malformed env value falls through to the param instead of vetoing it), exposed in
+  `teammate_profile` / `teammate_list`. Passing an empty string explicit-clears a
+  previously-set field; omitting the argument leaves it untouched.
+- **WP-37 — `teammate_request_compact` tool (19th tool).** A new tool for requesting a
+  compaction, with a server-stamped requester (never client-supplied), write-time authz
+  (self or manager-of-target only), and an atomic write against a frozen cross-repo v1
+  request-file JSON contract. The sender name `compact-broker` is now reserved at
+  registration — an agent can no longer claim it, closing an in-band forgery path
+  against the broker's own audit/completion DMs.
+- **WP-38 — broker delivery CLI.** `python -m teammate_comms.deliver` wraps `send_dm`
+  in-process so the non-MCP broker daemon can deliver completion/expiry notices as real
+  teammate-comms DMs, with every storage guarantee (lock, unread cap, atomic write,
+  transcript tee) for free. Server startup now drops a `plugin-runtime.json` invocation
+  pointer (python executable, plugin root, version) for the broker to discover the CLI.
+
 ## v0.12.0
 
 **Fable-audit hardening pass.** A full internal audit across protocol correctness,

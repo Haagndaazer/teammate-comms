@@ -243,6 +243,13 @@ def build_child_env(base, agent, project_dir, team=None, comms_dir=None, spawned
         env["TEAMMATE_SPAWNED_BY"] = spawned_by
     else:
         env.pop("TEAMMATE_SPAWNED_BY", None)
+    # WP-36 gate finding (BLOCKER): a reincarnated child launches via a fresh console/wt.exe,
+    # never inside the PARENT's WezTerm pane — so WEZTERM_PANE/WEZTERM_UNIX_SOCKET inherited
+    # verbatim from `base` would register the child with its MANAGER's pane binding, and the
+    # broker would then type /compact + CR into the manager's own pane. Same never-inherit
+    # discipline as TEAMMATE_SPAWNED_BY above: popped unconditionally, never carried down.
+    env.pop("WEZTERM_PANE", None)
+    env.pop("WEZTERM_UNIX_SOCKET", None)
     # Strip the reincarnate GATE so a spawned child can't itself re-spawn unless its operator
     # explicitly opts back in (the reincarnate gate is opt-in-default-off by design, F-1). This
     # is the gate ONLY — TEAMMATE_LAUNCH_ARGS is a launch override the child SHOULD inherit so

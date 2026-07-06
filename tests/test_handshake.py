@@ -565,7 +565,8 @@ def main():
     if any("id" in m and m["id"] is None and "result" in m for m in msgs):
         failures.append("notification-form ping produced a response frame (WP-16 AC-3, should be silent)")
 
-    # tools/list: 18 tools (13 original + 4 project-profile tools + 1 avatar tool), each with an object inputSchema
+    # tools/list: 19 tools (13 original + 4 project-profile tools + 1 avatar tool + 1 WP-37
+    # compact-request tool), each with an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_ack", "teammate_list", "teammate_whoami",
@@ -573,7 +574,7 @@ def main():
                       "teammate_react", "teammate_reincarnate", "teammate_dashboard",
                       "teammate_delete",
                       "project_register", "list_projects", "project_profile", "project_delete",
-                      "teammate_set_avatar"}
+                      "teammate_set_avatar", "teammate_request_compact"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")
     else:
