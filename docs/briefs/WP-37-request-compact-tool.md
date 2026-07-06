@@ -66,6 +66,14 @@ plugin.
    - Write via `write_json_atomic` (comms.py:615) — temp sibling + `os.replace`, same dir.
 5. **Return string**: request id + target + "broker validates and injects at a safe point;
    completion or expiry (TTL 900s) comes back as a teammate-comms message."
+6. **Reserve the sentinel name** (peer-review finding, added post-dispatch): the denial
+   audit trail — and WP-38's completion notices — are trustworthy only if nobody else can
+   speak as `compact-broker`. Today any agent can `teammate_register(agent="compact-broker")`
+   and forge broker notices in-band (`_check_reserved_name` blocks only Windows device
+   names; the only identity guard in `register_identity` is `type == "human"`). Add a
+   guard in `register_identity` rejecting the name `compact-broker` (same shape as the
+   human-operator rejection, case-insensitively — the G2 case-variant lesson applies):
+   the sentinel is a SENDER LABEL, never a registrable identity.
 
 ## Acceptance criteria
 
@@ -81,7 +89,9 @@ plugin.
   not-registered error (`_require_registered`).
 - AC-5 (atomicity): after a successful call, the request dir contains the final `.json` and
   zero `*.tmp` residue; the write path is `write_json_atomic` (grep-proof in diff).
-- AC-6: all four suites green on Windows (`uv run --no-sync python tests/<suite>.py`).
+- AC-6 (reservation): `teammate_register(agent="compact-broker")` → `CommsError`; so does
+  `Compact-Broker` (case variant). Existing agents unaffected.
+- AC-7: all four suites green on Windows (`uv run --no-sync python tests/<suite>.py`).
 
 ## Known-intentional — do NOT "fix"
 
