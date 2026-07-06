@@ -188,6 +188,21 @@ def _collect_profile_args(args):
     return {name: args[name] for name in PROFILE_FIELDS if name in args}
 
 
+# WP-36: `manager` is a registry-record field (an authz key for teammate_request_compact), NOT
+# a PROFILE_FIELDS entry — it gets agent-name validation, not a free-text length cap. Shared
+# schema property for both teammate_register and teammate_update.
+_MANAGER_PROPERTY = {
+    "manager": {
+        "type": "string",
+        "description": (
+            "The teammate this agent reports to (command authority, e.g. for compact "
+            "requests) — auto-filled from $AGENT_MANAGER if set, else pass explicitly. "
+            "Pass an empty string to clear it. Omit to leave unchanged."
+        ),
+    },
+}
+
+
 _PROJECT_DESCRIPTIONS = {
     "summary":     "One-liner shown in list_projects — keep terse.",
     "description": "Short paragraph describing the project.",
@@ -241,6 +256,7 @@ TOOL_DEFINITIONS = [
                     "description": "Optional comms root override (else $TEAMMATE_COMMS_DIR or the project dir).",
                 },
                 **_profile_schema_properties(),
+                **_MANAGER_PROPERTY,
             },
             "required": ["agent"],
         },
@@ -331,14 +347,14 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_update",
         "description": (
-            "Update your own profile fields (role, personality, status, authority). "
-            "Use this to keep your status fresh as you move between tasks so "
-            "teammates can see what you're doing without interrupting you. Updates "
-            "only your own record; pass an empty string to clear a field."
+            "Update your own profile fields (role, personality, status, authority) "
+            "or your manager. Use this to keep your status fresh as you move between "
+            "tasks so teammates can see what you're doing without interrupting you. "
+            "Updates only your own record; pass an empty string to clear a field."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": _profile_schema_properties(),
+            "properties": {**_profile_schema_properties(), **_MANAGER_PROPERTY},
         },
     },
     {
@@ -592,9 +608,11 @@ def _handle_register(args, ctx):
         team = None
     comms_dir = args.get("comms_dir")
     profile = _collect_profile_args(args)  # validated inside register_identity
+    manager = args.get("manager")  # WP-36: None (absent) preserves; "" clears; validated inside
     # ctx["register"] does the side effects (resolve root, inbox, registry,
     # start watching) and returns a human-readable status string.
-    return ctx["register"](agent, team.strip() if team else None, comms_dir, profile)
+    return ctx["register"](agent, team.strip() if team else None, comms_dir, profile,
+                            manager=manager)
 
 
 def _clean_message(message):
@@ -967,6 +985,14 @@ def _handle_list(args, ctx):
         if role:
             rows.append(f"      role:      {role}")
         # personality intentionally excluded from list — use teammate_profile for full details
+        # WP-36: only when set — keep the list lean for agents outside WezTerm / with no manager.
+        manager = record.get("manager")
+        if manager:
+            rows.append(f"      manager:   {manager}")
+        pane_id = record.get("pane_id")
+        wezterm_socket = record.get("wezterm_socket")
+        if pane_id is not None or wezterm_socket:
+            rows.append(f"      pane:      {wezterm_socket or '?'}#{pane_id if pane_id is not None else '?'}")
     teammates = "Registered teammates:\n" + "\n".join(rows) if rows else "No registered teammates yet."
     if filtered_count:
         teammates += (
@@ -1096,9 +1122,21 @@ def _handle_whoami(args, ctx):
 def _handle_update(args, ctx):
     agent, team, root = _require_registered(ctx)
     raw = _collect_profile_args(args)
-    if not raw:
-        raise CommsError(f"Provide at least one profile field to update: {sorted(PROFILE_FIELDS)}.")
+    manager_given = "manager" in args
+    if not raw and not manager_given:
+        raise CommsError(
+            f"Provide at least one profile field to update: {sorted(PROFILE_FIELDS)}, or manager."
+        )
     fields = {k: validate_profile_field(k, v) for k, v in raw.items()}
+    if manager_given:
+        raw_manager = args.get("manager")
+        # CLEAR MECHANICS (WP-36): validate_agent_name("") always raises, so an empty/
+        # whitespace value is the clear sentinel handled BEFORE validation ever runs.
+        if not isinstance(raw_manager, str) or not raw_manager.strip():
+            fields["manager"] = None
+        else:
+            validate_agent_name(raw_manager.strip())
+            fields["manager"] = raw_manager.strip()
     # Best-effort lock: a False return means the write was dropped (e.g. heartbeat
     # contention) — surface that instead of falsely reporting success.
     if not write_agent_record(root, team, agent, timeout=5, **fields):
@@ -1121,6 +1159,15 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     for field in PROFILE_FIELDS:
         value = record.get(field)
         lines.append(f"  {field + ':':<13}{value if value else '(not set)'}")
+    # WP-36: always render all three broker-registration fields, `(not set)` when null.
+    # pane_id uses `is not None` (NOT truthiness) — WezTerm panes are 0-indexed, and pane 0
+    # is the ordinary single-pane value, not an absence.
+    manager = record.get("manager")
+    lines.append(f"  {'manager:':<13}{manager if manager else '(not set)'}")
+    wezterm_socket = record.get("wezterm_socket")
+    lines.append(f"  {'wezterm_socket:':<13}{wezterm_socket if wezterm_socket else '(not set)'}")
+    pane_id = record.get("pane_id")
+    lines.append(f"  {'pane_id:':<13}{pane_id if pane_id is not None else '(not set)'}")
     avatar_meta = record.get("avatar")
     if isinstance(avatar_meta, dict) and root is not None:
         from . import avatars as _avatars_mod

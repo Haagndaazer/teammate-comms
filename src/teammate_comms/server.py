@@ -251,13 +251,15 @@ def _project_label_from_git_remote(proj_dir):
     return _project_label_from_remote(result.stdout.strip())
 
 
-def register_identity(agent, team, comms_dir, profile=None):
+def register_identity(agent, team, comms_dir, profile=None, manager=None):
     """Establish identity + start watching. Raises CommsError on bad input.
 
     Used by the teammate_register tool and by the optional env auto-register.
     ``profile`` is an optional dict of free-text profile fields (role/personality/
-    status/authority) validated and written onto the registry record. Returns a
-    human-readable status string.
+    status/authority) validated and written onto the registry record. ``manager``
+    is the explicit teammate_register param (WP-36) — see the precedence note
+    below; None means "not given" (distinct from an explicit empty-string clear).
+    Returns a human-readable status string.
     """
     validate_agent_name(agent)
     profile = dict(profile or {})
@@ -291,6 +293,48 @@ def register_identity(agent, team, comms_dir, profile=None):
             validate_agent_name(spawned_by)
         except CommsError:
             spawned_by = None
+
+    # Manager field (WP-36, command authority — NOT provenance; see spawned_by above for the
+    # different fact). Precedence: $AGENT_MANAGER env (Wellington's launcher sets it for
+    # subordinates; a malformed value is DROPPED like spawned_by) > explicit `manager` param
+    # (a malformed value RAISES — the caller typed it) > neither given → omit the key entirely
+    # so write_agent_record's field-merge preserves whatever is already on disk.
+    manager_fields = {}
+    env_manager = os.environ.get("AGENT_MANAGER")
+    if not _looks_unset(env_manager):
+        candidate = env_manager.strip()
+        try:
+            validate_agent_name(candidate)
+            manager_fields["manager"] = candidate
+        except CommsError:
+            pass
+    elif manager is not None:
+        # CLEAR MECHANICS (peer-review finding): validate_agent_name("") always RAISES, so an
+        # empty/whitespace explicit value is handled as the clear sentinel BEFORE validation
+        # ever runs — only a non-empty explicit value goes through validate_agent_name.
+        if not manager.strip():
+            manager_fields["manager"] = None
+        else:
+            validate_agent_name(manager.strip())
+            manager_fields["manager"] = manager.strip()
+
+    # WezTerm pane binding (WP-36) — captured at register only, no heartbeat refresh. Always
+    # computed (even to None) so it's always PASSED to write_agent_record below: a re-register
+    # outside WezTerm must overwrite a stale binding with None, not silently keep it (the field-
+    # merge otherwise preserves an omitted key, which here would mean the broker keeps typing
+    # into a pane this agent no longer owns).
+    pane_id = None
+    pane_env = os.environ.get("WEZTERM_PANE")
+    if not _looks_unset(pane_env):
+        try:
+            pane_id = int(pane_env.strip())
+        except ValueError:
+            pane_id = None  # malformed value never fails registration
+    wezterm_socket = None
+    socket_env = os.environ.get("WEZTERM_UNIX_SOCKET")
+    if not _looks_unset(socket_env):
+        wezterm_socket = Path(socket_env.strip()).name or None
+
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
     my_instance_id = _identity.get_instance_id()
@@ -369,7 +413,9 @@ def register_identity(agent, team, comms_dir, profile=None):
         # looking textually identical to a genuinely-offline recipient.
         comms_root=str(root),
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
+        pane_id=pane_id, wezterm_socket=wezterm_socket,
         **profile_fields,
+        **manager_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),
     ) or {}
     # Take the epoch straight off THIS call's return (WP-19 gate CR) — NEVER from a

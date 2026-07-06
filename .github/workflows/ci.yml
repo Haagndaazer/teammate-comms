@@ -1,10 +1,12 @@
 name: CI
 
-# Run all three (zero-dependency, stdlib-only) acceptance suites on every OS. The handshake
+# Run all four (zero-dependency, stdlib-only) acceptance suites on every OS. The handshake
 # harness drives the MCP server over a pipe and exercises the in-process unit blocks (storage,
-# channel, dashboard HTTP, hooks); the WP-13/WP-14 suites cover project profiles and avatars.
-# No secrets, no network. CI syncs no extras — the WP-14 suite's Pillow-dependent checks
-# self-skip (never fail) when Pillow isn't installed; see test_wp14_avatars.py's _HAS_PILLOW.
+# channel, dashboard HTTP, hooks); the WP-13/WP-14 suites cover project profiles and avatars;
+# test_compact.py covers the compaction-broker registration fields (WP-36) and request tool
+# (WP-37). No secrets, no network. CI syncs no extras — the WP-14 suite's Pillow-dependent
+# checks self-skip (never fail) when Pillow isn't installed; see test_wp14_avatars.py's
+# _HAS_PILLOW.
 on:
   push:
     branches: [main]
@@ -48,3 +50,5 @@ jobs:
         run: uv run --no-sync python tests/test_wp13_projects.py
       - name: Run WP-14 avatar suite
         run: uv run --no-sync python tests/test_wp14_avatars.py
+      - name: Run compaction-broker suite (WP-36/WP-37)
+        run: uv run --no-sync python tests/test_compact.py
