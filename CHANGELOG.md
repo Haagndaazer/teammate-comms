@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.13.1
 
 - **WP-39 — `teammate_request_compact` alerts the requester's manager on a self-compact.**
   A self-compact request now best-effort DMs (sender `compact-broker`) the requester's
