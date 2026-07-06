@@ -398,7 +398,7 @@ tool v0.10.0 + 1 compact-request tool WP-37):**
 | `list_projects` | — | Concise directory: display name + live roster + summary per project. Trailing aggregate: undocumented project labels + near-miss agents. |
 | `project_profile` | `key?` | Full project detail: all fields, provenance, live roster (liveness per member). |
 | `project_delete` | `key?` | Remove a project profile file. |
-| `teammate_request_compact` | `target` (agent name) | Authorize (self, or a subordinate of the caller via WP-36's `manager` field) then atomically drop a v1 request file the compaction-broker daemon consumes; a denial best-effort DMs an audit line from `compact-broker` to the requester. No TTL expiry, exec-time re-authz, or injection here — that's the broker's half. |
+| `teammate_request_compact` | `target` (agent name) | Authorize (self, or a subordinate of the caller via WP-36's `manager` field) then atomically drop a v1 request file the compaction-broker daemon consumes; a denial best-effort DMs an audit line from `compact-broker` to the requester. On the self-compact leg, also best-effort DMs the requester's manager (WP-39) — iff `manager` is truthy, `!= requester`, and resolves to a REGISTERED teammate. No TTL expiry, exec-time re-authz, or injection here — that's the broker's half. |
 
 Every tool's error text wraps the underlying cause with a one-line action sentence.
 

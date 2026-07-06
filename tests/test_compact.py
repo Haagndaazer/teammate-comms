@@ -1,4 +1,4 @@
-"""Compaction-broker plugin support — acceptance tests (shared suite, WP-36 + WP-37 + WP-38).
+"""Compaction-broker plugin support — acceptance tests (shared suite, WP-36 + WP-37 + WP-38 + WP-39).
 
 WP-36 (this pass): registration auto-capture — pane_id, wezterm_socket, manager fields.
   AC-1: pane_id/wezterm_socket captured as int/basename; pane_id=0 renders as 0, not absent.
@@ -22,6 +22,20 @@ WP-37: teammate_request_compact — write-time authz + atomic v1 request-file dr
         not-registered error.
   AC-5 (atomicity): the request dir holds only the final .json, zero .tmp residue.
   AC-6 (reservation): registering as 'compact-broker' (any case) is rejected.
+  AC-7: all four suites green on Windows (this file's own presence + ci.yml wiring).
+
+WP-39: teammate_request_compact wakes the requester's manager on a self-compact.
+  AC-1: self-compact with a REGISTERED manager -> exactly one send_dm(to=manager,
+        sender='compact-broker') proven at the call boundary (spy, not just inbox content);
+        alert lands in the manager's inbox; return string carries the "notified" line.
+  AC-2: no manager set -> zero send_dm calls, no error, no false "notified" claim.
+  AC-3: manager-compacts-subordinate leg -> zero alert calls (no self-echo to the manager).
+  AC-4: manager field set but unregistered -> zero send_dm calls, no phantom registry record,
+        no false "notified" claim.
+  AC-5: send_dm raises on the alert call -> request still succeeds and file still lands, but
+        the return does NOT claim "notified" (proves try/except isolation + the `notified`
+        flag's honesty).
+  AC-6: anti-regression — all WP-37 ACs above still pass unchanged.
   AC-7: all four suites green on Windows (this file's own presence + ci.yml wiring).
 
 WP-38: broker delivery CLI — `python -m teammate_comms.deliver`.
@@ -161,6 +175,30 @@ class FakeIdentity:
 def _ctx_for(agent, team, root):
     return {"identity": FakeIdentity(agent, team, root), "register": None,
             "auto_register_error": lambda: None}
+
+
+@contextlib.contextmanager
+def _spy_send_dm(raise_on_to=None):
+    """Monkeypatch tools_mod.send_dm (the name _handle_request_compact calls at module scope)
+    to record every call's (to, sender, message) — proving the WP-39 alert guards at the CALL
+    boundary, not just via inbox-content side effects (peer-review finding #1: an inbox-only
+    check can't tell the guard apart from send_dm's own None-validation swallow). If
+    `raise_on_to` is given, a call with that `to` raises instead of performing the real send
+    (AC-5: proves the try/except isolates the request from an alert-send failure)."""
+    calls = []
+    original = tools_mod.send_dm
+
+    def fake(root, team, sender, to, message, **kwargs):
+        calls.append({"to": to, "sender": sender, "message": message})
+        if raise_on_to is not None and to == raise_on_to:
+            raise RuntimeError("simulated send_dm failure")
+        return original(root, team, sender, to, message, **kwargs)
+
+    tools_mod.send_dm = fake
+    try:
+        yield calls
+    finally:
+        tools_mod.send_dm = original
 
 
 # ── AC-1 / AC-3: pane_id / wezterm_socket captured at register_identity ────────────────
@@ -490,6 +528,131 @@ def test_wp37_ac6_reservation():
               "AC-6: the reservation must not affect registration of an ordinary agent name")
 
 
+# ── WP-39 AC-1: subordinate self-compact alerts a registered manager ───────────────────
+
+def test_wp39_ac1_self_compact_alerts_registered_manager():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "A", type="full", channel=True)
+        write_agent_record(root, None, "B", type="full", channel=True, manager="A")
+        ctx_b = _ctx_for("B", None, root)
+
+        with _spy_send_dm() as calls:
+            result = tools_mod._handle_request_compact({"target": "B"}, ctx_b)
+
+        reqs_dir = get_compact_requests_dir(root)
+        check(len(list(reqs_dir.glob("*.json"))) == 1,
+              "AC-1: the request file must still land regardless of the alert")
+
+        alert_calls = [c for c in calls if c["to"] == "A"]
+        check(len(calls) == 1 and len(alert_calls) == 1,
+              f"tautology[AC-1]: exactly one send_dm call must fire, to=='A' — got {calls}")
+        check(alert_calls[0]["sender"] == COMPACT_BROKER_SENDER,
+              "AC-1: the alert must be sent from the COMPACT_BROKER_SENDER sentinel")
+        check("B" in alert_calls[0]["message"],
+              "AC-1: the alert body must name the requester (B)")
+
+        ctx_a = _ctx_for("A", None, root)
+        inbox_text = tools_mod._handle_inbox({"show_all": True}, ctx_a)
+        check(COMPACT_BROKER_SENDER in inbox_text and "B" in inbox_text,
+              "AC-1: the alert DM must actually land in A's inbox, from 'compact-broker', naming B")
+
+        check("manager 'A' was notified" in result,
+              f"AC-1: the return string must end with the manager-notified transparency line, got {result!r}")
+
+
+# ── WP-39 AC-2: no manager -> no alert, no error, no false claim ───────────────────────
+
+def test_wp39_ac2_no_manager_no_alert():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "S", type="full", channel=True)
+        ctx_s = _ctx_for("S", None, root)
+
+        with _spy_send_dm() as calls:
+            result = tools_mod._handle_request_compact({"target": "S"}, ctx_s)
+
+        reqs_dir = get_compact_requests_dir(root)
+        check(len(list(reqs_dir.glob("*.json"))) == 1,
+              "AC-2: the request file must still land with no manager set")
+        check(len(calls) == 0,
+              f"tautology[AC-2]: zero send_dm calls when no manager is set — got {calls}")
+        check("notified" not in result,
+              f"AC-2: the return string must not claim a notification, got {result!r}")
+
+
+# ── WP-39 AC-3: manager-compacts-subordinate -> no self-echo alert ─────────────────────
+
+def test_wp39_ac3_manager_leg_no_self_echo():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "A", type="full", channel=True)
+        write_agent_record(root, None, "B", type="full", channel=True, manager="A")
+        ctx_a = _ctx_for("A", None, root)
+
+        with _spy_send_dm() as calls:
+            result = tools_mod._handle_request_compact({"target": "B"}, ctx_a)
+
+        reqs_dir = get_compact_requests_dir(root)
+        check(len(list(reqs_dir.glob("*.json"))) == 1,
+              "AC-3: the request file must still land on the manager-compact leg")
+        check(len(calls) == 0,
+              f"tautology[AC-3]: zero alert send_dm calls on the manager-compact leg (A "
+              f"compacting B) — an alert here would be a self-echo to A — got {calls}")
+        inbox_text = tools_mod._handle_inbox({"show_all": True}, ctx_a)
+        check(COMPACT_BROKER_SENDER not in inbox_text,
+              "AC-3: A's own inbox must stay clean — no self-echo alert DM")
+        check("notified" not in result,
+              f"AC-3: the return string must not claim a notification on the manager leg, got {result!r}")
+
+
+# ── WP-39 AC-4: unregistered manager -> no send, no phantom inbox, honest return ────────
+
+def test_wp39_ac4_unregistered_manager_no_send():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "U", type="full", channel=True, manager="ghost")
+        ctx_u = _ctx_for("U", None, root)
+
+        with _spy_send_dm() as calls:
+            result = tools_mod._handle_request_compact({"target": "U"}, ctx_u)
+
+        reqs_dir = get_compact_requests_dir(root)
+        check(len(list(reqs_dir.glob("*.json"))) == 1,
+              "AC-4: the request file must still land with an unregistered manager field")
+        check(len(calls) == 0,
+              f"tautology[AC-4]: zero send_dm calls when manager 'ghost' is never registered — "
+              f"got {calls}")
+        check(read_agent_record(root, None, "ghost") is None,
+              "tautology[AC-4]: no phantom registry record must be created for 'ghost'")
+        check("notified" not in result,
+              f"AC-4: the return string must not claim a notification, got {result!r}")
+
+
+# ── WP-39 AC-5: best-effort isolation + honest return under a raising send_dm ──────────
+
+def test_wp39_ac5_alert_failure_isolated_and_honest():
+    td, root = _make_root()
+    with td:
+        write_agent_record(root, None, "A", type="full", channel=True)
+        write_agent_record(root, None, "B", type="full", channel=True, manager="A")
+        ctx_b = _ctx_for("B", None, root)
+
+        with _spy_send_dm(raise_on_to="A") as calls:
+            result = tools_mod._handle_request_compact({"target": "B"}, ctx_b)
+
+        check(len(calls) == 1 and calls[0]["to"] == "A",
+              f"tautology[AC-5]: the alert send_dm must still be ATTEMPTED (and raise) — got {calls}")
+        reqs_dir = get_compact_requests_dir(root)
+        check(len(list(reqs_dir.glob("*.json"))) == 1,
+              "AC-5: the request file must land even though the alert send raised")
+        check(isinstance(result, str) and "Compact requested for 'B'" in result,
+              f"AC-5: a raising alert send must not fail the overall request, got {result!r}")
+        check("notified" not in result,
+              f"tautology[AC-5]: the return must NOT claim 'notified' when the send raised "
+              f"(proves the `notified` flag stays False on failure) — got {result!r}")
+
+
 # ── WP-38: broker delivery CLI ──────────────────────────────────────────────────────────
 
 def _run_deliver(args, input_bytes=None, timeout=15):
@@ -780,6 +943,11 @@ def main():
         ("WP-37 AC-3: anti-spoof (requester stamped, not passed)", test_wp37_ac3_anti_spoof),
         ("WP-37 AC-4: unregistered target/caller", test_wp37_ac4_unregistered),
         ("WP-37 AC-6: sentinel-name reservation", test_wp37_ac6_reservation),
+        ("WP-39 AC-1: self-compact alerts registered manager", test_wp39_ac1_self_compact_alerts_registered_manager),
+        ("WP-39 AC-2: no manager -> no alert", test_wp39_ac2_no_manager_no_alert),
+        ("WP-39 AC-3: manager leg -> no self-echo", test_wp39_ac3_manager_leg_no_self_echo),
+        ("WP-39 AC-4: unregistered manager -> no send", test_wp39_ac4_unregistered_manager_no_send),
+        ("WP-39 AC-5: alert failure isolated + honest return", test_wp39_ac5_alert_failure_isolated_and_honest),
         ("WP-38 AC-1: --message form + transcript tee", test_wp38_ac1_message_form_and_transcript_tee),
         ("WP-38 AC-2: stdin exact content (BOM/newline/non-ASCII)", test_wp38_ac2_stdin_exact_content),
         ("WP-38 AC-3: bad input exits 2", test_wp38_ac3_bad_input_exits_2),

@@ -33,7 +33,7 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 | `list_projects` | — | List all registered project profiles: display name + live teammate roster + summary per project. Use `project_profile` for full details. Also surfaces undocumented project labels (agents active with no profile) and near-miss agents (raw field differs from canonical key). |
 | `project_profile` | `key?` | Full detail for one project — all stored fields, provenance (created_by/at, updated_by/at), and the live-derived teammate roster with liveness. `key` defaults to your project. |
 | `project_delete` | `key?` | Remove a project profile. By convention only delete your own project's profile unless the user asks otherwise. |
-| `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself, or a subordinate whose `manager` field names you, via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. |
+| `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself, or a subordinate whose `manager` field names you, via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 
 **Project profiles — team-level metadata.** Beyond per-agent `project` labels, first-class
 project profiles let teammates discover *which projects exist*, *who works on each*, and

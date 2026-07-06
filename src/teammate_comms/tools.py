@@ -591,7 +591,8 @@ TOOL_DEFINITIONS = [
             "again and does the actual injection at a safe point. Agents self-compact at a "
             "safe boundary (subordinate: on handing work back for gate check; manager: "
             "before blocking on subordinates); a manager may also request one for their own "
-            "subordinate. Completion or expiry (TTL 900s) arrives later as a teammate-comms "
+            "subordinate. A self-compact best-effort notifies your registered manager, if you "
+            "have one. Completion or expiry (TTL 900s) arrives later as a teammate-comms "
             "message from 'compact-broker'."
         ),
         "inputSchema": {
@@ -2134,9 +2135,30 @@ def _handle_request_compact(args, ctx):
         "ttl_seconds": 900,
     }
     write_json_atomic(requests_dir / f"{fname_stamp}-{req_id[:8]}.json", record)
-    return (f"Compact requested for {target!r} (request id: {req_id}). The broker validates "
-            f"again and injects at a safe point; completion or expiry (TTL 900s) comes back "
-            f"as a teammate-comms message.")
+
+    # WP-39: on the self-compact leg only, best-effort wake the requester's manager — the
+    # request is otherwise silent to a manager who owns the requester. `manager` must resolve
+    # to a REGISTERED teammate (not just be the self-declared, unvalidated field on the target
+    # record) — else `manager == "compact-broker"` would trip send_dm's self-send guard and be
+    # swallowed, `"Compact-Broker"` would create a phantom broker-branded inbox, and any
+    # mistyped/unregistered name would litter a phantom inbox for nothing.
+    notified = False
+    if (target == requester and manager and manager != requester
+            and read_agent_record(root, team, manager) is not None):
+        try:
+            send_dm(root, team, COMPACT_BROKER_SENDER, manager,
+                    f"{requester} requested a self-compact (id {req_id[:8]}, TTL 900s). "
+                    f"The broker will inject at a safe point when they're idle.")
+            notified = True
+        except Exception:
+            pass
+
+    result = (f"Compact requested for {target!r} (request id: {req_id}). The broker validates "
+              f"again and injects at a safe point; completion or expiry (TTL 900s) comes back "
+              f"as a teammate-comms message.")
+    if notified:
+        result += f" Your manager {manager!r} was notified."
+    return result
 
 
 _HANDLERS = {
