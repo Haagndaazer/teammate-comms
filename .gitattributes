@@ -13,3 +13,5 @@
 # replay offset (and warn on every flush). Binary → content-equal == byte-equal, killing
 # that whole class and making the union driver byte-deterministic.
 .cognition/*.jsonl merge=union -text
+# vibe-cognition: append-only journal union-merge (safe to remove)
+.cognition/journal.jsonl merge=union
