@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.13.1
+
+- **WP-39 — `teammate_request_compact` alerts the requester's manager on a self-compact.**
+  A self-compact request now best-effort DMs (sender `compact-broker`) the requester's
+  registered manager, if one is set and resolves to a registered teammate — closing the
+  gap where a subordinate's self-compact was silent to the manager who owns them. No
+  change to the manager-compacting-subordinate leg or the frozen v1 request-file contract.
+
 ## v0.13.0
 
 **Compaction-broker plugin support.** Three work packages (WP-36–WP-38) add the
