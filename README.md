@@ -40,7 +40,7 @@ That's the whole loop: register once each, then `teammate_send`/`teammate_inbox`
 
 | Tool | Args | Behavior |
 |------|------|----------|
-| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once at session start to establish identity, register your inbox, and arm the channel. Optionally set your profile (`project` is auto-filled). |
+| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once, whenever you want to join comms, to establish identity, register your inbox, and arm the channel. Opt-in — nothing calls this for you. Optionally set your profile (`project` is auto-filled). |
 | `teammate_send` | `to`, `message`, `priority?`, `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (fans out to all members); `@name` (a member) flags a mention; `post_type` builds a decision trail. |
 | `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read your unread messages (or count). `since`/`limit` page a large inbox (id cursor + most-recent-N). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies already shown are suppressed by default, durably across sessions — pass `show_all:true` to re-read them. A live unread queue is capped at 1000 — beyond that, the oldest overflow moves to your read history (never dropped) and stops appearing here. |
 | `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. `"all"` clears only what you've **seen** (messages that arrived since your last `teammate_inbox` read are kept). |
@@ -293,20 +293,16 @@ marketplace registration entirely:
 claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 ```
 
-No env var is required. At session start, call `teammate_register(agent: "Grant")`
-(add `team:` for namespaced inboxes) to establish identity and arm the channel.
-Custom channels require `--dangerously-load-development-channels` — the flag only
-bypasses the plugin allowlist; your org's `channelsEnabled` policy still applies.
+No env var is required. **Registration is opt-in:** call
+`teammate_register(agent: "Grant")` (add `team:` for namespaced inboxes) whenever you
+(or the user) want this instance to join comms — nothing nudges an agent to register
+automatically, so agents don't self-register under arbitrary names. Custom channels
+require `--dangerously-load-development-channels` — the flag only bypasses the plugin
+allowlist; your org's `channelsEnabled` policy still applies.
 
 **First install:** a SessionStart hook builds the (zero-dep) venv so the server
 launches with `uv run --no-sync`. If the server isn't connected on the very first
 session, **restart Claude Code once** — every session after is instant.
-
-The server's standing instructions (register, drain your inbox, **update your status as
-you work**) reach the agent via the MCP `initialize` handshake. Because MCP instructions
-aren't known to survive a context compaction, a second SessionStart hook (matcher
-`compact`) re-injects them after a `/compact` — single-sourced from
-`teammate_comms.instructions`, so the text never drifts.
 
 ### Trusting the channel (skip the dangerous flag)
 

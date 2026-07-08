@@ -54,15 +54,13 @@ teammate-comms/
 │   ├── comms.py                # storage / registry / liveness / transcript (§8)
 │   ├── channel.py              # background inbox watcher + push (§7)
 │   ├── tools.py                # MCP tool definitions + handlers (§9)
-│   ├── instructions.py         # standing-instructions text + SessionStart reinject entry point (§6)
 │   ├── spawn.py                # teammate_reincarnate launcher (argv/env builders + spawn)
 │   ├── dashboard.py            # stdlib web console server (§9, teammate_dashboard)
 │   ├── avatars.py              # teammate_set_avatar ingest/render pipeline (§9, lazy Pillow import)
 │   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
 ├── hooks/
 │   ├── hooks.json
-│   ├── session-start.sh        # builds the venv before the server spawns
-│   └── reinject-instructions.sh # re-injects the standing instructions after a compact
+│   └── session-start.sh        # builds the venv before the server spawns
 ├── skills/teammate-comms/SKILL.md
 ├── tests/test_handshake.py     # end-to-end server test (handshake + tools + channel + dashboard HTTP + hooks)
 ├── .github/workflows/ci.yml    # CI: run the harness on ubuntu + windows (added 0.7.x)
@@ -97,12 +95,10 @@ fast, predictable spawn:
   venv already exists mid-session) — contract-independent and hermetically tested.
 - **First-session UX:** on a fresh install the hook builds the venv and the server
   connects after a **restart** — identical to vibe-cognition. Documented in the README.
-- A **second SessionStart hook** (`hooks/reinject-instructions.sh`, `matcher:"compact"`)
-  re-emits the server `INSTRUCTIONS` as `additionalContext` after a `/compact` (added
-  0.7.0). The MCP `initialize` handshake surfaces them at session start, but those aren't
-  known to survive a compaction; the text is single-sourced in `teammate_comms.instructions`
-  (stdlib-only `main()` → SessionStart JSON, run via the same `uv run --no-sync` launch) so
-  server + hook never drift. Mirrors vibe-cognition's pattern.
+- **Registration is opt-in (WP-41, 0.14.0):** the MCP `initialize` handshake carries no
+  `instructions` field, and there is no compaction re-injection hook. The toolset is fully
+  functional; an agent joins comms only when it (or the user) explicitly calls
+  `teammate_register`, or `TEAMMATE_AGENT` is set. Nothing is advertised in-session.
 
 `mcpServers` is declared **inline in `plugin.json`** with `${CLAUDE_PLUGIN_ROOT}`, so
 the plugin is self-contained and does not write into a project's `.mcp.json`.
@@ -201,7 +197,8 @@ with an id returns `-32601`; unknown notifications are ignored). A background
 write stdout under a **single lock**, so messages never interleave at the byte level.
 
 - `initialize` advertises `capabilities.experimental['claude/channel'] = {}` plus
-  `tools`, and echoes `protocolVersion` + `instructions`.
+  `tools`, and echoes `protocolVersion`. It carries **no `instructions` field** —
+  registration is opt-in (WP-41, 0.14.0); nothing nudges an agent in-session.
 - The channel push is a **raw JSON-RPC notification** (`method:
   "notifications/claude/channel"`, `params: {content, meta}`) written directly to
   stdout under the lock.
@@ -226,36 +223,15 @@ stdout lock (no CRLF, no cp1252); stdin is decoded with `utf-8-sig` to tolerate 
 leading BOM. No handler may `print` to stdout (that's the protocol stream);
 diagnostics go to stderr → `~/.claude/debug/<session-id>.txt`.
 
-**H5 — the standing-instructions contract (WP-30):** everything in this doc about
-`INSTRUCTIONS` reaching the agent rests on one UNVERIFIED assumption: that Claude Code's
-`initialize.instructions` field is actually surfaced to the model every session, not just
-accepted and discarded. There is no in-repo test for this (none is possible — it depends on
-CC's own prompt assembly, outside this process). **How to verify by hand:** after
-`teammate_register`, run `/mcp` — the `teammate-comms` server should be listed; the standing
-rules text ("Update your teammate-comms status as you work...") should be visible somewhere
-in the session's MCP instructions block. If it's ever NOT there, the whole
-`instructions`/reinject-after-compact design (this section + `reinject-instructions.sh`)
-needs re-examination — h1's version stamp (below) at least tells you WHICH build's text you
-were looking at when you checked.
-
-**H1 — version stamps (WP-30):** the running server's `INSTRUCTIONS` are spawn-frozen for
-the process's lifetime, while a mid-session plugin update changes what's on disk — nothing
-used to record which version produced which text. `server.py` now logs
-`starting teammate-comms v<version>` once at startup (stderr → the debug log), and
-`instructions.py`'s `_REINJECT_HEADER` (the block `reinject-instructions.sh` emits after a
-compact) is stamped `# teammate-comms v<version> - Standing Practices ...` — a
-stale-vs-current mismatch between the two is now visible instead of silent.
-
 **H7/H8 — housekeeping notes (WP-30):** the tool list is **static per process** — new tools
 only ever arrive via a full server respawn (a plugin update + Claude Code restart), so no
 `notifications/tools/list_changed` emitter is needed; nothing in this design changes tools
-at runtime. `${CLAUDE_PLUGIN_ROOT}` is expanded independently by **three** consumers —
-`plugin.json`'s `mcpServers` spawn, `hooks/session-start.sh`, and
-`hooks/reinject-instructions.sh` — the invariant all three rely on is that Claude Code
-expands it identically for all three within one session (same plugin install → same path);
-if that ever diverges (e.g. a mid-session plugin reinstall changing the resolved root), the
-hooks and the server would disagree about which venv/instructions are current — no code
-change follows from this today, it's recorded so a future divergence isn't a mystery.
+at runtime. `${CLAUDE_PLUGIN_ROOT}` is expanded independently by **two** consumers —
+`plugin.json`'s `mcpServers` spawn and `hooks/session-start.sh` — the invariant both rely on
+is that Claude Code expands it identically within one session (same plugin install → same
+path); if that ever diverges (e.g. a mid-session plugin reinstall changing the resolved
+root), the hook and the server would disagree about which venv is current — no code change
+follows from this today, it's recorded so a future divergence isn't a mystery.
 
 ---
 
@@ -802,9 +778,10 @@ claude --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 ```
 
-Then at session start call `teammate_register(agent: "<name>")` (add `team:` for
-namespaced inboxes); the channel arms on registration. **Power-user shortcut:** set
-`$TEAMMATE_AGENT` before launch to auto-register.
+Then, when you want this instance to join comms, call
+`teammate_register(agent: "<name>")` (add `team:` for namespaced inboxes); the
+channel arms on registration. **Power-user shortcut:** set `$TEAMMATE_AGENT`
+before launch to auto-register.
 
 Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled (individual
 Pro/Max: on by default). Custom channels require `--dangerously-load-development-channels`

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.0
+
+**WP-41 — registration is now opt-in; the auto-register nudge is removed.** The MCP
+`initialize` handshake no longer carries a standing-instructions block, and the
+post-compaction re-injection hook (`hooks/reinject-instructions.sh`) is deleted along with
+`teammate_comms.instructions`. Agents are no longer told to call `teammate_register` at
+session start, so they no longer auto-register under arbitrary names. The toolset is fully
+intact — register explicitly (`teammate_register`) or set `TEAMMATE_AGENT` to join. The
+load-bearing venv-build SessionStart hook is unchanged.
+
 ## v0.13.1
 
 - **WP-39 — `teammate_request_compact` alerts the requester's manager on a self-compact.**

@@ -241,14 +241,15 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_register",
         "description": (
-            "Establish this instance's identity (call once at session start, like "
-            "the old setup step). Registers your inbox and starts the channel that "
-            "wakes you when teammates message you. Run teammate_inbox afterward to "
-            "drain anything that arrived while you were down. Optionally set your "
-            "profile (role, personality, status, authority) — update it later with "
-            "teammate_update. Re-registering later only re-establishes your identity "
-            "and channel: your existing profile is preserved, so you do NOT need to "
-            "re-supply role/personality/authority — pass a field only to change it."
+            "Opt-in: establishes this instance's identity — call it once, whenever "
+            "you (or the user) want this instance to join comms. Registers your "
+            "inbox and starts the channel that wakes you when teammates message "
+            "you. Run teammate_inbox afterward to drain anything that arrived "
+            "while you were down. Optionally set your profile (role, personality, "
+            "status, authority) — update it later with teammate_update. "
+            "Re-registering later only re-establishes your identity and channel: "
+            "your existing profile is preserved, so you do NOT need to re-supply "
+            "role/personality/authority — pass a field only to change it."
         ),
         "inputSchema": {
             "type": "object",

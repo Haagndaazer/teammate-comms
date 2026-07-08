@@ -1,5 +1,5 @@
 {
-  "description": "teammate-comms — pre-build the venv, surface launch identity, and re-inject standing instructions after a compact",
+  "description": "teammate-comms — pre-build the venv and surface launch identity",
   "hooks": {
     "SessionStart": [
       {
@@ -8,16 +8,6 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
             "timeout": 120
-          }
-        ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/reinject-instructions.sh\"",
-            "timeout": 30
           }
         ]
       }
