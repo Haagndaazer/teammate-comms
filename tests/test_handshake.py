@@ -532,16 +532,16 @@ def main():
             failures.append(f"initialize missing tools capability: {caps}")
         if init.get("result", {}).get("protocolVersion") != "2025-06-18":
             failures.append("initialize did not echo protocolVersion")
-        # the handshake surfaces the standing instructions, incl. the status rule (v0.7.0)
-        instr = init.get("result", {}).get("instructions", "")
-        if "teammate_register" not in instr or "status as you work" not in instr:
-            failures.append(f"initialize instructions missing/incomplete: {instr[:80]!r}")
-        # WP-10: the authority-coordination standing rule reaches the handshake too. Bind its
-        # DISTINCTIVE reason-phrase (who-owns + coordinate-before) — NOT the bare token "authority",
-        # which already appears in the profile-fields list (asserting that would be a tautology).
-        _instr_l = instr.lower()
-        if "authority over the areas" not in _instr_l or "before you modify" not in _instr_l:
-            failures.append(f"initialize instructions missing the authority-coordination rule (WP-10): {instr[:120]!r}")
+        # WP-41: registration is opt-in — the handshake carries NO standing-instructions
+        # nudge at all. Assert the specific absence (not just "falsy"), so this fails
+        # against a revert that re-adds a non-empty "instructions" field.
+        instr = init.get("result", {}).get("instructions")
+        if instr:
+            failures.append(f"initialize result carries an 'instructions' field (WP-41 opt-in regression): {instr[:80]!r}")
+        if "instructions" in init.get("result", {}):
+            failures.append("initialize result has an 'instructions' key at all (WP-41: key must be omitted)")
+        if "teammate_register" in json.dumps(init.get("result", {})):
+            failures.append("initialize result mentions teammate_register (WP-41 opt-in regression)")
 
     # WP-16 gate micro-CR: the pipe block itself hit an OSError (server died mid-block) —
     # report this FIRST and specifically, since it explains why the AC-1/2/3 checks below fail.
@@ -1117,36 +1117,6 @@ def main():
             failures.append("whole-group delete did not emit a group deletion event")
     except Exception as e:
         failures.append(f"delete unit checks errored: {e}")
-
-    # ── compact re-injection (v0.7.0): instructions.py single-sources the text + emits
-    #    valid SessionStart additionalContext JSON for the matcher:"compact" hook ──
-    try:
-        import io as _io
-        from contextlib import redirect_stdout as _redirect
-
-        from teammate_comms import instructions as _ins
-        from teammate_comms.server import INSTRUCTIONS as _srv_instr
-        if _ins.INSTRUCTIONS is not _srv_instr:
-            failures.append("server INSTRUCTIONS is not single-sourced from instructions.py")
-        if "status as you work" not in _ins.INSTRUCTIONS:
-            failures.append("INSTRUCTIONS missing the 'update your status as you work' standing rule")
-        _ins_l = _ins.INSTRUCTIONS.lower()   # WP-10: authority-coordination rule, distinctive phrase
-        if "authority over the areas" not in _ins_l or "before you modify" not in _ins_l:
-            failures.append("INSTRUCTIONS missing the WP-10 authority-coordination standing rule")
-        _buf = _io.StringIO()
-        with _redirect(_buf):
-            _ins.main()
-        _emitted = json.loads(_buf.getvalue())  # must be valid JSON
-        _hso = _emitted.get("hookSpecificOutput", {})
-        if _hso.get("hookEventName") != "SessionStart":
-            failures.append(f"reinject hookEventName wrong: {_hso.get('hookEventName')}")
-        if "status as you work" not in _hso.get("additionalContext", ""):
-            failures.append("reinject additionalContext missing the standing rule")
-        _ac_l = _hso.get("additionalContext", "").lower()   # WP-10: the reinject path carries it too
-        if "authority over the areas" not in _ac_l or "before you modify" not in _ac_l:
-            failures.append("reinject additionalContext missing the WP-10 authority-coordination rule")
-    except Exception as e:
-        failures.append(f"instructions/reinject checks errored: {e}")
 
     # ── WP-1 (v0.7.1) — missed-event correctness: poll-cursor burst (A-1), reaction-wake
     #    high-water cursor (A-2), blocking reaction/deletion appends (A-3). Hermetic, own roots.
@@ -1930,7 +1900,7 @@ def main():
         if _bash:
             _hooks = REPO / "hooks"
             _noroot = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
-            for _script in ("session-start.sh", "reinject-instructions.sh"):
+            for _script in ("session-start.sh",):
                 _p = subprocess.run([_bash, str(_hooks / _script)], env=_noroot,
                                     input=b"", capture_output=True, timeout=30)
                 if _p.returncode != 0 or _p.stdout.decode("utf-8", "replace").strip() != "{}":
@@ -4993,75 +4963,6 @@ def main():
                                  f"{_out2_30a!r}")
     except Exception as e:
         failures.append(f"WP-30 AC-1 unit checks errored: {e}")
-
-    # ── WP-30 AC-2 (P5/H1) — reinject-instructions.sh self-filter + version stamp ──
-    try:
-        import shutil as _sh30b
-        _bash30b = _sh30b.which("bash")
-        if _bash30b:
-            # Silvie's gate CR: the original version of this test pointed CLAUDE_PLUGIN_ROOT at
-            # THIS repo and relied on its .venv already being synced — works on a machine that
-            # already ran the dev setup, fails on a bare checkout (a fresh gate worktree has no
-            # .venv). Fix: a fake `uv` on PATH whose "run" re-dispatches straight to the CURRENT
-            # test interpreter with src/ on PYTHONPATH — no real venv anywhere. This still proves
-            # everything the test is FOR (self-filter, '{}'-on-noncompact, payload emission, the
-            # H1 version stamp) through the hook's real bash plumbing.
-            _plugin_root30b = tempfile.mkdtemp(prefix="tc-30-ac2-root-")
-            _fakebin30b = tempfile.mkdtemp(prefix="tc-30-ac2-bin-")
-            _fake_uv30b = Path(_fakebin30b) / "uv"
-            _fake_uv30b.write_text(
-                "#!/usr/bin/env bash\n"
-                "if [ \"$1\" = \"run\" ]; then\n"
-                "    shift\n"
-                "    while [ $# -gt 0 ] && [ \"$1\" != \"python\" ]; do shift; done\n"
-                "    if [ \"$1\" = \"python\" ]; then\n"
-                "        shift\n"
-                "        PYTHONPATH=\"${TC_TEST_SRC}\" exec \"${TC_TEST_PYTHON}\" \"$@\"\n"
-                "    fi\n"
-                "fi\n"
-                "exit 0\n",
-                encoding="utf-8",
-            )
-            _fake_uv30b.chmod(0o755)
-
-            _script30b = str(REPO / "hooks" / "reinject-instructions.sh")
-            _env30b = dict(os.environ)
-            _env30b["CLAUDE_PLUGIN_ROOT"] = _plugin_root30b
-            _env30b["PATH"] = _fakebin30b + os.pathsep + _env30b.get("PATH", "")
-            _env30b["TC_TEST_PYTHON"] = sys.executable
-            _env30b["TC_TEST_SRC"] = str(SRC)
-
-            _p1_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
-                                     input=b'{"source":"startup"}', capture_output=True, timeout=30)
-            _out1_30b = _p1_30b.stdout.decode("utf-8", "replace").strip()
-            if _out1_30b != "{}":
-                failures.append(f"WP-30 AC-2 [tautology: source=startup must self-filter to "
-                                 f"'{{}}' without ever exec'ing the instructions module]: "
-                                 f"{_out1_30b!r} stderr={_p1_30b.stderr.decode('utf-8', 'replace')!r}")
-
-            _p2_30b = subprocess.run([_bash30b, _script30b], env=_env30b,
-                                     input=b'{"source":"compact"}', capture_output=True, timeout=30)
-            _out2_30b = _p2_30b.stdout.decode("utf-8", "replace").strip()
-            from teammate_comms import __version__ as _ver30b
-            if "Update your teammate-comms status" not in _out2_30b:
-                failures.append(f"WP-30 AC-2: source=compact should emit the standing-rules "
-                                 f"payload: {_out2_30b!r} "
-                                 f"stderr={_p2_30b.stderr.decode('utf-8', 'replace')!r}")
-            if f"v{_ver30b}" not in _out2_30b:
-                failures.append(f"WP-30 AC-2: source=compact payload missing the H1 version "
-                                 f"stamp v{_ver30b}: {_out2_30b!r}")
-    except Exception as e:
-        failures.append(f"WP-30 AC-2 unit checks errored: {e}")
-
-    # ── WP-30 AC-4 (H5/H7/H8) — DESIGN.md carries the new notes (source grep) ──
-    try:
-        _design_src30d = (REPO / "DESIGN.md").read_text(encoding="utf-8")
-        for _needle30d in ("H5 — the standing-instructions contract", "H1 — version stamps",
-                          "H7/H8 — housekeeping notes", "tools/list_changed"):
-            if _needle30d not in _design_src30d:
-                failures.append(f"WP-30 AC-4: DESIGN.md missing expected note {_needle30d!r}")
-    except Exception as e:
-        failures.append(f"WP-30 AC-4 unit check errored: {e}")
 
     # ── WP-31 AC-1 (N6/N7/N9) — schema-level text greps ──
     try:

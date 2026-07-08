@@ -15,7 +15,7 @@ tools by the bundled `teammate-comms` server — call the tools; do not shell ou
 
 | Tool | Args | Behavior |
 |------|------|----------|
-| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Call once at session start.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
+| `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | **Opt-in — call once, whenever you want to join comms.** Establishes your identity, registers your inbox, and arms the channel that wakes you. Optionally set your profile (`project` is auto-filled). The other messaging tools error until you do this. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox. Reports whether `to`'s channel is live (auto-nudge) or the message is queued. `from` is your registered identity; sending to yourself is rejected. **`to` may be a `#`-prefixed group** — fans out to every member; `@name` (a member) flags a mention; `post_type` builds a decision trail. |
 | `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read *your* unread messages (or just the count). `since`/`limit` page a large inbox (id cursor + most-recent-N). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies of messages already delivered are suppressed by default (durable across sessions) — pass `show_all=True` to re-read them (useful after context compaction). |
 | `teammate_ack` | `id` (a message id, or `"all"`) | Move message(s) from unread → read. `"all"` clears only what you've **seen** as of your last `teammate_inbox` read — arrivals since then are kept. |
@@ -52,7 +52,8 @@ project profiles let teammates discover *which projects exist*, *who works on ea
   Backslashes (Windows) and forward slashes (Unix) normalize to the same key, so all
   agents on the same project land in the same roster regardless of OS.
 
-**Startup protocol:** as soon as the session begins, call
+**Startup protocol:** registration is opt-in — nothing nudges you to register
+automatically. When you (or the user) want this instance to join comms, call
 `teammate_register(agent: "<your-name>")` (the human/lead tells you your name) —
 optionally with a profile (`role`, `personality`, `status`, `authority`) — then
 `teammate_inbox` to drain anything that queued while you were down. After that the
@@ -153,8 +154,9 @@ Or load straight from a local checkout for development:
 claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 ```
 
-Then, at session start, call `teammate_register(agent: "Grant")` (add `team:` if
-using team-namespaced inboxes). The channel arms on registration.
+Then, when you want this instance to join comms, call
+`teammate_register(agent: "Grant")` (add `team:` if using team-namespaced inboxes).
+The channel arms on registration.
 
 Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled
 (individual Pro/Max: on by default). Custom channels require

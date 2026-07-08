@@ -28,7 +28,6 @@ from pathlib import Path
 
 from . import __version__, channel
 from . import tools as tools_mod
-from .instructions import INSTRUCTIONS
 from .comms import (
     COMPACT_BROKER_SENDER,
     PROFILE_FIELDS,
@@ -55,9 +54,6 @@ SERVER_NAME = "teammate-comms"
 # requested protocolVersion (a client requesting an unsupported version must be told the
 # truth, not a false compatibility claim).
 PROTOCOL_VERSION = "2025-06-18"
-
-# INSTRUCTIONS lives in instructions.py (single source of truth) so the compact-matched
-# SessionStart hook (hooks/reinject-instructions.sh) can re-emit the exact same text.
 
 _stdout_lock = threading.Lock()
 _initialized = threading.Event()
@@ -496,7 +492,6 @@ def handle(msg, ctx):
                 "tools": {},
             },
             "serverInfo": {"name": SERVER_NAME, "version": __version__},
-            "instructions": INSTRUCTIONS,
         }
         if msg_id is not None:
             respond(msg_id, result)
@@ -658,10 +653,10 @@ def main():
         _avatar_subcommand(sys.argv[2:])
         return
 
-    # H1: the running server's INSTRUCTIONS/serverInfo.version are spawn-frozen for this
-    # process's whole lifetime, while a mid-session plugin update changes what's on disk —
-    # this line is the diagnostic anchor for "was this session running stale code" in the
-    # debug log (~/.claude/debug/<session>.txt).
+    # The running server's serverInfo.version is spawn-frozen for this process's whole
+    # lifetime, while a mid-session plugin update changes what's on disk — this line is
+    # the diagnostic anchor for "was this session running stale code" in the debug log
+    # (~/.claude/debug/<session>.txt).
     log(f"starting teammate-comms v{__version__}")
     _write_plugin_runtime_pointer()
 
