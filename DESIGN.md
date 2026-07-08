@@ -778,9 +778,10 @@ claude --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 claude --plugin-dir C:\Users\colto\Documents\Projects\teammate-comms --dangerously-load-development-channels plugin:teammate-comms@coltondyck
 ```
 
-Then at session start call `teammate_register(agent: "<name>")` (add `team:` for
-namespaced inboxes); the channel arms on registration. **Power-user shortcut:** set
-`$TEAMMATE_AGENT` before launch to auto-register.
+Then, when you want this instance to join comms, call
+`teammate_register(agent: "<name>")` (add `team:` for namespaced inboxes); the
+channel arms on registration. **Power-user shortcut:** set `$TEAMMATE_AGENT`
+before launch to auto-register.
 
 Prerequisites: Claude Code **v2.1.80+**, `uv` installed, channels enabled (individual
 Pro/Max: on by default). Custom channels require `--dangerously-load-development-channels`

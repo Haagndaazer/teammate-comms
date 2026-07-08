@@ -150,6 +150,31 @@ uv run --no-sync python tests/test_compact.py
 All four suites green. Silvie re-runs them at the pinned commit in an isolated worktree
 before sign-off (do not trust the handed green).
 
+## GATE ROUND 1 — bounce delta (Silvie, 2026-07-08, @a19d88a)
+
+Round-1 diff was correct on everything specced, all four suites green — but the gate
+(adversarial reviewer + confirmed by Silvie) found the nudge-surface inventory was
+incomplete. AC-3 ("no surviving 'register at session start' directive anywhere shipped")
+is **not** met by removing only the handshake instructions. Two survivors to fix:
+
+- **[BLOCKER] `src/teammate_comms/tools.py:244-245`** — the `teammate_register` tool
+  description still reads *"Establish this instance's identity (call once at session start,
+  like the old setup step)."* This ships via `tools/list` **every session** and is what the
+  model reads to decide when to call the tool — a stronger nudge than the field we removed.
+  Reword to opt-in: drop "call once at session start, like the old setup step"; state that
+  registration establishes identity + arms the channel, called when you want to join comms.
+  **Check the WP-31 schema-grep test block doesn't assert on the old phrase** — re-run the
+  full gate.
+- **[SHOULD-FIX] `DESIGN.md:781` (§11)** — still says *"Then at session start call
+  `teammate_register`"*. Reword to opt-in, consistent with §6 (DESIGN ~64-67).
+
+Not required (conscious call): the deleted WP-30 AC-4 grep also guarded two unrelated needles
+("H7/H8 housekeeping", "tools/list_changed") that still exist in DESIGN — leaving that
+coverage dropped is fine; don't re-add a trimmed grep.
+
+Re-confirm AC-3 with a repo-wide sweep (`grep -ri "at session start" src docs skills`) before
+handing back — only non-shipping/brief text should remain.
+
 ## Handoff protocol
 
 - Fix + proof in the same commit. Post the branch + commit SHA when ready for the gate.
