@@ -1369,11 +1369,11 @@ def main():
         #     never-emitted batch can't later be re-nudged (CR fix). NOT (False, 0, now).
         if _cre(set(), 9000.0, 1000.0, _RMAX) != (False, 0, None):
             failures.append("WP-9 empty-unseen did not disarm (must return last_emit=None)")
-        # (7) read-position (v0.4.2) suppression: a fully-read batch reduces unseen to empty
-        #     upstream, so even after an eternity nothing re-nudges (no waking a read message).
-        unread, muted, seen = {"a", "b"}, set(), {"a", "b"}
-        if _cre((unread - muted) - seen, 1e9, 0.0, 0)[0]:
-            failures.append("WP-9 re-nudged for fully-read (last_seen) messages")
+        # (7) empty-unseen suppression: however the caller's unseen set ends up empty
+        #     upstream (post-WP-42: unread_ids - muted_ids, once auto-ack has moved every
+        #     shown message to read.json) — even after an eternity nothing re-nudges.
+        if _cre(set(), 1e9, 0.0, 0)[0]:
+            failures.append("WP-9 re-nudged for an already fully-consumed (empty-unseen) batch")
         # (8) cap-reset round-trip: a fresh emit (caller sets attempts=0, last_emit=now)
         #     re-arms the backoff — the next batch fires again after BASE.
         if not _cre(U, 100.0 + _RB, 100.0, 0)[0]:
@@ -3062,6 +3062,69 @@ def main():
             failures.append(f"WP-42 T7: remaining window (w1+w2) should render full: {_sb[:80]!r}")
         if _c15.read_json_safe(_t8_ix / f"{_b15_agent}_unread.json"):
             failures.append("WP-42 T7: second windowed read should have drained the rest")
+
+        # ── T8 — AC-5 composition: the legacy sweep is independent of since/limit. A
+        #    windowed read (limit=1) must still sweep the WHOLE legacy backlog while moving
+        #    only the shown window of the genuinely-new messages (gate round 1 should-fix) ──
+        _t9_root = tempfile.mkdtemp(prefix="tc-15-t9-")
+        _t9_ix = _c15.get_inboxes_dir(_t9_root, None)
+        _c15.ensure_inbox(_t9_ix, _b15_agent)
+        _l1 = {"id": "t9-l1", "from": "alice", "priority": "normal", "message": "legacy-one-body"}
+        _l2 = {"id": "t9-l2", "from": "bob",   "priority": "normal", "message": "legacy-two-body"}
+        _n1 = {"id": "t9-n1", "from": "carol", "priority": "normal", "message": "new-one-body"}
+        _n2 = {"id": "t9-n2", "from": "dave",  "priority": "normal", "message": "new-two-body"}
+        _n3 = {"id": "t9-n3", "from": "erin",  "priority": "normal", "message": "new-three-body"}
+        _c15.write_json_atomic(_t9_ix / f"{_b15_agent}_unread.json", [_l1, _l2, _n1, _n2, _n3])
+        _c15.write_json_atomic(_t9_ix / f"{_b15_agent}_seen.json", ["t9-l1", "t9-l2"])
+        _ctx15t9 = {"identity": _Id15(_b15_agent, _t9_root)}
+        _s9 = _hi15({"limit": 1}, _ctx15t9)
+        if "legacy-one-body" in _s9 or "legacy-two-body" in _s9:
+            failures.append(f"WP-42 T8: legacy bodies must not render full even under a windowed read: {_s9[:160]!r}")
+        if "new-three-body" not in _s9:
+            failures.append(f"WP-42 T8: windowed read must still show its own window (n3): {_s9[:160]!r}")
+        if "new-one-body" in _s9 or "new-two-body" in _s9:
+            failures.append(f"WP-42 T8: windowed read must not show messages outside its window: {_s9[:160]!r}")
+        _t9_unread_after = {m.get("id") for m in _c15.read_json_safe(_t9_ix / f"{_b15_agent}_unread.json")}
+        if _t9_unread_after != {"t9-n1", "t9-n2"}:
+            failures.append(f"WP-42 T8: the legacy backlog must sweep WHOLE while only the shown window moves: {_t9_unread_after}")
+        _t9_read_after = {m.get("id") for m in _c15.read_json_safe(_t9_ix / f"{_b15_agent}_read.json")}
+        if not {"t9-l1", "t9-l2", "t9-n3"} <= _t9_read_after:
+            failures.append(f"WP-42 T8: swept legacy ids + the shown window must all land in read.json: {_t9_read_after}")
+        if (_t9_ix / f"{_b15_agent}_seen.json").exists():
+            failures.append("WP-42 T8: legacy seen.json should be deleted even under a windowed read")
+
+        # ── T9 — BLOCKER fix (gate round 1): show_read on a corrupt read.json must return a
+        #    graceful transient-unavailable message and NEVER reset the file to [] — the C1
+        #    anti-pattern read_json_safe would otherwise wipe read history + read receipts ──
+        _t10_root = tempfile.mkdtemp(prefix="tc-15-t10-")
+        _t10_ix = _c15.get_inboxes_dir(_t10_root, None)
+        _c15.ensure_inbox(_t10_ix, _b15_agent)
+        _t10_read_file = _t10_ix / f"{_b15_agent}_read.json"
+        _t10_read_file.write_text("{not valid json", encoding="utf-8")
+        _ctx15t10 = {"identity": _Id15(_b15_agent, _t10_root)}
+        _s10 = _hi15({"show_read": 3}, _ctx15t10)
+        if "unavailable" not in _s10.lower():
+            failures.append(f"WP-42 T9: corrupt read.json under show_read must report transient-unavailable, got: {_s10!r}")
+        if _t10_read_file.read_text(encoding="utf-8") != "{not valid json":
+            failures.append("WP-42 T9: corrupt read.json must NOT be reset/rewritten by show_read (no destructive self-heal)")
+
+        # ── T10 — should-fix (gate round 1): show_read excludes acked_unseen (cap-overflow,
+        #    never actually shown) records from its history window ──
+        _t11_root = tempfile.mkdtemp(prefix="tc-15-t11-")
+        _t11_ix = _c15.get_inboxes_dir(_t11_root, None)
+        _c15.ensure_inbox(_t11_ix, _b15_agent)
+        _overflow_rec = {"id": "t11-overflow", "from": "alice", "priority": "normal",
+                          "message": "overflow-body", "read_at": "2026-01-01T00:00:00.000000+00:00",
+                          "acked_unseen": True, "capped": True}
+        _genuine_rec = {"id": "t11-genuine", "from": "bob", "priority": "normal",
+                         "message": "genuine-body", "read_at": "2026-01-01T00:00:01.000000+00:00"}
+        _c15.write_json_atomic(_t11_ix / f"{_b15_agent}_read.json", [_overflow_rec, _genuine_rec])
+        _ctx15t11 = {"identity": _Id15(_b15_agent, _t11_root)}
+        _s11 = _hi15({"show_read": 5}, _ctx15t11)
+        if "overflow-body" in _s11:
+            failures.append(f"WP-42 T10: show_read must exclude acked_unseen (never-shown) records: {_s11!r}")
+        if "genuine-body" not in _s11:
+            failures.append(f"WP-42 T10: show_read must still return genuine read history: {_s11!r}")
 
     except Exception as e:
         failures.append(f"WP-42 auto-ack / legacy-sweep unit checks errored: {e}")

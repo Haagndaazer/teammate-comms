@@ -462,7 +462,7 @@ def test_wp37_ac2_manager():
         check(len(list(reqs_dir.glob("*.json"))) == after_manager_request,
               "tautology[AC-2]: a denied request must write NO file — count must stay unchanged")
 
-        inbox_text = tools_mod._handle_inbox({"show_all": True}, ctx_c)
+        inbox_text = tools_mod._handle_inbox({}, ctx_c)
         check(COMPACT_BROKER_SENDER in inbox_text,
               "AC-2: the denial audit DM must land in C's own inbox, from 'compact-broker'")
         check("B" in inbox_text,
@@ -553,7 +553,7 @@ def test_wp39_ac1_self_compact_alerts_registered_manager():
               "AC-1: the alert body must name the requester (B)")
 
         ctx_a = _ctx_for("A", None, root)
-        inbox_text = tools_mod._handle_inbox({"show_all": True}, ctx_a)
+        inbox_text = tools_mod._handle_inbox({}, ctx_a)
         check(COMPACT_BROKER_SENDER in inbox_text and "B" in inbox_text,
               "AC-1: the alert DM must actually land in A's inbox, from 'compact-broker', naming B")
 
@@ -599,7 +599,7 @@ def test_wp39_ac3_manager_leg_no_self_echo():
         check(len(calls) == 0,
               f"tautology[AC-3]: zero alert send_dm calls on the manager-compact leg (A "
               f"compacting B) — an alert here would be a self-echo to A — got {calls}")
-        inbox_text = tools_mod._handle_inbox({"show_all": True}, ctx_a)
+        inbox_text = tools_mod._handle_inbox({}, ctx_a)
         check(COMPACT_BROKER_SENDER not in inbox_text,
               "AC-3: A's own inbox must stay clean — no self-echo alert DM")
         check("notified" not in result,

@@ -874,10 +874,10 @@ def _apply_tombstone(records, msg_id, deleted_by):
 
 def tombstone_in_inbox(root, team, member, msg_id, deleted_by):
     """Tombstone a message (by id) in a member's inbox — BOTH ``_unread.json`` and
-    ``_read.json`` under the UNREAD file's lock (mirrors ``_handle_ack``, which protects
-    ``_read.json`` with the unread lock; locking each file separately would race ack).
-    Lock-then-read so ``read_json_safe``'s reset-corrupt-to-[] can't clobber a concurrent
-    partial write. Writes a file only when it actually changed. -> found in either?"""
+    ``_read.json`` under the UNREAD file's lock (mirrors ``_handle_inbox``'s auto-ack path,
+    which protects ``_read.json`` with the unread lock; locking each file separately would
+    race a move). Lock-then-read so ``read_json_safe``'s reset-corrupt-to-[] can't clobber a
+    concurrent partial write. Writes a file only when it actually changed. -> found in either?"""
     inboxes_dir = get_inboxes_dir(root, team)
     unread_file = inboxes_dir / f"{member}_unread.json"
     read_file = inboxes_dir / f"{member}_read.json"

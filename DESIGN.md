@@ -475,7 +475,7 @@ that is otherwise append-only:
   fresh dashboard load omits the absent group, and `resolve_message`'s group-dir fallback finds
   nothing. Closing either would require holding the group meta lock across the inbox fan-out —
   the cross-store atomicity deliberately not built. The MCP inbox read is the only surface that
-  briefly shows the orphan, until it's acked.
+  briefly shows the orphan, until it's read.
 
 **Group chat (added 0.4.0, storage changed WP-25/C3).** Named group chats addressed with
 a `#` sigil (`teammate_send(to="#design")`) — a separate namespace from agents, so names

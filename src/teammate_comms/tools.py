@@ -790,7 +790,18 @@ def _handle_inbox(args, ctx):
             raise CommsError("'show_read' cannot be combined with count_only/since/limit.")
         if not isinstance(show_read, int) or show_read < 1:
             raise CommsError("'show_read' must be an integer >= 1.")
-        recent = read_json_safe(read_file)[-show_read:]
+        if not read_file.exists():
+            return "No read messages yet."
+        # read_json_readonly (not read_json_safe): an unlocked destructive reset-to-[] on a
+        # transient parse failure would wipe read history AND every group read receipt
+        # derived from it (C1 anti-pattern) — None here means "unreadable right now", not
+        # "empty", so we report and bail without ever touching the file.
+        read_history = read_json_readonly(read_file)
+        if read_history is None:
+            return "Read history temporarily unavailable — try again."
+        # acked_unseen records are cap-overflow markers, never actually shown to the agent —
+        # exclude them so show_read only ever surfaces genuine read history.
+        recent = [m for m in read_history if not m.get("acked_unseen")][-show_read:]
         if not recent:
             return "No read messages yet."
         rx_all = aggregate_reactions_with_baseline(
