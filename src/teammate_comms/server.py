@@ -41,7 +41,6 @@ from .comms import (
     now_timestamp,
     read_agent_record,
     read_json_readonly,
-    read_json_safe,
     resolve_comms_root,
     validate_agent_name,
     validate_profile_field,
@@ -70,11 +69,6 @@ class Identity:
         self.team = None
         self.root = None
         self.unread_file = None
-        # Ids returned by the most recent full teammate_inbox read this session, so
-        # ack("all") only clears what the agent has actually SEEN (arrivals after the
-        # last read are preserved). None = never read this session (ack-all then clears
-        # everything, preserving startup-drain). Cleared to None on identity change.
-        self._last_seen = None
         # Monotonically incremented on every .set() call. The watcher detects a same-name
         # re-registration (post-compaction) by comparing generations and resets known_ids,
         # clocks, and cursors so stale in-memory state doesn't suppress new wakes.
@@ -90,12 +84,6 @@ class Identity:
         # instance_id with an epoch that still matches ours means a competitor's heartbeat
         # write raced OUR register, not a legitimate new registration — see channel.py.
         self._epoch = None
-        # M3 (WP-22): ids from {agent}_seen.json ∩ current unread, seeded ONCE at registration.
-        # A wake that fires before this session's first teammate_inbox read must not count a
-        # message WP-15 already delivered (full body) in a PRIOR session as "new" — durable_seen
-        # is a SEPARATE set from _last_seen (which only ever grows from an in-session READ) per
-        # the WP-15 decision to leave that field/sentinel alone.
-        self._durable_seen = set()
 
     def get_instance_id(self):
         return self.instance_id
@@ -110,9 +98,6 @@ class Identity:
 
     def set(self, agent, team, root, unread_file):
         with self._lock:
-            if agent != self.agent:
-                self._last_seen = None  # new identity → drop the previous one's seen-ids
-                self._durable_seen = set()
             self._generation += 1
             self.agent, self.team, self.root, self.unread_file = agent, team, root, unread_file
 
@@ -126,26 +111,6 @@ class Identity:
         root/inbox with a NEW generation for one watcher tick."""
         with self._lock:
             return (self.agent, self.team, self.root, self.unread_file, self._generation)
-
-    def set_last_seen(self, ids):
-        """Record the set of message ids shown by the latest full inbox read."""
-        with self._lock:
-            self._last_seen = set(ids)
-
-    def get_last_seen(self):
-        """Return a copy of the last-seen id set, or None if never read this session."""
-        with self._lock:
-            return None if self._last_seen is None else set(self._last_seen)
-
-    def set_durable_seen(self, ids):
-        """Seed the durable-seen set (M3) — called once at registration."""
-        with self._lock:
-            self._durable_seen = set(ids)
-
-    def get_durable_seen(self):
-        """Return a copy of the durable-seen set (never None — empty until seeded)."""
-        with self._lock:
-            return set(self._durable_seen)
 
     def get_generation(self):
         """Return the current generation counter (bumped on every .set() call)."""
@@ -451,13 +416,6 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
     global _auto_register_error
     _auto_register_error = None
     unread = read_json_readonly(unread_file) or []
-    # M3 (WP-22): seed durable_seen from the persisted seen-file ∩ current unread — a wake that
-    # fires before this session's first teammate_inbox read must not count a message WP-15
-    # already delivered (full body) in a PRIOR session as "new". Intersected with unread so
-    # acked/removed ids can't inflate it.
-    seen_ids = set(read_json_safe(inboxes_dir / f"{agent}_seen.json"))
-    unread_ids = {m.get("id") for m in unread}
-    _identity.set_durable_seen(seen_ids & unread_ids)
     _registered.set()
 
     log(f"registered: agent={agent!r} team={team!r} comms_root={root} (from {source})")

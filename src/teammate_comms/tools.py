@@ -300,29 +300,23 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "teammate_inbox",
-        "description": "Read your own unread messages (or just the unread count). Optional 'since'/'limit' page a large inbox. Bodies of messages already shown are suppressed by default (durable across sessions — pass show_all=True to re-read them).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "count_only": {"type": "boolean", "description": "If true, return only the unread count."},
-                "since": {"type": "string", "description": "Only show unread messages with id >= this cursor (page forward through a large inbox)."},
-                "limit": {"type": "integer", "description": "Show only the most recent N unread (after any 'since' filter). ack(\"all\") then clears only what was shown."},
-                "show_all": {"type": "boolean", "description": "Re-show bodies of messages already delivered (default suppresses them, durable across sessions, to avoid re-dumping context)."},
-            },
-        },
-    },
-    {
-        "name": "teammate_ack",
         "description": (
-            "Acknowledge a message (move it from unread to read). Pass a specific "
-            "message id, or \"all\" to clear the whole inbox."
+            "Read your own unread messages (or just the unread count). Reading IS acking: "
+            "every message this call shows moves immediately into your read inbox, so a "
+            "repeat call never re-shows it and there is no separate ack step. Optional "
+            "'since'/'limit' page a large inbox — only the messages actually shown move; the "
+            f"rest stay unread untouched. Pass show_read=N to re-read your N most recent "
+            f"already-read messages instead (post-compaction recovery) — moves nothing, and "
+            f"the read inbox only holds your most recent {_READ_CAP} entries."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "Message id to ack, or \"all\". Note: \"all\" with no prior teammate_inbox read this session drains the whole inbox (startup-drain); after a read it clears only what that read showed, preserving messages that arrived since."},
+                "count_only": {"type": "boolean", "description": "If true, return only the unread count. Moves nothing."},
+                "since": {"type": "string", "description": "Only show unread messages with id >= this cursor (page forward through a large inbox). Only the shown messages move to read."},
+                "limit": {"type": "integer", "description": "Show only the most recent N unread (after any 'since' filter). Only the shown messages move to read; the rest stay unread."},
+                "show_read": {"type": "integer", "description": "Re-read your N most recent already-read messages (post-compaction recovery) instead of unread. Moves nothing. Cannot be combined with count_only/since/limit."},
             },
-            "required": ["id"],
         },
     },
     {
@@ -384,12 +378,12 @@ TOOL_DEFINITIONS = [
             "a member (they get a 🔔 flag in their wake and inbox) — which fans out to "
             "every member and wakes them. The full ordered thread is kept in a shared "
             "transcript — use action='history' as the canonical record (it survives inbox "
-            "acks). Groups are open: any registered teammate can join, post, and read "
+            "reads). Groups are open: any registered teammate can join, post, and read "
             "history — do not post secrets expecting privacy. Actions: create, delete "
             "(creator-only), join, leave, add (members), members (list), history (read "
             "the shared transcript; optionally filter by 'sender', 'post_type', and a "
             "'since' id cursor — the decision trail), mute, unmute (silence/restore this "
-            "group's channel wakes for you; messages still arrive), reads (who has acked "
+            "group's channel wakes for you; messages still arrive), reads (who has read "
             "up to where)."
         ),
         "inputSchema": {
@@ -398,7 +392,7 @@ TOOL_DEFINITIONS = [
                 "action": {
                     "type": "string",
                     "enum": list(_GROUP_ACTIONS),
-                    "description": "create | delete | join | leave | add | members | history | mute | unmute (silence/restore this group's channel wakes for you; messages still arrive) | reads (who has acked up to where)",
+                    "description": "create | delete | join | leave | add | members | history | mute | unmute (silence/restore this group's channel wakes for you; messages still arrive) | reads (who has read up to where)",
                 },
                 "group": {"type": "string", "description": "Group name (a leading '#' is optional)."},
                 "members": {
@@ -419,7 +413,7 @@ TOOL_DEFINITIONS = [
         "name": "teammate_react",
         "description": (
             "React to a message (by its id) with a basic emoji — thumbsup, rofl, smile, "
-            "cry, 100, or fire — a lightweight acknowledgement without sending a message. "
+            "cry, 100, or fire — a lightweight response without sending a message. "
             "It wakes ONLY the author of the reacted-to message (never the group, never on "
             "remove); everyone sees it in teammate_inbox / teammate_group history / the "
             "dashboard. Pass remove=true to take your reaction back."
@@ -772,90 +766,133 @@ def _sender_summary(msgs):
     return ", ".join(f"{n}×{c}" if c > 1 else n for n, c in counts.items())
 
 
+def _iso_utc_now():
+    # Explicit strftime (NOT isoformat(), which drops the fractional segment entirely when
+    # microsecond == 0) so read_at is always fixed-width.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "+00:00"
+
+
 def _handle_inbox(args, ctx):
     agent, team, root = _require_registered(ctx)
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, agent)
     unread_file = inboxes_dir / f"{agent}_unread.json"
-    # Locked (C1): unread.json is the highest-contention multi-writer file. Under the lock no
-    # writer can be mid-write, so a parse failure here is REAL corruption — read_json_safe's
-    # destructive reset-to-[] is then the correct self-heal, not a false-positive on a torn
-    # partial write. Scope covers ONLY this read (not the reactions read below).
-    with file_lock(unread_file):
-        all_unread = read_json_safe(unread_file)
+    read_file = inboxes_dir / f"{agent}_read.json"
     seen_file = inboxes_dir / f"{agent}_seen.json"
 
-    if args.get("count_only"):
+    show_read = args.get("show_read")
+    count_only = bool(args.get("count_only"))
+    since = args.get("since")
+    limit = args.get("limit")
+
+    if show_read is not None:
+        if count_only or since or limit:
+            raise CommsError("'show_read' cannot be combined with count_only/since/limit.")
+        if not isinstance(show_read, int) or show_read < 1:
+            raise CommsError("'show_read' must be an integer >= 1.")
+        if not read_file.exists():
+            return "No read messages yet."
+        # read_json_readonly (not read_json_safe): an unlocked destructive reset-to-[] on a
+        # transient parse failure would wipe read history AND every group read receipt
+        # derived from it (C1 anti-pattern) — None here means "unreadable right now", not
+        # "empty", so we report and bail without ever touching the file.
+        read_history = read_json_readonly(read_file)
+        if read_history is None:
+            return "Read history temporarily unavailable — try again."
+        # acked_unseen records are cap-overflow markers, never actually shown to the agent —
+        # exclude them so show_read only ever surfaces genuine read history.
+        recent = [m for m in read_history if not m.get("acked_unseen")][-show_read:]
+        if not recent:
+            return "No read messages yet."
+        rx_all = aggregate_reactions_with_baseline(
+            read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
+        out = [f"=== {len(recent)} most recent read message(s) for {agent} (history — nothing moved) ==="]
+        for msg in recent:
+            out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
+        return "\n".join(out)
+
+    if count_only:
+        # Locked (C1) even for a count: unread.json is the highest-contention multi-writer
+        # file, and under the lock a parse failure is REAL corruption — read_json_safe's
+        # destructive reset-to-[] is then the correct self-heal, not a false-positive on a
+        # torn partial write.
+        with file_lock(unread_file):
+            all_unread = read_json_safe(unread_file)
         return str(len(all_unread))
 
-    # Prune persisted seen-set to current unread immediately — stale ids (acked/removed) can
-    # never resurrect, and there is no window between session start and the first read.
-    _unread_ids = {m.get("id") for m in all_unread}
-    persisted = set(read_json_safe(seen_file)) & _unread_ids
+    # The auto-ack path: the ENTIRE select→move→write sequence runs under ONE
+    # file_lock(unread_file) acquisition with a FRESH read taken here, under the lock. A read
+    # taken before acquiring the lock (then bolted onto a later write) can silently drop a
+    # message that arrives in the gap — the #1 identified failure mode; the P4 test exists to
+    # catch it.
+    with file_lock(unread_file):
+        all_unread = read_json_safe(unread_file)
 
-    # Optional windowing (C-3): 'since' (id >= cursor) then 'limit' (the most recent N). For an
-    # unbounded inbox the agent can page rather than pull everything at once.
-    messages = all_unread
-    since = args.get("since")
-    if isinstance(since, str) and since.strip():
-        s = since.strip()
-        messages = [m for m in messages if m.get("id", "") >= s]
-    limit = args.get("limit")
-    if isinstance(limit, int) and limit > 0 and len(messages) > limit:
-        messages = messages[-limit:]                       # most recent N within the filter
+        # Transitional legacy seen.json sweep (sole exception to "only shown bodies move to
+        # read" — these bodies WERE shown, in a prior session, before auto-ack existed).
+        # Independent of since/limit (clears the whole legacy backlog in one visit).
+        legacy_msgs = []
+        if seen_file.exists():
+            legacy_ids = set(read_json_safe(seen_file)) & {m.get("id") for m in all_unread}
+            if legacy_ids:
+                legacy_msgs = [m for m in all_unread if m.get("id") in legacy_ids]
+                all_unread = [m for m in all_unread if m.get("id") not in legacy_ids]
+            seen_file.unlink(missing_ok=True)
 
-    # last_seen accumulates every id SHOWN this session (UNION, not replace), pruned to the
-    # CURRENT unread ids. Two contracts ride on this: (1) ack("all") clears only what was
-    # actually shown, so a limited read can't drain unshown messages (silent loss); (2) an id
-    # shown on an EARLIER page must STAY seen when a later windowed read shows a different
-    # page — else it falls out of last_seen while still unread → the watcher re-counts it as
-    # unseen and re-nudges a message the agent already read (the v0.4.2 contract; two
-    # individually-correct changes composing into a regression). Pruning to current-unread lets
-    # acked/removed ids leave naturally (bounded, exactly like the watcher's known_ids). A
-    # count-only read (above) returns before here, so it never counts as a read.
-    _prev_seen = (ctx["identity"].get_last_seen() or set()) | persisted
-    _shown = {m.get("id") for m in messages}
-    ctx["identity"].set_last_seen((_prev_seen | _shown) & _unread_ids)
-    write_json_atomic(seen_file, sorted((persisted | _shown) & _unread_ids))
+        total_unread = len(all_unread)
 
-    if not messages:
+        # Optional windowing (C-3): 'since' (id >= cursor) then 'limit' (the most recent N).
+        # Only what's actually selected here moves to read — the rest stays unread untouched.
+        messages = all_unread
+        if isinstance(since, str) and since.strip():
+            s = since.strip()
+            messages = [m for m in messages if m.get("id", "") >= s]
+        if isinstance(limit, int) and limit > 0 and len(messages) > limit:
+            messages = messages[-limit:]                       # most recent N within the filter
+
+        shown_ids = {m.get("id") for m in messages}
+        remaining_unread = [m for m in all_unread if m.get("id") not in shown_ids]
+
+        read_at = _iso_utc_now()
+        moved = [dict(m, read_at=read_at) for m in messages] + [dict(m, read_at=read_at) for m in legacy_msgs]
+
+        # Write order (the _cap_unread ordering, not the removed ack handler's): append to
+        # read.json FIRST, then rewrite unread.json. A crash between the two writes then
+        # duplicates a message across both files — never loses it from both.
+        read = read_json_safe(read_file)
+        read.extend(moved)
+        if len(read) > _READ_CAP:
+            read = read[-_READ_CAP:]
+        write_json_atomic(read_file, read)
+        write_json_atomic(unread_file, remaining_unread)
+
+    if not messages and not legacy_msgs:
         return ("No unread messages." if not (since or limit)
-                else f"No unread messages match the filter ({len(all_unread)} total unread).")
+                else f"No unread messages match the filter ({total_unread} total unread).")
 
-    # Body suppression: messages already shown this session don't re-dump their body.
-    # _prev_seen is captured BEFORE set_last_seen above — NEVER-MISS invariant: a message
-    # showing for the first time this call lands in new_msgs and always renders full.
-    # Suppressed messages remain unread — ack("all") and ack(id) still work normally.
-    show_all = bool(args.get("show_all"))
-    new_msgs = [m for m in messages if m.get("id") not in _prev_seen]
-    seen_msgs = [m for m in messages if m.get("id") in _prev_seen]
+    out = []
+    if messages:
+        # WP-27: baseline (compacted-away events) + the live tail together — completeness
+        # holds regardless of whether/when a compaction has run.
+        rx_all = aggregate_reactions_with_baseline(
+            read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
+        header = f"=== {len(messages)} unread message(s) for {agent}"
+        if len(messages) < total_unread:
+            header += f" (showing {len(messages)} of {total_unread}; page with since/limit)"
+        header += " ==="
+        out.append(header)
+        for msg in messages:
+            out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
+    elif since or limit:
+        out.append(f"No new messages in this window ({total_unread} total unread).")
+    else:
+        out.append("No unread messages.")
 
-    if not show_all and not new_msgs:
-        n = len(seen_msgs)
-        _sfrom = _sender_summary(seen_msgs)
-        if since or limit:
-            return (f"No new messages in this window ({n} already delivered — from: {_sfrom}). "
-                    f"Remove since/limit or pass show_all=True to re-read.")
-        return (f"No new messages. {n} message(s) already delivered (from: {_sfrom}). "
-                f"Pass show_all=True to re-read.")
+    if legacy_msgs:
+        _sfrom = _sender_summary(legacy_msgs)
+        out.append(f"\n({len(legacy_msgs)} message(s) already delivered in a prior session "
+                   f"(from: {_sfrom}) — not re-shown.)")
 
-    render_msgs = messages if show_all else new_msgs
-
-    # WP-27: baseline (compacted-away events) + the live tail together — completeness holds
-    # regardless of whether/when a compaction has run.
-    rx_all = aggregate_reactions_with_baseline(
-        read_reaction_state(root, team), read_reactions(root, team, limit=_REACTIONS_TAIL))
-    header = f"=== {len(messages)} unread message(s) for {agent}"
-    if len(messages) < len(all_unread):
-        header += f" (showing {len(messages)} of {len(all_unread)}; page with since/limit)"
-    header += " ==="
-    out = [header]
-    for msg in render_msgs:
-        out.extend(_format_message_block(msg, agent=agent, reactions=rx_all.get(msg.get("id"))))
-    if not show_all and seen_msgs:
-        _sfrom = _sender_summary(seen_msgs)
-        out.append(f"\n({len(seen_msgs)} message(s) already delivered (from: {_sfrom}) — not re-shown. "
-                   f"Pass show_all=True to re-read.)")
     return "\n".join(out)
 
 
@@ -863,11 +900,11 @@ def _cap_unread(unread, read_file):
     """T2: if ``unread`` exceeds ``_UNREAD_CAP`` after an append, move the OLDEST overflow
     records into ``read_file`` tagged ``acked_unseen`` (never actually read — same M5
     semantics; a hard drop would be message loss, which the audit's own rubric calls
-    critical) AND ``capped`` (distinguishes cap-overflow from ack("all")'s startup-drain in
-    forensics). Caller must hold the SAME lock that guards ``read_file`` (the established
-    tombstone/ack pattern — this reads-modifies-writes it). Returns the (possibly trimmed)
-    unread list; the caller writes it back. Strictly-greater gate: exactly AT the cap never
-    triggers a move.
+    critical) AND ``capped`` (forensic marker). After WP-42, cap-overflow is the ONLY source
+    of ``acked_unseen`` records. Caller must hold the SAME lock that guards ``read_file`` (the
+    established tombstone pattern — this reads-modifies-writes it). Returns the (possibly
+    trimmed) unread list; the caller writes it back. Strictly-greater gate: exactly AT the cap
+    never triggers a move.
     """
     if len(unread) <= _UNREAD_CAP:
         return unread
@@ -880,68 +917,6 @@ def _cap_unread(unread, read_file):
         read = read[-_READ_CAP:]
     write_json_atomic(read_file, read)
     return kept
-
-
-def _handle_ack(args, ctx):
-    agent, team, root = _require_registered(ctx)
-    msg_id = args.get("id")
-    if not isinstance(msg_id, str) or not msg_id.strip():
-        raise CommsError("'id' is required (a message id, or \"all\").")
-    msg_id = msg_id.strip()
-
-    inboxes_dir = get_inboxes_dir(root, team)
-    ensure_inbox(inboxes_dir, agent)
-    unread_file = inboxes_dir / f"{agent}_unread.json"
-    read_file = inboxes_dir / f"{agent}_read.json"
-
-    with file_lock(unread_file):
-        unread = read_json_safe(unread_file)
-        read = read_json_safe(read_file)
-        if not unread:
-            return "No unread messages to acknowledge."
-
-        if msg_id == "all":
-            last_seen = ctx["identity"].get_last_seen()
-            if last_seen is None:
-                # Never read this session → clear everything (startup-drain behavior).
-                acked, unread = unread, []
-                # M5: tag each drained record — it was never actually SEEN (drained cold, not
-                # read), so group_read_positions must not infer "caught up" from it (a false
-                # read-receipt via the startup-drain path). Seen-then-acked records (the else
-                # branch below) stay untagged — receipts on that path are unchanged.
-                acked = [dict(m, acked_unseen=True) for m in acked]
-                result = f"Acknowledged all {len(acked)} message(s)."
-            else:
-                # Only ack messages the agent has actually SEEN; preserve arrivals that
-                # landed after the last teammate_inbox read.
-                acked = [m for m in unread if m.get("id") in last_seen]
-                unread = [m for m in unread if m.get("id") not in last_seen]
-                if not acked:
-                    return ("No seen messages to acknowledge — new arrivals since your "
-                            "last read are kept. Call teammate_inbox to read them first.")
-                result = f"Acknowledged {len(acked)} seen message(s)."
-                if unread:
-                    result += (f" Kept {len(unread)} that arrived since your last read — "
-                               f"call teammate_inbox to see them.")
-            read.extend(acked)
-        else:
-            to_ack = next((m for m in unread if m.get("id") == msg_id), None)
-            if to_ack is None:
-                available = ", ".join(m.get("id", "?") for m in unread) or "(none)"
-                raise CommsError(f"No unread message with id {msg_id!r}. Available ids: {available}")
-            read.append(to_ack)
-            unread = [m for m in unread if m.get("id") != msg_id]
-            result = f"Acknowledged message {msg_id} from {to_ack.get('from')}."
-
-        # Cap _read.json growth (C-3): it's an append-forever acked-history log. Keep the most
-        # recent _READ_CAP entries — read receipts (group_read_positions reads the max acked id
-        # per member) only ever care about recent positions, so trimming ancient acked history
-        # is safe. Bounds the file the watcher never reads but ack rewrites each time.
-        if len(read) > _READ_CAP:
-            read = read[-_READ_CAP:]
-        write_json_atomic(unread_file, unread)
-        write_json_atomic(read_file, read)
-    return result
 
 
 def _norm_project_label(raw):
@@ -1514,17 +1489,18 @@ def _handle_group(args, ctx):
                  f"{', '.join(sorted(muted)) or '(none)'}."))
 
     if action == "reads":
-        # Read-only read receipts (ack/seen position per member, inferred from _read.json).
+        # Read-only read receipts: true "read up to here" positions per member, inferred
+        # from _read.json (reading a message IS what moves it there).
         meta = read_group_meta(root, team, group)
         if meta is None:
             raise CommsError(f"No group {sigil!r}.")
         members = meta.get("members", [])
         positions = group_read_positions(root, team, group, members)
-        lines = [f"{sigil} read positions (furthest-acked group message per member):"]
+        lines = [f"{sigil} read positions (furthest-read group message per member):"]
         for m in members:
-            lines.append(f"  - {m}: {positions.get(m) or '(none acked)'}")
+            lines.append(f"  - {m}: {positions.get(m) or '(none read)'}")
         if group_read_has_unseen_acks(root, team, group, members):
-            lines.append("(startup-drained messages are not counted as read)")
+            lines.append("(cap-overflow messages are not counted as read)")
         return "\n".join(lines)
 
     # action == "history"
@@ -2166,7 +2142,6 @@ _HANDLERS = {
     "teammate_register": _handle_register,
     "teammate_send": _handle_send,
     "teammate_inbox": _handle_inbox,
-    "teammate_ack": _handle_ack,
     "teammate_list": _handle_list,
     "teammate_whoami": _handle_whoami,
     "teammate_update": _handle_update,

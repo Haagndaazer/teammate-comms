@@ -874,10 +874,10 @@ def _apply_tombstone(records, msg_id, deleted_by):
 
 def tombstone_in_inbox(root, team, member, msg_id, deleted_by):
     """Tombstone a message (by id) in a member's inbox — BOTH ``_unread.json`` and
-    ``_read.json`` under the UNREAD file's lock (mirrors ``_handle_ack``, which protects
-    ``_read.json`` with the unread lock; locking each file separately would race ack).
-    Lock-then-read so ``read_json_safe``'s reset-corrupt-to-[] can't clobber a concurrent
-    partial write. Writes a file only when it actually changed. -> found in either?"""
+    ``_read.json`` under the UNREAD file's lock (mirrors ``_handle_inbox``'s auto-ack path,
+    which protects ``_read.json`` with the unread lock; locking each file separately would
+    race a move). Lock-then-read so ``read_json_safe``'s reset-corrupt-to-[] can't clobber a
+    concurrent partial write. Writes a file only when it actually changed. -> found in either?"""
     inboxes_dir = get_inboxes_dir(root, team)
     unread_file = inboxes_dir / f"{member}_unread.json"
     read_file = inboxes_dir / f"{member}_read.json"
@@ -1204,10 +1204,12 @@ def group_read_positions(root, team, group, members):
     this group's sigil — an ack/seen upper bound (gaps possible), groups-only. Returns
     ``{member: id_or_None}``; reads are non-destructive.
 
-    M5: records tagged ``acked_unseen`` (drained by ack("all")'s cold-start path, or moved by
-    the T2 unread cap — neither was ever actually SEEN) are EXCLUDED from the max-id inference
-    — counting them would be a false read-receipt. See ``group_read_has_unseen_acks`` for the
-    companion "some positions used tagged records" signal.
+    M5: records tagged ``acked_unseen`` (moved by the T2 unread cap-overflow — the ONLY
+    source since WP-42; never actually SEEN) are EXCLUDED from the max-id inference —
+    counting them would be a false read-receipt. See ``group_read_has_unseen_acks`` for the
+    companion "some positions used tagged records" signal. Since WP-42 (auto-ack on read),
+    every other position here is a true "read up to here" mark: reading a message via
+    teammate_inbox is what moves it into ``_read.json`` in the first place.
     """
     sigil = group if str(group).startswith("#") else f"#{group}"
     inboxes_dir = get_inboxes_dir(root, team)
@@ -1223,8 +1225,8 @@ def group_read_positions(root, team, group, members):
 
 def group_read_has_unseen_acks(root, team, group, members):
     """True if ANY member's ``_read.json`` holds an ``acked_unseen`` record for this group
-    (M5) — drives the ``reads`` action's footnote ("startup-drained messages are not counted
-    as read")."""
+    (M5) — drives the ``reads`` action's footnote ("cap-overflow messages are not counted as
+    read"). Since WP-42, cap-overflow is the ONLY source of ``acked_unseen``."""
     sigil = group if str(group).startswith("#") else f"#{group}"
     inboxes_dir = get_inboxes_dir(root, team)
     for member in members:

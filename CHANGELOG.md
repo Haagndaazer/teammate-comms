@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.15.0
+
+> **WP-42 — reading is acking.** `teammate_inbox` now immediately moves every message it
+> shows into your read inbox; the unread inbox only ever contains messages you have never
+> seen, so restarts no longer resurface stale "unread" messages. The `teammate_ack` tool is
+> removed (breaking). `show_all` is replaced by `show_read: N`, which reads back your N most
+> recent read messages (post-compaction recovery). Group read receipts are now true "read up
+> to here" positions. Legacy per-agent `seen.json` files are swept into the read inbox on
+> first contact and deleted. Accepted transient: between a post-upgrade registration and an
+> agent's first `teammate_inbox` read, wake counts may over-count legacy previously-shown
+> ids that haven't gone through the sweep yet — this self-heals on that first read.
+
 ## v0.14.0
 
 **WP-41 — registration is now opt-in; the auto-register nudge is removed.** The MCP
