@@ -242,26 +242,34 @@ gates open: `notifications/initialized` AND registration. Once armed it:
 - Polls `<self>_unread.json` every ~0.5s via a **non-destructive read** (never
   rewrites the file on a partial/corrupt read — that would destroy a message
   mid-delivery).
-- **Nudge gating (v0.4.2):** nudges only for messages the agent hasn't been shown —
-  an unread id that is neither in `Identity.last_seen` (ids returned by the last full
-  `teammate_inbox`) nor in a watcher-local `known_ids` set (seeded to the inbox
-  contents at registration so pre-existing messages don't nudge, then accumulating
-  what's already been nudged). The emitted `count` is the number of *unseen* unread
-  messages, so a read-but-unacked message never pads it. Reading (not acking) silences
-  a nudge. Missed-nudge-safe: a genuinely new message has a fresh id in neither set, so
-  it always nudges. (Replaced the earlier integer `baseline` count, which re-nudged on
-  every count rise and counted read-but-unacked messages — the v0.4.1-test noise.)
-- **Body suppression + cross-session seen-file (WP-11b / WP-15):** `teammate_inbox`
-  suppresses re-dumping message bodies already shown to the agent. The suppression set
-  has two layers: (1) `Identity._last_seen` — an in-memory set of ids shown in the
-  current session; (2) `{agent}_seen.json` in the inboxes dir — a persisted set that
-  survives restarts. On every non-count read, `_handle_inbox` loads and prunes the
-  on-disk set (intersected with current unread — stale ids drop immediately), unions it
-  with `_last_seen`, and writes back the updated set. `Identity._last_seen` remains
-  `None` until the first inbox read each session; this `None` sentinel is consumed by
-  `ack("all")` startup-drain (drains the whole inbox when never-read-this-session) and
-  the watcher's unseen filter. **Do not persist `_last_seen` itself** — only the
-  separate `seen_file` is persisted, so the sentinel semantics are preserved intact.
+- **Nudge gating, simplified by auto-ack (WP-42):** nudges only for messages still in
+  `_unread.json` and not already nudged-for (a watcher-local `known_ids` set, seeded to
+  the inbox contents at registration so pre-existing messages don't nudge, then
+  accumulating what's already been nudged). `unseen = unread_ids − muted_ids` — no
+  separate "shown but not yet acked" state to subtract, because reading a message via
+  `teammate_inbox` moves it out of `_unread.json` immediately (see below), so unread
+  now literally means never-shown. The emitted `count` is `len(unseen)`. Reading a
+  message silences its nudge by construction. Missed-nudge-safe: a genuinely new
+  message has a fresh id outside `known_ids`, so it always nudges.
+- **Auto-ack on read (WP-42) — reading IS acking:** `teammate_inbox` moves every
+  message it shows straight into `{agent}_read.json` (stamped `read_at`, ISO-8601 UTC)
+  in the same call, under one `file_lock(unread_file)` acquisition covering a fresh
+  read through the final write (a stale pre-lock read reused for the write-back would
+  silently drop a concurrently-arrived message — the #1 failure mode the lock scope
+  guards against). Write order matches `_cap_unread`: `_read.json` first, then
+  `_unread.json` — a crash between the two duplicates a message across both files,
+  never loses it. `since`/`limit` move only the messages actually shown; the rest stay
+  unread untouched. There is no separate ack tool (`teammate_ack` was removed) and no
+  per-session suppression state (`Identity._last_seen` / `_durable_seen` are gone) —
+  the unread/read files are the only truth. `show_read: N` non-destructively re-reads
+  the N most recent `_read.json` entries (post-compaction recovery) without touching
+  unread. **Legacy `{agent}_seen.json` transitional sweep:** on the first non-count-only
+  `teammate_inbox` call after upgrading from a pre-0.15.0 install, any id listed in a
+  leftover `{agent}_seen.json` that's still in unread moves to read (same lock, same
+  write order) rendered as a one-line summary only (never the full body — it WAS shown,
+  in a prior session, the sole sanctioned exception to "only shown bodies move"); the
+  whole backlog clears in one visit and the legacy file is then deleted. No migration
+  script — old backlogs just drain naturally on each agent's next inbox read.
 - Emits `notifications/claude/channel` with `meta = {count, agent}` and **signal-only**
   content naming WHERE the messages came from (senders / `#groups`) plus a 🔔 @mention
   note and the group reply target when applicable (`emit_channel_event`,
@@ -272,7 +280,7 @@ gates open: `notifications/initialized` AND registration. Once armed it:
   (unread, not-yet-read) group message, the content **names the group reply target** —
   *"reply to the group with `teammate_send to:'#<group>'`"* (distinct unseen groups,
   `sorted`) — so a woken agent replies to the group, not 1:1 to the sender (which would
-  silently fracture the thread). v0.4.4 computes this from `unread − last_seen` (not just
+  silently fracture the thread). v0.4.4 computes this from the full unread set (not just
   the messages that triggered the wake), so a DM-triggered wake still surfaces a pending
   group thread (the mixed-batch case). 1:1-only wakes keep the generic text.
 - Heartbeats the agent's registry record every ~5s.
@@ -283,12 +291,13 @@ inbox unprompted, so "drained on the next `teammate_inbox`" only holds once *som
 wakes it. Claude Code is known to drop channel notifications — GH **#38736** (mid-turn
 notifications dropped, not queued, despite the docs) and **#61797** (sporadic silent drops at
 idle), both unresolved — so after one emit the watcher **re-nudges** still-unseen unread with
-capped exponential backoff: if `unseen = (unread − muted) − last_seen` persists, re-emit the
+capped exponential backoff: if `unseen = unread_ids − muted_ids` persists, re-emit the
 same wake at 120 s, then 240 s, then 480 s, capped at 3 attempts. Re-nudge is
 **content-agnostic** — a dropped emit is a dropped emit regardless of message type (DM, group,
 urgent, @mention). Re-nudge gates on the **exact same `unseen` set** the first nudge uses, so
-a read-but-unacked or muted message can never re-nudge (the v0.4.2 no-noise contract, preserved
-verbatim). Crucially the backoff clock is **armed only by a real fresh emit** — when `unseen`
+a read (WP-42: reading removes a message from unread entirely) or muted message can never
+re-nudge (the v0.4.2 no-noise contract, preserved verbatim). Crucially the backoff clock is
+**armed only by a real fresh emit** — when `unseen`
 empties (caught up) the clock is **disarmed** (not re-stamped), so a batch that was never
 first-nudged (a message that arrived while its group was muted and is later unmuted, or the
 registration seed window) stays permanently re-nudge-silent until a genuinely new message
@@ -351,15 +360,14 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **19 tools (13 original + 4 project-profile tools v0.9.0 + 1 avatar
-tool v0.10.0 + 1 compact-request tool WP-37):**
+long-lived server. **18 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
+project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, profile? (`project`/`role`/`personality`/`status`/`authority`) | Establish identity, register the inbox, arm the channel. Optionally set a profile (`project` is auto-filled). Re-registering only re-establishes identity + channel and **preserves** the existing profile. |
 | `teammate_send` | `to`, `message`, `priority?` (`normal`\|`urgent`), `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox (atomic write). Report whether `to`'s channel is live (auto-nudge) or offline (queued). Self-send rejected. **A `#`-prefixed `to` posts to a group** (fan-out); `@name` tokens to group members become `mentions`. |
-| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read this agent's unread messages (or just the count). `since`/`limit` page a large inbox; bodies already shown are suppressed by default (durable across sessions) — `show_all:true` re-reads them. Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
-| `teammate_ack` | `id` (or `"all"`) | Move a message from unread → read. |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_read?` | Read this agent's unread messages (or just the count). Reading IS acking (WP-42): every message shown moves immediately into `_read.json`, so there's no separate ack step. `since`/`limit` page a large inbox — only the messages actually shown move. `show_read:N` non-destructively re-reads the N most recent already-read messages instead (post-compaction recovery). Shows group tag, `post_type`, `🔔(@you)`, `↳ re`, and reaction summaries. |
 | `teammate_list` | `all?` | List registered agents with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a Groups section. Defaults to your project only; `all:true` shows every project. Humans show `🧑 (operator)` + `presence`. |
 | `teammate_whoami` | `verbose?` | Resolved identity, team, comms dir, and own profile (diagnostics). `verbose:true` adds a read-only **doctor** section — comms root, per-agent heartbeat freshness/liveness, sub-stream file sizes, unread counts, leftover lock dirs (G-5). |
 | `teammate_update` | `project?`/`role?`/`personality?`/`status?`/`authority?` | Update own profile fields (self-only field-merge; empty string clears a field). |
@@ -387,7 +395,8 @@ that is otherwise append-only:
   `messages.json` and `messages.jsonl` — WP-25's dual-store), every member's inbox copy,
   and the transcript, so the tombstone is applied to each durable store (the inbox helper
   locks the **unread** file and rewrites
-  both `_unread`/`_read` under it — same lock discipline as `teammate_ack`). Keeping the id
+  both `_unread`/`_read` under it — same lock discipline as `teammate_inbox`'s auto-ack move).
+  Keeping the id
   + `reply_to` means citations and thread/group continuity survive. Permission is
   **author-or-operator** (`is_operator=True` only on the dashboard path).
 - **Teammate = hard remove, offline only.** Deletes the registry record + inbox files +
@@ -531,13 +540,16 @@ watcher with **no `channel.py` change**.
   no count change).
 - **Mute:** `muted_groups` on the member's agent record (the watcher already reads that
   record, cached on the 5s heartbeat). The watcher drops muted-group messages from the
-  wake/count via an inline set-difference (`(unread_ids - muted_ids) - known_ids - last_seen`
-  in channel.py — there is no separate `_audible` helper) but keeps them in the inbox;
+  wake/count via an inline set-difference (`unread_ids - muted_ids` in channel.py — there
+  is no separate `_audible` helper; WP-42 dropped the former `- known_ids - last_seen`
+  terms since a read message no longer sits in unread at all) but keeps them in the inbox;
   `known_ids` still absorbs the muted ids so an unmute never retro-nudges. A 1:1 DM (no
   `group` key) can never be muted.
 - **Read receipts:** read-only inference — `group_read_positions` reads each member's
-  `_read.json` for the max acked group-message id (no write path, no ack change). Surfaced
-  via `teammate_group reads` + dashboard ticks. An ack/seen upper bound, groups-only.
+  `_read.json` for the max read group-message id (no write path beyond `teammate_inbox`'s
+  own auto-ack move). Surfaced via `teammate_group reads` + dashboard ticks. Since WP-42,
+  these are true "read up to here" positions — a member's furthest read is exactly the
+  furthest group message they've actually pulled through `teammate_inbox`. Groups-only.
 - **Threading:** an optional `reply_to` id stored unvalidated (a citation hint), rendered
   flat (`↳ re <id>`); `history reply_to=<id>` pulls a thread. No send-path read.
 - **Reactions:** `teammate_react` appends to an always-on (NOT transcript-gated) NDJSON
@@ -859,6 +871,12 @@ subheads with the profile `summary`/`status`. No second grouping structure.
     Single branch (`fix/fable-audit-260701`), fix-forward, fix+proof in the same commit
     throughout. This doc mega-pass (README/SKILL/DESIGN + version bump + CHANGELOG + local
     tags) is WP-32, the last WP in the epic.
+17. **Auto-ack on read** (0.15.0, WP-42): reading a message via `teammate_inbox` IS acking
+    it now — `teammate_ack` is removed (breaking) and WP-15's `{agent}_seen.json`
+    body-suppression scheme is replaced by moving shown messages straight into
+    `_read.json`. `show_all` → `show_read:N` (read-history recovery). Group read receipts
+    are now true "read up to here" positions. A legacy `{agent}_seen.json` sweeps into
+    `_read.json` on first contact post-upgrade, then is deleted.
 
 **Remaining:**
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.

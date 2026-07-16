@@ -7,15 +7,15 @@ polls the agent's own ``_unread.json`` and emits a ``notifications/claude/channe
 event for messages the agent **has not yet been shown** — so a peer's
 ``teammate_send`` writing this inbox *is* the nudge.
 
-Nudge gating (v0.4.2): a message wakes the agent only if its id is neither already
-seen (in ``Identity.last_seen`` — the ids returned by the last full
-``teammate_inbox`` read) nor already nudged-for (a watcher-local ``known_ids`` set).
-At registration ``known_ids`` is seeded to whatever is already in the inbox, so
-pre-existing messages don't nudge (the agent drains them with a startup
-``teammate_inbox``). The emitted count is the number of *unseen* unread messages, so
-a message you've read but not yet acked never pads the count. Reading — not acking —
-is what silences a nudge. This is missed-nudge-safe: a genuinely new message has a
-fresh id in neither set, so it always nudges.
+Nudge gating (WP-42: auto-ack on read simplified this — ``_unread.json`` now literally
+means "never shown", since ``teammate_inbox`` moves whatever it shows straight into
+``_read.json``): a message wakes the agent only if its id is both still in unread and
+not already nudged-for (a watcher-local ``known_ids`` set). At registration
+``known_ids`` is seeded to whatever is already in the inbox, so pre-existing messages
+don't nudge (the agent drains them with a startup ``teammate_inbox``). The emitted
+count is the number of unread-and-unmuted messages. Reading a message removes it from
+unread entirely, which is what silences a nudge for it. This is missed-nudge-safe: a
+genuinely new message has a fresh id outside ``known_ids``, so it always nudges.
 
 Reliability contract: the inbox JSON is the source of truth, but a dropped channel push
 is NOT auto-recovered — an idle agent never reads its inbox unprompted, so the old
@@ -149,9 +149,10 @@ def compute_reemit(unseen_ids, now_mono, last_emit_mono, attempts):
     unread after an exponential-backoff quiet period (``REEMIT_BASE_SECONDS × 2**attempts``
     → 120, 240, 480 s), capped at ``REEMIT_MAX_ATTEMPTS``.
 
-    ``unseen_ids`` MUST be the same ``(unread - muted) - last_seen`` set the fresh path
-    uses, so a read-but-unacked or muted message can never re-nudge — that single shared
-    computation is what keeps the v0.4.2 no-noise contract provably intact.
+    ``unseen_ids`` MUST be the same ``unread_ids - muted_ids`` set the fresh path uses
+    (WP-42: reading a message removes it from unread, so a read message can never re-nudge
+    by construction), so a muted message can never re-nudge — that single shared computation
+    is what keeps the v0.4.2 no-noise contract provably intact.
 
     The clock (``last_emit_mono``) is armed ONLY by a real fresh emit (the caller stamps it
     there), never by this function — so a batch that was never first-nudged (a message that
@@ -323,9 +324,9 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
 
             # Identity (re)set: re-seed for the new inbox. Triggers on agent name change OR on a
             # same-name re-registration (post-compaction), detected via a bumped generation counter.
-            # Identity.set already cleared last_seen on name-change; the watcher reset here purges
-            # known_ids and clocks so stale in-memory state doesn't suppress wakes after re-register.
-            # last_hb=0 forces an immediate heartbeat + muted-cache refresh.
+            # The watcher reset here purges known_ids and clocks so stale in-memory state doesn't
+            # suppress wakes after re-register. last_hb=0 forces an immediate heartbeat +
+            # muted-cache refresh.
             if agent != last_agent or generation != last_generation:
                 known_ids = None
                 last_agent = agent
@@ -425,18 +426,15 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                     # drained by the agent's startup teammate_inbox — don't nudge for them.
                     known_ids = set(unread_ids)
                 else:
-                    # UNSEEN = (unread - muted) - last_seen — the ONE set both the first-nudge
-                    # and the WP-9 re-nudge gate on. A read-but-unacked message (in last_seen)
-                    # and any muted-group message are excluded, so neither can ever (re-)nudge:
-                    # that shared computation is what keeps the v0.4.2 no-noise contract intact.
-                    # Muted ids are still tracked in known_ids below, so an unmute never
-                    # retro-nudges. M3: also exclude durable_seen — ids WP-15 already delivered
-                    # (full body) in a PRIOR session, per the persisted seen-file snapshotted at
-                    # registration — so a wake firing before this session's first
-                    # teammate_inbox read doesn't over-count them as "new".
-                    last_seen = identity.get_last_seen() or set()
-                    durable_seen = identity.get_durable_seen()
-                    unseen_ids = (unread_ids - muted_ids) - last_seen - durable_seen
+                    # UNSEEN = unread - muted — the ONE set both the first-nudge and the WP-9
+                    # re-nudge gate on. WP-42 (auto-ack on read) made this valid: unread now
+                    # literally means never-shown, since teammate_inbox moves whatever it shows
+                    # straight into the read inbox — no separate last_seen/durable_seen tracking
+                    # is needed to exclude a read-but-unacked message, because that state no
+                    # longer exists. Muted-group messages are excluded so they can never
+                    # (re-)nudge; muted ids are still tracked in known_ids below, so an unmute
+                    # never retro-nudges.
+                    unseen_ids = unread_ids - muted_ids
                     fresh = unseen_ids - known_ids
                     if fresh:
                         # A genuinely-new message → first nudge. group_targets name the reply
@@ -456,10 +454,11 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                         # unaware of still-unseen unread (GH #38736/#61797). Re-nudge with capped
                         # backoff for ANY still-unseen message (content-agnostic recovery — a
                         # dropped emit is a dropped emit regardless of message type). compute_reemit
-                        # also RESETS the clock+attempts when unseen is empty (caught up), so an
-                        # ack/read re-arms the next batch cleanly. No-noise contract holds because
-                        # unseen_ids = (unread - muted) - last_seen already excludes read-but-unacked
-                        # and muted, and compute_reemit's first-emit guard is unchanged.
+                        # also RESETS the clock+attempts when unseen is empty (caught up), so a
+                        # read re-arms the next batch cleanly. No-noise contract holds because
+                        # unseen_ids = unread_ids - muted_ids already excludes read (a read message
+                        # leaves unread entirely) and muted, and compute_reemit's first-emit guard
+                        # is unchanged.
                         do_reemit, reemit_attempts, last_emit_mono = compute_reemit(
                             unseen_ids, now, last_emit_mono, reemit_attempts)
                         if do_reemit:

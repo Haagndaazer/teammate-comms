@@ -28,13 +28,13 @@ teammate_register(agent: "bob")
 teammate_send(to: "alice", message: "hey, ready when you are")
 
 # Back on instance A — its channel wakes it automatically (no polling); it then:
-teammate_inbox()             # → shows bob's message
-teammate_ack(id: "all")
+teammate_inbox()             # → shows bob's message (reading it moves it to your read history)
 teammate_send(to: "bob", message: "got it, starting now")
 ```
 
-That's the whole loop: register once each, then `teammate_send`/`teammate_inbox`/
-`teammate_ack` from there. A's wake is automatic — B's message *is* the nudge.
+That's the whole loop: register once each, then `teammate_send`/`teammate_inbox` from
+there. A's wake is automatic — B's message *is* the nudge, and reading it in
+`teammate_inbox` *is* acking it — there's no separate ack step.
 
 ## Tools
 
@@ -42,13 +42,12 @@ That's the whole loop: register once each, then `teammate_send`/`teammate_inbox`
 |------|------|----------|
 | `teammate_register` | `agent`, `team?`, `comms_dir?`, *profile?* (`project`, `role`, `personality`, `status`, `authority`) | Call once, whenever you want to join comms, to establish identity, register your inbox, and arm the channel. Opt-in — nothing calls this for you. Optionally set your profile (`project` is auto-filled). |
 | `teammate_send` | `to`, `message`, `priority?`, `post_type?` (`decision`/`blocker`/`fyi`/`chatter`), `reply_to?` | Append a message to `to`'s inbox; report whether `to`'s channel is live or queued. Self-send is rejected. **`to` may be a `#`-prefixed group name** (fans out to all members); `@name` (a member) flags a mention; `post_type` builds a decision trail. |
-| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_all?` | Read your unread messages (or count). `since`/`limit` page a large inbox (id cursor + most-recent-N). Shows the group tag, `post_type`, `🔔(@you)` mentions, `↳ re` replies, and reaction summaries. Bodies already shown are suppressed by default, durably across sessions — pass `show_all:true` to re-read them. A live unread queue is capped at 1000 — beyond that, the oldest overflow moves to your read history (never dropped) and stops appearing here. |
-| `teammate_ack` | `id` (or `"all"`) | Move messages unread → read. `"all"` clears only what you've **seen** (messages that arrived since your last `teammate_inbox` read are kept). |
+| `teammate_inbox` | `count_only?`, `since?`, `limit?`, `show_read?` | Read your unread messages (or count). Reading IS acking — every message shown moves immediately into your read history, so there's no separate ack step. `since`/`limit` page a large inbox (id cursor + most-recent-N) — only the messages actually shown move. `show_read:N` non-destructively re-reads your N most recent already-read messages instead (handy after context compaction). A live unread queue is capped at 1000 — beyond that, the oldest overflow moves to your read history (never dropped) and stops appearing here. |
 | `teammate_list` | `all?` | List registered teammates with type + liveness (**always shows `project`, `status`, `authority`**; `role`/`personality` when set), plus a **Groups** section. Comms are global by default, but this **list view defaults to your project only** — pass `all:true` for every teammate across every project. The human operator shows as `🧑 (operator)`. |
 | `teammate_whoami` | `verbose?` | Registration state, identity, team, comms dir, and your own profile (diagnostics). `verbose:true` adds a read-only **doctor** report — comms root, per-agent heartbeat liveness, sub-stream file sizes, unread counts, and any leftover lock dirs (use it when comms seem stuck). |
 | `teammate_update` | `role?`, `personality?`, `status?`, `authority?` | Update your own profile fields (keep `status` fresh). Empty string clears a field. |
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
-| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. `history` reads the shared transcript (filterable into a decision trail); `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's acked up to where. |
+| `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. `history` reads the shared transcript (filterable into a decision trail); `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's read up to where. |
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (shown in inbox/history/dashboard). Wakes only the **author** of the reacted-to message (never the group, never on remove). |
 | `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED` (default off); confirms launch, not registration. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) and register the human operator as a first-class teammate. |
@@ -151,7 +150,7 @@ decision trail (also by `sender`/`since`/`reply_to`). `@name` a group member to 
 mention — their channel wake gets a 🔔 (content-only; never inflates the count). Mute a
 noisy group with `teammate_group(action:"mute", group:"#x")` — its messages still land in
 your inbox, you just aren't woken (a 1:1 DM is never muted). `reply_to` a message id to
-thread (a flat citation hint). `teammate_group(action:"reads")` shows who has acked up to
+thread (a flat citation hint). `teammate_group(action:"reads")` shows who has read up to
 which message.
 
 ## Reactions
@@ -159,7 +158,7 @@ which message.
 React to any message by id with a basic emoji — `teammate_react(to_message:"<id>",
 emoji:"fire")` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`; `remove:true` to take it
 back). A reaction **wakes only the author** of the reacted-to message — the lightweight way
-to acknowledge without sending a message — and never the group, never the reactor, never on
+to respond without sending a message — and never the group, never the reactor, never on
 remove; everyone else just sees it in `teammate_inbox` / `teammate_group history` / the
 dashboard. They live in an always-on `reactions.jsonl` keyed by the target message id (so
 the same mechanism covers DMs and group posts).

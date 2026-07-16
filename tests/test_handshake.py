@@ -5,7 +5,7 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 17 tools (register + 16), each with a valid object inputSchema
+    - tools/list returns 18 tools (register + 17), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
     - teammate_register (with a profile) establishes identity; teammate_whoami flips
       to registered and echoes the profile
@@ -15,8 +15,9 @@ primary path). Asserts both halves of the unified server:
       (group-tagged 👥) but NOT the sender; the shared transcript records it;
       teammate_group history returns it (and filters by sender); unknown action +
       duplicate create are isError
-    - ack("all") only clears messages SEEN as of the last teammate_inbox read; an
-      arrival that lands after the read is preserved (v0.4.1)
+    - WP-42: teammate_inbox auto-acks whatever it shows (reading IS acking, no separate
+      ack step); a message that arrives AFTER a read still shows on the NEXT read —
+      auto-ack never moves what it didn't show (supersedes the v0.4.1 ack("all") guard)
 
   Profile fields:
     - teammate_register echoes the profile back (role + personality shown on register)
@@ -36,7 +37,7 @@ primary path). Asserts both halves of the unified server:
     - the registry record is written, and type:"full" SURVIVES a heartbeat cycle
 
   Tool half + error paths (all stay alive):
-    - send / inbox / ack round-trip; self-send, unknown tool, missing arg, bad name
+    - send / inbox round-trip; self-send, unknown tool, missing arg, bad name
       all return isError; an unknown JSON-RPC method returns -32601
 
   Version sync: __init__.py, plugin.json, pyproject.toml all agree.
@@ -242,9 +243,9 @@ def main():
     time.sleep(1.5)
 
     send(proc, {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})
+                "params": {"name": "teammate_inbox", "arguments": {}}})   # shows + auto-acks "hello via channel"
     send(proc, {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
-                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})
+                "params": {"name": "teammate_inbox", "arguments": {}}})   # WP-42: repeat read shows nothing (already moved to read)
     send(proc, {"jsonrpc": "2.0", "id": 15, "method": "ping"})
     time.sleep(0.6)
 
@@ -279,16 +280,16 @@ def main():
     append_external_message(root, AGENT, PEER, "from the group", group=GROUP_SIGIL)
     time.sleep(0.6)
     send(proc, {"jsonrpc": "2.0", "id": 25, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})   # last_seen = {this msg}
+                "params": {"name": "teammate_inbox", "arguments": {}}})   # shows + auto-acks "from the group"
     time.sleep(0.4)
 
-    # A1: ack("all") must PRESERVE a message that arrives AFTER the last read.
+    # WP-42 (was A1/ack-all-preserves-post-read-arrival): a message that arrives AFTER a read
+    # must still show on the NEXT read — auto-ack only ever moves what it actually SHOWED, so
+    # this is now proven by ordinary inbox mechanics rather than a separate ack step.
     append_external_message(root, AGENT, PEER, "arrived-after-read")
     time.sleep(0.3)
     send(proc, {"jsonrpc": "2.0", "id": 26, "method": "tools/call",
-                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})   # acks SEEN only
-    send(proc, {"jsonrpc": "2.0", "id": 27, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})            # still shows the new one
+                "params": {"name": "teammate_inbox", "arguments": {}}})   # shows ONLY the new arrival
     # A2: history sender filter (only AGENT posted "group hello" to the transcript).
     send(proc, {"jsonrpc": "2.0", "id": 28, "method": "tools/call",
                 "params": {"name": "teammate_group",
@@ -299,11 +300,10 @@ def main():
     time.sleep(0.5)
 
     # v0.4.4 mixed-batch: a DM-triggered wake must still name a PENDING unseen group
-    # thread. Drain to a clean slate, then inject an (unread) group msg + a later DM in
-    # SEPARATE polls. The DM wake fires at count=2 (group+DM both unseen) and must name
-    # the group target — under v0.4.3 it would not (DM alone in `fresh`).
-    send(proc, {"jsonrpc": "2.0", "id": 30, "method": "tools/call",
-                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})   # clear leftover (seen)
+    # thread. The inbox is already a clean slate here (WP-42: id 26's read auto-acked
+    # everything shown so far — no separate drain/ack step is needed). Inject an (unread)
+    # group msg + a later DM in SEPARATE polls. The DM wake fires at count=2 (group+DM both
+    # unseen) and must name the group target — under v0.4.3 it would not (DM alone in `fresh`).
     time.sleep(0.6)
     # carries an @mention of AGENT → the wake(s) for it must include the 🔔 line
     append_external_message(root, AGENT, PEER, "mixed-group @test-chan", group=GROUP_SIGIL,
@@ -377,18 +377,18 @@ def main():
                                          "reply_to": "2026-01-01T00:00:00.000000"}}})
     time.sleep(0.5)
 
-    # ── Mute (v0.6.0) ── drain to a clean slate, mute #brainstorm, then inject a muted
-    # group message + a 1:1 DM, then unmute + inject a new group message. The watcher's
-    # muted-cache refreshes on the 5s heartbeat, so each mute/unmute is followed by a
-    # heartbeat-length wait. Invariants proven by the LAST TWO nudges (both count "1"):
+    # ── Mute (v0.6.0) ── drain to a clean slate first (WP-42: teammate_inbox auto-acks
+    # whatever it shows — this alone clears the mixed-batch group+DM messages, no separate
+    # ack call needed). Mute #brainstorm, then inject a muted group message + a 1:1 DM, then
+    # unmute + inject a new group message. The watcher's muted-cache refreshes on the 5s
+    # heartbeat, so each mute/unmute is followed by a heartbeat-length wait. Invariants proven
+    # by the LAST TWO nudges (both count "1"):
     #   - DM woke WHILE the group was muted (never-mute-a-DM) — count 1, names no group;
     #   - the new group woke AFTER unmute (restore) — count 1, names #brainstorm;
     #   - count 1 (not 2) on each → the muted message neither padded the count nor
     #     retro-nudged on unmute. (The global non_one==[one "2"] assertion guards this too.)
     send(proc, {"jsonrpc": "2.0", "id": 40, "method": "tools/call",
-                "params": {"name": "teammate_inbox", "arguments": {}}})       # drain-read
-    send(proc, {"jsonrpc": "2.0", "id": 41, "method": "tools/call",
-                "params": {"name": "teammate_ack", "arguments": {"id": "all"}}})  # clear inbox
+                "params": {"name": "teammate_inbox", "arguments": {}}})       # drain-read (auto-acks)
     send(proc, {"jsonrpc": "2.0", "id": 42, "method": "tools/call",
                 "params": {"name": "teammate_group", "arguments": {"action": "mute", "group": GROUP_SIGIL}}})
     time.sleep(0.5)
@@ -438,8 +438,8 @@ def main():
     append_external_message(root, AGENT, PEER, "after-unmute-grp", group=GROUP_SIGIL)  # wakes (count 1, names group)
     time.sleep(1.3)
 
-    # Read receipts (read-only inference): AGENT has acked group messages (ack-all above),
-    # so its position is a real id; PEER never acked → (none acked).
+    # Read receipts (read-only inference): AGENT auto-acked a group message via teammate_inbox
+    # (id 25 above), so its position is a real id; PEER never read → (none read).
     send(proc, {"jsonrpc": "2.0", "id": 46, "method": "tools/call",
                 "params": {"name": "teammate_group", "arguments": {"action": "reads", "group": GROUP_SIGIL}}})
     # reincarnate is GATED off by default (env has no TEAMMATE_REINCARNATE_ENABLED) → isError,
@@ -565,18 +565,18 @@ def main():
     if any("id" in m and m["id"] is None and "result" in m for m in msgs):
         failures.append("notification-form ping produced a response frame (WP-16 AC-3, should be silent)")
 
-    # tools/list: 19 tools (13 original + 4 project-profile tools + 1 avatar tool + 1 WP-37
-    # compact-request tool), each with an object inputSchema
+    # tools/list: 18 tools (WP-42 removed teammate_ack — reading is acking now), each with
+    # an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
-                      "teammate_ack", "teammate_list", "teammate_whoami",
+                      "teammate_list", "teammate_whoami",
                       "teammate_update", "teammate_profile", "teammate_group",
                       "teammate_react", "teammate_reincarnate", "teammate_dashboard",
                       "teammate_delete",
                       "project_register", "list_projects", "project_profile", "project_delete",
                       "teammate_set_avatar", "teammate_request_compact"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
-        failures.append(f"tools/list names mismatch: {tl}")
+        failures.append(f"tools/list names mismatch: {tl}")  # WP-42 AC-4: teammate_ack must be absent
     else:
         for t in tl:
             sch = t.get("inputSchema")
@@ -660,8 +660,9 @@ def main():
         failures.append(f"1:1 nudge wrongly named a group target: {mwakes[0]['params']['content']}")
     if "hello via channel" not in text(13):
         failures.append(f"teammate_inbox missing message: {text(13)}")
-    if is_error(14) or "Acknowledged" not in text(14):
-        failures.append(f"teammate_ack failed: {text(14)}")
+    # WP-42: reading IS acking — a repeat teammate_inbox call shows nothing (moved to read.json).
+    if is_error(14) or "No unread messages" not in text(14):
+        failures.append(f"WP-42 auto-ack: repeat teammate_inbox should show nothing: {text(14)}")
     if by_id.get(15, {}).get("result") != {}:
         failures.append(f"ping result not empty: {by_id.get(15)}")
 
@@ -719,13 +720,13 @@ def main():
     if "👥" not in text(25):
         failures.append(f"teammate_inbox group tag missing glyph: {text(25)}")
 
-    # A1: ack("all") preserved the post-read arrival; the seen group msg was acked
-    if is_error(26) or "Acknowledged" not in text(26) or "Kept 1" not in text(26):
-        failures.append(f"ack-all did not preserve post-read arrival: {text(26)}")
-    if "arrived-after-read" not in text(27):
-        failures.append(f"post-read arrival was wrongly acked (not in inbox): {text(27)}")
-    if "from the group" in text(27):
-        failures.append(f"seen message was not acked by ack-all: {text(27)}")
+    # WP-42 (was A1): a message that arrived AFTER the id-25 read shows on the next read;
+    # the already-read "from the group" message does NOT reappear (moved to read.json, not
+    # merely suppressed) — reading is acking, there's no separate ack step to get wrong.
+    if is_error(26) or "arrived-after-read" not in text(26):
+        failures.append(f"post-read arrival did not show on the next read: {text(26)}")
+    if "from the group" in text(26):
+        failures.append(f"already-read message wrongly reappeared (should be in read.json, not unread): {text(26)}")
     # A2: history sender filter
     if is_error(28) or "group hello" not in text(28):
         failures.append(f"history sender={AGENT} missing AGENT's message: {text(28)}")
@@ -846,11 +847,11 @@ def main():
     # ── read receipts (v0.6.0, read-only inference) ──
     if is_error(46) or "read positions" not in text(46):
         failures.append(f"reads action failed: {text(46)}")
-    # AGENT acked group messages → a real position (not "(none acked)"); PEER never acked
-    if f"{AGENT}: (none acked)" in text(46) or f"{AGENT}: " not in text(46):
-        failures.append(f"reads: AGENT should have an acked group position: {text(46)}")
-    if f"{PEER}: (none acked)" not in text(46):
-        failures.append(f"reads: PEER never acked, should be (none acked): {text(46)}")
+    # AGENT read a group message via inbox → a real position (not "(none read)"); PEER never read
+    if f"{AGENT}: (none read)" in text(46) or f"{AGENT}: " not in text(46):
+        failures.append(f"reads: AGENT should have a read group position: {text(46)}")
+    if f"{PEER}: (none read)" not in text(46):
+        failures.append(f"reads: PEER never read, should be (none read): {text(46)}")
 
     # ── mute (v0.6.0) ──
     if is_error(42) or "Muted" not in text(42):
@@ -1402,10 +1403,10 @@ def main():
     except Exception as e:
         failures.append(f"WP-9 re-nudge unit checks errored: {e}")
 
-    # ── WP-11b — inbox body suppression (hermetic, isolated temp root — no shared inbox) ──
-    # Tests _handle_inbox's _prev_seen/new_msgs/seen_msgs split directly. A second read in the
-    # same session must suppress already-shown bodies; show_all=True restores them.
-    # Isolated from the channel harness to prevent polluting the timing-sensitive watcher tests.
+    # ── WP-42 (supersedes WP-11b) — auto-ack on read (hermetic, isolated temp root — no shared
+    #    inbox). Reading IS acking now: a second teammate_inbox call shows nothing (the message
+    #    already moved to read.json); show_read=N re-reads read history instead, non-destructively.
+    #    Isolated from the channel harness to prevent polluting the timing-sensitive watcher tests.
     try:
         from teammate_comms.tools import _handle_inbox as _hi11b
         from teammate_comms import comms as _c11b
@@ -1421,36 +1422,50 @@ def main():
         _c11b.write_json_atomic(_inboxes11b / f"{_b11b_agent}_unread.json", [_probe_msg])
 
         class _Id11b:
-            def __init__(self):
-                self._ls = None
             def snapshot(self):
                 return (_b11b_agent, _b11b_team, _b11b_root, None)
-            def get_last_seen(self):
-                return self._ls
-            def set_last_seen(self, v):
-                self._ls = v
 
         _ctx11b = {"identity": _Id11b()}
 
-        # First read: body must appear (message is new this session)
+        # First read: body must appear, and the message moves out of unread into read.json.
         _r1 = _hi11b({}, _ctx11b)
         if "suppression-probe-body" not in _r1:
-            failures.append(f"WP-11b suppression: first read must show the body: {_r1}")
+            failures.append(f"WP-42 auto-ack: first read must show the body: {_r1}")
+        _unread11b = _c11b.read_json_safe(_inboxes11b / f"{_b11b_agent}_unread.json")
+        if _unread11b:
+            failures.append(f"WP-42 auto-ack: message should have moved out of unread after "
+                            f"being shown: {_unread11b}")
+        _read11b = _c11b.read_json_safe(_inboxes11b / f"{_b11b_agent}_read.json")
+        if len(_read11b) != 1 or "read_at" not in _read11b[0]:
+            failures.append(f"WP-42 auto-ack: shown message should land in read.json with a "
+                            f"read_at stamp: {_read11b}")
 
-        # Second read: body must be suppressed (id now in last_seen); note must appear
+        # Second read: nothing left to show — there is no ack step, reading already moved it.
         _r2 = _hi11b({}, _ctx11b)
         if "suppression-probe-body" in _r2:
-            failures.append(f"WP-11b suppression: second read re-dumped already-seen body (should suppress): {_r2}")
-        if "already delivered" not in _r2 and "No new messages" not in _r2:
-            failures.append(f"WP-11b suppression: second read missing suppression note: {_r2}")
+            failures.append(f"WP-42 auto-ack: second read re-dumped an already-read body "
+                            f"(reading IS acking, it should be gone from unread): {_r2}")
+        if "No unread messages" not in _r2:
+            failures.append(f"WP-42 auto-ack: second read should report no unread messages: {_r2}")
 
-        # show_all=True: body must reappear (escape hatch for post-compaction re-read)
-        _r3 = _hi11b({"show_all": True}, _ctx11b)
+        # show_read=1: non-destructively re-reads the 1 most recent read message; moves nothing.
+        _r3 = _hi11b({"show_read": 1}, _ctx11b)
         if "suppression-probe-body" not in _r3:
-            failures.append(f"WP-11b suppression show_all=True: body should reappear: {_r3}")
+            failures.append(f"WP-42 show_read: body should reappear from read history: {_r3}")
+        _read11b_after = _c11b.read_json_safe(_inboxes11b / f"{_b11b_agent}_read.json")
+        if _read11b_after != _read11b:
+            failures.append(f"WP-42 show_read: must not mutate read.json: before={_read11b} "
+                            f"after={_read11b_after}")
+
+        # show_read combined with count_only/since/limit is a usage error.
+        try:
+            _hi11b({"show_read": 1, "count_only": True}, _ctx11b)
+            failures.append("WP-42 show_read: combining with count_only should raise CommsError")
+        except _c11b.CommsError:
+            pass
 
     except Exception as e:
-        failures.append(f"WP-11b inbox suppression unit checks errored: {e}")
+        failures.append(f"WP-42 auto-ack inbox unit checks errored: {e}")
 
     # ── WP-12 — live-watcher re-nudge + re-register-reset (the regression guards that were
     #    missing from WP-11a and let the watcher-crash bug ship green). Drive run_watcher on a
@@ -1634,12 +1649,15 @@ def main():
                 if not _wait_until12(lambda: len(_emits12b) >= 1, timeout=5.0):
                     failures.append("WP-12b no-noise: no fresh DM emit")
                 else:
-                    # Mark as read (set_last_seen with the message id)
-                    _id12b.set_last_seen({"dm-12b"})
+                    # WP-42: "marking as read" IS auto-ack — a real teammate_inbox read removes
+                    # the message from unread entirely, so simulate that directly (the mock
+                    # identity's last_seen stub is dead code post-WP-42; the watcher no longer
+                    # consults it — unseen is purely unread_ids - muted_ids now).
+                    _c12.write_json_atomic(_unread12b, [])
                     # Wait well past the re-nudge window — no second emit should arrive
                     time.sleep(_TINY_BASE * 6)
                     if len(_emits12b) > 1:
-                        failures.append(f"WP-12b no-noise: re-nudged a read message ({len(_emits12b)} emits)")
+                        failures.append(f"WP-12b no-noise: re-nudged a read (removed-from-unread) message ({len(_emits12b)} emits)")
             finally:
                 _stop12b.set()
                 _ch12.REEMIT_BASE_SECONDS = _orig_base2
@@ -2161,65 +2179,114 @@ def main():
     except Exception as e:
         failures.append(f"WP-6 race+scale unit checks errored: {e}")
 
-    # ── WP-7 P4 (C-3) — teammate_inbox since/limit windowing; the SILENT-LOSS guard: ack("all")
-    #    after a LIMITED read clears only what was SHOWN, never unshown messages. ──
+    # ── WP-7 P4 (C-3), ported for WP-42 — teammate_inbox since/limit windowing; the
+    #    SILENT-LOSS guard: a LIMITED/windowed read moves ONLY what it SHOWS to read.json —
+    #    unshown messages (out of window, or arriving concurrently) must survive in unread. ──
     try:
         from teammate_comms import comms as _c7
         from teammate_comms import tools as _t7
 
         class _Id7:
             def __init__(self, agent, root):
-                self.agent, self.root, self._seen = agent, root, None
+                self.agent, self.root = agent, root
 
             def snapshot(self):
                 return (self.agent, None, self.root, None)
 
-            def set_last_seen(self, ids):
-                self._seen = set(ids)
-
-            def get_last_seen(self):
-                return self._seen
         proot7 = tempfile.mkdtemp(prefix="tc-wp7-p4-")
         for i in range(5):
             _t7.send_dm(proot7, None, "alice", "bob", f"m{i}")
         _ctx7 = {"identity": _Id7("bob", proot7)}
         _binb = _c7.get_inboxes_dir(proot7, None) / "bob_unread.json"
-        # limited read → most recent 2; header notes it; set_last_seen reflects ONLY those 2.
+        _brdb = _c7.get_inboxes_dir(proot7, None) / "bob_read.json"
+        # limited read -> shows the most recent 2 (of 5) and auto-moves ONLY those 2 to read.
         _out = _t7._handle_inbox({"limit": 2}, _ctx7)
         if "showing 2 of 5" not in _out:
             failures.append(f"P4: limited inbox didn't note 'showing 2 of 5': {_out[:90]!r}")
-        _seen = _ctx7["identity"].get_last_seen()
-        if _seen is None or len(_seen) != 2:
-            failures.append(f"P4: set_last_seen did not reflect ONLY the 2 shown ids ({_seen})")
-        # ack-all now clears ONLY the 2 shown — the other 3 remain unread (NO silent loss).
-        _t7._handle_ack({"id": "all"}, _ctx7)
+        _read_after1 = _c7.read_json_safe(_brdb)
+        if len(_read_after1) != 2 or not all("read_at" in m for m in _read_after1):
+            failures.append(f"P4: exactly the 2 shown messages should move to read.json with "
+                            f"read_at stamps: {_read_after1}")
         _rem = _c7.read_json_safe(_binb)
         if len(_rem) != 3:
-            failures.append(f"P4 SILENT-LOSS: ack('all') after limit=2 left {len(_rem)} unread (want 3)")
-        # since filter: only ids >= the cursor (page forward). The 3 remaining are the oldest 3.
+            failures.append(f"P4 SILENT-LOSS: a limit=2 read moved more than it showed, leaving "
+                            f"{len(_rem)} unread (want 3)")
+        # since filter: only ids >= the cursor (page forward), evaluated over the now-reduced
+        # unread set. The 3 remaining are the oldest 3; only the newest of those matches.
         _ids = sorted(m["id"] for m in _rem)
-        _sout = _t7._handle_inbox({"since": _ids[-1]}, {"identity": _Id7("bob", proot7)})
+        _sout = _t7._handle_inbox({"since": _ids[-1]}, _ctx7)
         if "1 unread message(s)" not in _sout:
             failures.append(f"P4 since filter: expected 1 message at/after the newest remaining: {_sout[:90]!r}")
-        # _read.json cap is module-level (_READ_CAP) and trims on ack — assert the constant is
-        # sane (a heavy 1000-ack test isn't worth the runtime; the trim is a plain slice).
+        _rem2 = _c7.read_json_safe(_binb)
+        if len(_rem2) != 2:
+            failures.append(f"P4 since filter SILENT-LOSS: the 2 messages below the cursor "
+                            f"should remain unread, found {len(_rem2)}")
+        # _read.json cap is module-level (_READ_CAP) — assert the constant is sane (a heavy
+        # 1000-message test isn't worth the runtime; the trim itself is a plain slice).
         if not (isinstance(_t7._READ_CAP, int) and _t7._READ_CAP > 0):
             failures.append("P4: _READ_CAP is not a positive int")
-        # P4 CR (v0.4.2 composition): an id SHOWN on an earlier page must STAY in last_seen when
-        # a later windowed read shows a DIFFERENT page — else it re-counts as unseen and the
-        # watcher would re-nudge a message the agent already read. last_seen is union-with-prune.
-        uroot = tempfile.mkdtemp(prefix="tc-wp7-p4u-")
-        for i in range(5):
-            _t7.send_dm(uroot, None, "alice", "bob", f"u{i}")
-        _uctx = {"identity": _Id7("bob", uroot)}
-        _uids = sorted(m["id"] for m in _c7.read_json_safe(_c7.get_inboxes_dir(uroot, None) / "bob_unread.json"))
-        _t7._handle_inbox({"since": _uids[1]}, _uctx)     # page A: shows ids >= id1 (incl _uids[1])
-        _t7._handle_inbox({"limit": 1}, _uctx)            # page B: shows only the newest id
-        if _uids[1] not in (_uctx["identity"].get_last_seen() or set()):
-            failures.append("P4 CR: an earlier-page id fell out of last_seen on a later windowed "
-                            "read (would re-nudge an already-read message)")
+
+        # P4 CONCURRENT-ARRIVAL (the #1 failure mode this WP guards against): a message SENT
+        # while a windowed teammate_inbox read is in flight must never vanish from BOTH
+        # unread.json and read.json — the fix is one file_lock(unread_file) covering a FRESH
+        # read through the final write; reusing an early-released read (the reverted-code bug)
+        # would silently drop whichever message landed in the gap.
+        race_root = tempfile.mkdtemp(prefix="tc-wp7-p4race-")
+        for i in range(3):
+            _t7.send_dm(race_root, None, "alice", "bob", f"r{i}")
+        race_ctx = {"identity": _Id7("bob", race_root)}
+        def _racer():
+            _t7.send_dm(race_root, None, "alice", "bob", "racer")
+        _rt = threading.Thread(target=_racer, daemon=True)
+        _rt.start()
+        _t7._handle_inbox({"limit": 2}, race_ctx)
+        _rt.join(timeout=3)
+        _race_unread = _c7.read_json_safe(_c7.get_inboxes_dir(race_root, None) / "bob_unread.json")
+        _race_read = _c7.read_json_safe(_c7.get_inboxes_dir(race_root, None) / "bob_read.json")
+        _all_ids = {m["id"] for m in _race_unread} | {m["id"] for m in _race_read}
+        if len(_all_ids) != 4:  # 3 seeded + 1 racer — none silently dropped from both files
+            failures.append(f"P4 CONCURRENT-ARRIVAL: expected 4 total messages across "
+                            f"read+unread, got {len(_all_ids)}: unread={_race_unread} "
+                            f"read={_race_read}")
     except Exception as e:
         failures.append(f"WP-7 P4 inbox-windowing unit checks errored: {e}")
+
+    # ── WP-42 AC-3 crash-ordering — read.json is written BEFORE unread.json on every
+    #    auto-ack move (the _cap_unread ordering; a crash between the two then duplicates a
+    #    message across both files, never loses it). Monkeypatches tools.write_json_atomic to
+    #    record call order — tautology-proof: the reverted (old ack-handler) ordering fails this. ──
+    try:
+        from teammate_comms import tools as _t42wo
+
+        _wo_root = tempfile.mkdtemp(prefix="tc-wp42-writeorder-")
+        _t42wo.send_dm(_wo_root, None, "alice", "bob", "order-probe")
+
+        class _Id42wo:
+            def snapshot(self):
+                return ("bob", None, _wo_root, None)
+
+        _calls42wo = []
+        _orig_wja42wo = _t42wo.write_json_atomic
+        def _spy_wja42wo(path, data):
+            _calls42wo.append(Path(path).name)
+            return _orig_wja42wo(path, data)
+        _t42wo.write_json_atomic = _spy_wja42wo
+        try:
+            _t42wo._handle_inbox({}, {"identity": _Id42wo()})
+        finally:
+            _t42wo.write_json_atomic = _orig_wja42wo
+
+        _read_idx = next((i for i, n in enumerate(_calls42wo) if n == "bob_read.json"), None)
+        _unread_idx = next((i for i, n in enumerate(_calls42wo) if n == "bob_unread.json"), None)
+        if _read_idx is None or _unread_idx is None:
+            failures.append(f"WP-42 crash-ordering: expected writes to both bob_read.json and "
+                            f"bob_unread.json, got {_calls42wo}")
+        elif _read_idx >= _unread_idx:
+            failures.append(f"WP-42 crash-ordering [tautology: read.json must be written BEFORE "
+                            f"unread.json — a crash between the two must duplicate, never lose, "
+                            f"a message]: write order was {_calls42wo}")
+    except Exception as e:
+        failures.append(f"WP-42 crash-ordering unit check errored: {e}")
 
     # ── WP-7 P1 (C-1) — read_jsonl_tail: seek-from-tail NDJSON reader. Reads only the file's
     #    tail, byte-identical to read_transcript(...)[-N:]; the react/resolve scans use it
@@ -2851,14 +2918,13 @@ def main():
     except Exception as e:
         failures.append(f"WP-8 P5 doctor unit checks errored: {e}")
 
-    # ── WP-15 — durable cross-session inbox body-suppression ──
-    # Tests that {agent}_seen.json persists body suppression across simulated new sessions.
-    # Hermetic, isolated temp root per sub-test.  A new session is simulated by resetting
-    # identity.last_seen to None (the "never read this session" sentinel) while leaving the
-    # on-disk seen_file intact — exactly what a real server restart does.
+    # ── WP-42 (supersedes WP-15) — auto-ack contract + the legacy seen.json transitional
+    #    sweep. WP-15's per-session body-suppression state (last_seen/seen.json-as-suppressor)
+    #    is gone: a message either moves to read.json when SHOWN, or stays in unread. The only
+    #    remaining role for {agent}_seen.json is the one-time legacy sweep on upgrade.
+    #    Hermetic, isolated temp root per sub-test.
     try:
         from teammate_comms.tools import _handle_inbox as _hi15
-        from teammate_comms.tools import _handle_ack as _ha15
         from teammate_comms import comms as _c15
 
         _b15_agent = "probe15"
@@ -2866,15 +2932,10 @@ def main():
         class _Id15:
             def __init__(self, agent, root, team=None):
                 self._agent, self._root, self._team = agent, root, team
-                self._ls = None
             def snapshot(self):
                 return (self._agent, self._team, self._root, None)
-            def get_last_seen(self):
-                return self._ls
-            def set_last_seen(self, v):
-                self._ls = v
 
-        # ── T1 — cross-session suppression ──
+        # ── T1 — shown moves to read.json (with read_at); a repeat read shows nothing ──
         _t1_root = tempfile.mkdtemp(prefix="tc-15-t1-")
         _t1_ix = _c15.get_inboxes_dir(_t1_root, None)
         _c15.ensure_inbox(_t1_ix, _b15_agent)
@@ -2882,49 +2943,66 @@ def main():
         _msg_b = {"id": "wp15-b", "from": "bob",   "priority": "normal", "message": "body-beta"}
         _c15.write_json_atomic(_t1_ix / f"{_b15_agent}_unread.json", [_msg_a, _msg_b])
         _ctx15 = {"identity": _Id15(_b15_agent, _t1_root)}
-        # Session 1: first read — both bodies appear, seen_file is written.
         _s1 = _hi15({}, _ctx15)
         if "body-alpha" not in _s1 or "body-beta" not in _s1:
-            failures.append(f"WP-15 T1: first read must show both bodies: {_s1[:120]!r}")
-        # Session 2: fresh Identity (last_seen=None by construction) + same inboxes dir.
-        # seen_file persists at {agent}_seen.json — suppression must come from it alone.
+            failures.append(f"WP-42 T1: first read must show both bodies: {_s1[:120]!r}")
+        _t1_unread_after1 = _c15.read_json_safe(_t1_ix / f"{_b15_agent}_unread.json")
+        if _t1_unread_after1:
+            failures.append(f"WP-42 T1: shown messages should have moved out of unread: {_t1_unread_after1}")
+        _t1_read1 = _c15.read_json_safe(_t1_ix / f"{_b15_agent}_read.json")
+        if {m.get("id") for m in _t1_read1} != {"wp15-a", "wp15-b"} or not all("read_at" in m for m in _t1_read1):
+            failures.append(f"WP-42 T1: both messages should land in read.json with read_at: {_t1_read1}")
+        # A repeat read (a fresh Identity object, simulating a new session) shows nothing — the
+        # unread file itself is the only truth now, no per-session suppression state involved.
         _ctx15["identity"] = _Id15(_b15_agent, _t1_root)
         _s2 = _hi15({}, _ctx15)
         if "body-alpha" in _s2 or "body-beta" in _s2:
-            failures.append(f"WP-15 T1: cross-session re-read re-dumped suppressed bodies: {_s2[:120]!r}")
-        if "already delivered" not in _s2 and "No new messages" not in _s2:
-            failures.append(f"WP-15 T1: count line absent from suppressed output: {_s2[:120]!r}")
-        if "this session" in _s2:
-            failures.append(f"WP-15 T1: count line still claims 'this session' for prior-session msg: {_s2[:120]!r}")
+            failures.append(f"WP-42 T1: repeat read re-dumped already-read bodies: {_s2[:120]!r}")
+        if "No unread messages" not in _s2:
+            failures.append(f"WP-42 T1: repeat read should report no unread messages: {_s2[:120]!r}")
 
-        # ── T2 — NEVER-MISS holds (new arrival after new-session reset renders full) ──
+        # ── T2 — NEVER-MISS: a message that arrives after a read still renders full ──
         _msg_c = {"id": "wp15-c", "from": "carol", "priority": "normal", "message": "body-new"}
-        _c15.write_json_atomic(_t1_ix / f"{_b15_agent}_unread.json", [_msg_a, _msg_b, _msg_c])
+        _c15.write_json_atomic(_t1_ix / f"{_b15_agent}_unread.json", [_msg_c])
         _ctx15["identity"] = _Id15(_b15_agent, _t1_root)
         _s3 = _hi15({}, _ctx15)
         if "body-new" not in _s3:
-            failures.append(f"WP-15 T2: NEVER-MISS failed — new body absent after new session: {_s3[:120]!r}")
+            failures.append(f"WP-42 T2: NEVER-MISS failed — new body absent: {_s3[:120]!r}")
         if "body-alpha" in _s3 or "body-beta" in _s3:
-            failures.append(f"WP-15 T2: prior-session bodies leaked in same read as NEVER-MISS: {_s3[:120]!r}")
+            failures.append(f"WP-42 T2: already-read bodies leaked back into a later read: {_s3[:120]!r}")
 
-        # ── T3 — ack("all") startup-drain drains BOTH msg-old and msg-new ──
-        # The sentinel is last_seen=None, NOT persisted seen_file — so both messages are drained.
+        # ── T3 — legacy seen.json transitional sweep: summary line (not full body), whole
+        #    backlog in one visit, file deleted after, NOT tagged acked_unseen (it WAS shown,
+        #    in a prior pre-WP-42 session — the sole sanctioned exception) ──
         _t3_root = tempfile.mkdtemp(prefix="tc-15-t3-")
         _t3_ix = _c15.get_inboxes_dir(_t3_root, None)
         _c15.ensure_inbox(_t3_ix, _b15_agent)
         _mo = {"id": "t3-old", "from": "alice", "priority": "normal", "message": "old-body"}
         _mn = {"id": "t3-new", "from": "bob",   "priority": "normal", "message": "new-body"}
         _c15.write_json_atomic(_t3_ix / f"{_b15_agent}_unread.json", [_mo, _mn])
-        _c15.write_json_atomic(_t3_ix / f"{_b15_agent}_seen.json", ["t3-old"])  # only old pre-seeded
+        _c15.write_json_atomic(_t3_ix / f"{_b15_agent}_seen.json", ["t3-old"])  # legacy: pre-WP-42 delivery
         _ctx15t3 = {"identity": _Id15(_b15_agent, _t3_root)}
-        _ack_r = _ha15({"id": "all"}, _ctx15t3)
-        if "Acknowledged all 2" not in _ack_r:
-            failures.append(f"WP-15 T3: startup ack-all drained wrong count (want 2 incl. msg-new): {_ack_r!r}")
-        _t3_left = _c15.read_json_safe(_t3_ix / f"{_b15_agent}_unread.json")
-        if _t3_left:
-            failures.append(f"WP-15 T3: inbox not empty after startup ack-all: {_t3_left}")
+        _sweep_out = _hi15({}, _ctx15t3)
+        if "old-body" in _sweep_out:
+            failures.append(f"WP-42 T3: legacy-swept message rendered its full body (want a summary line only): {_sweep_out!r}")
+        if "new-body" not in _sweep_out:
+            failures.append(f"WP-42 T3: genuinely-new message must still render full: {_sweep_out!r}")
+        if "already delivered" not in _sweep_out:
+            failures.append(f"WP-42 T3: legacy sweep missing its one-line summary: {_sweep_out!r}")
+        _t3_unread_after = _c15.read_json_safe(_t3_ix / f"{_b15_agent}_unread.json")
+        if _t3_unread_after:
+            failures.append(f"WP-42 T3: legacy sweep should clear the WHOLE backlog in one visit: {_t3_unread_after}")
+        _t3_read_after = _c15.read_json_safe(_t3_ix / f"{_b15_agent}_read.json")
+        _t3_old_rec = next((m for m in _t3_read_after if m.get("id") == "t3-old"), None)
+        if _t3_old_rec is None:
+            failures.append(f"WP-42 T3: legacy-swept message did not land in read.json: {_t3_read_after}")
+        elif _t3_old_rec.get("acked_unseen"):
+            failures.append(f"WP-42 T3: legacy-swept record must NOT be tagged acked_unseen: {_t3_old_rec}")
+        if (_t3_ix / f"{_b15_agent}_seen.json").exists():
+            failures.append("WP-42 T3: legacy seen.json should be deleted after the sweep")
 
-        # ── T4 — load-time prune: stale id absent from output AND from seen_file after read ──
+        # ── T4 — a seen.json id no longer in unread is dropped (no ghost resurrection); the
+        #    live id it's paired with sweeps as summary-only, and seen.json is still deleted ──
         _t4_root = tempfile.mkdtemp(prefix="tc-15-t4-")
         _t4_ix = _c15.get_inboxes_dir(_t4_root, None)
         _c15.ensure_inbox(_t4_ix, _b15_agent)
@@ -2934,45 +3012,35 @@ def main():
         _ctx15t4 = {"identity": _Id15(_b15_agent, _t4_root)}
         _s4 = _hi15({}, _ctx15t4)
         if "stale-ghost" in _s4:
-            failures.append(f"WP-15 T4: stale id resurrected in inbox output: {_s4[:120]!r}")
-        _t4_sf = _c15.read_json_safe(_t4_ix / f"{_b15_agent}_seen.json")
-        if "stale-ghost" in _t4_sf:
-            failures.append(f"WP-15 T4: stale id NOT pruned from seen_file after read: {_t4_sf}")
-        if "live-body" in _s4:   # t4-live was in prior seen_file → suppressed
-            failures.append(f"WP-15 T4: prior-session body leaked through after load-time prune: {_s4[:120]!r}")
+            failures.append(f"WP-42 T4: stale id resurrected in inbox output: {_s4[:120]!r}")
+        if "live-body" in _s4:   # t4-live is legacy-swept -> summary-only, never a full render
+            failures.append(f"WP-42 T4: legacy-swept body leaked through as a full render: {_s4[:120]!r}")
+        if (_t4_ix / f"{_b15_agent}_seen.json").exists():
+            failures.append("WP-42 T4: legacy seen.json should be deleted even with a stale entry")
 
-        # ── T5 — show_all=True re-dumps suppressed bodies across the session boundary ──
-        _ctx15["identity"] = _Id15(_b15_agent, _t1_root)   # fresh session, seen_file has all three
-        _s5_sup = _hi15({}, _ctx15)   # without show_all: prior-session bodies must be suppressed
-        if "body-alpha" in _s5_sup or "body-beta" in _s5_sup or "body-new" in _s5_sup:
-            failures.append(f"WP-15 T5: without show_all, prior-session bodies leaked through: {_s5_sup[:120]!r}")
-        _s5 = _hi15({"show_all": True}, _ctx15)   # with show_all: all bodies re-dump in same session
+        # ── T5 — show_read=N re-reads history non-destructively ──
+        _ctx15["identity"] = _Id15(_b15_agent, _t1_root)
+        _s5 = _hi15({"show_read": 3}, _ctx15)
         if "body-alpha" not in _s5 or "body-beta" not in _s5 or "body-new" not in _s5:
-            failures.append(f"WP-15 T5: show_all=True did not re-dump all suppressed bodies: {_s5[:120]!r}")
+            failures.append(f"WP-42 T5: show_read=3 should return all 3 read messages: {_s5[:200]!r}")
+        if _c15.read_json_safe(_t1_ix / f"{_b15_agent}_unread.json"):
+            failures.append("WP-42 T5: show_read must not move anything")
 
-        # ── T6 — watcher no-noise: after cross-session read, last_seen set → no re-nudge ──
-        # guards that set_last_seen fires even on an all-suppressed read (no early-return path skips it)
-        _t6_seen = _ctx15["identity"].get_last_seen() or set()
-        if not {"wp15-a", "wp15-b", "wp15-c"} <= _t6_seen:
-            failures.append(f"WP-15 T6: last_seen after cross-session read missing ids: {_t6_seen}")
-        _t6_unread = {m.get("id") for m in _c15.read_json_safe(_t1_ix / f"{_b15_agent}_unread.json")}
-        _t6_unseen = _t6_unread - _t6_seen
-        if _t6_unseen:
-            failures.append(f"WP-15 T6: watcher would re-nudge already-read message ids: {_t6_unseen}")
+        # ── T6 — count_only is inert: the legacy sweep does NOT run, nothing moves ──
+        _t6_root = tempfile.mkdtemp(prefix="tc-15-t6-")
+        _t6_ix = _c15.get_inboxes_dir(_t6_root, None)
+        _c15.ensure_inbox(_t6_ix, _b15_agent)
+        _c15.write_json_atomic(_t6_ix / f"{_b15_agent}_unread.json",
+                               [{"id": "t6-1", "from": "x", "priority": "normal", "message": "t6body"}])
+        _c15.write_json_atomic(_t6_ix / f"{_b15_agent}_seen.json", ["t6-1"])
+        _ctx15t6 = {"identity": _Id15(_b15_agent, _t6_root)}
+        _hi15({"count_only": True}, _ctx15t6)
+        if not (_t6_ix / f"{_b15_agent}_seen.json").exists():
+            failures.append("WP-42 T6: count_only must NOT run the legacy sweep (seen.json should survive)")
+        if _c15.read_json_safe(_t6_ix / f"{_b15_agent}_read.json"):
+            failures.append("WP-42 T6: count_only must not move anything to read.json")
 
-        # ── T7 — count_only is inert: no seen_file created by a count-only call ──
-        # guards write placement: seen_file write must be AFTER the count_only early-return
-        _t7_root = tempfile.mkdtemp(prefix="tc-15-t7-")
-        _t7_ix = _c15.get_inboxes_dir(_t7_root, None)
-        _c15.ensure_inbox(_t7_ix, _b15_agent)
-        _c15.write_json_atomic(_t7_ix / f"{_b15_agent}_unread.json",
-                               [{"id": "t7-1", "from": "x", "priority": "normal", "message": "t7body"}])
-        _ctx15t7 = {"identity": _Id15(_b15_agent, _t7_root)}
-        _hi15({"count_only": True}, _ctx15t7)
-        if (_t7_ix / f"{_b15_agent}_seen.json").exists():
-            failures.append("WP-15 T7: count_only created seen_file (must be inert)")
-
-        # ── T8 — windowed cross-session: window A suppressed, window B renders full ──
+        # ── T7 — windowed reads move only the window; the rest stays unread ──
         _t8_root = tempfile.mkdtemp(prefix="tc-15-t8-")
         _t8_ix = _c15.get_inboxes_dir(_t8_root, None)
         _c15.ensure_inbox(_t8_ix, _b15_agent)
@@ -2981,20 +3049,22 @@ def main():
         _w3 = {"id": "t8-w3", "from": "carol", "priority": "normal", "message": "win-thr-body"}
         _c15.write_json_atomic(_t8_ix / f"{_b15_agent}_unread.json", [_w1, _w2, _w3])
         _ctx15t8 = {"identity": _Id15(_b15_agent, _t8_root)}
-        # Session 1: read window A = only w3 (since >= "t8-w3").
         _sa = _hi15({"since": "t8-w3"}, _ctx15t8)
         if "win-thr-body" not in _sa:
-            failures.append(f"WP-15 T8 session-1: window A did not render w3 body: {_sa[:80]!r}")
-        # Session 2: fresh Identity; read window B = newest 2 (w2+w3). w3 suppressed, w2 full.
-        _ctx15t8["identity"] = _Id15(_b15_agent, _t8_root)
+            failures.append(f"WP-42 T7: windowed read did not render w3 body: {_sa[:80]!r}")
+        _t8_unread_after_a = {m.get("id") for m in _c15.read_json_safe(_t8_ix / f"{_b15_agent}_unread.json")}
+        if _t8_unread_after_a != {"t8-w1", "t8-w2"}:
+            failures.append(f"WP-42 T7: windowed read moved more than its window: {_t8_unread_after_a}")
         _sb = _hi15({"limit": 2}, _ctx15t8)
         if "win-thr-body" in _sb:
-            failures.append(f"WP-15 T8: window-A id (w3) not suppressed in session-2 read: {_sb[:80]!r}")
-        if "win-two-body" not in _sb:
-            failures.append(f"WP-15 T8: window-B new id (w2) wrongly suppressed: {_sb[:80]!r}")
+            failures.append(f"WP-42 T7: already-read w3 wrongly reappeared: {_sb[:80]!r}")
+        if "win-one-body" not in _sb or "win-two-body" not in _sb:
+            failures.append(f"WP-42 T7: remaining window (w1+w2) should render full: {_sb[:80]!r}")
+        if _c15.read_json_safe(_t8_ix / f"{_b15_agent}_unread.json"):
+            failures.append("WP-42 T7: second windowed read should have drained the rest")
 
     except Exception as e:
-        failures.append(f"WP-15 cross-session suppression unit checks errored: {e}")
+        failures.append(f"WP-42 auto-ack / legacy-sweep unit checks errored: {e}")
 
     # ── WP-16 AC-4 — handle_safely: a dispatch crash is answered -32603, the loop survives ──
     try:
@@ -3645,58 +3715,18 @@ def main():
     except Exception as e:
         failures.append(f"WP-22 AC-2 unit check errored: {e}")
 
-    # ── WP-22 AC-3 (M3) — durable_seen excludes a prior-session id from the wake COUNT ──
-    # Tautology: fails on current main (counts A+B=2 instead of B alone).
-    try:
-        from teammate_comms import server as _srv22c, channel as _ch22c
-        from teammate_comms.comms import (
-            get_inboxes_dir as _gid22c, ensure_inbox as _ei22c, write_json_atomic as _wja22c,
-        )
+    # ── WP-22 AC-3/AC-4 (M3) — SUPERSEDED by WP-42, deliberately not ported. ──
+    # M3's durable_seen mechanism existed to exclude a message shown in a PRIOR session (but
+    # still sitting unread, per the old ack-required model) from the wake COUNT. WP-42 removed
+    # durable_seen entirely along with the ack step it was compensating for: under auto-ack, a
+    # message shown via teammate_inbox leaves unread immediately, so it can no longer sit
+    # unread-but-already-shown in the first place — EXCEPT for legacy pre-v0.15.0 seen.json
+    # backlogs, which the brief's "no migration script" decision explicitly accepts may
+    # transiently inflate a wake count until the agent's next teammate_inbox call (which sweeps
+    # the whole legacy backlog in one visit — see the WP-42 T3/T4 legacy-sweep tests). That
+    # sweep-on-next-read behavior is what's actually tested now, not a wake-count guarantee.
 
-        _t22c_root = tempfile.mkdtemp(prefix="tc-22-ac3-")
-        _agent22c = "probe22ac3"
-        _ix22c = _gid22c(_t22c_root, None)
-        _ei22c(_ix22c, _agent22c)
-        _msg_a22c = {"id": "22c-a", "from": "alice", "priority": "normal", "message": "prior-body"}
-        _wja22c(_ix22c / f"{_agent22c}_unread.json", [_msg_a22c])
-        _wja22c(_ix22c / f"{_agent22c}_seen.json", ["22c-a"])  # A already delivered a PRIOR session
-
-        _srv22c.register_identity(_agent22c, None, _t22c_root, {})  # seeds durable_seen={A}
-
-        _emits22c = []
-        def _send22c(obj):
-            if obj.get("method") == "notifications/claude/channel":
-                _emits22c.append(obj)
-        _init22c, _reg22c, _stop22c = threading.Event(), threading.Event(), threading.Event()
-        _init22c.set(); _reg22c.set()
-        _wt22c = threading.Thread(target=_ch22c.run_watcher,
-                                  args=(_send22c, _srv22c._identity, _init22c, _reg22c, _stop22c),
-                                  daemon=True)
-        _wt22c.start()
-        try:
-            time.sleep(0.7)  # let tick 1 seed known_ids={A} on unread=[A] alone (no wake yet)
-            # NOW a brand-new message B arrives.
-            _msg_b22c = {"id": "22c-b", "from": "bob", "priority": "normal", "message": "new-body"}
-            _wja22c(_ix22c / f"{_agent22c}_unread.json", [_msg_a22c, _msg_b22c])
-            _ok22c = wait_until(lambda: len(_emits22c) >= 1, timeout=3.0)
-            if not _ok22c:
-                failures.append("WP-22 AC-3: no wake fired for the new message B")
-            else:
-                _meta22c = _emits22c[0].get("params", {}).get("meta", {})
-                if _meta22c.get("count") != "1":
-                    failures.append(f"WP-22 AC-3 [tautology: wake count must be 1 (B only) — "
-                                     f"durable_seen must exclude A]: {_meta22c}")
-        finally:
-            _stop22c.set()
-            _wt22c.join(timeout=2)
-    except Exception as e:
-        failures.append(f"WP-22 AC-3 unit check errored: {e}")
-    # AC-4 (M3): ack("all")-with-no-prior-read still drains everything including a durable_seen
-    # id — unchanged, since durable_seen never touches Identity._last_seen/_handle_ack at all.
-    # Covered by the (untouched) WP-15 T3 block elsewhere in this same run; not duplicated here.
-
-    # ── WP-22 AC-5/AC-6 (M2) — pending-file recovery: idempotent merge, sender pended-text,
-    # composed with M3 so a pending-merged already-seen id doesn't re-nudge ──
+    # ── WP-22 AC-5/AC-6 (M2) — pending-file recovery: idempotent merge, sender pended-text ──
     try:
         from teammate_comms import channel as _ch22e
         from teammate_comms.comms import (
@@ -3744,8 +3774,11 @@ def main():
         if not _rjs22e(_member_pending22e):
             failures.append("WP-22 AC-5b: message did not land in the member's pending file")
 
-        # AC-6: compose M2 with M3 — an id already in {agent}_seen.json (durable_seen) that
-        # ALSO shows up via a pending merge must not cause a fresh wake or a duplicate entry.
+        # AC-6: compose M2 with the watcher's known_ids seeding — an id already sitting in
+        # unread BEFORE the watcher's first tick (here, ALSO duplicated via a pending merge)
+        # must not cause a fresh wake or a duplicate entry. (Pre-WP-42 this composed with M3's
+        # durable_seen; M3 is gone, but known_ids seeding alone already covers this case since
+        # the message predates the watcher's first read — see the WP-22 AC-3/AC-4 note above.)
         _t22f_root = tempfile.mkdtemp(prefix="tc-22-ac6-")
         _agent22f = "probe22ac6"
         _ix22f = _gid22e(_t22f_root, None)
@@ -3756,7 +3789,7 @@ def main():
         _wja22e(_ix22f / f"{_agent22f}_pending.json", [dict(_msg22f)])  # duplicate retry, same id
 
         from teammate_comms import server as _srv22f
-        _srv22f.register_identity(_agent22f, None, _t22f_root, {})  # durable_seen={22f-a}
+        _srv22f.register_identity(_agent22f, None, _t22f_root, {})
         _emits22f = []
         def _send22f(obj):
             if obj.get("method") == "notifications/claude/channel":
@@ -4100,8 +4133,9 @@ def main():
     except Exception as e:
         failures.append(f"WP-24 AC-3/AC-4 unit checks errored: {e}")
 
-    # ── WP-25 AC-1 (M5) — acked_unseen tag: cold-start drain doesn't inflate read positions ──
-    # Tautology: current main reports the drained id as the position.
+    # ── WP-25 AC-1 (M5), rewritten for WP-42 — acked_unseen (cap-overflow is its ONLY source
+    #    now, teammate_ack is gone) is excluded from group read-position inference; a genuine
+    #    read via teammate_inbox (auto-ack) still advances it. ──
     try:
         from teammate_comms import tools as _t25a
         from teammate_comms import comms as _c25a
@@ -4112,37 +4146,35 @@ def main():
         _c25a.write_group_meta(_t25a_root, None, _grp25a,
                                {"name": _grp25a, "members": [_sender25a, _member25a],
                                 "creator": _sender25a, "createdAt": _c25a.now_timestamp()})
-        _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "first message")
+        _mid25a = _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "first message")["id"]
 
         class _Id25a:
             def __init__(self, agent, root):
                 self.agent, self.root = agent, root
-                self._ls = None
             def snapshot(self):
                 return (self.agent, None, self.root, None)
-            def get_last_seen(self):
-                return self._ls
-            def set_last_seen(self, v):
-                self._ls = v
 
-        _ctx25a = {"identity": _Id25a(_member25a, _t25a_root)}
-        _t25a._handle_ack({"id": "all"}, _ctx25a)  # cold-start drain (last_seen is None)
-
+        _inboxes25a = _c25a.get_inboxes_dir(_t25a_root, None)
+        # Simulate a cap-overflow record directly (a real 1000-message overflow is exercised
+        # end-to-end in AC-2/AC-3 below) — it must NOT advance the read position.
+        _c25a.write_json_atomic(_inboxes25a / f"{_member25a}_read.json", [
+            {"id": _mid25a, "from": _sender25a, "group": f"#{_grp25a}", "message": "first message",
+             "acked_unseen": True, "capped": True}])
         _positions25a = _c25a.group_read_positions(_t25a_root, None, _grp25a,
                                                     [_sender25a, _member25a])
         if _positions25a.get(_member25a) is not None:
-            failures.append(f"WP-25 AC-1 [tautology: a cold-start-drained (never-seen) message "
-                             f"must NOT advance the read position — got "
-                             f"{_positions25a.get(_member25a)!r}, want None]")
+            failures.append(f"WP-25 AC-1: a cap-overflow (acked_unseen) record must NOT advance "
+                             f"the read position — got {_positions25a.get(_member25a)!r}, want None")
 
-        # A seen-then-acked message still advances the position (receipts unchanged there).
-        _mid25a = _t25a.send_group(_t25a_root, None, _sender25a, f"#{_grp25a}", "second message")["id"]
-        _ctx25a["identity"].set_last_seen({_mid25a})  # simulate a real teammate_inbox read
-        _t25a._handle_ack({"id": "all"}, _ctx25a)
+        # A genuine read (teammate_inbox — WP-42 auto-ack) still advances the position, untagged.
+        _c25a.write_json_atomic(_inboxes25a / f"{_member25a}_unread.json", [
+            {"id": _mid25a, "from": _sender25a, "group": f"#{_grp25a}", "message": "first message"}])
+        _c25a.write_json_atomic(_inboxes25a / f"{_member25a}_read.json", [])  # reset the cap-overflow probe
+        _t25a._handle_inbox({}, {"identity": _Id25a(_member25a, _t25a_root)})
         _positions25a2 = _c25a.group_read_positions(_t25a_root, None, _grp25a,
                                                      [_sender25a, _member25a])
         if _positions25a2.get(_member25a) != _mid25a:
-            failures.append(f"WP-25 AC-1: a seen-then-acked message should still advance the "
+            failures.append(f"WP-25 AC-1: a genuinely-read message should advance the "
                              f"position: {_positions25a2.get(_member25a)!r} != {_mid25a!r}")
     except Exception as e:
         failures.append(f"WP-25 AC-1 unit checks errored: {e}")
