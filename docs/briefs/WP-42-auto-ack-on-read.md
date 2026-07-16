@@ -223,3 +223,50 @@ before sign-off (do not trust the handed green).
 - Do **not** commit `.cognition/journal.jsonl` on the WP branch (shared-checkout rule).
 - Before any destructive git op (`reset`, `clean`, `stash`, `checkout -- <journal>`), ping
   Silvie to flush first.
+
+## GATE ROUND 1 — bounce delta (Silvie, 2026-07-16, @eb6c43c)
+
+Round-1 diff was correct on the core mechanics — single-lock fresh-read auto-ack, read-first
+write order, legacy sweep, watcher collapse all verified; all four pinned suites green in
+Silvie's own isolated-worktree run (provenance-checked); tautology check passed (new tests
+fail loudly against reverted src). One blocker + bundled should-fixes:
+
+- **[BLOCKER] `tools.py` show_read branch (~793):** `read_json_safe(read_file)` UNLOCKED —
+  read_json_safe destructively resets the file to `[]` on any parse failure (comms.py
+  ~600-610), so a transient read failure on `{agent}_read.json` wipes read history + all
+  group read receipts. This is the C1 anti-pattern the fable audit rated high on the sibling
+  file, and the brief's known-intentional list said "C1 locking stays." **One direction:**
+  if `read_file` does not exist → "No read messages yet." Else use
+  `read_json_readonly(read_file)` (already imported in tools.py); on `None` (transiently
+  unreadable) return a one-line "read history temporarily unavailable — try again" WITHOUT
+  mutating the file — never treat unreadable as empty, never reset. Add a test: corrupt
+  read.json + show_read → graceful message, file NOT rewritten to [].
+- **[SHOULD-FIX] show_read leaks never-read records:** filter records tagged `acked_unseen`
+  (cap-overflow — never actually read) out of show_read's window; they must not render as
+  re-readable history. Test it.
+- **[SHOULD-FIX] `comms.py` ~877:** tombstone_in_inbox docstring still says "mirrors
+  `_handle_ack`" — reword (the handler is gone).
+- **[SHOULD-FIX] `skills/teammate-comms/SKILL.md` ~26:** teammate_react row still says
+  "a lightweight ack" — align with the reworded tools.py/README ("a lightweight response").
+- **[SHOULD-FIX] `tests/test_compact.py` ~465, 556, 602:** still pass `show_all=True` to
+  _handle_inbox — now a silently-ignored dead param in a pinned gate suite. Update each call
+  to the new contract per the scenario's intent.
+- **[SHOULD-FIX] missing composition test:** assert AC-5's "sweep is independent of
+  since/limit" — a windowed read (limit=1) with a legacy seen.json must still sweep the
+  WHOLE legacy backlog while moving only the shown window of new messages.
+- **[SHOULD-FIX] `tests/test_handshake.py` ~1339-1404 (WP-9 compute_reemit block):** left
+  byte-identical; comments still describe last_seen/v0.4.2 suppression that no longer
+  exists. Keep the pure-function coverage; update comments/locals to the new contract.
+  (The live no-re-nudge-after-read property is already proven at ~1649-1660 — leave that.)
+- **[SHOULD-FIX] CHANGELOG:** add one sentence disclosing the accepted transient: between a
+  post-upgrade registration and the first inbox read, wake counts may over-count legacy
+  previously-shown ids (durable_seen's old job); self-heals on first read. Currently this is
+  disclosed only inside a deleted-test comment.
+- Optional nits (fix if touching anyway): DESIGN.md ~478 "until it's acked"; static/index.html
+  groupReads comment `maxAckedId`.
+
+For-the-record correction (recorded to cognition): the round-1 handoff claimed a legacy
+message body "re-renders once post-upgrade" — false; the sweep you implemented prevents
+exactly that. The real accepted transient is the wake-count one above.
+
+Re-run the full pinned gate; post the new SHA. Same handoff protocol.
