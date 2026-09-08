@@ -152,6 +152,11 @@ def test_wp43_ac2_register_stores_and_clears_session():
         result = server_mod.register_identity("Cx", None, str(root), harness_session="  x  y ")
         check(read_agent_record(root, None, "Cx").get("harness_session") == "x y",
               "AC-2: session id is whitespace-collapsed")
+        try:
+            server_mod.register_identity("Cx", None, str(root), harness_session="--thread")
+            check(False, "AC-2: a session id starting with '-' must be rejected")
+        except Exception as e:
+            check("must not start with '-'" in str(e), f"AC-2: leading-dash rejection text ({e})")
     td2, root2 = _make_root()
     with td2, env_vars(TEAMMATE_HARNESS=None, CLAUDE_PROJECT_DIR=None):
         result = server_mod.register_identity("Cl", None, str(root2))
@@ -428,7 +433,7 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 
 LITERAL_BASELINE = {
-    "__init__.py": 1, "avatars.py": 1, "channel.py": 19, "comms.py": 8, "dashboard.py": 0,
+    "__init__.py": 1, "avatars.py": 1, "channel.py": 17, "comms.py": 8, "dashboard.py": 0,
     "deliver.py": 2, "server.py": 9, "spawn.py": 29, "tools.py": 6,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
@@ -565,6 +570,14 @@ def test_wp45_ac5_codex_hook_shell():
         check("restart Codex once" not in ctx2, "AC-5: no restart note when the stamp matches")
         log = (rig / "codex.log").read_text(encoding="utf-8")
         check(log.count("mcp add") == 1, "tautology[AC-5]: stamp match spawns no second codex mcp add")
+
+        decoy = ('{"note":"x \\"session_id\\":\\"decoy\\" \\"cwd\\":\\"/decoy\\"",'
+                 '"session_id":"0000-real","cwd":"/real","source":"resume",'
+                 '"tail":"\\"cwd\\":\\"/late\\""}')
+        rd = run(decoy)
+        ctxd = json.loads(rd.stdout)["hookSpecificOutput"]["additionalContext"]
+        check("thread_id=0000-real project_dir=/real." in ctxd,
+              f"AC-5: escaped decoy keys inside string values never win ({ctxd[:120]})")
 
         r3 = run('{"session_id":"0000-2222","cwd":"/tmp","source":"compact"}')
         check(r3.stdout.strip() == "{}", f"AC-5: compact source still self-filters to {{}} ({r3.stdout!r})")

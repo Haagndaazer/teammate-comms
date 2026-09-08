@@ -109,6 +109,24 @@ class Identity:
         with self._lock:
             return (self.harness_session, self._waker_generation)
 
+    def apply(self, agent, team, root, unread_file, harness_session):
+        """Set identity (bumping the identity generation only when agent/team/root change)
+        and harness_session (bumping the waker generation only on change) under ONE lock."""
+        with self._lock:
+            same = (self.agent is not None and self.agent == agent and self.team == team
+                    and self.root == root)
+            if not same:
+                self._generation += 1
+                self.agent, self.team, self.root, self.unread_file = agent, team, root, unread_file
+            if harness_session != self.harness_session:
+                self.harness_session = harness_session
+                self._waker_generation += 1
+
+    def snapshot_all(self):
+        with self._lock:
+            return (self.agent, self.team, self.root, self.unread_file, self._generation,
+                    self.harness_session, self._waker_generation)
+
     def matches(self, agent, team, root):
         with self._lock:
             return (self.agent is not None and self.agent == agent and self.team == team
@@ -356,6 +374,8 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
         harness_session = " ".join(harness_session.split())
         if len(harness_session) > 200:
             raise CommsError("'harness_session' must be at most 200 characters.")
+        if harness_session.startswith("-"):
+            raise CommsError("'harness_session' must not start with '-'.")
     else:
         harness_session = None
 
@@ -445,9 +465,7 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
     # both instances would store N+1 as "my epoch" and the TOCTOU tie-break would have BOTH
     # sides re-claim forever, exactly the flap the tie-break exists to kill. The return value
     # is race-free by construction (computed under the same lock as the write).
-    if not _identity.matches(agent, team, root):
-        _identity.set(agent, team, root, unread_file)
-    _identity.set_harness_session(harness_session)
+    _identity.apply(agent, team, root, unread_file, harness_session)
     _identity.set_epoch(effective.get("epoch"))
     # S4: ANY successful register clears a stale auto-register failure — the agent is
     # registered now (whether this call WAS the auto-register retry or a manual one), so the

@@ -177,20 +177,6 @@ def make_waker(harness, session, send_message, runner=None):
     return cls(session, runner=runner)
 
 
-def emit_channel_event(send_message, agent, count, groups=None,
-                       mentioned=False, senders=None):
-    """Push one ``notifications/claude/channel`` event for ``count`` unread."""
-    content, meta = build_wake_payload(agent, count, groups=groups, mentioned=mentioned,
-                                       senders=senders)
-    return ChannelWaker(send_message).wake(content, meta)
-
-
-def emit_reaction_event(send_message, agent, reactions):
-    """Wake the AUTHOR of reacted-to messages over the Claude channel."""
-    content, meta = build_reaction_payload(agent, reactions)
-    return ChannelWaker(send_message).wake(content, meta)
-
-
 def compute_reaction_wakes(reactions, known_ids, agent):
     """Pure reaction-wake decision for one heartbeat tick (no I/O — hermetically testable).
 
@@ -392,7 +378,12 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
     last_waker_generation = None
     wake_disabled_logged = False
     make = waker_factory or make_waker
-    snapshot_waker = getattr(identity, "snapshot_waker", None) or (lambda: (None, 0))
+    snapshot_all = getattr(identity, "snapshot_all", None)
+    if snapshot_all is None:
+        snapshot_waker = getattr(identity, "snapshot_waker", None) or (lambda: (None, 0))
+
+        def snapshot_all():
+            return identity.snapshot_with_generation() + snapshot_waker()
 
     def dispatch(kind, content, meta, count, attempt):
         nonlocal wake_disabled_logged
@@ -416,7 +407,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             # W4: ONE lock acquisition — snapshot() + get_generation() as two separate calls
             # could have a set() land in between, pairing a STALE root/inbox with a NEW
             # generation for one tick.
-            agent, team, root, unread_file, generation = identity.snapshot_with_generation()
+            (agent, team, root, unread_file, generation,
+             session, waker_generation) = snapshot_all()
             if agent is None or root is None:
                 stop_evt.wait(POLL_SECONDS)
                 continue
@@ -440,7 +432,6 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 hb_failed = False
                 last_waker_generation = None
 
-            session, waker_generation = snapshot_waker()
             if waker_generation != last_waker_generation:
                 harness = harness_mod.current()
                 waker = make(harness, session, send_message)

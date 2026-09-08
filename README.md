@@ -372,14 +372,17 @@ woken; the register result says so. `teammate_list` shows `harness: codex`.
 
 **How the wake works.** The agent's own teammate-comms server watches its inbox exactly as
 on Claude Code, but delivers the wake by running `codex queue --thread <id> --message …`:
-an idle Codex session starts a new turn within a second or two; a busy one takes the
-message as its next turn. The queue is durable, so there is no re-nudge backoff on Codex.
+an idle Codex session starts a new turn (near-instantly in the field test; Codex's own
+poll ceiling is 10 s); a busy one takes the message as its next turn. The queue is
+durable, so there is no re-nudge backoff on Codex.
 Wake breadcrumbs (`wake-emit harness=codex rc=…`) go to the server's stderr.
 
 `teammate_reincarnate` on Codex needs `TEAMMATE_REINCARNATE_ENABLED=1` on the
 `teammate-comms` MCP entry (`codex mcp add … --env`), because Codex's MCP child
 environment is an allowlist; the spawned Codex teammate gets its name from the launch
-prompt and registers itself.
+prompt and registers itself. Caveat: the plugin hook re-runs `codex mcp add` whenever its
+launch line changes (a version bump, a moved data dir), and that replaces the entry's env
+block — re-add `TEAMMATE_REINCARNATE_ENABLED=1` afterwards if reincarnate stops working.
 
 Uninstall:
 
