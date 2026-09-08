@@ -260,6 +260,22 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Optional comms root override (else $TEAMMATE_COMMS_DIR or the project dir).",
                 },
+                "harness_session": {
+                    "type": "string",
+                    "description": (
+                        "Your harness's own session/thread id, if it has one (e.g. the thread id "
+                        "shown in your session-start context or $CODEX_THREAD_ID). Some harnesses "
+                        "need it to wake you when teammates message you. Session-scoped: omit it "
+                        "and any earlier value is cleared."
+                    ),
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": (
+                        "Your project directory, used only to derive the `project` label when "
+                        "the harness does not provide it via the environment. Need not exist."
+                    ),
+                },
                 **_profile_schema_properties(),
                 **_MANAGER_PROPERTY,
             },
@@ -631,10 +647,17 @@ def _handle_register(args, ctx):
     comms_dir = args.get("comms_dir")
     profile = _collect_profile_args(args)  # validated inside register_identity
     manager = args.get("manager")  # WP-36: None (absent) preserves; "" clears; validated inside
+    harness_session = args.get("harness_session")
+    if harness_session is not None and not isinstance(harness_session, str):
+        raise CommsError("'harness_session' must be a string.")
+    project_dir = args.get("project_dir")
+    if project_dir is not None and not isinstance(project_dir, str):
+        raise CommsError("'project_dir' must be a string.")
     # ctx["register"] does the side effects (resolve root, inbox, registry,
     # start watching) and returns a human-readable status string.
     return ctx["register"](agent, team.strip() if team else None, comms_dir, profile,
-                            manager=manager)
+                            manager=manager, harness_session=harness_session,
+                            project_dir=project_dir)
 
 
 def _clean_message(message):
@@ -979,6 +1002,7 @@ def _handle_list(args, ctx):
             # Heartbeat-freshness only (no per-agent liveness subprocess).
             live = is_channel_alive(record, pid_check=False)
             rows.append(f"  - {path.stem}{me}: type={kind}, channel={'live' if live else 'offline'}")
+            rows.append(f"      harness:   {record.get('harness') or '(not set)'}")
         # project + status + authority always surface — the at-a-glance fields
         # (project matters most now that comms are global across projects).
         rows.append(f"      project:   {record.get('project') or '(not set)'}")
@@ -1110,6 +1134,8 @@ def _handle_whoami(args, ctx):
         "comms_root": str(root),
         "inboxes_dir": str(get_inboxes_dir(root, team)),
         "profile": {field: record.get(field) for field in PROFILE_FIELDS},
+        "harness": record.get("harness"),
+        "harness_session": record.get("harness_session"),
     }
     if record.get("spawned_by"):
         info["spawned_by"] = record["spawned_by"]  # F-5 provenance breadcrumb, surfaced here
@@ -1166,6 +1192,7 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     else:
         live = is_channel_alive(record, pid_check=False)
         lines.append(f"  {'channel:':<13}{'live' if live else 'offline'}")
+        lines.append(f"  {'harness:':<13}{record.get('harness') or '(not set)'}")
     for field in PROFILE_FIELDS:
         value = record.get(field)
         lines.append(f"  {field + ':':<13}{value if value else '(not set)'}")

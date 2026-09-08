@@ -52,3 +52,5 @@ jobs:
         run: uv run --no-sync python tests/test_wp14_avatars.py
       - name: Run compaction-broker suite (WP-36/WP-37/WP-38)
         run: uv run --no-sync python tests/test_compact.py
+      - name: Run Codex parity suite (WP-43..WP-46)
+        run: uv run --no-sync python tests/test_codex.py
