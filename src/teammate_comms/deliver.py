@@ -62,7 +62,8 @@ def build_parser():
         help="Comms root. A daemon launched outside the agents' own environment (Task "
              "Scheduler, bare PowerShell) MUST pass this explicitly — otherwise it can "
              "silently resolve a DIFFERENT root than the agents use (TEAMMATE_COMMS_DIR / "
-             "CLAUDE_CONFIG_DIR / ~/.claude) and queue a DM into a root nobody reads.",
+             "~/.teammate-comms, or the legacy ~/.claude until migrated) and queue a DM into "
+             "a root nobody reads.",
     )
     parser.add_argument("--team", default=None, help="Optional team namespace.")
     return parser

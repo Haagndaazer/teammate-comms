@@ -28,10 +28,13 @@ RE-NUDGES still-unseen unread with capped exponential backoff (see ``compute_ree
 
 import os
 import socket
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
+from . import harness as harness_mod
 from .comms import (
     HEARTBEAT_STALENESS_SECONDS,
     REACTION_EMOJI,
@@ -65,18 +68,10 @@ def _log_emit(kind, unseen, attempt):
           file=sys.stderr, flush=True)
 
 
-def emit_channel_event(send_message, agent, count, groups=None,
-                       mentioned=False, senders=None):
-    """Push one ``notifications/claude/channel`` event for ``count`` unread.
-
-    Signal-only wake: names WHERE the messages came from (``senders`` for DMs,
-    ``groups`` for group posts) plus a 🔔 @mention note and the group reply target
-    when applicable. The v0.6 "You are <name>: <personality>" owner-reminder was
-    dropped (WP-11a): the persona is durable in the agent's session context and the
-    register echo; repeating it every ~10 msgs was redundant token cost.
-    """
+def build_wake_payload(agent, count, groups=None, mentioned=False, senders=None):
+    """Pure: the signal-only wake text + meta for ``count`` unread (senders for DMs,
+    groups for group posts, a 🔔 note on @mention, the group reply target when any)."""
     mention_note = "🔔 @mention. " if mentioned else ""
-    # DM senders first, then #groups (groups already carry the '#').
     sources = sorted(set(senders or [])) + sorted(groups or [])
     from_part = f" from {', '.join(sources)}" if sources else ""
     if groups:
@@ -85,17 +80,12 @@ def emit_channel_event(send_message, agent, count, groups=None,
     else:
         group_line = ""
     content = f"{mention_note}📬 {count} new message(s){from_part}.{group_line}"
-    meta = {"count": str(count), "agent": agent}
-    send_message({
-        "jsonrpc": "2.0",
-        "method": "notifications/claude/channel",
-        "params": {"content": content, "meta": meta},
-    })
+    return content, {"count": str(count), "agent": agent}
 
 
-def emit_reaction_event(send_message, agent, reactions):
-    """Wake the AUTHOR of reacted-to messages. Distinct ``meta.kind="reaction"`` so
-    consumers separate it from message wakes (it never participates in the unseen count)."""
+def build_reaction_payload(agent, reactions):
+    """Pure: wake text + meta for the AUTHOR of reacted-to messages (``meta.kind``
+    separates it from message wakes)."""
     parts, seen = [], set()
     for r in reactions[-6:]:
         who, em = r.get("from"), r.get("emoji")
@@ -104,12 +94,87 @@ def emit_reaction_event(send_message, agent, reactions):
         seen.add((who, em))
         parts.append(f"{who} {REACTION_EMOJI.get(em, em)}")
     content = f"💬 {', '.join(parts)} reacted to your message(s)."
-    send_message({
-        "jsonrpc": "2.0",
-        "method": "notifications/claude/channel",
-        "params": {"content": content,
-                   "meta": {"count": str(len(reactions)), "agent": agent, "kind": "reaction"}},
-    })
+    return content, {"count": str(len(reactions)), "agent": agent, "kind": "reaction"}
+
+
+class ChannelWaker:
+    """Claude Code wake: a synchronous ``notifications/claude/channel`` push."""
+
+    name = "channel"
+
+    def __init__(self, send_message):
+        self._send = send_message
+
+    def wake(self, content, meta):
+        self._send({
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {"content": content, "meta": meta},
+        })
+        return True
+
+
+CODEX_QUEUE_TIMEOUT_SECONDS = 20
+
+
+class CodexQueueWaker:
+    """Codex wake: queue the wake text as a user turn on our own thread via ``codex queue``,
+    on a daemon thread so the watcher loop never blocks. At most one in flight; a wake
+    requested while busy is reported dropped so the caller retries next tick."""
+
+    name = "codex-queue"
+
+    def __init__(self, session, runner=None, timeout=CODEX_QUEUE_TIMEOUT_SECONDS):
+        self._session = session
+        self._runner = runner or subprocess.run
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._thread = None
+        self._busy_logged = False
+
+    def argv(self, content):
+        return ["codex", "queue", "--thread", self._session, "--message", content]
+
+    def _run(self, argv):
+        outcome = "rc=?"
+        try:
+            result = self._runner(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=self._timeout)
+            outcome = f"rc={getattr(result, 'returncode', 0)}"
+        except subprocess.TimeoutExpired:
+            outcome = "timeout"
+        except OSError as exc:
+            outcome = f"error={exc}"
+        print(f"[teammate-comms] wake-emit harness=codex {outcome}", file=sys.stderr, flush=True)
+
+    def wake(self, content, meta):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                if not self._busy_logged:
+                    self._busy_logged = True
+                    print("[teammate-comms] wake-emit harness=codex dropped-busy (retrying next tick)",
+                          file=sys.stderr, flush=True)
+                return False
+            self._busy_logged = False
+            self._thread = threading.Thread(target=self._run, args=(self.argv(content),),
+                                            daemon=True)
+            self._thread.start()
+            return True
+
+
+WAKERS = {ChannelWaker.name: ChannelWaker, CodexQueueWaker.name: CodexQueueWaker}
+
+
+def make_waker(harness, session, send_message, runner=None):
+    """Build the waker for ``harness``; None when it needs a session id and has none."""
+    if harness.wake == ChannelWaker.name:
+        return ChannelWaker(send_message)
+    if harness.needs_session and not session:
+        return None
+    cls = WAKERS.get(harness.wake)
+    if cls is None:
+        return None
+    return cls(session, runner=runner)
 
 
 def compute_reaction_wakes(reactions, known_ids, agent):
@@ -287,7 +352,8 @@ def merge_pending_into_unread(root, team, agent):
     return True
 
 
-def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt):
+def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt,
+                waker_factory=None):
     """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
 
     ``identity`` is the server's shared Identity object (thread-safe snapshot).
@@ -307,6 +373,30 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                        # (logged once per demotion episode, not per tick)
     hb_failed = False  # W7: True while a heartbeat write is lock-contended (logged once per
                        # consecutive-failure episode, not per tick)
+    waker = None
+    harness = harness_mod.current()
+    last_waker_generation = None
+    wake_disabled_logged = False
+    make = waker_factory or make_waker
+    snapshot_all = getattr(identity, "snapshot_all", None)
+    if snapshot_all is None:
+        snapshot_waker = getattr(identity, "snapshot_waker", None) or (lambda: (None, 0))
+
+        def snapshot_all():
+            return identity.snapshot_with_generation() + snapshot_waker()
+
+    def dispatch(kind, content, meta, count, attempt):
+        nonlocal wake_disabled_logged
+        if waker is None:
+            if harness.needs_session and not wake_disabled_logged:
+                wake_disabled_logged = True
+                print(f"[teammate-comms] wake disabled for agent={last_agent!r}: register with "
+                      f"harness_session so teammates can wake you.", file=sys.stderr, flush=True)
+            return False
+        if waker.wake(content, meta):
+            _log_emit(kind, count, attempt)
+            return True
+        return False
 
     while not stop_evt.is_set():
         try:
@@ -317,7 +407,8 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
             # W4: ONE lock acquisition — snapshot() + get_generation() as two separate calls
             # could have a set() land in between, pairing a STALE root/inbox with a NEW
             # generation for one tick.
-            agent, team, root, unread_file, generation = identity.snapshot_with_generation()
+            (agent, team, root, unread_file, generation,
+             session, waker_generation) = snapshot_all()
             if agent is None or root is None:
                 stop_evt.wait(POLL_SECONDS)
                 continue
@@ -339,6 +430,15 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 reemit_attempts = 0
                 demoted = False
                 hb_failed = False
+                last_waker_generation = None
+
+            if waker_generation != last_waker_generation:
+                harness = harness_mod.current()
+                waker = make(harness, session, send_message)
+                if last_waker_generation is not None:
+                    last_hb = 0.0
+                last_waker_generation = waker_generation
+                wake_disabled_logged = False
 
             now = time.monotonic()
             if now - last_hb >= HEARTBEAT_SECONDS:
@@ -398,11 +498,13 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 # the pure compute_reaction_wakes (hermetically tested). Seed = no startup wake.
                 reactions = read_reactions(root, team, since=reaction_cursor, limit=500,
                                            oldest_first=(reaction_cursor is not None))
-                fresh_rx, known_reaction_ids, new_rcursor = compute_reaction_wakes(
+                fresh_rx, next_known_rx, new_rcursor = compute_reaction_wakes(
                     reactions, known_reaction_ids, agent)
                 if fresh_rx:
-                    emit_reaction_event(send_message, agent, fresh_rx)
-                    _log_emit("reaction", len(fresh_rx), 0)
+                    content, meta = build_reaction_payload(agent, fresh_rx)
+                    if not dispatch("reaction", content, meta, len(fresh_rx), 0):
+                        next_known_rx, new_rcursor = known_reaction_ids, None
+                known_reaction_ids = next_known_rx
                 if new_rcursor is not None:
                     reaction_cursor = new_rcursor
 
@@ -442,14 +544,14 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                         # senders name the 🔔 and the sources. All from the shared payload.
                         unseen_count, group_targets, mentioned, senders = _wake_payload(
                             messages, unseen_ids, agent)
-                        emit_channel_event(send_message, agent, unseen_count,
-                                           groups=group_targets,
-                                           mentioned=mentioned, senders=senders)
-                        _log_emit("fresh", unseen_count, 0)
-                        known_ids |= unread_ids
-                        last_emit_mono = now      # (re)arm the re-nudge backoff for this batch
-                        reemit_attempts = 0
-                    else:
+                        content, meta = build_wake_payload(
+                            agent, unseen_count, groups=group_targets,
+                            mentioned=mentioned, senders=senders)
+                        if dispatch("fresh", content, meta, unseen_count, 0):
+                            known_ids |= unread_ids
+                            last_emit_mono = now      # (re)arm the re-nudge backoff for this batch
+                            reemit_attempts = 0
+                    elif not harness.durable_wake:
                         # No NEW message, but a dropped channel push may have left the agent
                         # unaware of still-unseen unread (GH #38736/#61797). Re-nudge with capped
                         # backoff for ANY still-unseen message (content-agnostic recovery — a
@@ -459,15 +561,18 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                         # unseen_ids = unread_ids - muted_ids already excludes read (a read message
                         # leaves unread entirely) and muted, and compute_reemit's first-emit guard
                         # is unchanged.
+                        prev_attempts, prev_emit_mono = reemit_attempts, last_emit_mono
                         do_reemit, reemit_attempts, last_emit_mono = compute_reemit(
                             unseen_ids, now, last_emit_mono, reemit_attempts)
                         if do_reemit:
                             unseen_count, group_targets, mentioned, senders = _wake_payload(
                                 messages, unseen_ids, agent)
-                            emit_channel_event(send_message, agent, unseen_count,
-                                               groups=group_targets,
-                                               mentioned=mentioned, senders=senders)
-                            _log_emit("renudge", unseen_count, reemit_attempts)
+                            content, meta = build_wake_payload(
+                                agent, unseen_count, groups=group_targets,
+                                mentioned=mentioned, senders=senders)
+                            if not dispatch("renudge", content, meta, unseen_count,
+                                            reemit_attempts):
+                                reemit_attempts, last_emit_mono = prev_attempts, prev_emit_mono
                     # Absorb muted ids as "known" every cycle (even with no fresh wake) so a
                     # later unmute finds them already-known → no retro-nudge for still-unread
                     # muted messages (safe under-nudge direction).

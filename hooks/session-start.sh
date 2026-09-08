@@ -28,16 +28,27 @@ if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
     exit 0
 fi
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
-VENV_DIR="${PLUGIN_ROOT}/.venv"
+VENV_DIR="${UV_PROJECT_ENVIRONMENT:-${PLUGIN_ROOT}/.venv}"
 STAMP="${VENV_DIR}/.uv-sync-stamp"
 
+_json_escape() {
+    printf '%s' "$1" | tr -d '\r\n' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g'
+}
+
 emit_context() {
-    # $1 = additionalContext string (already JSON-escaped by the caller's heredoc)
+    # $1 = additionalContext string (already JSON-escaped by the caller's heredoc);
+    # a harness note in TEAMMATE_HOOK_NOTE is escaped here and prefixed to every exit.
+    local text="$1"
+    if [ -n "${TEAMMATE_HOOK_NOTE:-}" ]; then
+        local note
+        note="$(_json_escape "$TEAMMATE_HOOK_NOTE")"
+        if [ -n "$text" ]; then text="${note} ${text}"; else text="$note"; fi
+    fi
     cat <<EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "SessionStart",
-    "additionalContext": "$1"
+    "additionalContext": "$text"
   }
 }
 EOF
@@ -93,5 +104,9 @@ fi
 # Identity is established at runtime via the teammate_register tool, so an unset
 # TEAMMATE_AGENT is the normal case — nothing to warn about. (Setting it is still
 # supported: the server auto-registers from it if present.)
-echo '{}'
+if [ -n "${TEAMMATE_HOOK_NOTE:-}" ]; then
+    emit_context ""
+else
+    echo '{}'
+fi
 exit 0

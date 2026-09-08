@@ -19,10 +19,14 @@ import sys
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
+from . import harness as harness_mod
 from .comms import (
+    COMMS_SUBDIR,
     COMPACT_BROKER_SENDER,
     DELETED_MARKER,
+    MIGRATED_MARKER,
     PROFILE_FIELDS,
     PROJECT_FIELDS,
     PROJECT_STATUS,
@@ -49,6 +53,8 @@ from .comms import (
     group_read_positions,
     human_presence_online,
     is_channel_alive,
+    legacy_comms_roots,
+    legacy_repopulated_entries,
     list_project_records,
     new_message_id,
     now_timestamp,
@@ -260,6 +266,22 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Optional comms root override (else $TEAMMATE_COMMS_DIR or the project dir).",
                 },
+                "harness_session": {
+                    "type": "string",
+                    "description": (
+                        "Your harness's own session/thread id, if it has one (e.g. the thread id "
+                        "shown in your session-start context or $CODEX_THREAD_ID). Some harnesses "
+                        "need it to wake you when teammates message you. Session-scoped: omit it "
+                        "and any earlier value is cleared."
+                    ),
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": (
+                        "Your project directory, used only to derive the `project` label when "
+                        "the harness does not provide it via the environment. Need not exist."
+                    ),
+                },
                 **_profile_schema_properties(),
                 **_MANAGER_PROPERTY,
             },
@@ -431,22 +453,24 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_reincarnate",
         "description": (
-            "Spawn a NEW Claude Code teammate in a new terminal window, in a given "
-            "project directory, as a named teammate (often a known offline one). It "
-            "auto-registers + arms its channel and becomes reachable on the shared comms. "
-            "GATED: disabled unless TEAMMATE_REINCARNATE_ENABLED is truthy (it launches OS "
-            "processes). Confirms LAUNCH, not registration — verify with teammate_list a "
-            "few seconds later. The spawned window may need one human approval to arm the "
-            "custom channel."
+            "Spawn a NEW teammate session in a new terminal window, in a given project "
+            "directory, as a named teammate (often a known offline one), on your own harness "
+            "by default. It registers itself and becomes reachable on the shared comms. "
+            "GATED: disabled unless TEAMMATE_REINCARNATE_ENABLED is truthy in the server's "
+            "environment (it launches OS processes). Confirms LAUNCH, not registration — verify "
+            "with teammate_list a few seconds later. The spawned window may need one human "
+            "approval before it can register."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "Teammate name to (re)spawn."},
-                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the child's cwd AND CLAUDE_PROJECT_DIR)."},
-                "prompt": {"type": "string", "description": "Optional first instruction (defaults to an inbox-drain bootstrap)."},
+                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the child's cwd and project). Must exist."},
+                "prompt": {"type": "string", "description": "Optional first instruction (defaults to a register + inbox-drain bootstrap)."},
                 "team": {"type": "string", "description": "Optional team (namespaced inboxes)."},
                 "comms_dir": {"type": "string", "description": "Optional comms-root override (default: inherit the shared global root)."},
+                "harness": {"type": "string", "enum": sorted(harness_mod.HARNESSES),
+                            "description": "Harness to spawn the teammate on (default: your own)."},
             },
             "required": ["agent", "project_dir"],
         },
@@ -631,10 +655,17 @@ def _handle_register(args, ctx):
     comms_dir = args.get("comms_dir")
     profile = _collect_profile_args(args)  # validated inside register_identity
     manager = args.get("manager")  # WP-36: None (absent) preserves; "" clears; validated inside
+    harness_session = args.get("harness_session")
+    if harness_session is not None and not isinstance(harness_session, str):
+        raise CommsError("'harness_session' must be a string.")
+    project_dir = args.get("project_dir")
+    if project_dir is not None and not isinstance(project_dir, str):
+        raise CommsError("'project_dir' must be a string.")
     # ctx["register"] does the side effects (resolve root, inbox, registry,
     # start watching) and returns a human-readable status string.
     return ctx["register"](agent, team.strip() if team else None, comms_dir, profile,
-                            manager=manager)
+                            manager=manager, harness_session=harness_session,
+                            project_dir=project_dir)
 
 
 def _clean_message(message):
@@ -979,6 +1010,7 @@ def _handle_list(args, ctx):
             # Heartbeat-freshness only (no per-agent liveness subprocess).
             live = is_channel_alive(record, pid_check=False)
             rows.append(f"  - {path.stem}{me}: type={kind}, channel={'live' if live else 'offline'}")
+            rows.append(f"      harness:   {record.get('harness') or '(not set)'}")
         # project + status + authority always surface — the at-a-glance fields
         # (project matters most now that comms are global across projects).
         rows.append(f"      project:   {record.get('project') or '(not set)'}")
@@ -1065,6 +1097,28 @@ def _doctor_report(root, team):
         except OSError:
             pass                                   # absent / unreadable → omit
     rep["files"] = files
+    legacy = {}
+    for legacy_root in legacy_comms_roots():
+        tree = Path(legacy_root) / COMMS_SUBDIR
+        if (tree / MIGRATED_MARKER).exists():
+            moved = read_json_readonly(tree / MIGRATED_MARKER) or {}
+            extra = legacy_repopulated_entries(legacy_root)
+            if extra:
+                legacy[str(legacy_root)] = (
+                    f"RE-POPULATED after migration to {moved.get('moved_to', '?')} "
+                    f"({', '.join(extra)}) — an old-version instance is still running; its "
+                    f"records are invisible to this team. Stop it, upgrade it, then move "
+                    f"those files into the new root by hand.")
+            else:
+                legacy[str(legacy_root)] = f"migrated to {moved.get('moved_to', '?')}"
+        elif tree.is_dir():
+            if Path(legacy_root) == Path(root):
+                legacy[str(legacy_root)] = "in use (this root); move deferred while agents are live"
+            else:
+                legacy[str(legacy_root)] = (
+                    "BOTH roots exist — this root wins and the legacy tree will never be "
+                    "moved automatically; merge it into this root by hand (see README).")
+    rep["legacy_root"] = legacy or "none"
     unread = {}
     try:
         for f in sorted(get_inboxes_dir(root, team).glob("*_unread.json")):
@@ -1110,6 +1164,8 @@ def _handle_whoami(args, ctx):
         "comms_root": str(root),
         "inboxes_dir": str(get_inboxes_dir(root, team)),
         "profile": {field: record.get(field) for field in PROFILE_FIELDS},
+        "harness": record.get("harness"),
+        "harness_session": record.get("harness_session"),
     }
     if record.get("spawned_by"):
         info["spawned_by"] = record["spawned_by"]  # F-5 provenance breadcrumb, surfaced here
@@ -1166,6 +1222,7 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     else:
         live = is_channel_alive(record, pid_check=False)
         lines.append(f"  {'channel:':<13}{'live' if live else 'offline'}")
+        lines.append(f"  {'harness:':<13}{record.get('harness') or '(not set)'}")
     for field in PROFILE_FIELDS:
         value = record.get(field)
         lines.append(f"  {field + ':':<13}{value if value else '(not set)'}")
@@ -1796,14 +1853,20 @@ def _handle_reincarnate(args, ctx):
             f"{target!r} is already live (pid={existing.get('pid')}, "
             f"host={existing.get('host')}). Reincarnate is for OFFLINE teammates."
         )
+    harness_arg = args.get("harness")
+    if harness_arg is None or harness_arg == "":
+        harness = harness_mod.current()
+    else:
+        harness = harness_mod.by_name(harness_arg)
+        if harness is None:
+            raise CommsError(f"'harness' must be one of {sorted(harness_mod.HARNESSES)}.")
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        prompt = (f"You are {target}. Call teammate_inbox to drain any queued messages, "
-                  f"then await instructions.")
+        prompt = harness.spawn_prompt.format(agent=target, project_dir=project_dir)
     team_arg = (args.get("team") or "").strip() or team
     comms_dir = args.get("comms_dir")
 
-    argv = spawn.build_claude_command(prompt)
+    argv = spawn.build_command(harness.spawn_builder, prompt, project_dir)
     env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir,
                                 spawned_by=agent)  # provenance breadcrumb (F-5)
     try:
@@ -1815,15 +1878,20 @@ def _handle_reincarnate(args, ctx):
     # W1: name the exact plugin spec used, so a fork/rehost operator can tell at a glance
     # whether the marketplace resolved correctly (and how to fix it if not).
     override_note = ""
-    if os.environ.get("TEAMMATE_LAUNCH_ARGS"):
-        # H4: TEAMMATE_LAUNCH_ARGS bypasses the plugin-spec/allowlist entirely — say so.
-        override_note = "\nLaunch override active (TEAMMATE_LAUNCH_ARGS) — allowlist detection bypassed."
-    else:
+    default_builder = harness_mod.HARNESSES[harness_mod.DEFAULT].spawn_builder
+    if os.environ.get(harness.launch_args_var):
+        # H4: a launch override bypasses the plugin-spec/allowlist entirely — say so.
+        override_note = (f"\nLaunch override active ({harness.launch_args_var}) — allowlist "
+                         f"detection bypassed.")
+    elif harness.spawn_builder == default_builder:
         override_note = (
             f"\nLaunched with plugin spec {spawn.plugin_spec()!r}. A fork/rehost that needs a "
             f"different marketplace should set TEAMMATE_PLUGIN_MARKETPLACE or "
-            f"TEAMMATE_LAUNCH_ARGS."
+            f"{harness.launch_args_var}."
         )
+    else:
+        override_note = (f"\nLaunched on {harness.display_name} as {argv[0]!r}; override the launch "
+                         f"line with {harness.launch_args_var}.")
     return durable_warning + (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
         f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "

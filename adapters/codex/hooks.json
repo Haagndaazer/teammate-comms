@@ -1,0 +1,19 @@
+{
+  "description": "teammate-comms — Codex hooks (MCP registration + thread-id handoff at session start)",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/adapters/codex/hooks/session-start.sh\"",
+            "commandWindows": "${CLAUDE_PLUGIN_ROOT}\\adapters\\codex\\hooks\\session-start.cmd",
+            "timeout": 120,
+            "additionalContextLimit": 2000
+          }
+        ]
+      }
+    ]
+  }
+}

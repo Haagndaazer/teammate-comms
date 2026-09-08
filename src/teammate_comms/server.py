@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__, channel
+from . import harness as harness_mod
 from . import tools as tools_mod
 from .comms import (
     COMPACT_BROKER_SENDER,
@@ -38,6 +39,7 @@ from .comms import (
     get_inboxes_dir,
     heartbeat_fresh,
     is_channel_alive,
+    migrate_legacy_root,
     now_timestamp,
     read_agent_record,
     read_json_readonly,
@@ -84,9 +86,52 @@ class Identity:
         # instance_id with an epoch that still matches ours means a competitor's heartbeat
         # write raced OUR register, not a legitimate new registration — see channel.py.
         self._epoch = None
+        self.harness_session = None
+        self._waker_generation = 0
 
     def get_instance_id(self):
         return self.instance_id
+
+    def set_harness_session(self, harness_session):
+        with self._lock:
+            if harness_session != self.harness_session:
+                self.harness_session = harness_session
+                self._waker_generation += 1
+
+    def get_harness_session(self):
+        with self._lock:
+            return self.harness_session
+
+    def get_waker_generation(self):
+        with self._lock:
+            return self._waker_generation
+
+    def snapshot_waker(self):
+        with self._lock:
+            return (self.harness_session, self._waker_generation)
+
+    def apply(self, agent, team, root, unread_file, harness_session):
+        """Set identity (bumping the identity generation only when agent/team/root change)
+        and harness_session (bumping the waker generation only on change) under ONE lock."""
+        with self._lock:
+            same = (self.agent is not None and self.agent == agent and self.team == team
+                    and self.root == root)
+            if not same:
+                self._generation += 1
+                self.agent, self.team, self.root, self.unread_file = agent, team, root, unread_file
+            if harness_session != self.harness_session:
+                self.harness_session = harness_session
+                self._waker_generation += 1
+
+    def snapshot_all(self):
+        with self._lock:
+            return (self.agent, self.team, self.root, self.unread_file, self._generation,
+                    self.harness_session, self._waker_generation)
+
+    def matches(self, agent, team, root):
+        with self._lock:
+            return (self.agent is not None and self.agent == agent and self.team == team
+                    and self.root == root)
 
     def set_epoch(self, epoch):
         with self._lock:
@@ -214,7 +259,8 @@ def _project_label_from_git_remote(proj_dir):
     return _project_label_from_remote(result.stdout.strip())
 
 
-def register_identity(agent, team, comms_dir, profile=None, manager=None):
+def register_identity(agent, team, comms_dir, profile=None, manager=None,
+                      harness_session=None, project_dir=None):
     """Establish identity + start watching. Raises CommsError on bad input.
 
     Used by the teammate_register tool and by the optional env auto-register.
@@ -239,7 +285,9 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
     # CLAUDE_PROJECT_DIR) unless the agent set it explicitly. With a global-by-
     # default comms root, this is how teammate_list shows who is working where.
     if "project" not in profile:
-        proj_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+        proj_dir = project_dir if isinstance(project_dir, str) and project_dir.strip() else None
+        if proj_dir is None:
+            proj_dir = os.environ.get("CLAUDE_PROJECT_DIR")
         if not _looks_unset(proj_dir):
             stripped_dir = proj_dir.strip()
             # G3: prefer the git remote-derived label (stable across clones/machines) over the
@@ -322,6 +370,15 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
     root, source = resolve_comms_root(comms_dir)
     hostname = socket.gethostname()
     my_instance_id = _identity.get_instance_id()
+    harness = harness_mod.current()
+    if isinstance(harness_session, str) and harness_session.strip():
+        harness_session = " ".join(harness_session.split())
+        if len(harness_session) > 200:
+            raise CommsError("'harness_session' must be at most 200 characters.")
+        if harness_session.startswith("-"):
+            raise CommsError("'harness_session' must not start with '-'.")
+    else:
+        harness_session = None
 
     # Read whatever is currently on disk for this name BEFORE any side effect — the human
     # guard (WP-19 item 5, mandatory) must fire before ensure_inbox/write ever touch the
@@ -398,6 +455,7 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
         comms_root=str(root),
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
         pane_id=pane_id, wezterm_socket=wezterm_socket,
+        harness=harness.name, harness_session=harness_session,
         **profile_fields,
         **manager_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),
@@ -408,7 +466,7 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
     # both instances would store N+1 as "my epoch" and the TOCTOU tie-break would have BOTH
     # sides re-claim forever, exactly the flap the tie-break exists to kill. The return value
     # is race-free by construction (computed under the same lock as the write).
-    _identity.set(agent, team, root, unread_file)
+    _identity.apply(agent, team, root, unread_file, harness_session)
     _identity.set_epoch(effective.get("epoch"))
     # S4: ANY successful register clears a stale auto-register failure — the agent is
     # registered now (whether this call WAS the auto-register retry or a manual one), so the
@@ -431,11 +489,14 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None):
             "No profile set — set one with teammate_update "
             "(role/personality/status/authority) so teammates know what you're doing. "
         )
+    session_hint = ""
+    if harness.needs_session and not harness_session:
+        session_hint = " " + harness.session_hint
     return warning + (
         f"Registered as {agent!r}{team_str}. Comms root: {root} (from {source}). "
         f"Channel armed. {profile_str}You have {len(unread)} unread message(s) — call "
         f"teammate_inbox to read them."
-    ) + note
+    ) + session_hint + note
 
 
 def handle(msg, ctx):
@@ -443,6 +504,9 @@ def handle(msg, ctx):
     msg_id = msg.get("id")  # echoed verbatim (preserves int/str type)
 
     if method == "initialize":
+        client = ((msg.get("params") or {}).get("clientInfo") or {})
+        log(f"initialize: client={client.get('name')!r} version={client.get('version')!r} "
+            f"harness={harness_mod.current().name}")
         result = {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
@@ -616,6 +680,12 @@ def main():
     # the diagnostic anchor for "was this session running stale code" in the debug log
     # (~/.claude/debug/<session>.txt).
     log(f"starting teammate-comms v{__version__}")
+    try:
+        status, detail = migrate_legacy_root()
+        if status != "skipped":
+            log(f"legacy comms root migration: {status} ({detail})")
+    except Exception as exc:
+        log(f"legacy comms root migration skipped: {exc}")
     _write_plugin_runtime_pointer()
 
     ctx = {"identity": _identity, "register": register_identity,

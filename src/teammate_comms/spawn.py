@@ -21,6 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import harness as harness_mod
 from .comms import CommsError
 
 # Lazily-available on Windows only; imported at module level (not inside the function) so a
@@ -219,6 +220,37 @@ def build_claude_command(prompt, extra_args=None, settings_paths=None):
     return argv
 
 
+def build_codex_command(prompt, project_dir=None, extra_args=None):
+    """Build the ``codex`` argv as a LIST. ``$TEAMMATE_LAUNCH_ARGS_CODEX`` overrides the base
+    line verbatim; the prompt is always the single trailing element."""
+    base = os.environ.get(harness_mod.HARNESSES["codex"].launch_args_var)
+    if base:
+        argv = shlex.split(base, posix=(os.name != "nt"))
+    else:
+        argv = ["codex", "-a", "never", "--dangerously-bypass-approvals-and-sandbox"]
+        if project_dir:
+            argv += ["-C", str(project_dir)]
+    if extra_args:
+        argv += list(extra_args)
+    if prompt:
+        argv.append(prompt)
+    return argv
+
+
+SPAWN_BUILDERS = {
+    "claude": lambda prompt, project_dir=None: build_claude_command(prompt),
+    "codex": build_codex_command,
+}
+
+
+def build_command(builder, prompt, project_dir=None):
+    """Build the launch argv for a harness's registered spawn builder."""
+    fn = SPAWN_BUILDERS.get(builder)
+    if fn is None:
+        raise CommsError(f"No spawn builder registered for {builder!r}.")
+    return fn(prompt, project_dir)
+
+
 def build_child_env(base, agent, project_dir, team=None, comms_dir=None, spawned_by=None):
     """Build the child env dict for the spawned instance.
 
@@ -306,10 +338,11 @@ def spawn_in_terminal(argv, cwd, env):
     """
     _reap_children()
     _ignore_sigchld_once()
-    if shutil.which("claude") is None:
+    exe = argv[0] if argv else ""
+    if not exe or shutil.which(exe) is None:
         raise FileNotFoundError(
-            "claude CLI not on PATH — the spawned teammate cannot launch. Install it or fix "
-            "PATH before retrying teammate_reincarnate."
+            f"{exe or '<empty argv>'} CLI not on PATH — the spawned teammate cannot launch. "
+            f"Install it or fix PATH before retrying teammate_reincarnate."
         )
     dn = subprocess.DEVNULL
     cwd = str(cwd)
