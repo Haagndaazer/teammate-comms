@@ -532,7 +532,10 @@ def test_wp45_ac5_codex_hook_shell():
         (rig / "bin").mkdir(parents=True)
         data = rig / "data"
         posix_rig = _posix(rig)
-        for name, body in (("codex", f'#!/usr/bin/env bash\necho "CODEX: $*" >> "{posix_rig}/codex.log"\nexit 0\n'),
+        fake_codex = (f'#!/usr/bin/env bash\necho "CODEX: $*" >> "{posix_rig}/codex.log"\n'
+                      f'case "$*" in "mcp get "*) if [ -f "{posix_rig}/mcp_get_json" ]; then '
+                      f'cat "{posix_rig}/mcp_get_json"; exit 0; fi; exit 1;; esac\nexit 0\n')
+        for name, body in (("codex", fake_codex),
                            ("uv", f'#!/usr/bin/env bash\necho "UV: $*" >> "{posix_rig}/uv.log"\nexit 0\n')):
             p = rig / "bin" / name
             p.write_text(body, encoding="utf-8", newline="\n")
@@ -581,6 +584,29 @@ def test_wp45_ac5_codex_hook_shell():
 
         r3 = run('{"session_id":"0000-2222","cwd":"/tmp","source":"compact"}')
         check(r3.stdout.strip() == "{}", f"AC-5: compact source still self-filters to {{}} ({r3.stdout!r})")
+
+        pretty = ('{\n  "name": "teammate-comms",\n  "env": {\n    "TEAMMATE_HARNESS": "codex",\n'
+                  '    "TEAMMATE_REINCARNATE_ENABLED": "1",\n    "UV_PROJECT_ENVIRONMENT": "old"\n  },\n'
+                  '  "cwd": "/somewhere"\n}\n')
+        (rig / "mcp_get_json").write_text(pretty, encoding="utf-8", newline="\n")
+        env["CLAUDE_PLUGIN_DATA"] = str(rig / "data2")
+        run('{"session_id":"0000-3333","cwd":"/tmp","source":"startup"}')
+        log = (rig / "codex.log").read_text(encoding="utf-8")
+        adds = [ln for ln in log.splitlines() if ln.startswith("CODEX: mcp add")]
+        check(len(adds) == 2 and "--env TEAMMATE_REINCARNATE_ENABLED=1" in adds[-1],
+              f"tautology[AC-5]: re-registration preserves a user-added env key ({adds[-1:]})")
+        check(adds[-1].count("--env TEAMMATE_HARNESS=") == 1 and adds[-1].count("--env UV_PROJECT_ENVIRONMENT=") == 1
+              and "--env cwd" not in adds[-1] and "old" not in adds[-1],
+              f"AC-5: managed keys passed once with fresh values, sibling fields untouched ({adds[-1]})")
+        compact = '{\n  "name": "teammate-comms",\n  "env": {},\n  "cwd": "/somewhere"\n}\n'
+        (rig / "mcp_get_json").write_text(compact, encoding="utf-8", newline="\n")
+        env["CLAUDE_PLUGIN_DATA"] = str(rig / "data3")
+        run('{"session_id":"0000-4444","cwd":"/tmp","source":"startup"}')
+        adds = [ln for ln in (rig / "codex.log").read_text(encoding="utf-8").splitlines()
+                if ln.startswith("CODEX: mcp add")]
+        check(len(adds) == 3 and adds[-1].count("--env ") == 2 and "cwd" not in adds[-1],
+              f"AC-5: a compact empty env block yields no extra args and never swallows cwd ({adds[-1]})")
+        env["CLAUDE_PLUGIN_DATA"] = str(data)
 
         env_plain = dict(env)
         env_plain.pop("TEAMMATE_HOOK_NOTE", None)

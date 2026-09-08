@@ -424,8 +424,9 @@ stopped, migrate, restart, roster intact on both harnesses. ≈ 1.5 days.
 - No template renderer; the SKILL harness section + lints are the drift guard.
 - Codex first session after install/update has no server; first session after a hook change
   runs without the hook. Documented, not worked around.
-- `codex mcp add` re-registration clobbers user-added env keys on the entry until
-  vibe-cognition's WP-P3 preserve-env step exists; we copy it when it lands.
+- `codex mcp add` re-registration preserves user-added env keys (vibe-cognition WP-P3's
+  `_preserved_env_args`, copied at `15f36ca`; managed keys `UV_PROJECT_ENVIRONMENT` and
+  `TEAMMATE_HARNESS` are always re-passed fresh).
 - Hooks write `~/.codex/config.toml` only through `codex mcp add`.
 
 ## 8. Risks

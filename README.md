@@ -380,9 +380,9 @@ Wake breadcrumbs (`wake-emit harness=codex rc=…`) go to the server's stderr.
 `teammate_reincarnate` on Codex needs `TEAMMATE_REINCARNATE_ENABLED=1` on the
 `teammate-comms` MCP entry (`codex mcp add … --env`), because Codex's MCP child
 environment is an allowlist; the spawned Codex teammate gets its name from the launch
-prompt and registers itself. Caveat: the plugin hook re-runs `codex mcp add` whenever its
-launch line changes (a version bump, a moved data dir), and that replaces the entry's env
-block — re-add `TEAMMATE_REINCARNATE_ENABLED=1` afterwards if reincarnate stops working.
+prompt and registers itself. The plugin hook re-runs `codex mcp add` whenever its launch
+line changes (a version bump, a moved data dir) and re-passes any env keys you added to
+the entry, so a `TEAMMATE_REINCARNATE_ENABLED=1` you set survives plugin updates.
 
 Uninstall:
 
