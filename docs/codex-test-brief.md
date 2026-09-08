@@ -6,8 +6,12 @@ and Claude Code with the current teammate-comms plugin. Mirrors vibe-cognition's
 report; do not work around.
 
 Commands marked (PS) run in PowerShell outside any Codex session; inside a Codex session
-call `codex.cmd` (the `.ps1` shim is blocked by execution policy) and expect process
-enumeration to be denied by the sandbox.
+call `codex.cmd` (the `.ps1` shim is blocked by execution policy). **Known sandbox
+limitation, not a FAIL:** inside Codex's own sandbox `codex.cmd …` fails with "Could not
+find home directory" and process enumeration is denied. When that happens, rerun the same
+read-only command outside the sandbox (request escalation, or the human runs it in
+PowerShell) and record that result. Only a product behaviour that contradicts an Expected
+line is a FAIL.
 
 ## Phase 0 — pre-install cleanliness
 

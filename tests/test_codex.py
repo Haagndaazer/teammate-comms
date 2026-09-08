@@ -289,7 +289,7 @@ def watcher(harness, session, runner=None, sent=None, hb=None):
     init.set()
     reg.set()
     sent = [] if sent is None else sent
-    factory = (lambda h, s, sm: channel_mod.make_waker(h, s, sm, runner=runner))
+    factory = (lambda h, s, sm: channel_mod.make_waker(h, s, sm, runner=runner, exe="codex"))
     old_hb = channel_mod.HEARTBEAT_SECONDS
     if hb is not None:
         channel_mod.HEARTBEAT_SECONDS = hb
@@ -415,6 +415,29 @@ def test_wp44_ac6_runner_failure_isolated():
         check(_wait(lambda: len(runner.calls) == 2), "AC-6: watcher keeps running after a runner error")
 
 
+def test_wp44_ac8_codex_exe_resolution():
+    calls = []
+    runner = lambda argv, **kw: calls.append(list(argv)) or types.SimpleNamespace(returncode=0)
+    with env_vars(PATH=""):
+        waker = channel_mod.CodexQueueWaker(SESSION, runner=runner)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            first, second = waker.wake("x", {}), waker.wake("y", {})
+        check(first is False and second is False and calls == [],
+              "tautology[AC-8]: no codex on PATH -> wake reports not dispatched, nothing runs")
+        check(err.getvalue().count("codex CLI not on PATH") == 1, "AC-8: missing CLI logged once")
+    waker = channel_mod.CodexQueueWaker(SESSION, runner=runner, exe=r"C:\x\codex.CMD")
+    check(waker.wake("z", {}) is True, "AC-8: explicit exe dispatches")
+    check(_wait(lambda: calls and calls[0][0] == r"C:\x\codex.CMD", timeout=3),
+          f"AC-8: argv[0] is the resolved executable, never the bare name ({calls[:1]})")
+    if os.name == "nt":
+        import shutil
+        resolved = shutil.which("codex")
+        if resolved:
+            check(resolved.lower().endswith((".cmd", ".exe", ".bat")),
+                  "AC-8: on Windows shutil.which returns a launchable shim, which bare 'codex' is not")
+
+
 def test_wp44_ac7_reaction_drop_not_retired():
     gate = threading.Event()
     runner = Runner(block=gate)
@@ -433,7 +456,7 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 
 LITERAL_BASELINE = {
-    "__init__.py": 1, "avatars.py": 1, "channel.py": 17, "comms.py": 5, "dashboard.py": 0,
+    "__init__.py": 1, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
     "deliver.py": 1, "server.py": 9, "spawn.py": 29, "tools.py": 6,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
@@ -532,7 +555,10 @@ def test_wp45_ac5_codex_hook_shell():
         (rig / "bin").mkdir(parents=True)
         data = rig / "data"
         posix_rig = _posix(rig)
-        for name, body in (("codex", f'#!/usr/bin/env bash\necho "CODEX: $*" >> "{posix_rig}/codex.log"\nexit 0\n'),
+        fake_codex = (f'#!/usr/bin/env bash\necho "CODEX: $*" >> "{posix_rig}/codex.log"\n'
+                      f'case "$*" in "mcp get "*) if [ -f "{posix_rig}/mcp_get_json" ]; then '
+                      f'cat "{posix_rig}/mcp_get_json"; exit 0; fi; exit 1;; esac\nexit 0\n')
+        for name, body in (("codex", fake_codex),
                            ("uv", f'#!/usr/bin/env bash\necho "UV: $*" >> "{posix_rig}/uv.log"\nexit 0\n')):
             p = rig / "bin" / name
             p.write_text(body, encoding="utf-8", newline="\n")
@@ -581,6 +607,29 @@ def test_wp45_ac5_codex_hook_shell():
 
         r3 = run('{"session_id":"0000-2222","cwd":"/tmp","source":"compact"}')
         check(r3.stdout.strip() == "{}", f"AC-5: compact source still self-filters to {{}} ({r3.stdout!r})")
+
+        pretty = ('{\n  "name": "teammate-comms",\n  "env": {\n    "TEAMMATE_HARNESS": "codex",\n'
+                  '    "TEAMMATE_REINCARNATE_ENABLED": "1",\n    "UV_PROJECT_ENVIRONMENT": "old"\n  },\n'
+                  '  "cwd": "/somewhere"\n}\n')
+        (rig / "mcp_get_json").write_text(pretty, encoding="utf-8", newline="\n")
+        env["CLAUDE_PLUGIN_DATA"] = str(rig / "data2")
+        run('{"session_id":"0000-3333","cwd":"/tmp","source":"startup"}')
+        log = (rig / "codex.log").read_text(encoding="utf-8")
+        adds = [ln for ln in log.splitlines() if ln.startswith("CODEX: mcp add")]
+        check(len(adds) == 2 and "--env TEAMMATE_REINCARNATE_ENABLED=1" in adds[-1],
+              f"tautology[AC-5]: re-registration preserves a user-added env key ({adds[-1:]})")
+        check(adds[-1].count("--env TEAMMATE_HARNESS=") == 1 and adds[-1].count("--env UV_PROJECT_ENVIRONMENT=") == 1
+              and "--env cwd" not in adds[-1] and "old" not in adds[-1],
+              f"AC-5: managed keys passed once with fresh values, sibling fields untouched ({adds[-1]})")
+        compact = '{\n  "name": "teammate-comms",\n  "env": {},\n  "cwd": "/somewhere"\n}\n'
+        (rig / "mcp_get_json").write_text(compact, encoding="utf-8", newline="\n")
+        env["CLAUDE_PLUGIN_DATA"] = str(rig / "data3")
+        run('{"session_id":"0000-4444","cwd":"/tmp","source":"startup"}')
+        adds = [ln for ln in (rig / "codex.log").read_text(encoding="utf-8").splitlines()
+                if ln.startswith("CODEX: mcp add")]
+        check(len(adds) == 3 and adds[-1].count("--env ") == 2 and "cwd" not in adds[-1],
+              f"AC-5: a compact empty env block yields no extra args and never swallows cwd ({adds[-1]})")
+        env["CLAUDE_PLUGIN_DATA"] = str(data)
 
         env_plain = dict(env)
         env_plain.pop("TEAMMATE_HOOK_NOTE", None)
@@ -895,6 +944,7 @@ def main():
         ("WP-44 AC-5: re-nudge gate + claude golden", test_wp44_ac5_renudge_gate_and_claude_golden),
         ("WP-44 AC-6: runner failure isolated", test_wp44_ac6_runner_failure_isolated),
         ("WP-44 AC-7: reaction drop not retired", test_wp44_ac7_reaction_drop_not_retired),
+        ("WP-44 AC-8: codex exe resolution", test_wp44_ac8_codex_exe_resolution),
         ("WP-45 AC-1: manifest parity", test_wp45_ac1_manifest_parity),
         ("WP-45 AC-2: PARITY.md completeness", test_wp45_ac2_parity_completeness),
         ("WP-45 AC-3: SKILL harness lint", test_wp45_ac3_skill_lint),

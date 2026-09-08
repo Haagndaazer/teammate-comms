@@ -35,19 +35,43 @@ _bc() { echo "[teammate-comms codex hook] pid=$$ $1 t=$(date +%s)" >&2; }
 
 _stamp_matches() { [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$DESIRED" ]; }
 
+MANAGED_ENV="UV_PROJECT_ENVIRONMENT TEAMMATE_HARNESS"
+
+_preserved_env_args() {
+    local json line key
+    json=$(codex mcp get "$SERVER_NAME" --json 2>/dev/null) || return 0
+    printf '%s\n' "$json" \
+        | sed -n '/"env": {}/d; /"env": {/,/^[[:space:]]*}/p' \
+        | sed -n 's/^[[:space:]]*"\([^"]*\)": "\(.*\)",\{0,1\}[[:space:]]*$/\1=\2/p' \
+        | sed 's/\\\\/\\/g; s/\\"/"/g' \
+        | while IFS= read -r line; do
+            key="${line%%=*}"
+            case " $MANAGED_ENV " in
+                *" $key "*) ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done
+}
+
 _register() {
     if ! command -v codex >/dev/null 2>&1; then
         NOTE="teammate-comms: the 'codex' CLI was not found on PATH from the session-start hook, so its MCP server is not registered yet. Run this once, then restart Codex: ${MANUAL_CMD}"
         return 0
     fi
     _bc "register_start"
+    local extra_args=()
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] && extra_args+=(--env "$line")
+    done < <(_preserved_env_args)
     if codex mcp add "$SERVER_NAME" \
         --env "UV_PROJECT_ENVIRONMENT=${VENV_DIR}" \
         --env "TEAMMATE_HARNESS=codex" \
+        "${extra_args[@]+"${extra_args[@]}"}" \
         -- uv run --no-sync --project "$ROOT_NATIVE" python -m teammate_comms.server >/dev/null 2>&1; then
         printf '%s' "$DESIRED" > "$STAMP"
         NOTE="teammate-comms registered its MCP server with Codex (user-level entry '${SERVER_NAME}'). INSTRUCTION: tell the user to restart Codex once to activate it; the teammate_* tools appear from the next session on."
-        _bc "register_done_ok"
+        _bc "register_done_ok preserved_env=${#extra_args[@]}"
     else
         NOTE="teammate-comms: 'codex mcp add' failed while registering the MCP server. INSTRUCTION: tell the user to run this once and restart Codex: ${MANUAL_CMD}"
         _bc "register_done_fail"
