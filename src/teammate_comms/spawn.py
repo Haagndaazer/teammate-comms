@@ -227,7 +227,8 @@ def build_codex_command(prompt, project_dir=None, extra_args=None):
     if base:
         argv = shlex.split(base, posix=(os.name != "nt"))
     else:
-        argv = ["codex", "-a", "never", "--dangerously-bypass-approvals-and-sandbox"]
+        exe = shutil.which("codex") or "codex"
+        argv = [exe, "-a", "never", "--dangerously-bypass-approvals-and-sandbox"]
         if project_dir:
             argv += ["-C", str(project_dir)]
     if extra_args:
