@@ -457,7 +457,7 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 LITERAL_BASELINE = {
     "__init__.py": 1, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
-    "deliver.py": 1, "server.py": 9, "spawn.py": 29, "tools.py": 6,
+    "deliver.py": 1, "server.py": 9, "spawn.py": 30, "tools.py": 6,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
                    "$teammate-comms", "codex")
@@ -470,6 +470,9 @@ def test_wp45_ac1_manifest_parity():
     check(claude["name"] == codex["name"] == "teammate-comms", "AC-1: manifest names agree")
     check(claude["version"] == codex["version"], "AC-1: manifest versions agree")
     check(f'version = "{codex["version"]}"' in pyproject, "AC-1: pyproject version matches manifests")
+    import teammate_comms
+    check(teammate_comms.__version__ == codex["version"],
+          f"AC-1: package __version__ ({teammate_comms.__version__}) matches the manifests ({codex['version']})")
     for key in ("skills", "hooks"):
         for rel in codex.get(key, []):
             check(rel.startswith("./"), f"AC-1: codex manifest path must start with ./ ({rel})")
@@ -641,13 +644,19 @@ def test_wp45_ac5_codex_hook_shell():
 
 def test_wp46_ac1_codex_builder_argv():
     from teammate_comms import spawn as spawn_mod
-    with env_vars(TEAMMATE_LAUNCH_ARGS=None, TEAMMATE_LAUNCH_ARGS_CODEX=None):
+    import shutil
+    with env_vars(TEAMMATE_LAUNCH_ARGS=None, TEAMMATE_LAUNCH_ARGS_CODEX=None, PATH=""):
         argv = spawn_mod.build_command("codex", "hello world", "E:/proj dir")
     check(argv == ["codex", "-a", "never", "--dangerously-bypass-approvals-and-sandbox",
                    "-C", "E:/proj dir", "hello world"], f"AC-1: codex argv ({argv})")
+    resolved = shutil.which("codex")
+    if resolved:
+        with env_vars(TEAMMATE_LAUNCH_ARGS_CODEX=None):
+            argv = spawn_mod.build_command("codex", "p", "/d")
+        check(argv[0] == resolved, f"tautology[AC-1]: argv[0] is the resolved codex shim, not the bare name ({argv[0]})")
     with env_vars(TEAMMATE_LAUNCH_ARGS="claude --channels x", TEAMMATE_LAUNCH_ARGS_CODEX=None):
         argv = spawn_mod.build_command("codex", "p", "/d")
-        check(argv[0] == "codex" and "--channels" not in argv,
+        check(os.path.basename(argv[0]).lower().startswith("codex") and "--channels" not in argv,
               "tautology[AC-1]: a Claude launch override never leaks into the codex argv")
     with env_vars(TEAMMATE_LAUNCH_ARGS_CODEX="codex --profile fast"):
         argv = spawn_mod.build_command("codex", "p", "/d")
@@ -699,11 +708,12 @@ def test_wp46_ac3_reincarnate_codex_prompt():
                 "teammate_reincarnate",
                 {"agent": "Codex1", "project_dir": str(proj), "harness": "codex"}, ctx)
             check(not is_error, f"AC-3: codex reincarnate dispatches ({text[:200]})")
-            check(launched and launched[-1][0][0] == "codex", "AC-3: launches the codex CLI")
+            check(launched and os.path.basename(launched[-1][0][0]).lower().startswith("codex"),
+                  f"AC-3: launches the codex CLI ({launched[-1][0][:1] if launched else launched})")
             prompt = launched[-1][0][-1] if launched else ""
             check("teammate_register(agent='Codex1'" in prompt and "harness_session=" in prompt
                   and str(proj) in prompt, f"AC-3: prompt carries the register call ({prompt[:160]})")
-            check("Launched on Codex as 'codex'" in text, "AC-3: result names the harness")
+            check("Launched on Codex as '" in text, "AC-3: result names the harness")
             text, is_error = tools_mod.dispatch(
                 "teammate_reincarnate",
                 {"agent": "Claude1", "project_dir": str(proj)}, ctx)

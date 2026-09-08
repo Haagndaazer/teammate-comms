@@ -2792,11 +2792,14 @@ def main():
                 failures.append("G-2 resolve_comms_root: TEAMMATE_COMMS_DIR branch wrong")
             os.environ.pop("TEAMMATE_COMMS_DIR", None)
             os.environ["CLAUDE_CONFIG_DIR"] = "/cfg"
-            if _c9.resolve_comms_root(None)[1] != "CLAUDE_CONFIG_DIR":
-                failures.append("G-2 resolve_comms_root: CLAUDE_CONFIG_DIR branch wrong")
+            _src_cfg = _c9.resolve_comms_root(None)[1]
+            if _src_cfg == "CLAUDE_CONFIG_DIR":
+                failures.append("G-2 resolve_comms_root: CLAUDE_CONFIG_DIR must not select the root (v0.16.0)")
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            if _c9.resolve_comms_root(None)[1] != "~/.claude default":
-                failures.append("G-2 resolve_comms_root: default branch wrong")
+            _src_def = _c9.resolve_comms_root(None)[1]
+            if _src_def not in ("~/.teammate-comms default",
+                                "legacy root (move to ~/.teammate-comms deferred)"):
+                failures.append(f"G-2 resolve_comms_root: default branch wrong ({_src_def!r})")
         finally:
             for _k, _v in _se.items():
                 os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
