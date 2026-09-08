@@ -33,7 +33,11 @@ agent's inbox file and emits `notifications/claude/channel` when new messages
 arrive, so a peer's `send` *is* the nudge — no ports, no cross-instance addressing.
 
 ### Wake regimes (pick by process topology, not by "team")
-- **Full instance** (its own `claude` process): woken by the **channel** here.
+- **Full instance** (its own harness process): woken by the harness's wake strategy, chosen
+  by the recipient's OWN server from the `harness.py` table (`TEAMMATE_HARNESS`): Claude
+  Code → the **channel** here; Codex → the server runs `codex queue --thread <session>` with
+  the same wake text (v0.16.0, `channel.py` `WAKERS`). Senders stay harness-blind; the inbox
+  file is the only shared contract.
 - **Spawned subagent** (a lead invoked it via the Agent/Task tool): woken by the
   parent's `SendMessage`. Channels do not apply — a spawned subagent has no
   independent session for a channel to inject into.

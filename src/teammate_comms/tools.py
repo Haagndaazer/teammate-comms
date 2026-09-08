@@ -20,6 +20,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 
+from . import harness as harness_mod
 from .comms import (
     COMPACT_BROKER_SENDER,
     DELETED_MARKER,
@@ -447,22 +448,24 @@ TOOL_DEFINITIONS = [
     {
         "name": "teammate_reincarnate",
         "description": (
-            "Spawn a NEW Claude Code teammate in a new terminal window, in a given "
-            "project directory, as a named teammate (often a known offline one). It "
-            "auto-registers + arms its channel and becomes reachable on the shared comms. "
-            "GATED: disabled unless TEAMMATE_REINCARNATE_ENABLED is truthy (it launches OS "
-            "processes). Confirms LAUNCH, not registration — verify with teammate_list a "
-            "few seconds later. The spawned window may need one human approval to arm the "
-            "custom channel."
+            "Spawn a NEW teammate session in a new terminal window, in a given project "
+            "directory, as a named teammate (often a known offline one), on your own harness "
+            "by default. It registers itself and becomes reachable on the shared comms. "
+            "GATED: disabled unless TEAMMATE_REINCARNATE_ENABLED is truthy in the server's "
+            "environment (it launches OS processes). Confirms LAUNCH, not registration — verify "
+            "with teammate_list a few seconds later. The spawned window may need one human "
+            "approval before it can register."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "Teammate name to (re)spawn."},
-                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the child's cwd AND CLAUDE_PROJECT_DIR)."},
-                "prompt": {"type": "string", "description": "Optional first instruction (defaults to an inbox-drain bootstrap)."},
+                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the child's cwd and project). Must exist."},
+                "prompt": {"type": "string", "description": "Optional first instruction (defaults to a register + inbox-drain bootstrap)."},
                 "team": {"type": "string", "description": "Optional team (namespaced inboxes)."},
                 "comms_dir": {"type": "string", "description": "Optional comms-root override (default: inherit the shared global root)."},
+                "harness": {"type": "string", "enum": sorted(harness_mod.HARNESSES),
+                            "description": "Harness to spawn the teammate on (default: your own)."},
             },
             "required": ["agent", "project_dir"],
         },
@@ -1823,14 +1826,20 @@ def _handle_reincarnate(args, ctx):
             f"{target!r} is already live (pid={existing.get('pid')}, "
             f"host={existing.get('host')}). Reincarnate is for OFFLINE teammates."
         )
+    harness_arg = args.get("harness")
+    if harness_arg is None or harness_arg == "":
+        harness = harness_mod.current()
+    else:
+        harness = harness_mod.by_name(harness_arg)
+        if harness is None:
+            raise CommsError(f"'harness' must be one of {sorted(harness_mod.HARNESSES)}.")
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        prompt = (f"You are {target}. Call teammate_inbox to drain any queued messages, "
-                  f"then await instructions.")
+        prompt = harness.spawn_prompt.format(agent=target, project_dir=project_dir)
     team_arg = (args.get("team") or "").strip() or team
     comms_dir = args.get("comms_dir")
 
-    argv = spawn.build_claude_command(prompt)
+    argv = spawn.build_command(harness.spawn_builder, prompt, project_dir)
     env = spawn.build_child_env(os.environ, target, str(project_dir), team_arg, comms_dir,
                                 spawned_by=agent)  # provenance breadcrumb (F-5)
     try:
@@ -1842,15 +1851,20 @@ def _handle_reincarnate(args, ctx):
     # W1: name the exact plugin spec used, so a fork/rehost operator can tell at a glance
     # whether the marketplace resolved correctly (and how to fix it if not).
     override_note = ""
-    if os.environ.get("TEAMMATE_LAUNCH_ARGS"):
-        # H4: TEAMMATE_LAUNCH_ARGS bypasses the plugin-spec/allowlist entirely — say so.
-        override_note = "\nLaunch override active (TEAMMATE_LAUNCH_ARGS) — allowlist detection bypassed."
-    else:
+    default_builder = harness_mod.HARNESSES[harness_mod.DEFAULT].spawn_builder
+    if os.environ.get(harness.launch_args_var):
+        # H4: a launch override bypasses the plugin-spec/allowlist entirely — say so.
+        override_note = (f"\nLaunch override active ({harness.launch_args_var}) — allowlist "
+                         f"detection bypassed.")
+    elif harness.spawn_builder == default_builder:
         override_note = (
             f"\nLaunched with plugin spec {spawn.plugin_spec()!r}. A fork/rehost that needs a "
             f"different marketplace should set TEAMMATE_PLUGIN_MARKETPLACE or "
-            f"TEAMMATE_LAUNCH_ARGS."
+            f"{harness.launch_args_var}."
         )
+    else:
+        override_note = (f"\nLaunched on {harness.display} as {argv[0]!r}; override the launch "
+                         f"line with {harness.launch_args_var}.")
     return durable_warning + (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"
         f"This confirms LAUNCH, not registration. Expect it to auto-register and arm its channel "

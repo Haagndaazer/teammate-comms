@@ -259,7 +259,8 @@ isn't prevention, so the safe habit is: set it per-launch, never durably.
 
 ## Two wake regimes
 
-- **Full instance** → woken by the **channel** here.
+- **Full instance** → woken by its harness's wake: the **channel** on Claude Code, or
+  its own server running `codex queue` on Codex (see [Codex CLI](#codex-cli)).
 - **Spawned subagent** → woken by its lead's `SendMessage` (no independent session
   for a channel to inject into); it then calls `teammate_inbox`.
 
@@ -343,6 +344,58 @@ Notes:
   `--channels` (no prompt) when present, falling back to the dangerous flag otherwise — so
   reincarnated windows arm silently once the allowlist is in place. (Override the whole
   spawn line with `$TEAMMATE_LAUNCH_ARGS` if you need to.)
+
+## Codex CLI
+
+teammate-comms also installs into OpenAI Codex CLI as a plugin (verified on codex-cli
+0.153.4; `codex queue` needs 0.149+; Windows needs Git for Windows so the hook can run
+under Git Bash). Claude Code and Codex sessions on one machine share the same comms root,
+so they message each other with nothing extra to configure.
+
+```bash
+codex plugin marketplace add Haagndaazer/colton-claude-plugins
+codex plugin add teammate-comms@coltondyck
+```
+
+Start Codex once inside any project and **restart it**: the first session's hook registers
+the MCP server with `codex mcp add` at user level, builds the plugin venv and tells you to
+restart (a newly installed hook also skips the session that trusts it). From the next
+session on the `teammate_*` tools are available and the session-start context hands the
+agent its thread id and project directory.
+
+**Register with your thread id.** Codex gives the MCP server no session or project
+information, so a Codex agent registers with
+`teammate_register(agent: "Cx", harness_session: "<thread id>", project_dir: "<dir>")` —
+the thread id is `$CODEX_THREAD_ID` in the agent's shell and is repeated in the
+session-start context. Without `harness_session` the agent can send and read but cannot be
+woken; the register result says so. `teammate_list` shows `harness: codex`.
+
+**How the wake works.** The agent's own teammate-comms server watches its inbox exactly as
+on Claude Code, but delivers the wake by running `codex queue --thread <id> --message …`:
+an idle Codex session starts a new turn within a second or two; a busy one takes the
+message as its next turn. The queue is durable, so there is no re-nudge backoff on Codex.
+Wake breadcrumbs (`wake-emit harness=codex rc=…`) go to the server's stderr.
+
+`teammate_reincarnate` on Codex needs `TEAMMATE_REINCARNATE_ENABLED=1` on the
+`teammate-comms` MCP entry (`codex mcp add … --env`), because Codex's MCP child
+environment is an allowlist; the spawned Codex teammate gets its name from the launch
+prompt and registers itself.
+
+Uninstall:
+
+```bash
+codex mcp remove teammate-comms
+codex plugin remove teammate-comms@coltondyck
+codex plugin marketplace remove coltondyck
+rm -rf ~/.codex/plugins/data/teammate-comms-coltondyck/
+```
+
+Developers can install the current `main` via this repo's own dev marketplace:
+`codex plugin marketplace add Haagndaazer/teammate-comms` then
+`codex plugin add teammate-comms@teammate-comms-dev`. Remove the dev marketplace once the
+`coltondyck` pin carries the version you want (Codex de-duplicates first-seen-wins).
+
+Per-surface parity is tracked in [docs/PARITY.md](docs/PARITY.md).
 
 ## Troubleshooting
 

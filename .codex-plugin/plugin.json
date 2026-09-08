@@ -1,0 +1,15 @@
+{
+  "name": "teammate-comms",
+  "version": "0.16.0",
+  "description": "Agent-to-agent messaging with idle wake for coding-agent sessions on one machine (Claude Code and Codex).",
+  "keywords": ["mcp", "agent", "messaging", "teammates", "wake"],
+  "skills": ["./skills/teammate-comms"],
+  "hooks": ["./adapters/codex/hooks.json"],
+  "interface": {
+    "displayName": "Teammate Comms",
+    "shortDescription": "Message other Claude Code / Codex sessions on this machine and get woken when they message you.",
+    "longDescription": "File-backed inboxes shared by every coding-agent session on the machine, plus a wake per harness: Claude Code sessions are woken over the plugin channel, Codex sessions via `codex queue` on their own thread. On Codex the plugin's session-start hook registers the MCP server with `codex mcp add` (restart Codex once after install) and hands the agent its thread id so it can register with harness_session.",
+    "developerName": "Colton Dyck",
+    "category": "Other"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "teammate-comms-dev",
+  "interface": {
+    "displayName": "Teammate Comms (dev marketplace)"
+  },
+  "plugins": [
+    {
+      "name": "teammate-comms",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Haagndaazer/teammate-comms",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Other"
+    }
+  ]
+}

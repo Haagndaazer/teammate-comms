@@ -427,6 +427,234 @@ def test_wp44_ac7_reaction_drop_not_retired():
               f"tautology[AC-7]: dropped reaction wake retried later (got {runner.calls})")
 
 
+LITERAL_BASELINE = {
+    "__init__.py": 1, "avatars.py": 1, "channel.py": 19, "comms.py": 8, "dashboard.py": 0,
+    "deliver.py": 2, "server.py": 9, "spawn.py": 29, "tools.py": 6,
+}
+SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
+                   "$teammate-comms", "codex")
+
+
+def test_wp45_ac1_manifest_parity():
+    claude = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    codex = json.loads((REPO / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    check(claude["name"] == codex["name"] == "teammate-comms", "AC-1: manifest names agree")
+    check(claude["version"] == codex["version"], "AC-1: manifest versions agree")
+    check(f'version = "{codex["version"]}"' in pyproject, "AC-1: pyproject version matches manifests")
+    for key in ("skills", "hooks"):
+        for rel in codex.get(key, []):
+            check(rel.startswith("./"), f"AC-1: codex manifest path must start with ./ ({rel})")
+            check((REPO / rel).exists(), f"AC-1: codex manifest path exists ({rel})")
+    check("mcpServers" not in codex and "channels" not in codex,
+          "AC-1: codex manifest ships no MCP server or channel (hook-managed registration)")
+    hooks = json.loads((REPO / "adapters" / "codex" / "hooks.json").read_text(encoding="utf-8"))
+    handler = hooks["hooks"]["SessionStart"][0]["hooks"][0]
+    win = handler["commandWindows"]
+    check('"' not in win and win.endswith("session-start.cmd"), "AC-1: commandWindows is one unquoted path")
+    market = json.loads((REPO / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
+    src = market["plugins"][0]["source"]
+    check(src["source"] in ("local", "url", "git-subdir", "npm"), "AC-1: marketplace source tag is one Codex accepts")
+
+
+def test_wp45_ac2_parity_completeness():
+    parity = (REPO / "docs" / "PARITY.md").read_text(encoding="utf-8")
+    rows = {ln.split("|")[1].strip() for ln in parity.splitlines() if ln.startswith("| ")}
+    for tool in tools_mod.TOOL_DEFINITIONS:
+        check(tool["name"] in rows, f"AC-2: PARITY.md lacks a row for tool {tool['name']}")
+    for script in sorted((REPO / "hooks").glob("*.sh")):
+        check(f"hooks/{script.name}" in rows, f"AC-2: PARITY.md lacks a row for hooks/{script.name}")
+    for ln in parity.splitlines():
+        if not ln.startswith("| ") or ln.startswith("| Surface") or ln.startswith("|---"):
+            continue
+        cells = [c.strip() for c in ln.strip("|").split("|")]
+        if any(c in ("partial", "waived") for c in cells[1:3]):
+            check(bool(cells[3]), f"AC-2: non-full row needs a note ({cells[0]})")
+
+
+def test_wp45_ac3_skill_lint():
+    text = (REPO / "skills" / "teammate-comms" / "SKILL.md").read_text(encoding="utf-8")
+    check("## Harness notes" in text, "AC-3: SKILL.md has a Harness notes section")
+    body = text.split("## Harness notes")[0].lower()
+    for word in SKILL_FORBIDDEN:
+        check(word not in body, f"AC-3: harness literal {word!r} outside Harness notes")
+    check("harness_session" in text, "AC-3: SKILL documents harness_session")
+
+
+def test_wp45_ac4_literal_ratchet():
+    import re
+    pat = re.compile(r"codex|claude", re.IGNORECASE)
+    for path in sorted((SRC / "teammate_comms").glob("*.py")):
+        if path.name == "harness.py":
+            continue
+        n = len(pat.findall(path.read_text(encoding="utf-8")))
+        base = LITERAL_BASELINE.get(path.name)
+        check(base is not None, f"AC-4: no literal baseline for {path.name}")
+        if base is not None:
+            check(n <= base, f"AC-4: {path.name} has {n} harness literals, baseline {base} — "
+                             f"move the fact into harness.py or raise the baseline deliberately")
+
+
+def _bash():
+    import shutil
+    b = shutil.which("bash")
+    if b and "system32" in b.lower():
+        for cand in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
+            if Path(cand).exists():
+                return cand
+        return None
+    return b
+
+
+def _posix(path):
+    import subprocess
+    bash = _bash()
+    if os.name != "nt" or not bash:
+        return str(path)
+    r = subprocess.run([bash, "-c", f'cygpath -u "{path}"'], capture_output=True, text=True)
+    return r.stdout.strip() or str(path)
+
+
+def test_wp45_ac5_codex_hook_shell():
+    import subprocess
+    bash = _bash()
+    if not bash:
+        print("(bash absent — skipping) ", end="")
+        return
+    td, root = _make_root()
+    with td:
+        rig = root / "rig"
+        (rig / "bin").mkdir(parents=True)
+        data = rig / "data"
+        posix_rig = _posix(rig)
+        for name, body in (("codex", f'#!/usr/bin/env bash\necho "CODEX: $*" >> "{posix_rig}/codex.log"\nexit 0\n'),
+                           ("uv", f'#!/usr/bin/env bash\necho "UV: $*" >> "{posix_rig}/uv.log"\nexit 0\n')):
+            p = rig / "bin" / name
+            p.write_text(body, encoding="utf-8", newline="\n")
+            p.chmod(0o755)
+        script = _posix(REPO / "adapters" / "codex" / "hooks" / "session-start.sh")
+        env = dict(os.environ)
+        env.update({"PATH": str(rig / "bin") + os.pathsep + env.get("PATH", ""),
+                    "CLAUDE_PLUGIN_ROOT": str(REPO), "CLAUDE_PLUGIN_DATA": str(data)})
+        env.pop("TEAMMATE_HOOK_NOTE", None)
+        env.pop("UV_PROJECT_ENVIRONMENT", None)
+
+        def run(payload):
+            return subprocess.run([bash, script], input=payload, capture_output=True, text=True,
+                                  env=env, timeout=120)
+
+        r1 = run('{"session_id":"01a08231-8f03-7120-9cac-06f6570eb99d","cwd":"E:\\\\E Drive Projects\\\\x","source":"startup"}')
+        check(r1.returncode == 0, f"AC-5: first run exits 0 ({r1.stderr[-300:]})")
+        out = json.loads(r1.stdout)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        check("thread_id=01a08231-8f03-7120-9cac-06f6570eb99d" in ctx, "AC-5: note carries the thread id")
+        check("project_dir=E:\\E Drive Projects\\x" in ctx, f"AC-5: note carries the unescaped cwd ({ctx[:120]})")
+        check("restart Codex once" in ctx, "AC-5: first run carries the restart note")
+        log = (rig / "codex.log").read_text(encoding="utf-8") if (rig / "codex.log").exists() else ""
+        calls = [ln for ln in log.splitlines() if ln.startswith("CODEX: mcp add teammate-comms")]
+        check(len(calls) == 1, f"AC-5: exactly one codex mcp add ({log!r})")
+        check(calls and "--env TEAMMATE_HARNESS=codex" in calls[0] and "--project" in calls[0]
+              and calls[0].rstrip().endswith("python -m teammate_comms.server"),
+              f"AC-5: registration argv shape ({calls[:1]})")
+        check((data / "codex-mcp.stamp").exists(), "AC-5: stamp written after registration")
+        check(data.is_dir(), "AC-5: hook creates the plugin data dir")
+
+        r2 = run('{"session_id":"0000-1111","cwd":"/home/x/we \\"q\\" dir","source":"resume"}')
+        ctx2 = json.loads(r2.stdout)["hookSpecificOutput"]["additionalContext"]
+        check('project_dir=/home/x/we "q" dir' in ctx2, f"AC-5: quoted POSIX cwd round-trips ({ctx2[:120]})")
+        check("restart Codex once" not in ctx2, "AC-5: no restart note when the stamp matches")
+        log = (rig / "codex.log").read_text(encoding="utf-8")
+        check(log.count("mcp add") == 1, "tautology[AC-5]: stamp match spawns no second codex mcp add")
+
+        r3 = run('{"session_id":"0000-2222","cwd":"/tmp","source":"compact"}')
+        check(r3.stdout.strip() == "{}", f"AC-5: compact source still self-filters to {{}} ({r3.stdout!r})")
+
+        env_plain = dict(env)
+        env_plain.pop("TEAMMATE_HOOK_NOTE", None)
+        r4 = subprocess.run([bash, _posix(REPO / "hooks" / "session-start.sh")], input="",
+                            capture_output=True, text=True, env=env_plain, timeout=120)
+        check(r4.returncode == 0 and (r4.stdout.strip() == "{}" or "restart Claude Code" in r4.stdout),
+              f"AC-5: claude path output unchanged ({r4.stdout[:120]!r})")
+
+
+def test_wp46_ac1_codex_builder_argv():
+    from teammate_comms import spawn as spawn_mod
+    with env_vars(TEAMMATE_LAUNCH_ARGS=None, TEAMMATE_LAUNCH_ARGS_CODEX=None):
+        argv = spawn_mod.build_command("codex", "hello world", "E:/proj dir")
+    check(argv == ["codex", "-a", "never", "--dangerously-bypass-approvals-and-sandbox",
+                   "-C", "E:/proj dir", "hello world"], f"AC-1: codex argv ({argv})")
+    with env_vars(TEAMMATE_LAUNCH_ARGS="claude --channels x", TEAMMATE_LAUNCH_ARGS_CODEX=None):
+        argv = spawn_mod.build_command("codex", "p", "/d")
+        check(argv[0] == "codex" and "--channels" not in argv,
+              "tautology[AC-1]: a Claude launch override never leaks into the codex argv")
+    with env_vars(TEAMMATE_LAUNCH_ARGS_CODEX="codex --profile fast"):
+        argv = spawn_mod.build_command("codex", "p", "/d")
+        check(argv == ["codex", "--profile", "fast", "p"], f"AC-1: codex override replaces the base line ({argv})")
+    with env_vars(TEAMMATE_LAUNCH_ARGS=None):
+        argv = spawn_mod.build_command("claude", "p")
+        check(argv[0] == "claude" and argv[-1] == "p" and "--permission-mode" in argv,
+              f"AC-1: claude builder unchanged ({argv})")
+    try:
+        spawn_mod.build_command("hermes", "p")
+        check(False, "AC-1: unknown builder must raise")
+    except Exception as e:
+        check("No spawn builder" in str(e), "AC-1: unknown builder error names the gap")
+
+
+def test_wp46_ac2_which_check_names_executable():
+    from teammate_comms import spawn as spawn_mod
+    real_popen = spawn_mod.subprocess.Popen
+
+    def forbidden(*a, **k):
+        raise AssertionError("Popen must not run when the executable is missing")
+    spawn_mod.subprocess.Popen = forbidden
+    try:
+        with env_vars(PATH=""):
+            try:
+                spawn_mod.spawn_in_terminal(["codex", "p"], ".", dict(os.environ))
+                check(False, "AC-2: missing codex must raise")
+            except FileNotFoundError as e:
+                check(str(e).startswith("codex CLI not on PATH"), f"AC-2: error names codex ({e})")
+            except AssertionError as e:
+                check(False, f"AC-2: {e}")
+    finally:
+        spawn_mod.subprocess.Popen = real_popen
+
+
+def test_wp46_ac3_reincarnate_codex_prompt():
+    from teammate_comms import spawn as spawn_mod
+    td, root = _make_root()
+    launched = []
+    real_spawn = spawn_mod.spawn_in_terminal
+    spawn_mod.spawn_in_terminal = lambda argv, cwd, env: launched.append((list(argv), str(cwd), dict(env))) or argv
+    try:
+        with td, env_vars(TEAMMATE_REINCARNATE_ENABLED="1", TEAMMATE_HARNESS=None,
+                          TEAMMATE_LAUNCH_ARGS=None, TEAMMATE_LAUNCH_ARGS_CODEX=None):
+            proj = root / "proj"
+            proj.mkdir()
+            ctx = _ctx_for("Lead", None, root)
+            text, is_error = tools_mod.dispatch(
+                "teammate_reincarnate",
+                {"agent": "Codex1", "project_dir": str(proj), "harness": "codex"}, ctx)
+            check(not is_error, f"AC-3: codex reincarnate dispatches ({text[:200]})")
+            check(launched and launched[-1][0][0] == "codex", "AC-3: launches the codex CLI")
+            prompt = launched[-1][0][-1] if launched else ""
+            check("teammate_register(agent='Codex1'" in prompt and "harness_session=" in prompt
+                  and str(proj) in prompt, f"AC-3: prompt carries the register call ({prompt[:160]})")
+            check("Launched on Codex as 'codex'" in text, "AC-3: result names the harness")
+            text, is_error = tools_mod.dispatch(
+                "teammate_reincarnate",
+                {"agent": "Claude1", "project_dir": str(proj)}, ctx)
+            check(not is_error and launched[-1][0][0] == "claude", "AC-3: default harness spawns claude")
+            check("plugin spec" in text, "AC-3: claude result keeps the plugin-spec note")
+            text, is_error = tools_mod.dispatch(
+                "teammate_reincarnate",
+                {"agent": "X", "project_dir": str(proj), "harness": "hermes"}, ctx)
+            check(is_error and "'harness' must be one of" in text, "AC-3: unknown harness rejected")
+    finally:
+        spawn_mod.spawn_in_terminal = real_spawn
+
+
 def main():
     sections = [
         ("WP-43 AC-1: harness table", test_wp43_ac1_harness_table),
@@ -442,6 +670,14 @@ def main():
         ("WP-44 AC-5: re-nudge gate + claude golden", test_wp44_ac5_renudge_gate_and_claude_golden),
         ("WP-44 AC-6: runner failure isolated", test_wp44_ac6_runner_failure_isolated),
         ("WP-44 AC-7: reaction drop not retired", test_wp44_ac7_reaction_drop_not_retired),
+        ("WP-45 AC-1: manifest parity", test_wp45_ac1_manifest_parity),
+        ("WP-45 AC-2: PARITY.md completeness", test_wp45_ac2_parity_completeness),
+        ("WP-45 AC-3: SKILL harness lint", test_wp45_ac3_skill_lint),
+        ("WP-45 AC-4: literal ratchet", test_wp45_ac4_literal_ratchet),
+        ("WP-45 AC-5: codex hook shell", test_wp45_ac5_codex_hook_shell),
+        ("WP-46 AC-1: codex builder argv", test_wp46_ac1_codex_builder_argv),
+        ("WP-46 AC-2: which check names executable", test_wp46_ac2_which_check_names_executable),
+        ("WP-46 AC-3: reincarnate codex prompt", test_wp46_ac3_reincarnate_codex_prompt),
     ]
     for label, fn in sections:
         n_before = len(failures)

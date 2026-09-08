@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.16.0
+
+> **Codex parity.** teammate-comms now installs into OpenAI Codex CLI as a plugin and
+> Claude Code and Codex sessions on one machine message each other with no protocol change.
+> Every harness-specific fact lives in one table (`src/teammate_comms/harness.py`, keyed by
+> `TEAMMATE_HARNESS`); wake delivery is a per-harness strategy chosen by the recipient's own
+> server: Claude Code keeps the channel push, Codex sessions are woken by their own server
+> running `codex queue --thread <id>` (durable, no re-nudge). `teammate_register` gains
+> `harness_session` (the harness's session/thread id — Codex agents pass `$CODEX_THREAD_ID`)
+> and `project_dir`; roster/profile/whoami show a `harness:` line for every non-human record
+> (`(not set)` until an agent re-registers). A same-name re-register no longer re-seeds nudge
+> state. `teammate_reincarnate` gains `harness?` and spawns Codex teammates with the identity
+> in the launch prompt. Packaging mirrors vibe-cognition v0.35.0: `.codex-plugin/plugin.json`,
+> `adapters/codex/` (hook registers the MCP server with `codex mcp add`; one restart after
+> install/update), a dev marketplace at `.agents/plugins/marketplace.json`, `docs/PARITY.md`
+> with a completeness test, and a per-file literal ratchet over `src/`. The shared
+> SessionStart hook honours `UV_PROJECT_ENVIRONMENT` and prefixes an escaped
+> `TEAMMATE_HOOK_NOTE` to every exit. Claude Code output is unchanged except the `harness:`
+> line. Comms root still defaults to `~/.claude` on both harnesses (move planned for v0.17.0).
+
 ## v0.15.0
 
 > **WP-42 — reading is acking.** `teammate_inbox` now immediately moves every message it

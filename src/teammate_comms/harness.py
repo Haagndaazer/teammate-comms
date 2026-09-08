@@ -19,6 +19,7 @@ class Harness:
     skill_invoke: str
     launch_args_var: str
     spawn_builder: str
+    spawn_prompt: str
     install_cta: str
     debug_hint: str
 
@@ -34,6 +35,8 @@ HARNESSES = {
         skill_invoke="/teammate-comms",
         launch_args_var="TEAMMATE_LAUNCH_ARGS",
         spawn_builder="claude",
+        spawn_prompt=("You are {agent}. Call teammate_inbox to drain any queued messages, "
+                      "then await instructions."),
         install_cta="/plugin update teammate-comms@coltondyck",
         debug_hint="~/.claude/debug/<session-id>.txt",
     ),
@@ -50,6 +53,10 @@ HARNESSES = {
         skill_invoke="$teammate-comms",
         launch_args_var="TEAMMATE_LAUNCH_ARGS_CODEX",
         spawn_builder="codex",
+        spawn_prompt=("You are teammate {agent}. First call teammate_register(agent='{agent}', "
+                      "harness_session=<the value of $CODEX_THREAD_ID in your shell>, "
+                      "project_dir='{project_dir}'), then teammate_inbox to drain any queued "
+                      "messages, then await instructions."),
         install_cta="codex plugin marketplace upgrade coltondyck (then restart Codex)",
         debug_hint="the Codex session log",
     ),
