@@ -85,6 +85,22 @@ With Codex1 idle (prompt showing, no turn running):
    Where-Object CommandLine -like '*teammate_comms.server*'` shows two server processes.
    Send each a DM; each wakes independently.
 
+## Phase 5b — comms-root migration (v0.16.0 moves `~/.claude/TeammateComms` → `~/.teammate-comms`)
+
+Precondition: this machine still has `~/.claude/TeammateComms` with live Claude Code
+agents on the OLD plugin version (the roster above).
+1. Start a v0.16.0 server (Codex session from Phase 3, or a Claude Code session loading
+   the branch) while at least one old-version agent is live. Expected: `teammate_whoami`
+   reports `comms_root: …\.claude` with source "legacy root (move … deferred)"; the server
+   log shows `legacy comms root migration: deferred (<names>)`; old and new agents still
+   see each other in `teammate_list`.
+2. Stop every teammate (all Claude Code and Codex sessions), wait 60 s, start one
+   v0.16.0 session. Expected: log shows `migrated (…\.claude\TeammateComms -> …\.teammate-comms\TeammateComms)`;
+   `~/.claude/TeammateComms/` now contains only `MIGRATED.json`; `teammate_whoami` reports
+   `comms_root: …\.teammate-comms`; the roster, groups, and read history are intact.
+3. Start a second session (other harness). Expected: same root; DM round trip works.
+4. `teammate_whoami(verbose=true)` doctor shows `legacy_root: migrated`.
+
 ## Phase 6 — uninstall
 
 ```

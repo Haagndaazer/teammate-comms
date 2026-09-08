@@ -19,11 +19,14 @@ import sys
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import harness as harness_mod
 from .comms import (
+    COMMS_SUBDIR,
     COMPACT_BROKER_SENDER,
     DELETED_MARKER,
+    MIGRATED_MARKER,
     PROFILE_FIELDS,
     PROJECT_FIELDS,
     PROJECT_STATUS,
@@ -50,6 +53,8 @@ from .comms import (
     group_read_positions,
     human_presence_online,
     is_channel_alive,
+    legacy_comms_roots,
+    legacy_repopulated_entries,
     list_project_records,
     new_message_id,
     now_timestamp,
@@ -1092,6 +1097,28 @@ def _doctor_report(root, team):
         except OSError:
             pass                                   # absent / unreadable → omit
     rep["files"] = files
+    legacy = {}
+    for legacy_root in legacy_comms_roots():
+        tree = Path(legacy_root) / COMMS_SUBDIR
+        if (tree / MIGRATED_MARKER).exists():
+            moved = read_json_readonly(tree / MIGRATED_MARKER) or {}
+            extra = legacy_repopulated_entries(legacy_root)
+            if extra:
+                legacy[str(legacy_root)] = (
+                    f"RE-POPULATED after migration to {moved.get('moved_to', '?')} "
+                    f"({', '.join(extra)}) — an old-version instance is still running; its "
+                    f"records are invisible to this team. Stop it, upgrade it, then move "
+                    f"those files into the new root by hand.")
+            else:
+                legacy[str(legacy_root)] = f"migrated to {moved.get('moved_to', '?')}"
+        elif tree.is_dir():
+            if Path(legacy_root) == Path(root):
+                legacy[str(legacy_root)] = "in use (this root); move deferred while agents are live"
+            else:
+                legacy[str(legacy_root)] = (
+                    "BOTH roots exist — this root wins and the legacy tree will never be "
+                    "moved automatically; merge it into this root by hand (see README).")
+    rep["legacy_root"] = legacy or "none"
     unread = {}
     try:
         for f in sorted(get_inboxes_dir(root, team).glob("*_unread.json")):
@@ -1863,7 +1890,7 @@ def _handle_reincarnate(args, ctx):
             f"{harness.launch_args_var}."
         )
     else:
-        override_note = (f"\nLaunched on {harness.display} as {argv[0]!r}; override the launch "
+        override_note = (f"\nLaunched on {harness.display_name} as {argv[0]!r}; override the launch "
                          f"line with {harness.launch_args_var}.")
     return durable_warning + (
         f"Launched a new terminal for teammate {target!r} in {project_dir}.\n"

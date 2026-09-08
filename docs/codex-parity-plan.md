@@ -443,7 +443,32 @@ stopped, migrate, restart, roster intact on both harnesses. ≈ 1.5 days.
    shows a post-compaction case that relied on the reseed, revert to bumping both generations
    and accept the swallow window instead.
 
-## 9. Decisions needed from Colton
+## 8a. Rulings (Colton, 2026-09-08) — supersede §4.5, §4.7, §5/§6 sequencing
+
+1. **Root move is AUTOMATIC** (decision `a4f07bf8007f`): no `migrate-root` command. The
+   first new-version server to start moves `~/.claude/TeammateComms` →
+   `~/.teammate-comms/TeammateComms` when NO agent under the old root is live
+   (`is_channel_alive`) or heartbeat-young (< 60 s), under a `.migrate.lock`; while that
+   guard refuses, new-version servers keep USING the old root (existing-root-wins, so a
+   rolling upgrade never splits the team) and retry on later starts; a `MIGRATED.json`
+   marker at the old location records the move and the doctor reports "legacy root present,
+   move deferred (live agents)" vs "migrated to <root>".
+2. **`CLAUDE_CONFIG_DIR` dropped** (decision `b31ca28ffd89`): explicit arg →
+   `TEAMMATE_COMMS_DIR` → `~/.teammate-comms`; `$CLAUDE_CONFIG_DIR/TeammateComms` is
+   consulted only as a legacy migration SOURCE when the variable is present.
+3. **Renderer adopted now** (decision `ddc42c241326`): `tools/render_harness.py` copied from
+   vibe-cognition `8fc5230` minus its agent-role render targets (no `agents-src` here; the
+   overlapping code is byte-identical and will be re-synced from Vince's WP-P3 commit);
+   its lints carried into `tests/test_codex.py`; `skills-src/teammate-comms/SKILL.md`
+   is the source; renders to `skills/teammate-comms/SKILL.md` (Claude) and
+   `adapters/codex/skills/teammate-comms/SKILL.md` (Codex, manifest points there); the
+   harness table's field names track vibe-cognition's (`display_name`, `skill_prefix` +
+   `skill_invoke()`, `spawn_tool`, `default_models`). §4.5's harness-notes section becomes
+   `{{harness:…}}` blocks; the literal lint moves onto the source.
+4. **One combined release** (decision `34a6e0f1329c`): v0.16.0 ships Codex parity AND the
+   root move; the `harness:` line convention stands. The human gate gains a migration phase.
+
+## 9. Decisions needed from Colton (RULED — kept for the record)
 
 1. WP-47 migration shape: explicit `migrate-root` command that refuses while agents are live
    (recommended) vs. automatic move on first new-version start.

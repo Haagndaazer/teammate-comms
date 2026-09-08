@@ -335,23 +335,81 @@ def _looks_unset(value):
     return not v or ("${" in v and "}" in v)
 
 
+COMMS_SUBDIR = "TeammateComms"
+MIGRATED_MARKER = "MIGRATED.json"
+MIGRATION_YOUNG_SECONDS = 60
+
+
+def default_comms_root():
+    return Path.home() / ".teammate-comms"
+
+
+def legacy_comms_roots():
+    """Roots older versions used, most specific first: ``$CLAUDE_CONFIG_DIR`` then ``~/.claude``."""
+    roots = []
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not _looks_unset(config):
+        roots.append(Path(config.strip()))
+    roots.append(Path.home() / ".claude")
+    return roots
+
+
+def _legacy_tree_pending(root):
+    tree = Path(root) / COMMS_SUBDIR
+    return tree.is_dir() and not (tree / MIGRATED_MARKER).exists()
+
+
+def legacy_repopulated_entries(root):
+    """Names written next to ``MIGRATED.json`` after the move — an old-version server still
+    running writes there and nobody on the new root can see it."""
+    tree = Path(root) / COMMS_SUBDIR
+    if not (tree / MIGRATED_MARKER).exists():
+        return []
+    try:
+        return sorted(p.name for p in tree.iterdir() if p.name != MIGRATED_MARKER)
+    except OSError:
+        return []
+
+
+def _heartbeat_blocks_migration(heartbeat, now):
+    """A missing heartbeat never blocks; an unparsable one always does (fail closed in front
+    of a one-way move); a well-formed one blocks while younger than the migration window."""
+    if not heartbeat:
+        return False
+    try:
+        stamp = datetime.strptime(heartbeat, TIMESTAMP_FMT)
+    except (TypeError, ValueError):
+        return True
+    return (now - stamp).total_seconds() < MIGRATION_YOUNG_SECONDS
+
+
+def _trees_match(src, dst):
+    """Every regular file under ``src`` exists under ``dst`` with the same size."""
+    for path in Path(src).rglob("*"):
+        if not path.is_file():
+            continue
+        target = Path(dst) / path.relative_to(src)
+        try:
+            if not target.is_file() or target.stat().st_size != path.stat().st_size:
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def resolve_comms_root(explicit=None):
     """Resolve the directory under which ``TeammateComms/`` lives.
 
     Order (first hit wins):
       1. ``explicit`` — a comms_dir passed to teammate_register.
       2. ``$TEAMMATE_COMMS_DIR`` — explicit env override (per-project isolation).
-      3. ``$CLAUDE_CONFIG_DIR`` — the user's Claude config dir, if relocated.
-      4. ``~/.claude`` — the default. This is **global by default**: every agent on
-         the machine shares one comms space, so agents in different projects can
-         message each other out of the box. For per-project isolation, set
-         ``$TEAMMATE_COMMS_DIR`` (or pass ``comms_dir``) to the project dir.
+      3. ``~/.teammate-comms`` — the harness-neutral default (global by default: every
+         agent on the machine, on any harness, shares one comms space). Until the legacy
+         ``~/.claude/TeammateComms`` tree has been moved here (``migrate_legacy_root`` at
+         server start, deferred while old-version agents are live), the legacy root keeps
+         winning so a rolling upgrade never splits the team.
 
-    Note: ``$CLAUDE_PROJECT_DIR`` is no longer the default root (that isolated
-    agents per repo) — it is now used only to auto-fill the ``project`` profile
-    field at registration. Always resolves (never raises).
-
-    Returns ``(root: Path, source: str)``.
+    Always resolves (never raises). Returns ``(root: Path, source: str)``.
     """
     if explicit and not _looks_unset(explicit):
         return Path(explicit.strip()), "comms_dir arg"
@@ -360,11 +418,78 @@ def resolve_comms_root(explicit=None):
     if not _looks_unset(override):
         return Path(override.strip()), "TEAMMATE_COMMS_DIR"
 
-    config = os.environ.get("CLAUDE_CONFIG_DIR")
-    if not _looks_unset(config):
-        return Path(config.strip()), "CLAUDE_CONFIG_DIR"
+    new_root = default_comms_root()
+    if not (new_root / COMMS_SUBDIR).is_dir():
+        for legacy in legacy_comms_roots():
+            if _legacy_tree_pending(legacy):
+                return legacy, "legacy root (move to ~/.teammate-comms deferred)"
+    return new_root, "~/.teammate-comms default"
 
-    return Path.home() / ".claude", "~/.claude default"
+
+def _agents_blocking_migration(tree, now):
+    """Names of agents under ``tree`` (any team) that look live or heartbeated recently."""
+    blocking = []
+    for path in sorted(Path(tree).glob("**/agents/*.json")):
+        record = read_json_readonly(path)
+        if not isinstance(record, dict) or record.get("type") == "human":
+            continue
+        if _heartbeat_blocks_migration(record.get("lastHeartbeat"), now):
+            blocking.append(record.get("name") or path.stem)
+    return blocking
+
+
+def migrate_legacy_root(now=None):
+    """Move the first pending legacy ``TeammateComms`` tree to the default root.
+
+    Runs at server start when no explicit root is configured. Refuses (returns
+    ``("deferred", names)``) while any agent under the legacy tree is live or has a heartbeat
+    younger than ``MIGRATION_YOUNG_SECONDS`` — an old-version server could still be writing
+    there. Serialised against other migrating servers by a sibling lock. Returns a
+    ``(status, detail)`` pair: ``skipped`` (override set / nothing pending), ``both-exist``,
+    ``locked``, ``deferred``, ``migrated`` or ``failed``.
+    """
+    if not _looks_unset(os.environ.get("TEAMMATE_COMMS_DIR")):
+        return "skipped", "TEAMMATE_COMMS_DIR set"
+    now = now or datetime.now()
+    new_root = default_comms_root()
+    new_tree = new_root / COMMS_SUBDIR
+    for legacy in legacy_comms_roots():
+        tree = Path(legacy) / COMMS_SUBDIR
+        if not _legacy_tree_pending(legacy):
+            extra = legacy_repopulated_entries(legacy)
+            if extra:
+                return "repopulated", (f"{tree} written after migration ({', '.join(extra)}) — "
+                                       f"an old-version instance is still running; its records "
+                                       f"are invisible to this team")
+            continue
+        if new_tree.exists():
+            return "both-exist", f"{tree} left in place; {new_tree} already exists"
+        with file_lock_optional(Path(legacy) / f"{COMMS_SUBDIR}.migrate", timeout=2) as acquired:
+            if not acquired:
+                return "locked", str(tree)
+            if not _legacy_tree_pending(legacy) or new_tree.exists():
+                return "skipped", "raced: nothing pending"
+            blocking = _agents_blocking_migration(tree, now)
+            if blocking:
+                return "deferred", ", ".join(blocking)
+            try:
+                new_root.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(tree, new_tree)
+                except OSError:
+                    shutil.copytree(tree, new_tree)
+                    if not _trees_match(tree, new_tree):
+                        shutil.rmtree(new_tree, ignore_errors=True)
+                        return "failed", f"{tree}: copy verification failed; legacy tree kept"
+                    shutil.rmtree(tree)
+                tree.mkdir(parents=True, exist_ok=True)
+                write_json_atomic(tree / MIGRATED_MARKER, {
+                    "v": 1, "moved_to": str(new_root), "at": now_timestamp(),
+                })
+            except OSError as exc:
+                return "failed", f"{tree}: {exc}"
+            return "migrated", f"{tree} -> {new_tree}"
+    return "skipped", "nothing pending"
 
 
 def get_inboxes_dir(root, team=None):

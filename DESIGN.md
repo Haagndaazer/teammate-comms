@@ -332,8 +332,14 @@ directory** (itself a git repo), so cwd/git-based resolution would scatter inbox
 into the cache. Resolve in this order, first hit wins:
 1. `comms_dir` arg passed to `teammate_register`.
 2. `$TEAMMATE_COMMS_DIR` (explicit override — use for per-project isolation).
-3. `$CLAUDE_CONFIG_DIR` (the user's Claude config dir, if relocated).
-4. `~/.claude` (the default). Comms live at `<root>/TeammateComms/[<team>/]…`.
+3. `~/.teammate-comms` (the harness-neutral default since 0.16.0). Comms live at
+   `<root>/TeammateComms/[<team>/]…`. `$CLAUDE_CONFIG_DIR` is deliberately NOT consulted
+   (a Codex server never sees it, so honouring it on one harness would split the roster).
+   A pre-0.16.0 tree under `~/.claude` (or `$CLAUDE_CONFIG_DIR`) is moved automatically
+   by `migrate_legacy_root` at server start — only when no agent under it is live or
+   heartbeated within 60 s (ledger 19: an old-version server may still be writing there),
+   under a sibling lock, leaving `MIGRATED.json`; until the move succeeds the legacy root
+   keeps winning resolution so a rolling upgrade never splits the team.
 
 **Global by default (0.3.0).** The default root is the user config dir (`~/.claude`),
 NOT the project dir — so every agent on the machine shares one comms space and agents

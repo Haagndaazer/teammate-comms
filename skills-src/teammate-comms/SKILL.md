@@ -108,7 +108,7 @@ a teammate name.
   wake mechanism (see Harness notes) — a peer's `teammate_send` writes your inbox and
   your own server nudges your live session, even while idle. No polling loop. On startup,
   call `teammate_inbox` once to drain anything that arrived while you were down.
-- **Spawned subagent** (a lead invoked it via the Agent tool): has no
+- **Spawned subagent** (a lead invoked it via the {{spawn_tool}}): has no
   independent session to wake. Its lead nudges it ("check your inbox"); the subagent
   then calls `teammate_inbox`.
 
@@ -155,9 +155,9 @@ other; `teammate_whoami` reports the resolved root.
 
 ## Harness notes
 
-Everything above is harness-neutral. Facts specific to Claude Code:
+Everything above is harness-neutral. Facts specific to {{harness_name}}:
 
-- Wake = the plugin **channel**: a `notifications/claude/channel` event pushed into
+{{harness:claude-code}}- Wake = the plugin **channel**: a `notifications/claude/channel` event pushed into
   your live session. The harness sometimes drops channel pushes (upstream GH #38736
   mid-turn, #61797 at idle), so the watcher re-nudges still-unseen messages on a capped
   backoff (120 s, 240 s, 480 s — 3 attempts). If every attempt is dropped the message
@@ -171,4 +171,21 @@ Everything above is harness-neutral. Facts specific to Claude Code:
 - `project` auto-fills from `$CLAUDE_PROJECT_DIR`; `harness_session` is not needed.
 - Spawned subagents are woken by their lead's `SendMessage`.
 - Server stderr lands in `~/.claude/debug/<session-id>.txt`; `/mcp` shows connection
-  status. Invoke this skill as `/teammate-comms`.
+  status. Invoke this skill as `{{invoke:teammate-comms}}`.{{/harness}}{{harness:codex}}- Wake = your own server runs `codex queue --thread <your thread id>` with the wake
+  text, which starts a new turn when you are idle and waits until your current turn ends
+  otherwise. Durable — nothing is dropped, so there is no re-nudge. The wake arrives as
+  a short user turn ("📬 N new message(s) from …"); call `teammate_inbox` and carry on.
+- You MUST register with `harness_session` set to your thread id — it is
+  `$CODEX_THREAD_ID` in your shell environment and is also handed to you in the
+  session-start context — and `project_dir` set to your project directory, because the
+  MCP server receives neither from the harness. Without `harness_session` you can send
+  and read but nobody can wake you (the register result says so).
+- Install: `codex plugin marketplace add Haagndaazer/colton-claude-plugins` then
+  `codex plugin add teammate-comms@coltondyck`; start the harness once in any project and
+  restart it (the first session's hook registers the MCP server with `codex mcp add`).
+  A newly installed hook also skips the session that trusts it. Invoke this skill as
+  `{{invoke:teammate-comms}}`.
+- `teammate_reincarnate` here requires `TEAMMATE_REINCARNATE_ENABLED=1` on the
+  `teammate-comms` MCP entry (`codex mcp add … --env`), not in your shell; a spawned
+  teammate gets its name from the launch prompt and registers itself.
+- Server stderr is in the harness's session log.{{/harness}}

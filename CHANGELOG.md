@@ -18,7 +18,16 @@
 > with a completeness test, and a per-file literal ratchet over `src/`. The shared
 > SessionStart hook honours `UV_PROJECT_ENVIRONMENT` and prefixes an escaped
 > `TEAMMATE_HOOK_NOTE` to every exit. Claude Code output is unchanged except the `harness:`
-> line. Comms root still defaults to `~/.claude` on both harnesses (move planned for v0.17.0).
+> line. The skill is rendered per harness from `skills-src/` by `tools/render_harness.py`
+> (copied from vibe-cognition) with a drift test.
+>
+> **Breaking — comms root moves to `~/.teammate-comms`.** `$CLAUDE_CONFIG_DIR` no longer
+> selects the root. The first 0.16.0 server that starts while no old-version agent is live
+> (no heartbeat within 60 s) moves `~/.claude/TeammateComms` to the new root automatically
+> and leaves `MIGRATED.json` behind; until then 0.16.0 servers keep using the legacy root so
+> a rolling upgrade never splits the team. `teammate_whoami verbose` reports `legacy_root`.
+> External tooling that hardcoded `~/.claude/TeammateComms` (the compaction broker's
+> `--comms-dir`, dashboards) must follow the new root.
 
 ## v0.15.0
 

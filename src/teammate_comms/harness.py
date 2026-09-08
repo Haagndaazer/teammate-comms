@@ -1,38 +1,49 @@
-"""Harness table: every harness-specific fact lives here, keyed by ``TEAMMATE_HARNESS``."""
+"""Harness policy table: every fact that differs between the agent harnesses this plugin
+runs under, resolved once from TEAMMATE_HARNESS. Field names track vibe-cognition's
+harness.py so the shared renderer stays a verbatim copy."""
 
 import os
 import sys
 from dataclasses import dataclass
 
+CLAUDE_CODE = "claude-code"
+CODEX = "codex"
 ENV_VAR = "TEAMMATE_HARNESS"
-DEFAULT = "claude-code"
+DEFAULT = CLAUDE_CODE
 
 
 @dataclass(frozen=True)
 class Harness:
     name: str
-    display: str
+    display_name: str
+    skill_prefix: str
+    spawn_tool: str
+    default_models: dict
     wake: str
     durable_wake: bool
     needs_session: bool
     session_hint: str
-    skill_invoke: str
     launch_args_var: str
     spawn_builder: str
     spawn_prompt: str
     install_cta: str
     debug_hint: str
 
+    def skill_invoke(self, skill):
+        return f"{self.skill_prefix}{skill}"
+
 
 HARNESSES = {
-    "claude-code": Harness(
-        name="claude-code",
-        display="Claude Code",
+    CLAUDE_CODE: Harness(
+        name=CLAUDE_CODE,
+        display_name="Claude Code",
+        skill_prefix="/",
+        spawn_tool="Agent tool",
+        default_models={"small": "haiku", "mid": "sonnet"},
         wake="channel",
         durable_wake=False,
         needs_session=False,
         session_hint="",
-        skill_invoke="/teammate-comms",
         launch_args_var="TEAMMATE_LAUNCH_ARGS",
         spawn_builder="claude",
         spawn_prompt=("You are {agent}. Call teammate_inbox to drain any queued messages, "
@@ -40,9 +51,12 @@ HARNESSES = {
         install_cta="/plugin update teammate-comms@coltondyck",
         debug_hint="~/.claude/debug/<session-id>.txt",
     ),
-    "codex": Harness(
-        name="codex",
-        display="Codex",
+    CODEX: Harness(
+        name=CODEX,
+        display_name="Codex",
+        skill_prefix="$",
+        spawn_tool="`spawn_agent` tool",
+        default_models={"small": None, "mid": None},
         wake="codex-queue",
         durable_wake=True,
         needs_session=True,
@@ -50,7 +64,6 @@ HARNESSES = {
             "Re-register with harness_session set to your thread id (from the session-start "
             "context or $CODEX_THREAD_ID) so teammates can wake you."
         ),
-        skill_invoke="$teammate-comms",
         launch_args_var="TEAMMATE_LAUNCH_ARGS_CODEX",
         spawn_builder="codex",
         spawn_prompt=("You are teammate {agent}. First call teammate_register(agent='{agent}', "

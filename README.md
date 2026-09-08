@@ -423,18 +423,26 @@ recovered either, past a capped number of retries).
   shortcut, if `$TEAMMATE_AGENT` (and optionally `$TEAMMATE_TEAM`) is set in the
   environment, the server auto-registers with it at startup. Diagnostics (resolved
   identity, comms root, collisions) are logged to `~/.claude/debug/<session-id>.txt`.
-- **Storage root** is **global by default** so agents in different projects can
-  message each other out of the box. Resolved as the `comms_dir` passed to
-  `teammate_register` → else `$TEAMMATE_COMMS_DIR` → else `$CLAUDE_CONFIG_DIR` → else
-  `~/.claude`. Messages live at `<root>/TeammateComms/[<team>/]inboxes/`; two
+- **Storage root** is **global by default** so agents in different projects (and on
+  different harnesses) can message each other out of the box. Resolved as the
+  `comms_dir` passed to `teammate_register` → else `$TEAMMATE_COMMS_DIR` → else
+  `~/.teammate-comms`. Messages live at `<root>/TeammateComms/[<team>/]inboxes/`; two
   instances must share a root. `teammate_whoami` reports which won. For **per-project
   isolation**, set `$TEAMMATE_COMMS_DIR` (or pass `comms_dir`) to the project dir.
-  `$CLAUDE_PROJECT_DIR` is no longer the default root — it now only auto-fills the
-  `project` profile field.
-  > **Migration note (0.3.0):** the default changed from per-project
-  > (`$CLAUDE_PROJECT_DIR`) to global (`~/.claude`). Inboxes created under an old
-  > project root won't be seen at the new global root — re-register, or set
-  > `$TEAMMATE_COMMS_DIR` to keep the old per-project location.
+  `$CLAUDE_PROJECT_DIR` is not the root — it only auto-fills the `project` profile field.
+  > **Migration note (0.16.0):** the default moved from `~/.claude` to the
+  > harness-neutral `~/.teammate-comms`, and `$CLAUDE_CONFIG_DIR` no longer influences
+  > the root (a Codex server can never see it). The move is automatic: the first 0.16.0
+  > server to start while **no** old-version agent is live (no heartbeat in the last 60 s)
+  > moves `~/.claude/TeammateComms` (or `$CLAUDE_CONFIG_DIR/TeammateComms`) to the new
+  > root and leaves a `MIGRATED.json` marker behind. Until then every 0.16.0 server keeps
+  > using the legacy root, so a rolling upgrade never splits the team; `teammate_whoami
+  > verbose` shows the state under `legacy_root`. Stop all sessions once to trigger it.
+  > Two states need a hand: **re-populated** (an old-version session started *after* the
+  > move and wrote beside `MIGRATED.json` — stop it, upgrade it, then move those files
+  > into `~/.teammate-comms/TeammateComms/`) and **both roots exist** (a new-version
+  > session created the new root before the legacy tree appeared — merge the legacy tree
+  > into the new one by hand, then delete it). The doctor names both explicitly.
 
 ### Environment variables (reference)
 
@@ -448,7 +456,8 @@ recovered either, past a capped number of retries).
 | `TEAMMATE_LAUNCH_ARGS` | Overrides the ENTIRE `claude` spawn line `teammate_reincarnate` uses for a child, verbatim — bypasses managed-settings/allowlist auto-detection. |
 | `TEAMMATE_PLUGIN_MARKETPLACE` | Overrides the marketplace name `teammate_reincarnate` uses when building a child's plugin spec (`plugin:teammate-comms@<marketplace>`) — for a fork/rehost published under a different marketplace than `coltondyck`. Falls back to a best-effort guess from `$CLAUDE_PLUGIN_ROOT`, then to `coltondyck`. |
 | `TEAMMATE_AVATARS_ENABLED=1` | Set before Claude Code launches to sync Pillow (the `images` extra) so `teammate_set_avatar` works — see [Avatars](#avatars-optional). |
-| `CLAUDE_CONFIG_DIR` | If your Claude config lives somewhere non-default, the comms root follows it (see precedence above). |
+| `CLAUDE_CONFIG_DIR` | No longer selects the comms root (since 0.16.0). Read only as a legacy migration source; set `TEAMMATE_COMMS_DIR` if you relocated your comms. |
+| `TEAMMATE_HARNESS` | Selects the harness policy row (`claude-code` default, `codex`); the Codex hook sets it on the MCP entry. Never set it by hand under Claude Code. |
 | `CLAUDE_PROJECT_DIR` | Set by Claude Code itself; auto-fills the `project` profile field at registration (no longer the storage root, since 0.3.0). |
 
 ### Cross-host transports
@@ -483,8 +492,9 @@ commit SHA):
 ## Uninstall & upgrade
 
 `/plugin uninstall` removes the plugin code but **does not touch your comms data** —
-everything teammate-comms wrote lives under `~/.claude/TeammateComms/` (or wherever
-`$TEAMMATE_COMMS_DIR` pointed) and stays behind:
+everything teammate-comms wrote lives under `~/.teammate-comms/TeammateComms/` (or
+wherever `$TEAMMATE_COMMS_DIR` pointed; `~/.claude/TeammateComms/` before 0.16.0) and
+stays behind:
 
 - `[<team>/]inboxes/` — every agent's `_unread.json`/`_read.json` message queues, plus
   per-agent `_pending.json` (fan-out recovery lane) and `_seen.json` (durable

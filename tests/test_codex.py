@@ -433,8 +433,8 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 
 LITERAL_BASELINE = {
-    "__init__.py": 1, "avatars.py": 1, "channel.py": 17, "comms.py": 8, "dashboard.py": 0,
-    "deliver.py": 2, "server.py": 9, "spawn.py": 29, "tools.py": 6,
+    "__init__.py": 1, "avatars.py": 1, "channel.py": 17, "comms.py": 5, "dashboard.py": 0,
+    "deliver.py": 1, "server.py": 9, "spawn.py": 29, "tools.py": 6,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
                    "$teammate-comms", "codex")
@@ -668,6 +668,218 @@ def test_wp46_ac3_reincarnate_codex_prompt():
         spawn_mod.spawn_in_terminal = real_spawn
 
 
+@contextlib.contextmanager
+def fake_home():
+    td, home = _make_root()
+    with td, env_vars(HOME=str(home), USERPROFILE=str(home), HOMEDRIVE=None, HOMEPATH=None,
+                      TEAMMATE_COMMS_DIR=None, CLAUDE_CONFIG_DIR=None):
+        yield home
+
+
+STALE = "2020-01-01T00:00:00.000000"
+
+
+def _plant_agent(root, name, heartbeat):
+    write_agent_record(root, None, name, type="full", channel=True, lastHeartbeat=heartbeat,
+                       pid=999999, host="elsewhere")
+
+
+def test_wp47_ac1_resolution_order():
+    from teammate_comms import comms as comms_mod
+    with fake_home() as home:
+        root, source = comms_mod.resolve_comms_root(None)
+        check(root == home / ".teammate-comms" and "default" in source,
+              f"AC-1: fresh machine resolves to ~/.teammate-comms ({root}, {source})")
+        with env_vars(CLAUDE_CONFIG_DIR=str(home / "cfg")):
+            root, _ = comms_mod.resolve_comms_root(None)
+            check(root == home / ".teammate-comms",
+                  "tautology[AC-1]: CLAUDE_CONFIG_DIR alone no longer selects the root")
+        with env_vars(TEAMMATE_COMMS_DIR=str(home / "iso")):
+            root, source = comms_mod.resolve_comms_root(None)
+            check(root == home / "iso" and source == "TEAMMATE_COMMS_DIR", "AC-1: env override wins")
+        (home / ".claude" / "TeammateComms" / "agents").mkdir(parents=True)
+        root, source = comms_mod.resolve_comms_root(None)
+        check(root == home / ".claude" and "deferred" in source,
+              f"AC-1: pending legacy tree wins while the new root is empty ({root}, {source})")
+        (home / ".teammate-comms" / "TeammateComms").mkdir(parents=True)
+        root, _ = comms_mod.resolve_comms_root(None)
+        check(root == home / ".teammate-comms", "AC-1: an existing new tree wins over a pending legacy one")
+
+
+def test_wp47_ac2_migration_moves_when_idle():
+    from teammate_comms import comms as comms_mod
+    with fake_home() as home:
+        legacy = home / ".claude"
+        _plant_agent(legacy, "Old", STALE)
+        (legacy / "TeammateComms" / "inboxes").mkdir(parents=True)
+        (legacy / "TeammateComms" / "inboxes" / "Old_unread.json").write_text("[]", encoding="utf-8")
+        status, detail = comms_mod.migrate_legacy_root()
+        check(status == "migrated", f"AC-2: stale-only legacy tree migrates ({status}: {detail})")
+        new_tree = home / ".teammate-comms" / "TeammateComms"
+        check((new_tree / "agents" / "Old.json").exists() and (new_tree / "inboxes" / "Old_unread.json").exists(),
+              "AC-2: records and inboxes arrive under the new root")
+        marker = legacy / "TeammateComms" / "MIGRATED.json"
+        check(marker.exists() and json.loads(marker.read_text(encoding="utf-8")).get("moved_to") == str(home / ".teammate-comms"),
+              "AC-2: MIGRATED.json names the new root")
+        check(sorted(p.name for p in (legacy / "TeammateComms").iterdir()) == ["MIGRATED.json"],
+              "AC-2: the legacy tree holds only the marker afterwards")
+        root, source = comms_mod.resolve_comms_root(None)
+        check(root == home / ".teammate-comms" and "default" in source, "AC-2: resolution follows the move")
+        status, _ = comms_mod.migrate_legacy_root()
+        check(status == "skipped", f"AC-2: second run is a no-op ({status})")
+        _plant_agent(legacy, "ReviveOld", comms_mod.now_timestamp())
+        status, detail = comms_mod.migrate_legacy_root()
+        check(status == "repopulated" and "agents" in detail,
+              f"tautology[AC-2]: records written beside the marker are reported, not hidden ({status}: {detail})")
+        rep = tools_mod._doctor_report(home / ".teammate-comms", None)
+        check("RE-POPULATED" in str(rep.get("legacy_root", {}).get(str(legacy), "")),
+              f"AC-2: doctor shouts about the re-populated legacy tree ({rep.get('legacy_root')})")
+
+
+def test_wp47_ac3_migration_deferred_while_live():
+    from teammate_comms import comms as comms_mod
+    from teammate_comms.comms import now_timestamp
+    with fake_home() as home:
+        legacy = home / ".claude"
+        _plant_agent(legacy, "Live", now_timestamp())
+        status, detail = comms_mod.migrate_legacy_root()
+        check(status == "deferred" and "Live" in detail,
+              f"tautology[AC-3]: a fresh heartbeat under the legacy root defers the move ({status}: {detail})")
+        check((legacy / "TeammateComms" / "agents" / "Live.json").exists()
+              and not (home / ".teammate-comms" / "TeammateComms").exists(),
+              "AC-3: nothing moved while deferred")
+        root, source = comms_mod.resolve_comms_root(None)
+        check(root == legacy and "deferred" in source, "AC-3: servers keep using the legacy root meanwhile")
+        check(not (legacy / "TeammateComms.migrate.lock").exists(), "AC-3: migration lock released")
+    with fake_home() as home:
+        _plant_agent(home / ".claude", "Garbled", "not-a-timestamp")
+        status, detail = comms_mod.migrate_legacy_root()
+        check(status == "deferred" and "Garbled" in detail,
+              f"tautology[AC-3]: an unparsable heartbeat blocks the move (fail closed) ({status})")
+    with fake_home() as home:
+        _plant_agent(home / ".claude", "NoBeat", None)
+        status, _ = comms_mod.migrate_legacy_root()
+        check(status == "migrated", f"AC-3: a record with no heartbeat never blocks ({status})")
+
+
+def test_wp47_ac4_migration_edge_cases():
+    from teammate_comms import comms as comms_mod
+    with fake_home() as home:
+        legacy = home / ".claude"
+        _plant_agent(legacy, "Old", STALE)
+        (home / ".teammate-comms" / "TeammateComms").mkdir(parents=True)
+        status, _ = comms_mod.migrate_legacy_root()
+        check(status == "both-exist" and (legacy / "TeammateComms" / "agents" / "Old.json").exists(),
+              f"AC-4: both trees present -> nothing moved ({status})")
+        rep = tools_mod._doctor_report(home / ".teammate-comms", None)
+        check("BOTH roots exist" in str(rep.get("legacy_root", {}).get(str(legacy), "")),
+              f"AC-4: doctor distinguishes the permanent both-exist state ({rep.get('legacy_root')})")
+    with fake_home() as home:
+        legacy = home / ".claude"
+        _plant_agent(legacy, "Old", STALE)
+        real_replace, real_copytree = comms_mod.os.replace, comms_mod.shutil.copytree
+
+        def cross_volume(src, dst, *args, **kw):
+            if Path(src) == legacy / "TeammateComms":
+                raise OSError("EXDEV")
+            return real_replace(src, dst, *args, **kw)
+
+        def lossy_copytree(src, dst, *args, **kw):
+            result = real_copytree(src, dst, *args, **kw)
+            if Path(src) == legacy / "TeammateComms":
+                (Path(dst) / "agents" / "Old.json").unlink()
+            return result
+        comms_mod.os.replace, comms_mod.shutil.copytree = cross_volume, lossy_copytree
+        try:
+            status, detail = comms_mod.migrate_legacy_root()
+        finally:
+            comms_mod.os.replace, comms_mod.shutil.copytree = real_replace, real_copytree
+        check(status == "failed" and "verification" in detail,
+              f"tautology[AC-4]: a lossy copy is detected before the source is deleted ({status}: {detail})")
+        check((legacy / "TeammateComms" / "agents" / "Old.json").exists()
+              and not (home / ".teammate-comms" / "TeammateComms").exists(),
+              "AC-4: legacy tree kept, partial copy removed")
+        comms_mod.os.replace = cross_volume
+        try:
+            status, _ = comms_mod.migrate_legacy_root()
+        finally:
+            comms_mod.os.replace = real_replace
+        check(status == "migrated" and (home / ".teammate-comms" / "TeammateComms" / "agents" / "Old.json").exists(),
+              f"AC-4: a verified cross-volume copy migrates ({status})")
+    with fake_home() as home:
+        _plant_agent(home / ".claude", "Old", STALE)
+        with env_vars(TEAMMATE_COMMS_DIR=str(home / "iso")):
+            status, _ = comms_mod.migrate_legacy_root()
+            check(status == "skipped", f"AC-4: TEAMMATE_COMMS_DIR set -> migration skipped ({status})")
+    with fake_home() as home:
+        status, _ = comms_mod.migrate_legacy_root()
+        check(status == "skipped", f"AC-4: nothing pending -> skipped ({status})")
+
+
+def test_wp47_ac5_doctor_reports_legacy_state():
+    from teammate_comms import comms as comms_mod
+    with fake_home() as home:
+        legacy = home / ".claude"
+        _plant_agent(legacy, "Old", STALE)
+        rep = tools_mod._doctor_report(legacy, None)
+        check(str(rep.get("legacy_root", {}).get(str(legacy), "")).startswith("in use (this root)"),
+              f"AC-5: doctor reports the legacy root in use ({rep.get('legacy_root')})")
+        comms_mod.migrate_legacy_root()
+        rep = tools_mod._doctor_report(home / ".teammate-comms", None)
+        check(str(rep.get("legacy_root", {}).get(str(legacy), "")).startswith("migrated to"),
+              f"AC-5: doctor reports the migration ({rep.get('legacy_root')})")
+
+
+RENDER_FORBIDDEN = ("Claude Code", "Codex", "/teammate-comms", "$teammate-comms", "SendMessage",
+                    "spawn_agent", "Agent tool", "CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT",
+                    "/plugin update", "codex plugin")
+
+
+def _render_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("render_harness", REPO / "tools" / "render_harness.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_wp48_ac1_render_drift_and_tokens():
+    import re
+    rh = _render_module()
+    problems = rh.render_all(check=True)
+    check(not problems, f"AC-1: rendered files match their sources ({problems})")
+    targets = rh.targets()
+    check(len(targets) == 2, f"AC-1: one skill renders to two harness files ({len(targets)})")
+    claude = harness_mod.HARNESSES[harness_mod.CLAUDE_CODE]
+    codex = harness_mod.HARNESSES[harness_mod.CODEX]
+    src = rh.SKILLS_SRC / "teammate-comms" / "SKILL.md"
+    text = src.read_text(encoding="utf-8")
+    block = re.compile(r"\{\{harness:([a-z-]+)\}\}.*?\{\{/harness\}\}", re.DOTALL)
+    check(bool(block.search(text)), "AC-1: the source uses at least one harness block")
+    out_c, out_x = rh.render_text(text, claude), rh.render_text(text, codex)
+    check(out_c != out_x, "tautology[AC-1]: harness blocks change the output")
+    check("{{" not in out_c and "{{" not in out_x, "AC-1: no leftover tokens")
+    check("`$teammate-comms`" in out_x and "`/teammate-comms`" in out_c, "AC-1: invoke token renders per harness")
+    stripped = block.sub("", text)
+    for lit in RENDER_FORBIDDEN:
+        check(lit not in stripped, f"AC-1: harness literal {lit!r} outside a harness block in the source")
+    check(not re.search(r"haiku|sonnet", stripped, re.IGNORECASE), "AC-1: no model names in the source")
+    desc = out_x.split("---")[1] if out_x.startswith("---") else ""
+    check(0 < len(desc) < 1024, "AC-1: codex description within the skill-list budget")
+    for name in ("{{bogus}}", "{{harness:codex}}{{harness:codex}}x{{/harness}}{{/harness}}", "x{{/harness}}"):
+        try:
+            rh.render_text(name, codex)
+            check(False, f"AC-1: renderer must reject {name!r}")
+        except rh.RenderError:
+            pass
+    rendered = sorted(p.parent.name for p in (REPO / "skills").glob("*/SKILL.md"))
+    sources = sorted(p.parent.name for p in rh.SKILLS_SRC.glob("*/SKILL.md"))
+    check(rendered == sources, f"AC-1: no orphan rendered skill ({rendered} vs {sources})")
+    codex_manifest = json.loads((REPO / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    check(codex_manifest["skills"] == ["./adapters/codex/skills/teammate-comms"],
+          "AC-1: codex manifest points at the codex render")
+
+
 def main():
     sections = [
         ("WP-43 AC-1: harness table", test_wp43_ac1_harness_table),
@@ -691,6 +903,12 @@ def main():
         ("WP-46 AC-1: codex builder argv", test_wp46_ac1_codex_builder_argv),
         ("WP-46 AC-2: which check names executable", test_wp46_ac2_which_check_names_executable),
         ("WP-46 AC-3: reincarnate codex prompt", test_wp46_ac3_reincarnate_codex_prompt),
+        ("WP-47 AC-1: root resolution order", test_wp47_ac1_resolution_order),
+        ("WP-47 AC-2: migration moves when idle", test_wp47_ac2_migration_moves_when_idle),
+        ("WP-47 AC-3: migration deferred while live", test_wp47_ac3_migration_deferred_while_live),
+        ("WP-47 AC-4: migration edge cases", test_wp47_ac4_migration_edge_cases),
+        ("WP-47 AC-5: doctor legacy state", test_wp47_ac5_doctor_reports_legacy_state),
+        ("WP-48 AC-1: renderer drift + tokens", test_wp48_ac1_render_drift_and_tokens),
     ]
     for label, fn in sections:
         n_before = len(failures)

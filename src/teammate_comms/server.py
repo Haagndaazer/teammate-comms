@@ -39,6 +39,7 @@ from .comms import (
     get_inboxes_dir,
     heartbeat_fresh,
     is_channel_alive,
+    migrate_legacy_root,
     now_timestamp,
     read_agent_record,
     read_json_readonly,
@@ -679,6 +680,12 @@ def main():
     # the diagnostic anchor for "was this session running stale code" in the debug log
     # (~/.claude/debug/<session>.txt).
     log(f"starting teammate-comms v{__version__}")
+    try:
+        status, detail = migrate_legacy_root()
+        if status != "skipped":
+            log(f"legacy comms root migration: {status} ({detail})")
+    except Exception as exc:
+        log(f"legacy comms root migration skipped: {exc}")
     _write_plugin_runtime_pointer()
 
     ctx = {"identity": _identity, "register": register_identity,
