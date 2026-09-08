@@ -27,6 +27,7 @@ RE-NUDGES still-unseen unread with capped exponential backoff (see ``compute_ree
 """
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -124,16 +125,18 @@ class CodexQueueWaker:
 
     name = "codex-queue"
 
-    def __init__(self, session, runner=None, timeout=CODEX_QUEUE_TIMEOUT_SECONDS):
+    def __init__(self, session, runner=None, timeout=CODEX_QUEUE_TIMEOUT_SECONDS, exe=None):
         self._session = session
         self._runner = runner or subprocess.run
         self._timeout = timeout
+        self._exe = exe or shutil.which("codex")
         self._lock = threading.Lock()
         self._thread = None
         self._busy_logged = False
+        self._missing_logged = False
 
     def argv(self, content):
-        return ["codex", "queue", "--thread", self._session, "--message", content]
+        return [self._exe, "queue", "--thread", self._session, "--message", content]
 
     def _run(self, argv):
         outcome = "rc=?"
@@ -148,6 +151,12 @@ class CodexQueueWaker:
         print(f"[teammate-comms] wake-emit harness=codex {outcome}", file=sys.stderr, flush=True)
 
     def wake(self, content, meta):
+        if not self._exe:
+            if not self._missing_logged:
+                self._missing_logged = True
+                print("[teammate-comms] wake disabled: codex CLI not on PATH (install it or fix "
+                      "PATH; wakes resume on the next registration)", file=sys.stderr, flush=True)
+            return False
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 if not self._busy_logged:
@@ -165,7 +174,7 @@ class CodexQueueWaker:
 WAKERS = {ChannelWaker.name: ChannelWaker, CodexQueueWaker.name: CodexQueueWaker}
 
 
-def make_waker(harness, session, send_message, runner=None):
+def make_waker(harness, session, send_message, runner=None, exe=None):
     """Build the waker for ``harness``; None when it needs a session id and has none."""
     if harness.wake == ChannelWaker.name:
         return ChannelWaker(send_message)
@@ -174,7 +183,7 @@ def make_waker(harness, session, send_message, runner=None):
     cls = WAKERS.get(harness.wake)
     if cls is None:
         return None
-    return cls(session, runner=runner)
+    return cls(session, runner=runner, exe=exe)
 
 
 def compute_reaction_wakes(reactions, known_ids, agent):
