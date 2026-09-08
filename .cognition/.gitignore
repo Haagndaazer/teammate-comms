@@ -5,3 +5,4 @@ chromadb/
 .last-rehydrate.json
 onboard-declined
 last-seen.json*
+backfill-identity-map.skeleton.json
