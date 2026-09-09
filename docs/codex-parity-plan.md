@@ -276,7 +276,9 @@ Frontmatter `description` becomes harness-neutral.
 ### 4.6 Reincarnate on Codex (`spawn.py`, `tools.py`)
 
 - `spawn.py` gains `build_codex_command(prompt, project_dir)` →
-  `["codex", "-C", project_dir, "-a", "never", "--dangerously-bypass-approvals-and-sandbox", prompt]`
+  `[<resolved codex shim>, "--dangerously-bypass-approvals-and-sandbox", "-C", project_dir, prompt]`
+  (gate finding: `-a never` cannot be combined with the bypass flag; the shim is resolved
+  with `shutil.which` because Windows Terminal cannot launch a bare `codex`)
   and `SPAWN_BUILDERS = {"claude": build_claude_command, "codex": build_codex_command}`.
   `_handle_reincarnate` picks the builder from `harness.current().spawn_builder`, overridable
   by a new optional `harness` arg (validated against `HARNESSES`).
