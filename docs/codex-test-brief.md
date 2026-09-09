@@ -75,7 +75,8 @@ With Codex1 idle (prompt showing, no turn running):
    `💬 <name> 👍 reacted to your message(s).`
 6. Codex → Claude: `Send Silvie a message saying "hello from Codex"`. Expected: the Claude
    session wakes via its channel and reads it.
-7. Server stderr: locate the teammate-comms server log Codex keeps (record the path) and
+7. Server stderr: Codex keeps MCP server stderr in `~/.codex/logs_2.sqlite`; query the
+   most recent rows (they are per session — filter by time, not by the first match) and
    confirm lines `wake-emit kind=fresh harness=codex` and `harness=codex rc=0`.
 
 ## Phase 5 — reincarnate + concurrency

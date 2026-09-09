@@ -647,8 +647,9 @@ def test_wp46_ac1_codex_builder_argv():
     import shutil
     with env_vars(TEAMMATE_LAUNCH_ARGS=None, TEAMMATE_LAUNCH_ARGS_CODEX=None, PATH=""):
         argv = spawn_mod.build_command("codex", "hello world", "E:/proj dir")
-    check(argv == ["codex", "-a", "never", "--dangerously-bypass-approvals-and-sandbox",
+    check(argv == ["codex", "--dangerously-bypass-approvals-and-sandbox",
                    "-C", "E:/proj dir", "hello world"], f"AC-1: codex argv ({argv})")
+    check("-a" not in argv, "tautology[AC-1]: -a cannot be combined with the bypass flag (gate finding)")
     resolved = shutil.which("codex")
     if resolved:
         with env_vars(TEAMMATE_LAUNCH_ARGS_CODEX=None):
