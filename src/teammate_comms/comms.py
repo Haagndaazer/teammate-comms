@@ -185,6 +185,11 @@ def validate_agent_name(name, param=None):
     """
     if not name and param:
         raise CommsError(f"'{param}' is required (a teammate name).")
+    if isinstance(name, str) and "@" in name:
+        raise CommsError(
+            f"{name!r} names a teammate on another machine; this only works for a teammate "
+            f"on this machine (a bare name)."
+        )
     if not isinstance(name, str) or not AGENT_NAME_PATTERN.match(name) or ".." in name:
         raise CommsError(
             f"Invalid agent name {name!r}. Use alphanumerics, hyphens, "
@@ -714,6 +719,8 @@ def delete_group(root, team, group):
 
 def ensure_inbox(inboxes_dir, agent):
     """Create ``<agent>_unread.json`` / ``_read.json`` if they don't exist."""
+    if "@" in str(agent):
+        raise CommsError(f"{agent!r} is on another machine and has no inbox here.")
     inboxes_dir.mkdir(parents=True, exist_ok=True)
     for suffix in ("_unread.json", "_read.json"):
         filepath = inboxes_dir / f"{agent}{suffix}"
@@ -1003,6 +1010,8 @@ def tombstone_in_inbox(root, team, member, msg_id, deleted_by):
     which protects ``_read.json`` with the unread lock; locking each file separately would
     race a move). Lock-then-read so ``read_json_safe``'s reset-corrupt-to-[] can't clobber a
     concurrent partial write. Writes a file only when it actually changed. -> found in either?"""
+    if "@" in str(member):
+        return False
     inboxes_dir = get_inboxes_dir(root, team)
     unread_file = inboxes_dir / f"{member}_unread.json"
     read_file = inboxes_dir / f"{member}_read.json"
@@ -1047,6 +1056,8 @@ def remove_group_messages_from_inbox(root, team, member, sigil):
     rejected. The residual is accepted as eventually-consistent (the dashboard omits the absent
     group on reload; ``resolve_message``'s group-dir fallback finds nothing). Both inbox files
     under the unread lock; writes only on change."""
+    if "@" in str(member):
+        return
     inboxes_dir = get_inboxes_dir(root, team)
     unread_file = inboxes_dir / f"{member}_unread.json"
     read_file = inboxes_dir / f"{member}_read.json"
@@ -1340,6 +1351,9 @@ def group_read_positions(root, team, group, members):
     inboxes_dir = get_inboxes_dir(root, team)
     positions = {}
     for member in members:
+        if "@" in str(member):
+            positions[member] = None
+            continue
         msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
         ids = [m.get("id") for m in msgs
                if isinstance(m, dict) and m.get("group") == sigil and m.get("id")
@@ -1355,6 +1369,8 @@ def group_read_has_unseen_acks(root, team, group, members):
     sigil = group if str(group).startswith("#") else f"#{group}"
     inboxes_dir = get_inboxes_dir(root, team)
     for member in members:
+        if "@" in str(member):
+            continue
         msgs = read_json_readonly(inboxes_dir / f"{member}_read.json") or []
         if any(isinstance(m, dict) and m.get("group") == sigil and m.get("acked_unseen")
                for m in msgs):
@@ -2042,3 +2058,48 @@ def read_deletions(root, team=None, since=None, limit=1000, oldest_first=False):
     except (FileNotFoundError, OSError):
         return []
     return _window(out, limit, oldest_first)
+
+
+RELAY_SENDER = "comms-relay"
+MACHINE_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def get_relay_dir(root):
+    """``<root>/TeammateComms/relay`` — not team-namespaced."""
+    return Path(root) / "TeammateComms" / "relay"
+
+
+def validate_machine_name(name, param=None):
+    """Return the lowercased machine name; raise CommsError if it is not a DNS label."""
+    if not isinstance(name, str) or not name.strip():
+        raise CommsError(f"'{param or 'machine'}' is required (a Tailscale machine name).")
+    machine = name.strip().lower()
+    if not MACHINE_NAME_PATTERN.match(machine):
+        raise CommsError(
+            f"Invalid machine name {name!r}. Use the Tailscale machine name: letters, "
+            f"digits and hyphens only."
+        )
+    _check_reserved_name(machine, "Machine name")
+    return machine
+
+
+def is_remote(name):
+    return isinstance(name, str) and "@" in name
+
+
+def split_address(value):
+    """``name`` -> (name, None); ``name@machine`` -> (name, machine)."""
+    if isinstance(value, str) and "@" in value:
+        name, _, machine = value.partition("@")
+        return name, machine
+    return value, None
+
+
+def validate_address(value, param=None):
+    """Validate ``name`` or ``name@machine``; return it with the machine lowercased."""
+    name, machine = split_address(value)
+    if machine is None:
+        validate_agent_name(name, param=param)
+        return name
+    validate_agent_name(name, param=param)
+    return f"{name}@{validate_machine_name(machine, param=param)}"

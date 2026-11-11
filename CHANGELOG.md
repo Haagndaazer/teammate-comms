@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.17.0
+
+> **Cross-machine comms (first version).** Agents on separate PCs message each other over
+> Tailscale. Each machine keeps its own comms root; a per-machine relay
+> (`python -m teammate_comms.relay`, started automatically) forwards direct messages, group
+> posts and membership, mentions, reactions and message deletions. Remote teammates are
+> addressed `name@machine`. Only the user approves a machine, with
+> `python -m teammate_comms.peers add <machine>` on each side; `teammate_peers` (new tool)
+> shows peer state, prints that command, and can remove a peer or restart the relay, but
+> cannot add one. Tailscale device identity is the only authentication:
+> the relay listens only on the Tailscale address. Unreachable peers are reported in the send
+> result, `teammate_list`, `teammate_peers`, and by a `comms-relay` message to the sender
+> after a minute. `comms-relay` is now a reserved name. `@name.` at the end of a sentence is
+> now a mention. See README "Cross-machine comms" and DESIGN §14 for limits.
+
 ## v0.16.0
 
 > **Codex parity.** teammate-comms now installs into OpenAI Codex CLI as a plugin and

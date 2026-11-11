@@ -58,6 +58,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `project_profile` | `key?` | Full detail for one project: all fields, provenance, live roster with liveness. `key` defaults to your project. |
 | `project_delete` | `key?` | Remove a project profile. |
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
+| `teammate_peers` | `action?` (`list`\|`remove`\|`restart`), `machine?` | Show and manage the other machines this one exchanges messages with over Tailscale; teammates there are addressed `name@machine`. `list` shows each peer's state, why it is unreachable if it is, and the command the user runs to approve a machine. Approving is reserved for the user: there is no `add` action. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -256,6 +257,80 @@ unset — this happened once via a `setx` demo, which is exactly why this warnin
 If the gate ends up durably set anyway, `teammate_reincarnate` detects it (Windows-only,
 best-effort via the registry) and warns on every call naming the fix — but detection
 isn't prevention, so the safe habit is: set it per-launch, never durably.
+
+## Cross-machine comms (Tailscale)
+
+Agents on separate PCs can message each other. Each machine keeps its own local comms
+root; a small **relay** process per machine forwards messages between them over
+[Tailscale](https://tailscale.com). Tailscale is required: it provides the encryption and
+is the only thing that proves which machine is talking, so the relay listens only on the
+machine's Tailscale address and never on the local network.
+
+**Set up** (once per pair of machines, both on the same tailnet):
+
+1. On the desktop, **you** run the approval command with `add laptop`.
+2. On the laptop, you run it with `add desktop`.
+
+The command is `<python> -m teammate_comms.peers add <machine>`, using the Python of the
+installed plugin. You do not have to work that path out: ask any registered session to call
+`teammate_peers()` and it prints the full command for that machine, ready to paste (in Claude
+Code, type `!` followed by the command to run it yourself in the session). The same command
+with `list` or `remove <machine>` shows or removes peers.
+
+Approving a machine is deliberately **not** an agent tool: only the user decides which
+machines may exchange messages, and agents are told not to run the command or edit the peers
+file. This is a guard rail, not a sandbox: an agent that has shell or file access on your
+account is technically able to do both.
+
+`machine` is the device's Tailscale name (`teammate_peers()` lists the devices it can see).
+Approval is mutual: a machine only accepts connections from machines in its own list. The
+relay starts by itself when peers are configured and a session registers.
+
+**Use.** A teammate on another machine is `name@machine`:
+
+```
+teammate_send(to:"bob@laptop", message:"...")
+teammate_group(action:"create", group:"design", members:["bob@laptop"])
+teammate_profile(agent:"bob@laptop")
+```
+
+`teammate_list` shows each peer machine, whether it is reachable, and its teammates. Direct
+messages, group chats (posts, join/leave/add, delete), `@name@machine` mentions, reactions
+and message deletion all cross machines. A message sent while the other machine is off is
+queued on disk and delivered when it returns.
+
+**When something is wrong you are told.** The send result says so, `teammate_list` and
+`teammate_peers` show the reason, and if a message is still undelivered after a minute the
+sender is woken by a message from `comms-relay` (and again once nothing is left waiting).
+Reasons are specific: Tailscale not connected on this machine, the other machine offline, its
+Tailscale key expired, its relay not answering (often a firewall), or this machine not
+approved there. The product does not require any particular Tailscale settings.
+
+**Firewall.** Only one of the two machines needs to accept an inbound connection; messages
+flow both ways over it. If neither does, allow inbound TCP 47821 from Tailscale. On Windows,
+as administrator:
+
+```
+netsh advfirewall firewall add rule name="teammate-comms relay" dir=in action=allow protocol=TCP localport=47821 remoteip=100.64.0.0/10
+```
+
+**Limits of this first version.**
+
+- A peer machine is trusted to speak for every name on it; it cannot speak for names on
+  any other machine. Only link machines you control.
+- Not relayed yet: read receipts for remote members, project profiles, group history from
+  before a machine joined, and the dashboard's roster of remote teammates (their messages
+  do appear).
+- Team namespaces (`team:`) cannot use cross-machine comms.
+- Machines sharing a group must be peered with each other directly; nothing is forwarded
+  through a third machine. A post names any member it could not be sent to for that reason.
+- Once a machine's last member leaves a group, a member on a machine still in the group has
+  to add someone from it again; it cannot rejoin by itself.
+- A dashboard-operator delete of someone else's message stays on the machine it was done on.
+- Reactions and deletes across machines need the transcript on (`TEAMMATE_TRANSCRIPT` unset).
+- Message ids are local-time based, so id *ordering* across machines needs matching time
+  zones and synced clocks. Delivery and wake do not depend on it.
+- Spawning or removing a teammate on another machine is deliberately not possible.
 
 ## Two wake regimes
 
@@ -457,12 +532,21 @@ recovered either, past a capped number of retries).
 | `TEAMMATE_PLUGIN_MARKETPLACE` | Overrides the marketplace name `teammate_reincarnate` uses when building a child's plugin spec (`plugin:teammate-comms@<marketplace>`) — for a fork/rehost published under a different marketplace than `coltondyck`. Falls back to a best-effort guess from `$CLAUDE_PLUGIN_ROOT`, then to `coltondyck`. |
 | `TEAMMATE_AVATARS_ENABLED=1` | Set before Claude Code launches to sync Pillow (the `images` extra) so `teammate_set_avatar` works — see [Avatars](#avatars-optional). |
 | `CLAUDE_CONFIG_DIR` | No longer selects the comms root (since 0.16.0). Read only as a legacy migration source; set `TEAMMATE_COMMS_DIR` if you relocated your comms. |
+| `TEAMMATE_RELAY_PORT` | Port the cross-machine relay listens on and dials (default 47821). A peer on a different port is set per peer in `relay/peers.json` (`{"port": N}`). |
+| `TEAMMATE_TAILSCALE_BIN` | Path to the `tailscale` command if it is not on PATH or in its default install location. |
+| `TEAMMATE_RELAY_AUTOSTART=0` | Stops sessions from starting the relay themselves; run `python -m teammate_comms.relay` yourself instead. |
 | `TEAMMATE_HARNESS` | Selects the harness policy row (`claude-code` default, `codex`); the Codex hook sets it on the MCP entry. Never set it by hand under Claude Code. |
 | `CLAUDE_PROJECT_DIR` | Set by Claude Code itself; auto-fills the `project` profile field at registration (no longer the storage root, since 0.3.0). |
 
 ### Cross-host transports
 
-teammate-comms needs its comms root on a **real shared filesystem that honors atomic
+**To link machines, use [Cross-machine comms](#cross-machine-comms-tailscale)**, where each machine
+keeps its own root. Pointing two machines at one shared root is a different, older setup with
+known hazards: liveness and ordering compare each machine's local clock and time zone, a lock
+held by a process that died on the other machine is never reclaimed, and the other machine
+gets the whole registry, not just messaging.
+
+If you share a root anyway, it must be a **real shared filesystem that honors atomic
 rename** (`os.replace`) — every write (registry records, inboxes, locks) depends on
 that atomicity for correctness.
 
@@ -523,4 +607,5 @@ the latest tagged release.
 
 ```bash
 uv run --no-dev python tests/test_handshake.py    # drives the server end-to-end
+uv run --no-dev python tests/test_relay.py        # cross-machine relay, two relays on loopback
 ```

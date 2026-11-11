@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import harness as harness_mod
+from . import relay as relay_mod
 from .comms import (
     COMMS_SUBDIR,
     COMPACT_BROKER_SENDER,
@@ -53,6 +54,7 @@ from .comms import (
     group_read_positions,
     human_presence_online,
     is_channel_alive,
+    is_remote,
     legacy_comms_roots,
     legacy_repopulated_entries,
     list_project_records,
@@ -71,11 +73,14 @@ from .comms import (
     remove_agent,
     remove_group_messages_from_inbox,
     remove_project_record,
+    split_address,
     strip_member_from_groups,
     tombstone_in_group_messages,
     tombstone_in_inbox,
+    validate_address,
     validate_agent_name,
     validate_group_name,
+    validate_machine_name,
     validate_profile_field,
     validate_project_dir,
     validate_project_field,
@@ -625,6 +630,34 @@ TOOL_DEFINITIONS = [
             "required": ["target"],
         },
     },
+    {
+        "name": "teammate_peers",
+        "description": (
+            "Manage which other machines this one exchanges messages with. Cross-machine "
+            "comms run over Tailscale: a peer is another device on the same tailnet, named by "
+            "its Tailscale machine name, and BOTH machines must add each other. Teammates on a "
+            "peer are then addressed as name@machine in teammate_send, teammate_profile and "
+            "group member lists, and appear in teammate_list. action=list (default) shows "
+            "each peer's state, the tailnet devices that could be added, and the command the "
+            "user runs to approve one; remove drops a peer; restart restarts this machine's "
+            "relay. Approving a machine is reserved for the user: there is no add action, and "
+            "you must not run the approval command or edit the peers file yourself."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "remove", "restart"],
+                    "description": "What to do (default list).",
+                },
+                "machine": {
+                    "type": "string",
+                    "description": "Tailscale machine name of the peer (for remove).",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -696,48 +729,79 @@ def _clean_post_type(value):
     return value
 
 
-_MENTION_RE = re.compile(r"@([a-zA-Z0-9][a-zA-Z0-9._-]*)")
+_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9._@-])@([a-zA-Z0-9][a-zA-Z0-9._-]*(?:@[A-Za-z0-9][A-Za-z0-9-]*)?)")
 
 
-def _parse_mentions(content, members):
-    """Extract @name tokens from the body, keep only actual group members (no phantom
-    mentions of non-members), de-duped + order-preserved."""
+def _parse_mentions(content, members, me=None):
+    """Extract @name / @name@machine tokens from the body, keep only actual group members
+    (no phantom mentions of non-members), de-duped + order-preserved."""
     members = set(members or [])
     seen, out = set(), []
-    for name in _MENTION_RE.findall(content or ""):
-        if name in members and name not in seen:
-            seen.add(name)
-            out.append(name)
+    for token in _MENTION_RE.findall(content or ""):
+        name, machine = split_address(token)
+        if machine is None:
+            candidates = [name, name.rstrip("._-")]
+        else:
+            machine = machine.lower().rstrip("-")
+            candidates = [name if machine == me else f"{name}@{machine}"]
+        for cand in candidates:
+            if cand in members:
+                if cand not in seen:
+                    seen.add(cand)
+                    out.append(cand)
+                break
     return out
 
 
-def send_dm(root, team, sender, to, message, priority="normal", post_type=None, reply_to=None):
-    """Core: deliver a 1:1 DM as ``sender``; return a dict for the wrapper to format.
+_NO_TEAM_RELAY = "Cross-machine comms are not available inside a team namespace yet."
 
-    Sender-explicit (not derived from any MCP identity) so the dashboard can post AS
-    the human. Writes the recipient's inbox (the delivery guarantee, which wakes a
-    live recipient via their own channel watcher), THEN tees the global transcript
-    (best-effort, LAST — observability never precedes or delays delivery).
-    """
-    validate_agent_name(to, param="to")
-    if to == sender:
+
+def _resolve_address(root, team, value, param):
+    """Validate ``name`` or ``name@machine`` -> ``(name, machine)``; machine is None when local."""
+    name, machine = split_address(validate_address(value, param=param))
+    if machine is None or machine == relay_mod.self_machine(root):
+        return name, None
+    if team:
+        raise CommsError(_NO_TEAM_RELAY)
+    peers = relay_mod.read_peers(root)
+    if machine not in peers:
         raise CommsError(
-            "Cannot send to yourself. teammate_send targets another teammate; "
-            "use teammate_inbox to read your own messages."
+            f"{machine!r} is not an approved peer machine (approved: "
+            f"{', '.join(sorted(peers)) or 'none'}). "
+            f"{relay_mod.approval_hint(root, machine)}"
         )
-    content = _clean_message(message)
-    priority = _clean_priority(priority)
-    pt = _clean_post_type(post_type)
+    return name, machine
 
+
+def _remote_machines(names):
+    return sorted({m for m in (split_address(n)[1] for n in names if n) if m})
+
+
+def _relay_out(root, team, machines, kind, payload, sender):
+    """Queue one event per approved machine; return the machines it was NOT queued for
+    (not an approved peer here, or the queue is full)."""
+    if team or not machines:
+        return []
+    peers = relay_mod.read_peers(root)
+    failed = []
+    for machine in machines:
+        if machine not in peers:
+            failed.append(machine)
+            continue
+        try:
+            relay_mod.enqueue(root, machine, kind, payload, sender=sender)
+        except (CommsError, OSError):
+            failed.append(machine)
+    relay_mod.ensure_relay(root)
+    return failed
+
+
+def deliver_dm_record(root, team, record, to):
+    """Write a prepared DM record into ``to``'s local inbox, then tee the transcript."""
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, to)
     unread_file = inboxes_dir / f"{to}_unread.json"
-
-    record = {"id": new_message_id(), "from": sender, "priority": priority, "message": content}
-    if pt:
-        record["post_type"] = pt  # additive: flows to inbox + NDJSON transcript
-    if isinstance(reply_to, str) and reply_to.strip():
-        record["reply_to"] = reply_to.strip()  # unvalidated hint (a citation)
     with file_lock(unread_file):
         messages = read_json_safe(unread_file)
         messages.append(record)
@@ -750,6 +814,42 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
 
     append_transcript(root, team, {**record, "to": to, "kind": "dm"})  # tee LAST
     return {"id": record["id"], "to": to, "to_type": to_type, "live": live}
+
+
+def send_dm(root, team, sender, to, message, priority="normal", post_type=None, reply_to=None):
+    """Core: deliver a 1:1 DM as ``sender``; return a dict for the wrapper to format.
+
+    Sender-explicit (not derived from any MCP identity) so the dashboard can post AS
+    the human. A local recipient's inbox is written directly (which wakes a live
+    recipient via their own channel watcher); a ``name@machine`` recipient is queued for
+    the relay. The global transcript is teed LAST either way.
+    """
+    name, machine = _resolve_address(root, team, to, "to")
+    target = name if machine is None else f"{name}@{machine}"
+    if target == sender:
+        raise CommsError(
+            "Cannot send to yourself. teammate_send targets another teammate; "
+            "use teammate_inbox to read your own messages."
+        )
+    content = _clean_message(message)
+    priority = _clean_priority(priority)
+    pt = _clean_post_type(post_type)
+
+    record = {"id": new_message_id(), "from": sender, "priority": priority, "message": content}
+    if pt:
+        record["post_type"] = pt  # additive: flows to inbox + NDJSON transcript
+    if isinstance(reply_to, str) and reply_to.strip():
+        record["reply_to"] = reply_to.strip()  # unvalidated hint (a citation)
+    if machine is None:
+        return deliver_dm_record(root, team, record, name)
+
+    relay_mod.enqueue(root, machine, "dm", {"record": record, "to": target}, sender=sender)
+    append_transcript(root, team, {**record, "to": target, "kind": "dm"})
+    started = relay_mod.ensure_relay(root)
+    entry = relay_mod.remote_agent(root, name, machine)
+    return {"id": record["id"], "to": target, "to_type": "remote",
+            "live": bool(entry and entry.get("live")),
+            "name": name, "machine": machine, "relay": started}
 
 
 def _handle_send(args, ctx):
@@ -765,6 +865,12 @@ def _handle_send(args, ctx):
 
     res = send_dm(root, team, agent, to, args.get("message"), args.get("priority", "normal"),
                   post_type=args.get("post_type"), reply_to=args.get("reply_to"))
+
+    if res["to_type"] == "remote":
+        lines = [f"Message queued for {res['to']} (id: {res['id']}); the relay carries it "
+                 f"to {res['machine']}."]
+        lines += relay_mod.delivery_report(root, res["name"], res["machine"], res["relay"])
+        return "\n".join(lines)
 
     lines = [f"Message sent to {to} (id: {res['id']})."]
     if res["to_type"] == "full":
@@ -1047,8 +1153,57 @@ def _handle_list(args, ctx):
             mark = " (member)" if _agent in members else ""
             group_rows.append(f"  - #{gp.name}{mark}: {len(members)} member(s) — {', '.join(members) or '(none)'}")
     if group_rows:
-        return teammates + "\n\nGroups:\n" + "\n".join(group_rows)
+        teammates += "\n\nGroups:\n" + "\n".join(group_rows)
+    remote_rows = _remote_roster_rows(root, team, my_project, my_project_norm, show_all)
+    if remote_rows:
+        teammates += "\n\n" + "\n".join(remote_rows)
     return teammates
+
+
+def _remote_roster_rows(root, team, my_project, my_project_norm, show_all):
+    if team:
+        return []
+    peers = relay_mod.read_peers(root)
+    if not peers:
+        return []
+    status = relay_mod.read_status(root)
+    rows = ["Remote teammates (address them as name@machine):"]
+    for machine in sorted(peers):
+        view = relay_mod.peer_view(root, machine, status)
+        roster = relay_mod.read_roster(root, machine)
+        current = view["ok"] and relay_mod.roster_fresh(roster)
+        if view["ok"]:
+            rows.append(f"  {machine}: reachable")
+        else:
+            waiting = f" {view['queued']} event(s) waiting." if view["queued"] else ""
+            rows.append(f"  {machine}: ⚠️ NOT REACHABLE — {view['text']}{waiting}")
+        agents = [e for e in (roster or {}).get("agents") or [] if isinstance(e, dict)]
+        if not agents:
+            rows.append("      (no roster received from it yet)")
+        hidden = 0
+        for entry in agents:
+            project = entry.get("project") or ""
+            if not show_all and my_project and project:
+                norm = _norm_project_label(project)
+                if (norm != my_project_norm if norm is not None and my_project_norm is not None
+                        else project != my_project):
+                    hidden += 1
+                    continue
+            state = ("live" if entry.get("live") else "offline") if current else "unknown"
+            address = f"{entry.get('name')}@{machine}"
+            if entry.get("type") == "human":
+                presence = {"live": "online", "offline": "away"}.get(state, "unknown")
+                rows.append(f"    - {address}: type=human 🧑 (operator), presence={presence}")
+            else:
+                rows.append(f"    - {address}: type={entry.get('type', 'full')}, channel={state}")
+            rows.append(f"        project:   {project or '(not set)'}")
+            rows.append(f"        status:    {entry.get('status') or '(not set)'}")
+            rows.append(f"        authority: {entry.get('authority') or '(not set)'}")
+            if entry.get("role"):
+                rows.append(f"        role:      {entry['role']}")
+        if hidden:
+            rows.append(f"      ({hidden} teammate(s) in other projects omitted — pass all=True.)")
+    return rows
 
 
 def _doctor_report(root, team):
@@ -1245,11 +1400,28 @@ def _format_profile(record, name, is_self=False, root=None, team=None):
     return "\n".join(lines)
 
 
+def _format_remote_profile(root, name, machine):
+    entry = relay_mod.remote_agent(root, name, machine)
+    view = relay_mod.peer_view(root, machine)
+    if entry is None:
+        raise CommsError(f"No teammate named {name!r} is known on {machine}. {view['text']}")
+    current = view["ok"] and relay_mod.roster_fresh(relay_mod.read_roster(root, machine))
+    state = ("live" if entry.get("live") else "offline") if current else "unknown"
+    lines = [f"Profile: {name}@{machine}", f"  {'type:':<13}{entry.get('type', 'full')}",
+             f"  {'machine:':<13}{machine}", f"  {'channel:':<13}{state}",
+             f"  {'harness:':<13}{entry.get('harness') or '(not set)'}"]
+    for field in PROFILE_FIELDS:
+        lines.append(f"  {field + ':':<13}{entry.get(field) or '(not set)'}")
+    return "\n".join(lines)
+
+
 def _handle_profile(args, ctx):
     agent, team, root = _require_registered(ctx)
     target = args.get("agent")
     if target is not None:
-        validate_agent_name(target)
+        target, machine = _resolve_address(root, team, target, "agent")
+        if machine is not None:
+            return _format_remote_profile(root, target, machine)
     else:
         target = agent
     record = read_agent_record(root, team, target)
@@ -1333,12 +1505,19 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
         record["post_type"] = pt  # additive: flows to inbox + group transcript + NDJSON
     # @mentions: shared list on the one record; each member's own watcher checks if IT is
     # mentioned (no per-member records). Only real members (no phantoms).
-    mentions = _parse_mentions(content, members)
+    mentions = _parse_mentions(content, members, relay_mod.self_machine(root))
     if mentions:
         record["mentions"] = mentions
     if isinstance(reply_to, str) and reply_to.strip():
         record["reply_to"] = reply_to.strip()  # unvalidated hint (a citation)
+    return post_group_record(root, team, group, record, members, meta=meta)
 
+
+def post_group_record(root, team, group, record, members, _relay=True, meta=None):
+    """Append a prepared group record, fan it out to local members, and queue it for the
+    machines of remote members (``_relay=False`` when the record itself arrived by relay)."""
+    sigil = f"#{group}"
+    sender = record["from"]
     # Group transcript is the canonical, ordered source of truth — write it first.
     append_group_message(root, team, group, record)
 
@@ -1347,7 +1526,7 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
     inboxes_dir = get_inboxes_dir(root, team)
     delivered, live, deferred, pended = [], 0, [], []
     for member in members:
-        if member == sender:
+        if member == sender or is_remote(member):
             continue
         try:
             ensure_inbox(inboxes_dir, member)
@@ -1375,9 +1554,22 @@ def send_group(root, team, sender, to_sigil, message, priority="normal", post_ty
             except CommsError:
                 deferred.append(member)  # both locks contended — never raise, today's fallback
 
+    remote, relay_failed = {}, []
+    if _relay:
+        for member in members:
+            machine = split_address(member)[1]
+            if machine and member != sender:
+                remote.setdefault(machine, []).append(member)
+        if remote:
+            meta = meta or read_group_meta(root, team, group) or {}
+            relay_failed = _relay_out(root, team, sorted(remote), "group_post", {
+                "group": group, "record": record, "members": members,
+                "creator": meta.get("creator"), "createdAt": meta.get("createdAt")}, sender)
+
     append_transcript(root, team, {**record, "kind": "group"})  # tee LAST (firehose)
     return {"id": record["id"], "sigil": sigil,
-            "delivered": delivered, "live": live, "deferred": deferred, "pended": pended}
+            "delivered": delivered, "live": live, "deferred": deferred, "pended": pended,
+            "remote": remote, "relay_failed": relay_failed}
 
 
 def _send_to_group(agent, team, root, to_sigil, args):
@@ -1392,13 +1584,57 @@ def _send_to_group(agent, team, root, to_sigil, args):
             f"Delivered to {len(delivered)} member(s) ({live} live, "
             f"{len(delivered) - live} queued): {', '.join(delivered)}."
         )
-    else:
+    elif not res["remote"]:
         lines.append("No other members yet — recorded in the transcript only.")
+    for machine, names in sorted(res["remote"].items()):
+        who = ", ".join(names)
+        view = relay_mod.peer_view(root, machine)
+        if machine not in relay_mod.read_peers(root):
+            lines.append(f"⚠️ WARNING: NOT SENT to {who} — {machine} is not an approved peer "
+                         f"of this machine, so nothing here can reach it. "
+                         f"{relay_mod.approval_hint(root, machine)}")
+        elif machine in res["relay_failed"]:
+            lines.append(f"⚠️ WARNING: NOT QUEUED for {who} — the queue for {machine} is full "
+                         f"or unwritable. See teammate_peers(action=\"list\").")
+        elif view["ok"]:
+            lines.append(f"Relaying to {machine}: {who}.")
+        elif view["state"] == "connecting":
+            lines.append(f"Queued for {machine} (not connected yet): {who}.")
+        else:
+            lines.append(f"⚠️ WARNING: NOT DELIVERED to {who} — {view['text']} Queued; it "
+                         f"sends automatically once {machine} is reachable.")
     if pended:
         lines.append(f"Queued for retry — their watcher will pick it up: {', '.join(pended)}.")
     if deferred:
         lines.append(f"Deferred (inbox busy; will catch up via history): {', '.join(deferred)}.")
     return "\n".join(lines)
+
+
+def _relay_group_add(root, team, group, meta, names, sender):
+    members = meta.get("members", [])
+    return _relay_out(root, team, _remote_machines(members), "group_members", {
+        "group": group, "op": "add", "names": names, "members": members,
+        "creator": meta.get("creator"), "createdAt": meta.get("createdAt")}, sender)
+
+
+def delete_group_local(root, team, group, by):
+    """Purge a group's inbox copies, remove its directory, then emit the deletion event."""
+    sigil = f"#{group}"
+    meta = read_group_meta(root, team, group) or {}
+    # Purge the fan-out copies that linger in member inboxes BEFORE the rmtree, by the GROUP
+    # PREDICATE (group == sigil), so a copy that lands between a snapshot and the purge is
+    # still caught (A-5). Order: clean inboxes -> rmtree -> emit the deletion event LAST, so a
+    # best-effort partial rmtree can't desync the dashboard.
+    msg_count = len([m for m in read_group_messages(root, team, group)
+                     if isinstance(m, dict) and m.get("id")])
+    for member in meta.get("members", []):
+        remove_group_messages_from_inbox(root, team, member, sigil)
+    delete_group(root, team, group)
+    # best-effort (block=False): the group dir is already gone, so a blocking raise here
+    # would lose the event permanently on retry (re-entry hits "No group").
+    append_deletion(root, team, {"target": sigil,  # id stamped under the lock inside append_deletion
+                                 "kind": "group", "by": by, "op": "delete"}, block=False)
+    return msg_count
 
 
 def _edit_group_members(root, team, group, sigil, mutate):
@@ -1423,7 +1659,8 @@ def _handle_group(args, ctx):
     if action == "create":
         members = [agent]
         for i, m in enumerate(args.get("members") or []):
-            validate_agent_name(m, param=f"members[{i}]")
+            name, machine = _resolve_address(root, team, m, f"members[{i}]")
+            m = name if machine is None else f"{name}@{machine}"
             if m not in members:
                 members.append(m)
         # G2: case-variant collision check at CREATE only — open membership means member
@@ -1438,16 +1675,17 @@ def _handle_group(args, ctx):
         with file_lock(_group_meta_file(root, team, group)):
             if read_group_meta(root, team, group) is not None:
                 raise CommsError(f"Group {sigil!r} already exists.")
-            write_group_meta(root, team, group, {
-                "name": group, "members": members,
-                "creator": agent, "createdAt": now_timestamp(),
-            })
+            meta = {"name": group, "members": members,
+                    "creator": agent, "createdAt": now_timestamp()}
+            write_group_meta(root, team, group, meta)
+        _relay_group_add(root, team, group, meta, members, agent)
         out = (f"Created group {sigil} with member(s): {', '.join(members)}. "
                f"Post with teammate_send(to=\"{sigil}\").")
         # F-2: open membership is intentional, so an unregistered member is NOT an error — but
         # warn so a typo'd name doesn't silently join a phantom (it just won't receive posts until
         # it registers under that exact name).
-        unknown = [m for m in members if m != agent and read_agent_record(root, team, m) is None]
+        unknown = [m for m in members if m != agent and not is_remote(m)
+                   and read_agent_record(root, team, m) is None]
         if unknown:
             out += (f"\nNOTE: no agent record yet for {', '.join(unknown)} — they'll receive "
                     f"posts in their inbox if/when they register under those exact names.")
@@ -1462,25 +1700,9 @@ def _handle_group(args, ctx):
         # Creator-only, OR any member if the creator is no longer a member (orphan).
         if not (agent == creator or (creator not in members and agent in members)):
             raise CommsError(f"Only the creator ({creator}) can delete {sigil}.")
-        # Purge the fan-out copies that linger in member inboxes BEFORE the rmtree. (The old
-        # bug: delete removed only the group dir, leaving those copies + the transcript behind,
-        # so a "deleted" group's messages still showed.) Purge by the GROUP PREDICATE
-        # (group == sigil), NOT a pre-snapshot id-set, so a copy that lands between the snapshot
-        # and the purge is still caught (A-5 window-shrink; the residual post-rmtree-recreate
-        # orphan is accepted as eventually-consistent — see remove_group_messages_from_inbox).
-        # Order: clean inboxes -> rmtree -> emit the deletion event LAST, so a best-effort
-        # partial rmtree can't desync the dashboard.
-        msg_count = len([m for m in read_group_messages(root, team, group)
-                         if isinstance(m, dict) and m.get("id")])
-        for member in members:
-            remove_group_messages_from_inbox(root, team, member, sigil)
-        delete_group(root, team, group)
-        # best-effort (block=False): the group dir is already gone, so emitting the event
-        # LAST is the recorded v0.7.0 ordering (a partial rmtree can't desync the
-        # dashboard) and a blocking raise here would lose the event permanently on retry
-        # (re-entry hits "No group"). A fresh dashboard load omits the absent group anyway.
-        append_deletion(root, team, {"target": sigil,  # id stamped under the lock inside append_deletion
-                                     "kind": "group", "by": agent, "op": "delete"}, block=False)
+        msg_count = delete_group_local(root, team, group, agent)
+        _relay_out(root, team, _remote_machines(members), "group_delete",
+                   {"group": group, "by": agent}, agent)
         return (f"Deleted group {sigil} (purged ~{msg_count} message(s) from "
                 f"member inboxes).")
 
@@ -1492,6 +1714,7 @@ def _handle_group(args, ctx):
             meta["members"] = members
             return meta
         meta = _edit_group_members(root, team, group, sigil, mutate)
+        _relay_group_add(root, team, group, meta, [agent], agent)
         return f"Joined {sigil}. Members: {', '.join(meta['members'])}."
 
     if action == "leave":
@@ -1499,14 +1722,19 @@ def _handle_group(args, ctx):
             meta["members"] = [m for m in meta.get("members", []) if m != agent]
             return meta
         meta = _edit_group_members(root, team, group, sigil, mutate)
+        _relay_out(root, team, _remote_machines(meta["members"]), "group_members",
+                   {"group": group, "op": "remove", "names": [agent]}, agent)
         return f"Left {sigil}. Members: {', '.join(meta['members']) or '(none)'}."
 
     if action == "add":
         to_add = args.get("members") or []
         if not to_add:
             raise CommsError("Provide 'members' (a list of names) to add.")
+        resolved = []
         for i, m in enumerate(to_add):
-            validate_agent_name(m, param=f"members[{i}]")
+            name, machine = _resolve_address(root, team, m, f"members[{i}]")
+            resolved.append(name if machine is None else f"{name}@{machine}")
+        to_add = resolved
 
         def mutate(meta):
             members = meta.get("members", [])
@@ -1516,6 +1744,7 @@ def _handle_group(args, ctx):
             meta["members"] = members
             return meta
         meta = _edit_group_members(root, team, group, sigil, mutate)
+        _relay_group_add(root, team, group, meta, to_add, agent)
         return f"Added to {sigil}. Members: {', '.join(meta['members'])}."
 
     if action == "members":
@@ -1573,7 +1802,7 @@ def _handle_group(args, ctx):
     filt = []
     sender = args.get("sender")
     if sender is not None:
-        validate_agent_name(sender)
+        sender = validate_address(sender, param="sender")
         messages = [m for m in messages if m.get("from") == sender]
         filt.append(f"from {sender}")
     post_type = _clean_post_type(args.get("post_type"))
@@ -1627,7 +1856,19 @@ def _scan_transcript_for_id(root, team, target_id):
     return None
 
 
-def react(root, team, reactor, target, emoji, remove=False):
+def _audience(root, team, info):
+    """Other machines holding a copy of the message ``resolve_message`` described."""
+    names = [info.get("from"), info.get("to")]
+    if info.get("kind") == "group":
+        try:
+            meta = read_group_meta(root, team, validate_group_name(info.get("group") or ""))
+        except CommsError:
+            meta = None
+        names += (meta or {}).get("members", [])
+    return _remote_machines(names)
+
+
+def react(root, team, reactor, target, emoji, remove=False, _relay=True):
     """Core: append a reaction add/remove event as ``reactor`` (sender-explicit so the
     dashboard reacts AS the human).
 
@@ -1658,6 +1899,10 @@ def react(root, team, reactor, target, emoji, remove=False):
     if target_from:
         record["target_from"] = target_from
     append_reaction(root, team, record)
+    if _relay:
+        _relay_out(root, team, _audience(root, team, resolved), "reaction",
+                   {"target": target, "emoji": emoji, "remove": bool(remove), "from": reactor},
+                   reactor)
     return record
 
 
@@ -1711,7 +1956,7 @@ def resolve_message(root, team, msg_id):
     return None
 
 
-def delete_message(root, team, caller, msg_id, is_operator=False):
+def delete_message(root, team, caller, msg_id, is_operator=False, _relay=True):
     """Tombstone a message everywhere it was written (author-or-operator).
 
     Returns a summary string; raises CommsError if not found or not permitted. The
@@ -1743,6 +1988,11 @@ def delete_message(root, team, caller, msg_id, is_operator=False):
         where = f"DM to {to}" if to else "DM"
     append_deletion(root, team, {"target": msg_id,  # id stamped under the lock inside append_deletion
                                  "kind": "message", "by": caller, "op": "delete"})
+    machines = _audience(root, team, info) if _relay else []
+    if machines and caller != author:
+        return (f"Deleted message {msg_id} ({where}) on this machine only — copies on "
+                f"{', '.join(machines)} stay, because only the author can delete there.")
+    _relay_out(root, team, machines, "deletion", {"target": msg_id, "by": caller}, caller)
     return f"Deleted message {msg_id} ({where}) — tombstoned everywhere it appeared."
 
 
@@ -1766,6 +2016,10 @@ def remove_teammate(root, team, caller, name, is_operator=False):
             f"the record."
         )
     removed_from = strip_member_from_groups(root, team, name)
+    for g in removed_from:
+        gone_from = (read_group_meta(root, team, g) or {}).get("members", [])
+        _relay_out(root, team, _remote_machines(gone_from), "group_members",
+                   {"group": g, "op": "remove", "names": [name]}, caller)
     failed_paths = remove_agent(root, team, name)
     extra = (f" Removed from group(s): {', '.join('#' + g for g in removed_from)}."
              if removed_from else "")
@@ -2206,6 +2460,27 @@ def _handle_request_compact(args, ctx):
     return result
 
 
+_PEER_ACTIONS = ("list", "remove", "restart")
+
+
+def _handle_peers(args, ctx):
+    _agent, team, root = _require_registered(ctx)
+    action = args.get("action") or "list"
+    if action == "add":
+        machine = validate_machine_name(args.get("machine"), param="machine")
+        raise CommsError(relay_mod.approval_hint(root, machine))
+    if action not in _PEER_ACTIONS:
+        raise CommsError(f"'action' must be one of {list(_PEER_ACTIONS)}.")
+    if team:
+        raise CommsError(_NO_TEAM_RELAY)
+    if action == "remove":
+        return relay_mod.remove_peer(root, args.get("machine"))
+    if action == "restart":
+        relay_mod.stop_and_wait(root)
+        return relay_mod.start_line(relay_mod.ensure_relay(root))
+    return relay_mod.peers_report(root)
+
+
 _HANDLERS = {
     "teammate_register": _handle_register,
     "teammate_send": _handle_send,
@@ -2225,6 +2500,7 @@ _HANDLERS = {
     "project_delete": _handle_project_delete,
     "teammate_set_avatar": _handle_set_avatar,
     "teammate_request_compact": _handle_request_compact,
+    "teammate_peers": _handle_peers,
 }
 
 

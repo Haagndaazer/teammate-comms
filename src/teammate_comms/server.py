@@ -28,9 +28,11 @@ from pathlib import Path
 
 from . import __version__, channel
 from . import harness as harness_mod
+from . import relay as relay_mod
 from . import tools as tools_mod
 from .comms import (
     COMPACT_BROKER_SENDER,
+    RELAY_SENDER,
     PROFILE_FIELDS,
     CommsError,
     _looks_unset,
@@ -280,6 +282,11 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
             f"Cannot register as {agent!r}: that name is reserved for the compaction-broker's "
             f"sender label (audit DMs, completion/expiry notices) — an agent may not claim it."
         )
+    if agent.lower() == RELAY_SENDER:
+        raise CommsError(
+            f"Cannot register as {agent!r}: that name is reserved for the cross-machine "
+            f"relay's delivery notices — an agent may not claim it."
+        )
     profile = dict(profile or {})
     # Auto-fill `project` from the current project dir (Claude Code injects
     # CLAUDE_PROJECT_DIR) unless the agent set it explicitly. With a global-by-
@@ -492,6 +499,8 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
     session_hint = ""
     if harness.needs_session and not harness_session:
         session_hint = " " + harness.session_hint
+    if not team:
+        relay_mod.ensure_relay(root)
     return warning + (
         f"Registered as {agent!r}{team_str}. Comms root: {root} (from {source}). "
         f"Channel armed. {profile_str}You have {len(unread)} unread message(s) — call "

@@ -54,3 +54,5 @@ jobs:
         run: uv run --no-sync python tests/test_compact.py
       - name: Run Codex parity suite (WP-43..WP-46)
         run: uv run --no-sync python tests/test_codex.py
+      - name: Run cross-machine relay suite
+        run: uv run --no-sync python tests/test_relay.py

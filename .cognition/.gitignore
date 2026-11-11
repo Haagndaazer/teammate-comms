@@ -6,3 +6,4 @@ chromadb/
 onboard-declined
 last-seen.json*
 backfill-identity-map.skeleton.json
+local/

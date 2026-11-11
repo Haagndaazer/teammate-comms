@@ -370,8 +370,9 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **18 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
-project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37):**
+long-lived server. **19 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
+project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37 + 1
+cross-machine `teammate_peers` tool, §14):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -772,7 +773,8 @@ so no future feature mistakes a convenience for a boundary:
   `teammate_set_avatar`'s WP-28 T1 guard raises if `agent` != the caller).
 
 This is **correct and intentional** for the threat model — your own agents, on your own
-machine, cooperating. The hard rule: a future cross-host / multi-user feature must **NOT**
+machine, cooperating. (Cross-machine comms, §14, add exactly such a layer: Tailscale device
+identity, enforced by the relay.) The hard rule: a future cross-host / multi-user feature must **NOT**
 build on the author-check or `from` as if they were real authentication; it would need an
 actual auth layer added first. (The dashboard's per-launch token *is* a real secret —
 loopback-bound, constant-time-compared, query-string-redacted in logs — but it guards the
@@ -892,3 +894,94 @@ subheads with the profile `summary`/`status`. No second grouping structure.
 - Migrate the `TestSVN` prototype to consume this plugin and drop its local skill copy.
 - (Optional) project roster index if agent count grows large.
 - (Optional) CLI-parity scripts, if ever wanted.
+
+---
+
+## 14. Cross-machine relay (first version)
+
+Agents on separate machines message each other without sharing a comms root. Plan,
+rulings and review history: `docs/cross-machine-plan.md`.
+
+**Shape.** Each machine keeps its own local root, so every local guarantee in this document
+is unchanged. `relay.py` is a standalone process (`python -m teammate_comms.relay`), one per
+machine, started detached by `ensure_relay` when peers are configured (on register, on a
+remote send, on approval of a peer) and guarded by a `file_lock` singleton. Tools queue
+**events** as files under `<root>/TeammateComms/relay/outbox/<machine>/`; the relay delivers
+them and applies incoming ones by calling the same cores the tools use (`deliver_dm_record`,
+`post_group_record`, `react`, `delete_message`, `_edit_group_members`, `delete_group_local`)
+with `_relay=False`, so an applied event is never re-queued. `channel.py` is untouched: the
+recipient's own watcher sees its inbox change.
+
+**Authentication is Tailscale device identity, and nothing else** (ruling: no shared
+secret). The relay binds only to this machine's Tailscale IPv4 address and does not listen
+at all while Tailscale is down. Every request's source address (the accepted socket's peer
+address, never a header) is mapped to a machine through `tailscale status --json`; it must be
+in `relay/peers.json` and must equal the request's claimed `from`. Devices shared in from
+another tailnet (`ShareeNode`, or a DNS name outside this tailnet's MagicDNS suffix) are never
+identified, and two devices with the same first label are both dropped. The network object is
+injectable only through `Relay(root, net=...)`; no environment variable or flag bypasses it.
+This replaces, for remote parties, the "any process of this OS user" trust domain of §10:
+**a peer machine may speak for any name on that machine and for no other name.**
+
+**Names.** Disk is local-relative (bare = here, `name@machine` = remote); the wire carries
+the sender's own disk form; the receiver localizes with the *verified* source machine
+(`_Names`): bare becomes `name@src`, `name@me` becomes bare, a third machine's name is kept.
+Actor fields (`from`, reactor, deleter, leaver, group deleter) must be bare on the wire. Every
+helper that derives an inbox path refuses or skips a remote name (`ensure_inbox` raises;
+`tombstone_in_inbox`, `remove_group_messages_from_inbox`, `group_read_positions`,
+`group_read_has_unseen_acks` skip), and `validate_agent_name` rejects `@` with a clear message.
+
+**Transport.** One endpoint, `POST /v1/exchange`, default port 47821. A request carries the
+sender's queued events and acknowledgements; the response carries the responder's queued
+events for the requester. Both directions therefore flow over a connection opened by
+*either* side, so only one machine needs to accept inbound traffic. Delivery is
+at-least-once: an event file is deleted only once the peer reports it applied or failed, and
+the receiver drops repeats with a persisted per-peer ring of event ids plus an id check
+against existing messages. A `RejectEvent` (invalid or not permitted) is reported back and
+dropped. Anything else is left unacknowledged and retried in order, up to 30 attempts for a
+lock timeout and 5 for any other error, then reported as failed like a rejection; the queue
+is never blocked indefinitely by one event. A failure is reported in whichever direction
+the event travelled (the response's `failed` list, or the next request's), and the origin
+relay DMs the event's sender from `comms-relay`.
+
+**Receive-side rules beyond the name rule.**
+- A message id must look like a locally minted one, and an id that already belongs to a
+  message by a different author is rejected (otherwise a peer could reuse a victim's id and
+  then "delete its own message").
+- A peer can post to or add members to an *existing* local group only if its machine already
+  has a member in that group; a group is created only by a membership event (never by a post)
+  and only if it has a member here. Consequence: once a machine's last member leaves a group,
+  that machine cannot rejoin by itself; a member on a machine still in the group must add it.
+- A deletion applies only when the localized deleter is the message's author. Operator
+  deletes do not cross machines.
+- Stored records are rebuilt from a field whitelist; nothing else from the wire is kept.
+
+**Liveness and loud failure.** Each relay ships a roster of its own agents every 10 s with a
+boolean `live` it computed locally; the receiver judges only the snapshot's age with its own
+clock, so clock skew and time zones do not affect liveness. `relay/status.json` holds each
+peer's state (`ok`, `tailscale_down`, `unknown_device`, `key_expired`, `offline`,
+`relay_down`, `not_approved`, `identity_mismatch`) with the reason. It surfaces in the send
+result, `teammate_list`, `teammate_peers`, and — after 60 s undelivered — a DM to the sender
+from the reserved name `comms-relay`, with a second one once nothing is waiting. A group
+member on a machine that is not an approved peer of the poster's machine is named in the
+post result as not sent. No Tailscale setting is required of the
+user; problems are detected and reported.
+
+**Peer approval is the user's.** `relay/peers.json` is written only by the user-run command
+`python -m teammate_comms.peers add|remove|list <machine>` (`peers.py`, a thin wrapper over
+`relay.approve_peer` / `remove_peer` / `peers_report`). `teammate_peers` has no `add` action;
+calling it with one returns the command for the user to run, and so does every "not an
+approved peer" error. An agent can still remove a peer or restart the relay, which only
+narrows what this machine talks to. The restriction is a guard rail: agents run as the user
+and could write the file or run the command, so the skill text forbids it.
+
+**Known limits.** Peer removal discards queued events without telling their senders. A full
+queue is reported for direct messages and group posts but not for membership, reaction or
+deletion events. Each new incoming message costs one `resolve_message` lookup, which scans the
+whole transcript when the id is not in its recent tail. An unapproved tailnet device can hold
+a handler thread until its request times out. Team namespaces are refused. Not relayed: read receipts, project profiles,
+late-joiner group history, remote roster in the dashboard. No forwarding through a third
+machine. Message ids stay naive-local-time (§8), so cross-machine id ordering needs matching
+time zones. Cross-machine reactions and deletes resolve through the transcript, so they need
+it enabled. Whether a detached relay survives the launching session's exit on every platform
+is unverified; if it dies, the next register or remote send restarts it.
