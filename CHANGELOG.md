@@ -9,7 +9,9 @@
 > addressed `name@machine`. Only the user approves a machine, with
 > `python -m teammate_comms.peers add <machine>` on each side; `teammate_peers` (new tool)
 > shows peer state, prints that command, and can remove a peer or restart the relay, but
-> cannot add one. Tailscale device identity is the only authentication:
+> cannot add one. A rejected event is reported to its author even if the response carrying
+> the rejection is lost, and a group change, reaction or deletion that cannot be relayed is
+> reported too. Tailscale device identity is the only authentication:
 > the relay listens only on the Tailscale address. Unreachable peers are reported in the send
 > result, `teammate_list`, `teammate_peers`, and by a `comms-relay` message to the sender
 > after a minute. `comms-relay` is now a reserved name. `@name.` at the end of a sentence is

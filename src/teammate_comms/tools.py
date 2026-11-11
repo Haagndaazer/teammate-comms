@@ -778,9 +778,33 @@ def _remote_machines(names):
     return sorted({m for m in (split_address(n)[1] for n in names if n) if m})
 
 
-def _relay_out(root, team, machines, kind, payload, sender):
+_RELAY_KIND_LABELS = {
+    "group_members": "group membership change",
+    "group_delete": "group deletion",
+    "reaction": "reaction",
+    "deletion": "message deletion",
+}
+
+
+def _report_unrelayed(root, sender, kind, machines, peers):
+    try:
+        if not sender or is_remote(sender) or read_agent_record(root, None, sender) is None:
+            return
+        where = ", ".join(
+            f"{m} (not an approved peer of this machine)" if m not in peers
+            else f"{m} (its queue is full or unwritable)" for m in machines)
+        send_dm(root, None, relay_mod.RELAY_SENDER, sender,
+                f"⚠️ NOT SENT: your {_RELAY_KIND_LABELS.get(kind, kind)} was applied on this "
+                f"machine but could not be relayed to {where}, so teammates there do not see "
+                f"it. See teammate_peers().", priority="urgent")
+    except Exception:
+        pass
+
+
+def _relay_out(root, team, machines, kind, payload, sender, report=True):
     """Queue one event per approved machine; return the machines it was NOT queued for
-    (not an approved peer here, or the queue is full)."""
+    (not an approved peer here, or the queue is full). With ``report`` the sender is told
+    about those by a comms-relay message; a caller that reports them itself passes False."""
     if team or not machines:
         return []
     peers = relay_mod.read_peers(root)
@@ -794,6 +818,8 @@ def _relay_out(root, team, machines, kind, payload, sender):
         except (CommsError, OSError):
             failed.append(machine)
     relay_mod.ensure_relay(root)
+    if failed and report:
+        _report_unrelayed(root, sender, kind, failed, peers)
     return failed
 
 
@@ -1564,7 +1590,7 @@ def post_group_record(root, team, group, record, members, _relay=True, meta=None
             meta = meta or read_group_meta(root, team, group) or {}
             relay_failed = _relay_out(root, team, sorted(remote), "group_post", {
                 "group": group, "record": record, "members": members,
-                "creator": meta.get("creator"), "createdAt": meta.get("createdAt")}, sender)
+                "creator": meta.get("creator"), "createdAt": meta.get("createdAt")}, sender, report=False)
 
     append_transcript(root, team, {**record, "kind": "group"})  # tee LAST (firehose)
     return {"id": record["id"], "sigil": sigil,

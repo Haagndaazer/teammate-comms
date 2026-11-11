@@ -457,6 +457,48 @@ def test_review_findings():
               f"R2: a member on an unapproved machine is named as not sent: {out}")
         check(not relay_mod.outbox_dir(w.root_a, "c").exists(), "R2: nothing queued for the unapproved machine")
 
+        grp({"action": "leave", "group": "g2"}, alice)
+        told = [m for m in unread(w.root_a, "alice") if m.get("from") == comms.RELAY_SENDER
+                and "NOT SENT" in m.get("message", "") and "c (not an approved peer" in m["message"]]
+        check(len(told) == 1, f"R4: a membership change that cannot be relayed is reported: "
+                              f"{[m.get('message', '')[:60] for m in unread(w.root_a, 'alice')]}")
+
+        grp({"action": "create", "group": "secret", "members": []}, bob)
+        grp({"action": "create", "group": "secret", "members": ["bob@b"]}, alice)
+        ev = json.loads(sorted(relay_mod.outbox_dir(w.root_a, "b").glob("*.json"))[-1]
+                        .read_text(encoding="utf-8"))
+        _status, lost = w.rb.handle_exchange("a", {
+            "v": relay_mod.PROTOCOL, "from": "a", "ack": [], "failed": [],
+            "events": [{"id": ev["id"], "kind": ev["kind"], "payload": ev["payload"]}]})
+        check([f["id"] for f in lost["failed"]] == [ev["id"]], "R5: B rejects the group it already owns")
+        reborn = relay_mod.Relay(w.root_b, net=w.net_b, port=free_port(), clock=w.clock)
+        check(ev["id"] in reborn._seen_ring("a")["failed"], "R5: a rejection survives a relay restart")
+        reborn.close()
+        w.pump()
+        told = [m for m in unread(w.root_a, "alice") if m.get("from") == comms.RELAY_SENDER
+                and "REJECTED by b: your group_members" in m.get("message", "")]
+        check(len(told) == 1, f"R5: a rejection whose response was lost still reaches the sender: "
+                              f"{[m.get('message', '')[:60] for m in unread(w.root_a, 'alice')]}")
+        check(relay_mod.queued_count(w.root_a, "b") == 0, "R5: the rejected event left A's queue")
+
+        outsider = tools_mod.send_group(w.root_b, None, "bob", "#secret", "private to b")
+        check_raises(lambda: relay_mod.apply_event(w.root_b, "b", "a", "reaction", {
+            "target": outsider["id"], "from": "alice", "emoji": "fire"}),
+            rej, "R6: a machine with no member in a group cannot react to its messages")
+
+        cmd = relay_mod.approve_command(w.root_a, "laptop")
+        check("-m teammate_comms.peers add laptop --comms-dir" in cmd, f"approval command: {cmd}")
+        check("--comms-dir" in relay_mod.approve_command(comms.resolve_comms_root()[0], "x"),
+              "the approval command always names the comms root")
+        real_exe = sys.executable
+        sys.executable = "C:\\Program Files\\Py\\python.exe"
+        try:
+            cmd = relay_mod.approve_command(w.root_a, "laptop")
+        finally:
+            sys.executable = real_exe
+        check(cmd.startswith('"C:/Program Files/Py/python.exe" -m teammate_comms.peers'),
+              f"a python path with a space is quoted without a shell-specific prefix: {cmd}")
+
         grp({"action": "create", "group": "locked", "members": []}, alice)
         relay_mod.update_peers(w.root_b, lambda p: {"a": {"port": free_port()}})
         w.rb._peers.clear()

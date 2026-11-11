@@ -181,7 +181,7 @@ Surfaces:
 
 `ensure_relay(root)` starts a detached relay when peers are configured and none is alive
 (pid in `status.json` checked with `_pid_alive`; the listening port is the second guard).
-Called on register, on any remote send, and on `teammate_peers add`. The relay exits when
+Called on register, on any remote send, and when the user approves a peer. The relay exits when
 the peers list is empty or a stop file names its pid. If the running relay's version differs
 from the caller's, `ensure_relay` requests a stop and starts the new one (ledger 19).
 
@@ -278,4 +278,4 @@ against a live tailnet on this machine, where Tailscale is installed but logged 
 Accepted as documented limits rather than fixed: cross-machine reactions and deletes need
 the transcript enabled; operator deletes of others' messages stay local; a peer machine can
 create groups and fill disk within the per-request limits; `teammate_peers add` is callable
-by an agent.
+by an agent *(no longer true: removed by the 2026-11-10 ruling in 2.3)*.

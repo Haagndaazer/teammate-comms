@@ -975,9 +975,17 @@ approved peer" error. An agent can still remove a peer or restart the relay, whi
 narrows what this machine talks to. The restriction is a guard rail: agents run as the user
 and could write the file or run the command, so the skill text forbids it.
 
-**Known limits.** Peer removal discards queued events without telling their senders. A full
-queue is reported for direct messages and group posts but not for membership, reaction or
-deletion events. Each new incoming message costs one `resolve_message` lookup, which scans the
+A rejection is stored with its reason in the seen file (`id<TAB>reason`), so a resend after a
+lost response, or after either relay restarts, is answered with the same failure instead of
+"applied". A membership change, group deletion, reaction or message deletion that cannot be
+queued for a machine (not an approved peer, or a full queue) is reported to its author by a
+`comms-relay` DM. A reaction or deletion is accepted only from a machine that is a party to
+the target: a member in the target's group, or one end of the DM. One request applies events
+for at most about 2 s; the rest stay queued on the sender and come in the next exchange.
+`ensure_relay` reports `failed` when the started process exits within a second without a
+live relay, and the child's stderr goes to `relay/relay.log`.
+
+**Known limits.** Peer removal discards queued events without telling their senders. Each new incoming message costs one `resolve_message` lookup, which scans the
 whole transcript when the id is not in its recent tail. An unapproved tailnet device can hold
 a handler thread until its request times out. Team namespaces are refused. Not relayed: read receipts, project profiles,
 late-joiner group history, remote roster in the dashboard. No forwarding through a third

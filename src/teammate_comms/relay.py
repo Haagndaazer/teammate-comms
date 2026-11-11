@@ -65,6 +65,8 @@ MAX_APPLY_ATTEMPTS = 5
 MAX_LOCK_ATTEMPTS = 30
 TAILSCALE_GRACE_SECONDS = 60
 STOP_WAIT_SECONDS = 8
+START_CHECK_SECONDS = 1.0
+APPLY_BUDGET_SECONDS = 2.0
 
 LOOP_SECONDS = 0.25
 POLL_IDLE_SECONDS = 2.0
@@ -359,12 +361,12 @@ def forget_peer(root, machine):
 def approve_command(root, machine):
     """The command a user runs on this machine to approve ``machine``."""
     exe = sys.executable.replace("\\", "/")
-    if " " in exe:
-        exe = f'& "{exe}"' if os.name == "nt" else f'"{exe}"'
-    command = f"{exe} -m teammate_comms.peers add {machine}"
-    if Path(root) != resolve_comms_root()[0]:
-        command += f' --comms-dir "{root}"'
-    return command
+    tail = f'-m teammate_comms.peers add {machine} --comms-dir "{Path(root).as_posix()}"'
+    if " " not in exe:
+        return f"{exe} {tail}"
+    if os.name == "nt":
+        return f'"{exe}" {tail}   (in PowerShell, start it with an ampersand: & "{exe}" {tail})'
+    return f'"{exe}" {tail}'
 
 
 def approval_hint(root, machine):
@@ -479,15 +481,23 @@ def ensure_relay(root):
         env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         cmd = [sys.executable, "-m", "teammate_comms.relay", "--comms-dir", str(root)]
         dn = subprocess.DEVNULL
-        kwargs = {"stdin": dn, "stdout": dn, "stderr": dn, "env": env, "close_fds": True}
-        if os.name == "nt":
-            no_window, new_group, breakaway = 0x08000000, 0x00000200, 0x01000000
-            try:
-                subprocess.Popen(cmd, creationflags=no_window | new_group | breakaway, **kwargs)
-            except OSError:
-                subprocess.Popen(cmd, creationflags=no_window | new_group, **kwargs)
-        else:
-            subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        get_relay_dir(root).mkdir(parents=True, exist_ok=True)
+        with open(log_file(root), "ab") as err:
+            kwargs = {"stdin": dn, "stdout": dn, "stderr": err, "env": env, "close_fds": True}
+            if os.name == "nt":
+                no_window, new_group, breakaway = 0x08000000, 0x00000200, 0x01000000
+                try:
+                    proc = subprocess.Popen(cmd, creationflags=no_window | new_group | breakaway,
+                                            **kwargs)
+                except OSError:
+                    proc = subprocess.Popen(cmd, creationflags=no_window | new_group, **kwargs)
+            else:
+                proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        deadline = time.monotonic() + START_CHECK_SECONDS
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return "running" if relay_alive(root) else "failed"
+            time.sleep(0.1)
         return "started"
     except Exception:
         return "failed"
@@ -813,18 +823,26 @@ def _apply_group_delete(root, names, payload):
     tools.delete_group_local(root, None, group, actor)
 
 
-def _resolve_target(root, target):
+def _resolve_target(root, names, target):
+    """The target message, only if the source machine is a party to it."""
     from . import tools
+    missing = RejectEvent(f"no message {target!r} here")
     info = tools.resolve_message(root, None, target)
     if info is None:
-        raise RejectEvent(f"no message {target!r} here")
+        raise missing
     if info.get("kind") == "group":
         try:
             group = validate_group_name(info.get("group") or "")
         except CommsError:
             group = None
-        if not group or read_group_meta(root, None, group) is None:
+        meta = read_group_meta(root, None, group) if group else None
+        if meta is None:
             raise RejectEvent(f"the group holding {target} no longer exists here")
+        if not _machine_in_group(meta, names.src):
+            raise missing
+    elif info.get("to") and names.src not in (split_address(info.get("from"))[1],
+                                              split_address(info["to"])[1]):
+        raise missing
     return info
 
 
@@ -835,7 +853,7 @@ def _apply_reaction(root, names, payload):
     emoji = payload.get("emoji")
     if emoji not in tools._REACTIONS:
         raise RejectEvent(f"unknown emoji {emoji!r}")
-    _resolve_target(root, target)
+    _resolve_target(root, names, target)
     tools.react(root, None, actor, target, emoji, bool(payload.get("remove")), _relay=False)
 
 
@@ -843,7 +861,7 @@ def _apply_deletion(root, names, payload):
     from . import tools
     actor = names.actor(payload.get("by"))
     target = _clean_id(payload.get("target"))
-    info = _resolve_target(root, target)
+    info = _resolve_target(root, names, target)
     if info.get("from") != actor:
         raise RejectEvent(f"{actor} is not the author of {target}")
     tools.delete_message(root, None, actor, target, _relay=False)
@@ -1016,51 +1034,76 @@ class Relay:
     def _seen_ring(self, machine):
         ring = self._seen.get(machine)
         if ring is None:
-            ids = []
+            lines = []
             try:
-                ids = [ln for ln in seen_file(self.root, machine).read_text(
+                lines = [ln for ln in seen_file(self.root, machine).read_text(
                     encoding="utf-8").splitlines() if ln][-SEEN_RING:]
             except OSError:
                 pass
-            ring = {"order": collections.deque(ids), "ids": set(ids), "appended": 0}
+            ids, failed = [], {}
+            for line in lines:
+                event_id, _, error = line.partition("\t")
+                ids.append(event_id)
+                if error:
+                    failed[event_id] = error
+            ring = {"order": collections.deque(ids), "ids": set(ids), "failed": failed,
+                    "appended": 0}
             self._seen[machine] = ring
         return ring
 
-    def _seen_add(self, machine, event_id):
+    def _seen_add(self, machine, event_id, error=""):
+        """Remember an event's outcome; a failed one keeps its reason so a resend gets it again."""
         ring = self._seen_ring(machine)
         if event_id in ring["ids"]:
             return
+        error = " ".join(str(error).split())[:300]
         ring["order"].append(event_id)
         ring["ids"].add(event_id)
+        if error:
+            ring["failed"][event_id] = error
         while len(ring["order"]) > SEEN_RING:
-            ring["ids"].discard(ring["order"].popleft())
+            old = ring["order"].popleft()
+            ring["ids"].discard(old)
+            ring["failed"].pop(old, None)
+
+        def line(i):
+            return f"{i}\t{ring['failed'][i]}" if i in ring["failed"] else i
         path = seen_file(self.root, machine)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             ring["appended"] += 1
             if ring["appended"] >= SEEN_RING:
-                path.write_text("\n".join(ring["order"]) + "\n", encoding="utf-8")
+                path.write_text("\n".join(line(i) for i in ring["order"]) + "\n",
+                                encoding="utf-8")
                 ring["appended"] = 0
             else:
                 with open(path, "a", encoding="utf-8") as f:
-                    f.write(event_id + "\n")
+                    f.write(line(event_id) + "\n")
         except OSError as e:
             self.log(f"could not persist seen id for {machine}: {e}")
 
     def _apply_events(self, machine, events):
         applied, failed = [], []
+        ring = self._seen_ring(machine)
+        started = time.monotonic()
         for ev in (events if isinstance(events, list) else [])[:MAX_EVENTS]:
             event_id = ev.get("id") if isinstance(ev, dict) else None
             if not isinstance(event_id, str) or not _ID_RE.match(event_id):
                 continue
-            if event_id in self._seen_ring(machine)["ids"]:
-                applied.append(event_id)
+            if event_id in ring["ids"]:
+                if event_id in ring["failed"]:
+                    failed.append({"id": event_id, "error": ring["failed"][event_id]})
+                else:
+                    applied.append(event_id)
                 continue
+            if (applied or failed) and time.monotonic() - started > APPLY_BUDGET_SECONDS:
+                break
+            error = ""
             try:
                 apply_event(self.root, self.machine, machine, ev.get("kind"), ev.get("payload"))
                 applied.append(event_id)
             except RejectEvent as e:
-                failed.append({"id": event_id, "error": str(e)[:300]})
+                error = str(e)[:300] or "rejected"
                 self.log(f"rejected {ev.get('kind')} {event_id} from {machine}: {e}")
             except Exception as e:
                 tries = self._attempts.get(event_id, 0) + 1
@@ -1070,9 +1113,11 @@ class Relay:
                 locked = isinstance(e, CommsError) and "Could not acquire lock" in str(e)
                 if tries < (MAX_LOCK_ATTEMPTS if locked else MAX_APPLY_ATTEMPTS):
                     break
-                failed.append({"id": event_id, "error": f"{type(e).__name__}: {e}"[:300]})
+                error = f"{type(e).__name__}: {e}"[:300]
+            if error:
+                failed.append({"id": event_id, "error": error})
             self._attempts.pop(event_id, None)
-            self._seen_add(machine, event_id)
+            self._seen_add(machine, event_id, error)
         return applied, failed
 
     def _next_batch(self, machine, st):
