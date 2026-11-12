@@ -58,7 +58,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `project_profile` | `key?` | Full detail for one project: all fields, provenance, live roster with liveness. `key` defaults to your project. |
 | `project_delete` | `key?` | Remove a project profile. |
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
-| `teammate_peers` | `action?` (`list`\|`remove`\|`restart`), `machine?` | Show and manage the other machines this one exchanges messages with over Tailscale; teammates there are addressed `name@machine`. `list` shows each peer's state, why it is unreachable if it is, and the command the user runs to approve a machine. Approving is reserved for the user: there is no `add` action. |
+| `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -268,19 +268,12 @@ machine's Tailscale address and never on the local network.
 
 **Set up** (once per pair of machines, both on the same tailnet):
 
-1. On the desktop, **you** run the approval command with `add laptop`.
-2. On the laptop, you run it with `add desktop`.
+1. On the desktop, ask any registered session to link the laptop: it calls
+   `teammate_peers(action:"add", machine:"laptop")`.
+2. On the laptop, ask a session to do the same with `machine:"desktop"`.
 
-The command is `<python> -m teammate_comms.peers add <machine>`, using the Python of the
-installed plugin. You do not have to work that path out: ask any registered session to call
-`teammate_peers()` and it prints the full command for that machine, ready to paste (in Claude
-Code, type `!` followed by the command to run it yourself in the session). The same command
-with `list` or `remove <machine>` shows or removes peers.
-
-Approving a machine is deliberately **not** an agent tool: only the user decides which
-machines may exchange messages, and agents are told not to run the command or edit the peers
-file. This is a guard rail, not a sandbox: an agent that has shell or file access on your
-account is technically able to do both.
+Agents are told to add a machine only when you ask. The same thing is available from a
+terminal as `<python> -m teammate_comms.peers add|remove|list <machine>`.
 
 `machine` is the device's Tailscale name (`teammate_peers()` lists the devices it can see).
 Approval is mutual: a machine only accepts connections from machines in its own list. The
@@ -328,8 +321,12 @@ netsh advfirewall firewall add rule name="teammate-comms relay" dir=in action=al
   to add someone from it again; it cannot rejoin by itself.
 - A dashboard-operator delete of someone else's message stays on the machine it was done on.
 - Reactions and deletes across machines need the transcript on (`TEAMMATE_TRANSCRIPT` unset).
-- Message ids are local-time based, so id *ordering* across machines needs matching time
-  zones and synced clocks. Delivery and wake do not depend on it.
+- Message ids are UTC, so machines in different time zones order correctly; each message
+  shows its send time in your local time. Id *ordering* across machines still needs
+  reasonably synced clocks. Delivery and wake do not depend on it.
+- After updating, restart every session on the machine. A session still on an older version
+  keeps writing local-time ids, and "since" filters, unread badges and reaction wakes can
+  skip across the two kinds for a few hours.
 - Spawning or removing a teammate on another machine is deliberately not possible.
 
 ## Two wake regimes
@@ -553,7 +550,7 @@ that atomicity for correctness.
 - **Supported:** one machine (the common case), or multiple NTP-synced hosts sharing a
   root over a real network filesystem (SMB/NFS), with the caveat that cross-host message
   *ordering* is only as good as clock sync between hosts (each writer mints ids from its
-  own local clock — see `DESIGN.md`'s message-id note).
+  own clock, in UTC — see `DESIGN.md`'s message-id note).
 - **Unsupported — a documented data-loss mode:** cloud-sync-backed roots (OneDrive,
   Dropbox, and similar). Those clients resolve concurrent writes with **conflicted-copy
   siblings** (e.g. `agents.json` next to `agents (conflicted copy — DESKTOP-X

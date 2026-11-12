@@ -109,6 +109,9 @@ removed from the tool; the user runs `python -m teammate_comms.peers add <machin
 validates the name, warns if no such Tailscale device is visible, and starts the relay.
 `teammate_peers` prints that command in full.
 
+**Revised again 2026-11-12 (owner ruling after the two-machine test):** terminal-only approval
+was too awkward to set up. `teammate_peers` has `add` again; the terminal command stays.
+
 ### 2.4 Transport
 
 One endpoint, `POST /v1/exchange`, default port 47821 (`TEAMMATE_RELAY_PORT`).
@@ -244,8 +247,9 @@ temporary roots.
 - Peer status fields unverified against a live tailnet.
 - Any missed site that turns a `name@machine` into a file name.
 - An agent can call `teammate_peers add`, which opens comms to another device on the
-  tailnet (including a device shared in from another user). *(Closed by the 2026-11-10 ruling
-  above, as far as a tool can: agents with shell access could still run the user command.)*
+  tailnet (including a device shared in from another user). *(Removed by the 2026-11-10 ruling,
+  restored by the 2026-11-12 ruling in 2.3; the skill tells agents to add a machine only
+  when their user asks.)*
 
 ## 7. Plan review outcome (2026-11-10)
 
@@ -278,4 +282,4 @@ against a live tailnet on this machine, where Tailscale is installed but logged 
 Accepted as documented limits rather than fixed: cross-machine reactions and deletes need
 the transcript enabled; operator deletes of others' messages stay local; a peer machine can
 create groups and fill disk within the per-request limits; `teammate_peers add` is callable
-by an agent *(no longer true: removed by the 2026-11-10 ruling in 2.3)*.
+by an agent *(removed 2026-11-10, restored 2026-11-12; see 2.3)*.

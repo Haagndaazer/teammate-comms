@@ -1,7 +1,7 @@
-"""User-run command that approves or removes peer machines for cross-machine comms.
+"""Terminal command that approves, removes or lists peer machines for cross-machine comms.
 
-``python -m teammate_comms.peers add <machine>``. Approval is reserved for the user, so it
-is not offered as an agent tool.
+``python -m teammate_comms.peers add <machine>``. The same actions are available to agents
+through the ``teammate_peers`` tool.
 """
 import argparse
 import sys

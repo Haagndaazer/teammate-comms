@@ -4382,17 +4382,22 @@ def main():
         from teammate_comms import comms as _c26b
 
         _t26b_root = tempfile.mkdtemp(prefix="tc-26-ac2-")
-        _real_nt26b = _c26b.now_timestamp
+        _real_nt26b, _real_lu26b = _c26b._id_clock, _c26b._local_as_utc_epoch
         try:
-            _c26b.now_timestamp = lambda: "2026-01-01T00:00:00.000000"  # frozen clock
+            _c26b._id_clock = lambda: 1767225600.0  # frozen clock: 2026-01-01T00:00:00Z
+            _c26b._local_as_utc_epoch = lambda e: e
             _r1_26b = _t26b.send_dm(_t26b_root, None, "s26b", "to26b-1", "one")
             _r2_26b = _t26b.send_dm(_t26b_root, None, "s26b", "to26b-2", "two")
+            for _r26b in (_r1_26b, _r2_26b):
+                if not _r26b["id"].startswith("2026-01-01T00:00:00.000000."):
+                    failures.append(f"WP-26 AC-2: the frozen clock did not reach the id: {_r26b['id']!r}")
             if _r1_26b["id"] == _r2_26b["id"]:
                 failures.append(f"WP-26 AC-2 [tautology: two send_dm calls under the SAME frozen "
                                  f"clock produced the SAME id — the disambiguator isn't wired in]: "
                                  f"{_r1_26b['id']!r}")
         finally:
-            _c26b.now_timestamp = _real_nt26b
+            _c26b._id_clock, _c26b._local_as_utc_epoch = _real_nt26b, _real_lu26b
+            _c26b._id_floors.clear()
     except Exception as e:
         failures.append(f"WP-26 AC-2 unit check errored: {e}")
 

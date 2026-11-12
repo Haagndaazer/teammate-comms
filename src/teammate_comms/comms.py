@@ -25,7 +25,7 @@ import time
 import urllib.parse
 import zlib
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Valid agent name: alphanumeric, hyphens, underscores, dots (no traversal).
@@ -37,7 +37,8 @@ AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 COMPACT_BROKER_SENDER = "compact-broker"
 
 # Single timestamp format shared by message IDs, registry records, and liveness
-# checks. Naive local time — writer and reader are always co-located.
+# checks. Message, reaction and deletion ids carry UTC (new_message_id); every other stamp
+# (heartbeats, presence, createdAt) is naive local time, written and read on one machine.
 TIMESTAMP_FMT = "%Y-%m-%dT%H:%M:%S.%f"
 
 # Optional free-text profile fields an agent can attach to its registry record,
@@ -81,8 +82,12 @@ def now_timestamp():
 _id_counter = itertools.count()
 
 
-def new_message_id():
-    """Generate a message id: ``now_timestamp() + "." + <disambiguator>`` (B3).
+def new_message_id(root=None):
+    """Generate a message id: ``<UTC timestamp> + "." + <disambiguator>`` (B3).
+
+    The timestamp is UTC so ids from machines in different time zones order correctly.
+    Pass ``root`` everywhere outside tests: it keeps new ids above the local-time ids the
+    root already held when it switched to UTC (see ``_id_stamp``).
 
     Bare microsecond timestamps collide: two writers (or two calls in the SAME process
     within one microsecond — exactly the scenario ``_window``'s docstring dismisses as
@@ -96,7 +101,7 @@ def new_message_id():
     is deliberately NOT included (too long for a per-message id) — a pid+timestamp collision
     across two DIFFERENT hosts within the same microsecond is an accepted residual risk (see
     the C4 note in DESIGN §storage: this disambiguator guarantees UNIQUENESS, not global
-    cross-host ORDER — ids order by each writer's local clock, and cross-host ordering is
+    cross-host ORDER — ids order by each writer's clock, and cross-host ordering is
     only as good as clock sync between hosts).
 
     Lexical ordering is preserved for a mixed old/new id population: for two ids sharing the
@@ -106,7 +111,116 @@ def new_message_id():
     holds everywhere without a migration: old bare ids and new suffixed ids coexist forever,
     do not rewrite stored ids to "fix" this.
     """
-    return f"{now_timestamp()}.{os.getpid():x}{next(_id_counter):x}"
+    return f"{_id_stamp(root)}.{os.getpid():x}{next(_id_counter):x}"
+
+
+ID_FLOOR_FILE = "id-floor.json"
+ID_FLOOR_COMPRESSION = 100
+_id_clock = time.time
+_id_floors = {}
+
+
+def _local_as_utc_epoch(epoch):
+    """The machine's local wall-clock reading at ``epoch``, as if that reading were UTC."""
+    return datetime.fromtimestamp(epoch).replace(tzinfo=timezone.utc).timestamp()
+
+
+def _valid_floor(data):
+    if not isinstance(data, dict):
+        return None
+    floor, created = data.get("floor"), data.get("created")
+    for value in (floor, created):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+            return None
+    return float(floor), float(created)
+
+
+def _publish_floor(path, floor, replace):
+    """Write the floor file whole, then publish it; with ``replace`` False an existing file wins."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{next(_id_counter):x}.tmp")
+    try:
+        tmp.write_text(json.dumps({"floor": floor[0], "created": floor[1]}), encoding="utf-8")
+        if replace:
+            os.replace(tmp, path)
+            return
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+        except OSError:
+            if not path.exists():
+                os.replace(tmp, path)
+    except OSError:
+        pass
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _id_floor(root):
+    """``(floor, created)`` for a comms root, or None when the root has no comms tree yet.
+
+    ``floor`` is the local wall-clock time at the moment this root switched to UTC ids, so
+    it is at least as high as every local-time id written before the switch. Only a floor
+    read back from the file is cached, so every process on the root uses the same one.
+    """
+    key = str(root)
+    if key in _id_floors:
+        return _id_floors[key]
+    tree = Path(root) / COMMS_SUBDIR
+    if not tree.is_dir():
+        return None
+    path = tree / ID_FLOOR_FILE
+    now = _id_clock()
+    mine = (_local_as_utc_epoch(now), now)
+    for replace in (False, True):
+        found = _valid_floor(read_json_readonly(path))
+        if found:
+            _id_floors[key] = found
+            return found
+        _publish_floor(path, mine, replace)
+    found = _valid_floor(read_json_readonly(path))
+    if found:
+        _id_floors[key] = found
+        return found
+    return mine
+
+
+def _id_stamp(root=None):
+    """UTC timestamp for a new id, never below the ids a root held before it switched to UTC."""
+    now = _id_clock()
+    stamp = now
+    floor = _id_floor(root) if root is not None else None
+    if floor:
+        stamp = max(now, floor[0] + max(0.0, now - floor[1]) / ID_FLOOR_COMPRESSION)
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime(TIMESTAMP_FMT)
+
+
+def message_ts():
+    """Send time for a message record: UTC epoch seconds, millisecond precision."""
+    return round(_id_clock(), 3)
+
+
+def clean_ts(value):
+    """A stored or received ``ts`` if it is a plausible epoch time, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not 0 < value < 4102444800:
+        return None
+    return round(float(value), 3)
+
+
+def local_time_text(ts):
+    """``ts`` rendered in this machine's local time, or '' if it cannot be."""
+    ts = clean_ts(ts)
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 # Windows reserved device names (G5) — checked on EVERY OS, not just Windows: a shared comms
@@ -371,7 +485,8 @@ def legacy_repopulated_entries(root):
     if not (tree / MIGRATED_MARKER).exists():
         return []
     try:
-        return sorted(p.name for p in tree.iterdir() if p.name != MIGRATED_MARKER)
+        return sorted(p.name for p in tree.iterdir()
+                      if p.name not in (MIGRATED_MARKER, ID_FLOOR_FILE))
     except OSError:
         return []
 
@@ -1703,7 +1818,7 @@ def append_reaction(root, team, record, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
-            record["id"] = new_message_id()
+            record["id"] = new_message_id(root)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             _maybe_compact_reactions(root, team)   # under the lock, never raises (C6)
@@ -2009,7 +2124,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
             with file_lock_optional(path, timeout=2) as acquired:
                 if not acquired:
                     return
-                record["id"] = new_message_id()
+                record["id"] = new_message_id(root)
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)
@@ -2020,7 +2135,7 @@ def append_deletion(root, team, record, block=True, timeout=5):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with file_lock(path, timeout=timeout):
-            record["id"] = new_message_id()
+            record["id"] = new_message_id(root)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
             _maybe_compact_deletions(root, team)   # under the lock, never raises (C-2)

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.1
+
+> Found in the first two-machine test. `teammate_peers` has its `add` action back, so linking
+> two machines is one tool call on each side (the terminal command remains). The relay
+> publishes its status before its first connection attempt, so it is no longer reported as
+> not running for the first seconds after start. Joining a group that does not exist on this
+> machine gives a clear message instead of a path error.
+>
+> **Message ids are now UTC.** Ids from machines in different time zones order correctly, and
+> each message carries its send time, shown in the reader's local time in the inbox, group
+> history and dashboard. Heartbeats are unchanged. **Restart every session on a machine after
+> updating:** a session still on an older version keeps writing local-time ids, and "since"
+> filters, unread badges and reaction wakes can skip across the two kinds for a few hours.
+
 ## 0.17.0
 
 > **Cross-machine comms (first version).** Agents on separate PCs message each other over

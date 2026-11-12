@@ -486,19 +486,6 @@ def test_review_findings():
             "target": outsider["id"], "from": "alice", "emoji": "fire"}),
             rej, "R6: a machine with no member in a group cannot react to its messages")
 
-        cmd = relay_mod.approve_command(w.root_a, "laptop")
-        check("-m teammate_comms.peers add laptop --comms-dir" in cmd, f"approval command: {cmd}")
-        check("--comms-dir" in relay_mod.approve_command(comms.resolve_comms_root()[0], "x"),
-              "the approval command always names the comms root")
-        real_exe = sys.executable
-        sys.executable = "C:\\Program Files\\Py\\python.exe"
-        try:
-            cmd = relay_mod.approve_command(w.root_a, "laptop")
-        finally:
-            sys.executable = real_exe
-        check(cmd.startswith('"C:/Program Files/Py/python.exe" -m teammate_comms.peers'),
-              f"a python path with a space is quoted without a shell-specific prefix: {cmd}")
-
         grp({"action": "create", "group": "locked", "members": []}, alice)
         relay_mod.update_peers(w.root_b, lambda p: {"a": {"port": free_port()}})
         w.rb._peers.clear()
@@ -652,16 +639,14 @@ def test_roster_and_status():
 
         check_raises(lambda: tools_mod._handle_peers({"action": "add", "machine": "Bad_Name"},
                                                      ctx_for("alice", w.root_a)), CommsError, "bad machine name")
-        check_raises(lambda: tools_mod._handle_peers({"action": "add", "machine": "c"},
+        check("c" not in relay_mod.read_peers(w.root_a), "a bad name approved nothing")
+        out = tools_mod._handle_peers({"action": "add", "machine": "c"}, ctx_for("alice", w.root_a))
+        check("c" in relay_mod.read_peers(w.root_a) and "Approved 'c'" in out,
+              f"the tool approves a peer: {out}")
+        tools_mod._handle_peers({"action": "remove", "machine": "c"}, ctx_for("alice", w.root_a))
+        check_raises(lambda: tools_mod._handle_group({"action": "join", "group": "nowhere"},
                                                      ctx_for("alice", w.root_a)), CommsError,
-                     "an agent cannot approve a peer")
-        check("c" not in relay_mod.read_peers(w.root_a), "the refused add changed nothing")
-        peer_tool = next(t for t in tools_mod.TOOL_DEFINITIONS if t["name"] == "teammate_peers")
-        check("add" not in peer_tool["inputSchema"]["properties"]["action"]["enum"],
-              "the tool offers no add action")
-        listing = tools_mod._handle_peers({}, ctx_for("alice", w.root_a))
-        check("-m teammate_comms.peers add <machine>" in listing and "--comms-dir" in listing,
-              f"list prints the user's approval command: {listing[-300:]}")
+                     "joining a group that is not on this machine is a clear error")
         check(peers_mod.main(["add", "c", "--comms-dir", str(w.root_a)], net=w.net_a) == 0
               and "c" in relay_mod.read_peers(w.root_a), "the user command approves a peer")
         check(peers_mod.main(["add", "Bad_Name", "--comms-dir", str(w.root_a)], net=w.net_a) == 1,
@@ -675,6 +660,136 @@ def test_roster_and_status():
               "remove drops the peer and its queue")
     finally:
         w.close()
+
+
+def test_status_before_first_exchange():
+    w = World()
+    try:
+        seen = {}
+        real = w.ra._exchange
+
+        def spy(machine, cfg, st):
+            seen["published"] = relay_mod.status_file(w.root_a).exists()
+            return real(machine, cfg, st)
+        w.ra._exchange = spy
+        relay_mod.status_file(w.root_a).unlink()
+        w.ra._status_last = None
+        w.ra._peers["b"]["next_due"] = 0
+        w.pump(1, b=False)
+        check(seen.get("published") is True,
+              f"the relay publishes its status before it tries a peer: {seen}")
+    finally:
+        w.close()
+
+
+def test_utc_ids_and_send_time():
+    from datetime import datetime, timezone
+
+    def stamp(epoch):
+        return datetime.fromtimestamp(epoch, timezone.utc).strftime(comms.TIMESTAMP_FMT)
+
+    t0 = 1_800_000_000.0
+    clock = {"now": t0}
+    real_clock, real_local = comms._id_clock, comms._local_as_utc_epoch
+    tmp = tempfile.TemporaryDirectory()
+    root = Path(tmp.name)
+    comms._id_clock = lambda: clock["now"]
+    try:
+        check(comms.new_message_id().startswith(stamp(t0) + "."), "an id carries the UTC time")
+        check(comms.new_message_id(root).startswith(stamp(t0) + "."),
+              "a root with no comms tree yet gets plain UTC ids")
+        check(not (root / "TeammateComms").exists(), "minting an id does not create the comms tree")
+
+        (root / "TeammateComms").mkdir()
+        comms._local_as_utc_epoch = lambda e: e + 7200
+        comms._id_floors.clear()
+        last_local_id = stamp(t0 + 7200 - 1) + ".ffff"
+        ids = []
+        for step in (0, 0.5, 60, 3600, 7199, 7200, 7201, 7272, 7273, 7300, 9000):
+            clock["now"] = t0 + step
+            ids.append(comms.new_message_id(root))
+        check(ids[0] > last_local_id, "east of UTC, the first UTC-era id sorts above existing local ids")
+        check(all(a[:26] < b[:26] for a, b in zip(ids, ids[1:])),
+              f"ids keep increasing across the hand-over to plain UTC: {[i[11:26] for i in ids]}")
+        check(ids[-1].startswith(stamp(t0 + 9000) + "."), "ids return to plain UTC once it passes the floor")
+        clock["now"] = t0 - 500
+        check(comms.new_message_id(root)[:26] >= stamp(t0 + 7200),
+              "a clock set backwards never yields an id below the floor")
+        floor = json.loads((root / "TeammateComms" / comms.ID_FLOOR_FILE).read_text(encoding="utf-8"))
+        check(floor == {"floor": t0 + 7200, "created": t0}, f"the floor is stored once: {floor}")
+
+        comms._id_floors.clear()
+        clock["now"] = t0 + 100
+        check(comms.new_message_id(root).startswith(stamp(t0 + 7200 + 1) + "."),
+              "another process reads the same floor instead of making its own")
+        (root / "TeammateComms" / comms.ID_FLOOR_FILE).write_text("garbage", encoding="utf-8")
+        comms._id_floors.clear()
+        first = comms.new_message_id(root)
+        check(first[:26] >= stamp(t0 + 7200 + 100), "a corrupt floor file is replaced by a higher floor")
+        repaired = json.loads((root / "TeammateComms" / comms.ID_FLOOR_FILE).read_text(encoding="utf-8"))
+        check(repaired == {"floor": t0 + 100 + 7200, "created": t0 + 100},
+              f"the corrupt floor file is repaired on disk: {repaired}")
+        comms._id_floors.clear()
+        clock["now"] = t0 + 300
+        check(comms.new_message_id(root).startswith(stamp(t0 + 100 + 7200 + 2) + "."),
+              "a later process uses the repaired floor, not one of its own")
+        leftovers = [p.name for p in (root / "TeammateComms").iterdir() if p.name.endswith(".tmp")]
+        check(not leftovers, f"no temp files are left behind: {leftovers}")
+        clock["now"] = t0 + 100
+        e = 1_700_000_000.0
+        check(real_local(e) == e + datetime.fromtimestamp(e).astimezone().utcoffset().total_seconds(),
+              "the local-clock reading matches this machine's UTC offset")
+        (root / "TeammateComms" / comms.MIGRATED_MARKER).write_text("{}", encoding="utf-8")
+        check(comms.legacy_repopulated_entries(root) == [],
+              "the floor file is not mistaken for an old session writing to a migrated root")
+        (root / "TeammateComms" / comms.MIGRATED_MARKER).unlink()
+
+        comms._local_as_utc_epoch = lambda e: e - 6 * 3600
+        comms._id_floors.clear()
+        (root / "TeammateComms" / comms.ID_FLOOR_FILE).unlink()
+        check(comms.new_message_id(root).startswith(stamp(t0 + 100) + "."),
+              "west of UTC the floor never changes an id")
+
+        src = (REPO / "src" / "teammate_comms")
+        import re
+        bare = [p.name for p in src.glob("*.py")
+                if re.search(r"(?<!def )new_message_id\(\s*(None)?\s*\)", p.read_text(encoding="utf-8"))]
+        check(not bare, f"every id minted in the package passes the comms root: {bare}")
+
+        clock["now"] = t0 + 200
+        add_agent(root, "ann")
+        add_agent(root, "ben")
+        sent = tools_mod.send_dm(root, None, "ann", "ben", "timed")
+        got = [m for m in unread(root, "ben") if m["id"] == sent["id"]]
+        check(got and got[0].get("ts") == t0 + 200, f"a direct message carries its send time: {got}")
+        tools_mod._handle_group({"action": "create", "group": "tz", "members": ["ben"]}, ctx_for("ann", root))
+        post = tools_mod.send_group(root, None, "ann", "#tz", "timed post")
+        got = [m for m in unread(root, "ben") if m["id"] == post["id"]]
+        check(got and got[0].get("ts") == t0 + 200, "a group post carries its send time")
+        block = "\n".join(tools_mod._format_message_block(got[0]))
+        check(f"| sent: {comms.local_time_text(t0 + 200)} ---" in block and comms.local_time_text(t0 + 200),
+              f"the message block shows the send time in local time: {block[:160]}")
+        check("sent:" not in "\n".join(tools_mod._format_message_block({"id": "x", "from": "y", "message": "z"})),
+              "a message without a send time shows none")
+
+        for bad in ("soon", True, -5, 1e12, float("nan")):
+            rec_id = comms.new_message_id()
+            relay_mod.apply_event(root, "b", "a", "dm", {"to": "ben@b", "record": {
+                "id": rec_id, "from": "zed", "priority": "normal", "message": "bad ts", "ts": bad}})
+            got = [m for m in unread(root, "ben") if m["id"] == rec_id]
+            check(got and "ts" not in got[0], f"a malformed send time ({bad!r}) is dropped, the message kept")
+        rec_id = comms.new_message_id()
+        relay_mod.apply_event(root, "b", "a", "dm", {"to": "ben@b", "record": {
+            "id": rec_id, "from": "zed", "priority": "normal", "message": "good ts", "ts": t0 + 5.123456}})
+        got = [m for m in unread(root, "ben") if m["id"] == rec_id]
+        check(got and got[0].get("ts") == round(t0 + 5.123456, 3), "a relayed message keeps its send time")
+    finally:
+        comms._id_clock, comms._local_as_utc_epoch = real_clock, real_local
+        comms._id_floors.clear()
+        try:
+            tmp.cleanup()
+        except OSError:
+            pass
 
 
 def test_tailscale_parsing():
@@ -731,6 +846,8 @@ def main():
         ("roster, status and peers tool", test_roster_and_status),
         ("Tailscale status parsing", test_tailscale_parsing),
         ("lifecycle guards", test_lifecycle_guards),
+        ("UTC ids, switchover floor and send time", test_utc_ids_and_send_time),
+        ("status published before the first exchange", test_status_before_first_exchange),
     ]
     for label, fn in sections:
         n_before = len(failures)

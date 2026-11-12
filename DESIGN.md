@@ -350,16 +350,47 @@ inbox names must be unique across all projects (two repos each registering `lead
 collide on one inbox — the server's same-name collision warning still applies); team
 namespacing carves out subsets.
 
-**Message-id format & cross-host ordering (WP-26, B3/C4).** `new_message_id()` mints
-`now_timestamp() + "." + <disambiguator>`, where the disambiguator is the writer's pid
+**Message-id format & cross-host ordering (WP-26, B3/C4).** `new_message_id(root)` mints
+`<UTC timestamp> + "." + <disambiguator>`, where the disambiguator is the writer's pid
 plus a per-process monotonic counter (both hex). A bare microsecond timestamp collides:
 two writers stamping the same microsecond otherwise produce two records sharing one id,
 which the dashboard's global per-id dedup silently drops one of, and every id-keyed
 consumer (ack, react, delete, cursors) becomes ambiguous about which record it means.
 The disambiguator guarantees **uniqueness**, not global cross-host **order**: ids order
-by each writer's own local clock, so cross-host ordering is only as good as clock sync
+by each writer's own clock, so cross-host ordering is only as good as clock sync
 between hosts (NTP-synced hosts are the supported envelope) — the skew itself is
-unfixable client-side. Old bare ids and new suffixed ids coexist forever (no migration):
+unfixable client-side.
+
+**UTC ids (0.17.1).** The timestamp in a message, reaction or deletion id is UTC, in the
+unchanged `TIMESTAMP_FMT` shape with no zone marker (old peers validate the shape, and every
+comparison is a string compare). Before 0.17.1 it was naive local time, which mis-ordered ids
+between machines in different time zones once the relay existed. Heartbeats, presence,
+`startedAt`, `createdAt` and log lines stay naive local time: they are written and read on one
+machine, and an older session on that machine compares them with its local clock.
+
+*Switchover floor.* On a machine east of UTC a UTC stamp is lower than the local-time ids
+already on disk, by the UTC offset. The first new-version id minted in a root that already has
+a comms tree writes `TeammateComms/id-floor.json` once (written whole to a temp file, then
+hard-linked into place so an existing file wins and no reader sees a partial one): `floor` is the local
+wall-clock time at that moment read as if it were UTC, `created` the real epoch. An id's stamp
+is `max(utc_now, floor + max(0, now - created) / 100)`: until UTC overtakes the floor, ids
+advance just above it at a hundredth of real speed, then continue as plain UTC with no step
+back. West of UTC the floor is below UTC from the start and never applies. A root with no
+comms tree gets no floor (and minting never creates the tree). A missing or corrupt file
+is replaced with a fresh, later floor, which can only raise ids; a process caches only a floor
+it read back from the file, and one that cannot write the file recomputes the floor on every
+id rather than inventing a private one. If the floor is created in the repeated hour after a
+daylight-saving fall-back, local ids from before the fall-back can sit up to an hour above it. The floor covers ids on disk before the
+switch; it cannot cover a session still running an older version, which keeps minting
+local-time ids. Until every session on a machine is restarted, id cursors (`since` filters,
+the reaction-wake cursor, dashboard cursors and unread markers) can skip events from the other
+generation for up to the UTC offset. Message delivery and message wakes do not use id order.
+
+*Send time.* Each message record carries `ts`, UTC epoch seconds to the millisecond. The
+inbox and group-history block appends `| sent: <local time and offset>`, and the dashboard
+formats it in the browser's zone; a record without `ts` (older, or from an older peer) shows
+no send time in the block and the id's wall-clock digits in the dashboard. The relay passes
+`ts` through only if it is a plausible number. `since` arguments take ids, never clock times. Old bare ids and new suffixed ids coexist forever (no migration):
 lexical comparison handles the mix, since a bare timestamp is always a strict string
 prefix of its own suffixed extension and therefore sorts before it.
 
@@ -905,7 +936,7 @@ rulings and review history: `docs/cross-machine-plan.md`.
 **Shape.** Each machine keeps its own local root, so every local guarantee in this document
 is unchanged. `relay.py` is a standalone process (`python -m teammate_comms.relay`), one per
 machine, started detached by `ensure_relay` when peers are configured (on register, on a
-remote send, on approval of a peer) and guarded by a `file_lock` singleton. Tools queue
+remote send, on `teammate_peers add`) and guarded by a `file_lock` singleton. Tools queue
 **events** as files under `<root>/TeammateComms/relay/outbox/<machine>/`; the relay delivers
 them and applies incoming ones by calling the same cores the tools use (`deliver_dm_record`,
 `post_group_record`, `react`, `delete_message`, `_edit_group_members`, `delete_group_local`)
@@ -967,13 +998,12 @@ member on a machine that is not an approved peer of the poster's machine is name
 post result as not sent. No Tailscale setting is required of the
 user; problems are detected and reported.
 
-**Peer approval is the user's.** `relay/peers.json` is written only by the user-run command
-`python -m teammate_comms.peers add|remove|list <machine>` (`peers.py`, a thin wrapper over
-`relay.approve_peer` / `remove_peer` / `peers_report`). `teammate_peers` has no `add` action;
-calling it with one returns the command for the user to run, and so does every "not an
-approved peer" error. An agent can still remove a peer or restart the relay, which only
-narrows what this machine talks to. The restriction is a guard rail: agents run as the user
-and could write the file or run the command, so the skill text forbids it.
+**Peer approval.** `teammate_peers(action="add")` and the terminal command
+`python -m teammate_comms.peers add|remove|list <machine>` (`peers.py`) both call
+`relay.approve_peer` / `remove_peer` / `peers_report`. An earlier build made approval
+terminal-only; setting up two machines that way proved too awkward, so the tool action was
+restored (owner ruling 2026-11-12) with the skill telling agents to add a machine only when
+their user asks.
 
 A rejection is stored with its reason in the seen file (`id<TAB>reason`), so a resend after a
 lost response, or after either relay restarts, is answered with the same failure instead of
@@ -989,7 +1019,7 @@ live relay, and the child's stderr goes to `relay/relay.log`.
 whole transcript when the id is not in its recent tail. An unapproved tailnet device can hold
 a handler thread until its request times out. Team namespaces are refused. Not relayed: read receipts, project profiles,
 late-joiner group history, remote roster in the dashboard. No forwarding through a third
-machine. Message ids stay naive-local-time (§8), so cross-machine id ordering needs matching
-time zones. Cross-machine reactions and deletes resolve through the transcript, so they need
+machine. Message ids are UTC (§8), so cross-machine id ordering needs synced clocks but not
+matching time zones; a peer still on 0.17.0 sends local-time ids. Cross-machine reactions and deletes resolve through the transcript, so they need
 it enabled. Whether a detached relay survives the launching session's exit on every platform
 is unverified; if it dies, the next register or remote send restarts it.

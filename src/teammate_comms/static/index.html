@@ -372,7 +372,14 @@ function selectConv(id) {
   if (ok) $("#compose").focus();
 }
 
-function fmtWhen(id) { const m = /T(\d{2}:\d{2}:\d{2})/.exec(id || ""); return m ? m[1] : ""; }
+function fmtWhen(rec) {
+  if (rec && typeof rec.ts === "number") {
+    const d = new Date(rec.ts * 1000);
+    if (!isNaN(d.getTime())) return d.toLocaleTimeString([], { hourCycle: "h23" });
+  }
+  const m = /T(\d{2}:\d{2}:\d{2})/.exec((rec && rec.id) || "");
+  return m ? m[1] : "";
+}
 
 function renderTranscript() {
   const main = $("#main"); main.textContent = "";
@@ -399,7 +406,7 @@ function renderMsg(rec) {
   const row = el("div", "msg" + (rec.priority === "urgent" && !isDel ? " urgent" : ""));
   const head = el("div");
   head.appendChild(span("who", rec.from));
-  head.appendChild(span("when", fmtWhen(rec.id)));
+  head.appendChild(span("when", fmtWhen(rec)));
   if (isDel) {                                  // tombstone: identity kept, body + extras suppressed
     row.appendChild(head);
     row.appendChild(span("body deleted", DELETED_TEXT));
@@ -493,7 +500,7 @@ function renderFeed(rec) {
   route.appendChild(span(null, rec.from));
   route.appendChild(span("arrow", " → "));
   route.appendChild(span(null, rec.group ? rec.group : (rec.to || "?")));
-  route.appendChild(span(null, "  " + fmtWhen(rec.id)));
+  route.appendChild(span(null, "  " + fmtWhen(rec)));
   if (rec.post_type) route.appendChild(span(null, "  [" + rec.post_type + "]"));
   if (rec.priority === "urgent") route.appendChild(span(null, "  URGENT"));
   if ((rec.mentions || []).length) route.appendChild(span(null, "  🔔" + rec.mentions.join(",")));

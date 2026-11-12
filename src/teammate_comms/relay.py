@@ -26,6 +26,7 @@ from .comms import (
     MACHINE_NAME_PATTERN,
     RELAY_SENDER,
     CommsError,
+    clean_ts,
     file_lock,
     find_group_case_variant,
     get_agents_dir,
@@ -358,25 +359,14 @@ def forget_peer(root, machine):
             pass
 
 
-def approve_command(root, machine):
-    """The command a user runs on this machine to approve ``machine``."""
-    exe = sys.executable.replace("\\", "/")
-    tail = f'-m teammate_comms.peers add {machine} --comms-dir "{Path(root).as_posix()}"'
-    if " " not in exe:
-        return f"{exe} {tail}"
-    if os.name == "nt":
-        return f'"{exe}" {tail}   (in PowerShell, start it with an ampersand: & "{exe}" {tail})'
-    return f'"{exe}" {tail}'
-
-
-def approval_hint(root, machine):
-    return (f"Only the user can approve a machine; agents cannot. Ask your user to run this "
-            f"on this machine: {approve_command(root, machine)}")
+def approval_hint(machine):
+    return (f"If your user wants this machine linked to {machine}, approve it with "
+            f"teammate_peers(action=\"add\", machine=\"{machine}\").")
 
 
 def remote_approval_hint(machine, me):
-    return (f"The user must approve this machine on {machine}: teammate_peers() there prints "
-            f"the exact command, which ends in `-m teammate_comms.peers add {me}`.")
+    return (f"A session on {machine} must approve this machine with "
+            f"teammate_peers(action=\"add\", machine=\"{me}\").")
 
 
 def start_line(started):
@@ -405,8 +395,9 @@ def approve_peer(root, machine, net=None):
         lines.append(f"⚠️ WARNING: no device named {machine!r} is visible in this tailnet. "
                      f"Visible devices: {', '.join(net.devices()) or '(none)'}.")
     mine = me.get("machine") or "<this machine's Tailscale name>"
-    lines.append(f"Both sides must approve each other: on {machine}, run the same command "
-                 f"with `add {mine}`. Teammates there are then addressed as name@{machine}.")
+    lines.append(f"Both sides must approve each other: on {machine}, a session runs "
+                 f"teammate_peers(action=\"add\", machine=\"{mine}\"). Teammates there are "
+                 f"then addressed as name@{machine}.")
     return "\n".join(lines)
 
 
@@ -456,8 +447,8 @@ def peers_report(root, net=None):
     others = [d for d in net.devices() if d not in peers]
     if others:
         lines.append(f"Other devices on this tailnet: {', '.join(others)}.")
-    lines.append(f"Only the user can approve a machine; agents cannot. The user runs, on this "
-                 f"machine: {approve_command(root, '<machine>')}")
+    lines.append("Approve a machine with teammate_peers(action=\"add\", machine=\"<name>\"), "
+                 "only when your user asks for it.")
     return "\n".join(lines)
 
 
@@ -713,6 +704,9 @@ def _clean_record(names, raw):
     reply_to = raw.get("reply_to")
     if isinstance(reply_to, str) and reply_to.strip():
         record["reply_to"] = reply_to.strip()[:128]
+    ts = clean_ts(raw.get("ts"))
+    if ts is not None:
+        record["ts"] = ts
     return record
 
 
@@ -1393,6 +1387,7 @@ class Relay:
                 for machine in list(self._peers):
                     if machine not in peers:
                         del self._peers[machine]
+        self._write_status(peers)
         for machine, cfg in peers.items():
             st = self._peer(machine)
             if not running:
