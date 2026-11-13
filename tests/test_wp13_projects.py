@@ -16,6 +16,7 @@ Run: uv run --no-dev python tests/test_wp13_projects.py
 """
 import json
 import os
+os.environ["TEAMMATE_RELAY_AUTOSTART"] = "0"
 import subprocess
 import sys
 import tempfile

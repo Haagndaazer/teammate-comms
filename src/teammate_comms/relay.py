@@ -24,6 +24,7 @@ from pathlib import Path
 from . import __version__
 from .comms import (
     MACHINE_NAME_PATTERN,
+    MIGRATED_MARKER,
     RELAY_SENDER,
     CommsError,
     clean_ts,
@@ -331,20 +332,20 @@ def delivery_report(root, name, machine, started=None):
     return lines
 
 
-def request_stop(root):
+def request_stop(root, pid=None):
     path = stop_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(read_status(root).get("pid") or "any"), encoding="utf-8")
+    path.write_text(str(pid or read_status(root).get("pid") or "any"), encoding="utf-8")
 
 
 def _version_key(value):
     return tuple(int(p) if p.isdigit() else 0 for p in str(value or "").split("."))
 
 
-def stop_and_wait(root, seconds=STOP_WAIT_SECONDS):
+def stop_and_wait(root, seconds=STOP_WAIT_SECONDS, pid=None):
     if not relay_alive(root):
         return
-    request_stop(root)
+    request_stop(root, pid)
     deadline = time.time() + seconds
     while time.time() < deadline and relay_alive(root):
         time.sleep(0.1)
@@ -458,15 +459,17 @@ def ensure_relay(root):
     Returns ``no_peers`` | ``running`` | ``started`` | ``disabled`` | ``failed``.
     """
     try:
-        if not read_peers(root):
+        if not read_peers(root) or (get_relay_dir(root).parent / MIGRATED_MARKER).exists():
             return "no_peers"
         status = read_status(root)
-        if relay_alive(root, status):
-            if _version_key(status.get("version")) >= _version_key(__version__):
-                return "running"
-            stop_and_wait(root)
+        current = relay_alive(root, status) and (
+            _version_key(status.get("version")) >= _version_key(__version__))
+        if current:
+            return "running"
         if os.environ.get(AUTOSTART_ENV, "").strip() == "0":
             return "disabled"
+        if relay_alive(root, status):
+            stop_and_wait(root, pid=status.get("pid"))
         env = dict(os.environ)
         src = str(Path(__file__).resolve().parents[1])
         env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")

@@ -69,6 +69,7 @@ Run: uv run --no-sync python tests/test_compact.py
 import contextlib
 import json
 import os
+os.environ["TEAMMATE_RELAY_AUTOSTART"] = "0"
 import re
 import subprocess
 import sys

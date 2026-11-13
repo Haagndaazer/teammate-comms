@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import os
+os.environ["TEAMMATE_RELAY_AUTOSTART"] = "0"
 import sys
 import tempfile
 import threading

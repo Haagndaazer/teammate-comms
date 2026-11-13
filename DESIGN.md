@@ -1012,6 +1012,9 @@ queued for a machine (not an approved peer, or a full queue) is reported to its 
 `comms-relay` DM. A reaction or deletion is accepted only from a machine that is a party to
 the target: a member in the target's group, or one end of the DM. One request applies events
 for at most about 2 s; the rest stay queued on the sender and come in the next exchange.
+`ensure_relay` is also called from server start (in a background thread, on the default root),
+so a plugin update replaces an older relay as soon as any session reconnects rather than at
+the next registration; with autostart disabled it never stops a running relay.
 `ensure_relay` reports `failed` when the started process exits within a second without a
 live relay, and the child's stderr goes to `relay/relay.log`.
 

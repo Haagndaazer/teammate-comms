@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.17.2
+
+> Found in the second two-machine test. A server that starts on a new plugin version now
+> replaces a relay still running the previous version straight away, instead of waiting for a
+> session to register; before, messages arriving in that gap were handled by the old relay and
+> lost their send time. Turning relay autostart off no longer stops a relay that is running.
+
 ## 0.17.1
 
 > Found in the first two-machine test. `teammate_peers` has its `add` action back, so linking

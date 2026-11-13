@@ -682,6 +682,64 @@ def test_status_before_first_exchange():
         w.close()
 
 
+def test_server_start_refreshes_relay():
+    tmp = tempfile.TemporaryDirectory()
+    calls = []
+    real, old_env = relay_mod.ensure_relay, os.environ.get("TEAMMATE_COMMS_DIR")
+    relay_mod.ensure_relay = lambda root: calls.append(Path(root))
+    os.environ["TEAMMATE_COMMS_DIR"] = tmp.name
+    try:
+        server_mod._refresh_relay()
+        check(calls == [Path(tmp.name)],
+              f"a starting server asks for the relay to be brought up to its version: {calls}")
+    finally:
+        relay_mod.ensure_relay = real
+        if old_env is None:
+            os.environ.pop("TEAMMATE_COMMS_DIR", None)
+        else:
+            os.environ["TEAMMATE_COMMS_DIR"] = old_env
+        tmp.cleanup()
+
+
+def test_starting_server_replaces_old_relay():
+    import subprocess
+    tmp = tempfile.TemporaryDirectory()
+    root = Path(tmp.name)
+    relay_mod.update_peers(root, lambda p: {"no-such-peer": {}})
+    comms.write_json_atomic(relay_mod.status_file(root), {
+        "pid": 1, "host": socket.gethostname(), "version": "0.0.1", "updated_epoch": time.time()})
+    env = dict(os.environ, TEAMMATE_COMMS_DIR=str(root), TEAMMATE_RELAY_AUTOSTART="1",
+               TEAMMATE_RELAY_PORT=str(free_port()), PYTHONPATH=str(REPO / "src"),
+               PYTHONIOENCODING="utf-8")
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    proc = subprocess.Popen([sys.executable, "-m", "teammate_comms.server"], env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 30
+        version = None
+        while time.time() < deadline:
+            status = relay_mod.read_status(root)
+            if status.get("pid") != 1 and relay_mod.relay_alive(root, status):
+                version = status.get("version")
+                break
+            time.sleep(0.2)
+        check(version == relay_mod.__version__,
+              f"a server that merely starts replaces an older relay with its own version: {version}")
+    finally:
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        relay_mod.stop_and_wait(root, seconds=15)
+        check(not relay_mod.relay_alive(root), "the test relay was stopped")
+        time.sleep(0.5)
+        try:
+            tmp.cleanup()
+        except OSError:
+            pass
+
+
 def test_utc_ids_and_send_time():
     from datetime import datetime, timezone
 
@@ -826,6 +884,12 @@ def test_lifecycle_guards():
         relay_mod.update_peers(root, lambda p: {"b": {}})
         check(relay_mod.ensure_relay(root) == "disabled", "autostart disabled by env in tests")
         check(not relay_mod.relay_alive(root), "nothing running")
+        comms.write_json_atomic(relay_mod.status_file(root), {
+            "pid": 1, "host": socket.gethostname(), "version": "0.0.1", "updated_epoch": time.time()})
+        check(relay_mod.ensure_relay(root) == "disabled" and not relay_mod.stop_file(root).exists(),
+              "with autostart off an older running relay is left alone")
+        (relay_mod.get_relay_dir(root).parent / comms.MIGRATED_MARKER).write_text("{}", encoding="utf-8")
+        check(relay_mod.ensure_relay(root) == "no_peers", "a migrated-away root never gets a relay")
     check_raises(lambda: server_mod.register_identity("Comms-Relay", None, None), CommsError,
                  "the relay's sender name is reserved")
 
@@ -848,6 +912,8 @@ def main():
         ("lifecycle guards", test_lifecycle_guards),
         ("UTC ids, switchover floor and send time", test_utc_ids_and_send_time),
         ("status published before the first exchange", test_status_before_first_exchange),
+        ("server start refreshes an outdated relay", test_server_start_refreshes_relay),
+        ("a starting server replaces an old relay (real processes)", test_starting_server_replaces_old_relay),
     ]
     for label, fn in sections:
         n_before = len(failures)

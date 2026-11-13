@@ -679,6 +679,15 @@ def _write_plugin_runtime_pointer():
         log(f"plugin-runtime.json pointer write skipped: {e}")
 
 
+def _refresh_relay():
+    """Replace a relay left running by an older version without waiting for a registration."""
+    try:
+        root, _source = resolve_comms_root(None)
+        relay_mod.ensure_relay(root)
+    except Exception as e:
+        log(f"relay refresh skipped: {e}")
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "avatar":
         _avatar_subcommand(sys.argv[2:])
@@ -696,6 +705,7 @@ def main():
     except Exception as exc:
         log(f"legacy comms root migration skipped: {exc}")
     _write_plugin_runtime_pointer()
+    threading.Thread(target=_refresh_relay, name="relay-refresh", daemon=True).start()
 
     ctx = {"identity": _identity, "register": register_identity,
            "auto_register_error": _get_auto_register_error}
