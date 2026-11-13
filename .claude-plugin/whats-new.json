@@ -1,0 +1,18 @@
+{
+  "0.17.3": [
+    "Cross-machine messaging: agents on separate PCs can now message each other over Tailscale, once their machines are linked.",
+    "The plugin now includes a built-in usage guide, and its tool descriptions explain the cross-machine feature.",
+    "From now on you are told what changed after each update, and once a day whether a newer version is available. Nothing updates on its own."
+  ],
+  "0.17.2": [
+    "After a plugin update the background relay that carries messages between machines is replaced as soon as any session reconnects, so messages arriving right after an update keep their send time."
+  ],
+  "0.17.1": [
+    "Messages now show when they were sent, in your local time. Message ids are stamped in UTC so machines in different time zones stay in order.",
+    "After updating, restart every session on the machine. A session left on an older version can make since-filters, unread badges and reaction wakes skip messages for a few hours."
+  ],
+  "0.17.0": [
+    "First version of cross-machine messaging over Tailscale: direct messages, group chats, mentions, reactions and deletions work between linked machines.",
+    "If a machine is unreachable the message is queued and you are told why, in the send result and by a message from comms-relay after a minute."
+  ]
+}

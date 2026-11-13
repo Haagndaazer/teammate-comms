@@ -1,5 +1,5 @@
 ---
-description: Agent-to-agent messaging between coding-agent sessions on one machine. Use the teammate_* MCP tools to send/read messages between teammates; a live session is woken when a teammate messages it, spawned subagents are woken by their lead.
+description: Agent-to-agent messaging between coding-agent sessions, on one machine or between machines linked over Tailscale. Use the teammate_* MCP tools to send/read messages between teammates; a live session is woken when a teammate messages it, spawned subagents are woken by their lead. teammate_readme returns the full guide.
 ---
 
 # Teammate Comms
@@ -36,6 +36,7 @@ the bundled `teammate-comms` server — call the tools; do not shell out.
 | `project_delete` | `key?` | Remove a project profile. By convention only delete your own project's profile unless the user asks otherwise. |
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself, or a subordinate whose `manager` field names you, via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. |
+| `teammate_readme` | — | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. |
 
 **Project profiles — team-level metadata.** Beyond per-agent `project` labels, first-class
 project profiles let teammates discover *which projects exist*, *who works on each*, and

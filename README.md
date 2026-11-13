@@ -59,6 +59,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `project_delete` | `key?` | Remove a project profile. |
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. |
+| `teammate_readme` | — | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -278,6 +279,10 @@ terminal as `<python> -m teammate_comms.peers add|remove|list <machine>`.
 `machine` is the device's Tailscale name (`teammate_peers()` lists the devices it can see).
 Approval is mutual: a machine only accepts connections from machines in its own list. The
 relay starts by itself when peers are configured and a session registers.
+
+**Updates.** At session start the plugin says what changed after an update (once per
+version) and, at most once a day, whether a newer version has been released. It never
+updates itself: run the update command it names, then restart every session on that machine.
 
 **Use.** A teammate on another machine is `name@machine`:
 
@@ -532,6 +537,8 @@ recovered either, past a capped number of retries).
 | `TEAMMATE_RELAY_PORT` | Port the cross-machine relay listens on and dials (default 47821). A peer on a different port is set per peer in `relay/peers.json` (`{"port": N}`). |
 | `TEAMMATE_TAILSCALE_BIN` | Path to the `tailscale` command if it is not on PATH or in its default install location. |
 | `TEAMMATE_RELAY_AUTOSTART=0` | Stops sessions from starting the relay themselves; run `python -m teammate_comms.relay` yourself instead. |
+| `TEAMMATE_WHATS_NEW=off` | Turns off the one-time note at session start that says what changed after an update. |
+| `TEAMMATE_UPDATE_NUDGE=off` | Turns off the once-a-day check for a newer released version. The check only reads the public marketplace; nothing is installed. |
 | `TEAMMATE_HARNESS` | Selects the harness policy row (`claude-code` default, `codex`); the Codex hook sets it on the MCP entry. Never set it by hand under Claude Code. |
 | `CLAUDE_PROJECT_DIR` | Set by Claude Code itself; auto-fills the `project` profile field at registration (no longer the storage root, since 0.3.0). |
 

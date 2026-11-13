@@ -11,6 +11,14 @@ CODEX = "codex"
 ENV_VAR = "TEAMMATE_HARNESS"
 DEFAULT = CLAUDE_CODE
 
+PLUGIN_NAME = "teammate-comms"
+PLUGIN_ROOT_ENV = "CLAUDE_PLUGIN_ROOT"
+PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA"
+WHATS_NEW_PATH = ".claude-plugin/whats-new.json"
+MARKETPLACE_URL_TEMPLATE = (
+    "https://raw.githubusercontent.com/Haagndaazer/colton-claude-plugins/main/{path}")
+PLUGIN_URL_TEMPLATE = "https://raw.githubusercontent.com/Haagndaazer/teammate-comms/{sha}/{path}"
+
 
 @dataclass(frozen=True)
 class Harness:
@@ -28,6 +36,8 @@ class Harness:
     spawn_prompt: str
     install_cta: str
     debug_hint: str
+    manifest_path: str
+    marketplace_manifest_path: str
 
     def skill_invoke(self, skill):
         return f"{self.skill_prefix}{skill}"
@@ -50,6 +60,8 @@ HARNESSES = {
                       "then await instructions."),
         install_cta="/plugin update teammate-comms@coltondyck",
         debug_hint="~/.claude/debug/<session-id>.txt",
+        manifest_path=".claude-plugin/plugin.json",
+        marketplace_manifest_path=".claude-plugin/marketplace.json",
     ),
     CODEX: Harness(
         name=CODEX,
@@ -72,6 +84,8 @@ HARNESSES = {
                       "messages, then await instructions."),
         install_cta="codex plugin marketplace upgrade coltondyck (then restart Codex)",
         debug_hint="the Codex session log",
+        manifest_path=".codex-plugin/plugin.json",
+        marketplace_manifest_path=".agents/plugins/marketplace.json",
     ),
 }
 

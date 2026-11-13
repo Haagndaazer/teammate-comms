@@ -78,6 +78,7 @@ fi
 # tell the agent to restart once (the prior fix was prose-only in README/DESIGN, invisible
 # in-session; missing uv/bash otherwise present as the identical silent "no teammate_* tools").
 FIRST_INSTALL=0
+FIRST_NOTE=""
 if [ ! -f "$STAMP" ]; then
     FIRST_INSTALL=1
 fi
@@ -95,17 +96,79 @@ if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$HASH" ]; then
         mkdir -p "${VENV_DIR}"
         echo "$HASH" > "$STAMP"
         if [ "$FIRST_INSTALL" = "1" ]; then
-            emit_context "teammate-comms just built its environment for the first time. If the teammate_* tools are not available in this session, restart Claude Code once (check with /mcp)."
-            exit 0
+            FIRST_NOTE="teammate-comms just built its environment for the first time. If the teammate_* tools are not available in this session, restart Claude Code once (check with /mcp)."
+        fi
+    fi
+fi
+
+# ── Step 3: what changed since the last session, and whether a newer version is pinned ──
+# Each module prints nothing or ONE line that is already JSON-escaped. A failure of either is
+# an empty note, never a dead hook. Skipped without a plugin data dir and under Codex (its
+# context budget is small and its marketplace does not list this plugin yet).
+WHATSNEW_NOTE=""
+UPDATE_NOTE=""
+PLUGIN_DATA="${CLAUDE_PLUGIN_DATA:-}"
+if [ -n "$PLUGIN_DATA" ] && [ "${TEAMMATE_HARNESS:-}" != "codex" ]; then
+    PLUGIN_ROOT_NATIVE="$PLUGIN_ROOT"
+    PLUGIN_DATA_NATIVE="$PLUGIN_DATA"
+    if command -v cygpath &>/dev/null; then
+        PLUGIN_ROOT_NATIVE=$(cygpath -m "$PLUGIN_ROOT" 2>/dev/null) || PLUGIN_ROOT_NATIVE="$PLUGIN_ROOT"
+        PLUGIN_DATA_NATIVE=$(cygpath -m "$PLUGIN_DATA" 2>/dev/null) || PLUGIN_DATA_NATIVE="$PLUGIN_DATA"
+    fi
+    _notice() {
+        UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
+            CLAUDE_PLUGIN_ROOT="${PLUGIN_ROOT_NATIVE}" \
+            CLAUDE_PLUGIN_DATA="${PLUGIN_DATA_NATIVE}" \
+            uv run --no-sync --project "${PLUGIN_ROOT}" python -m "$1" </dev/null 2>/dev/null \
+            | tr -d '\r\n'
+    }
+    _is_off() {
+        case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+            off|0|false|no) return 0 ;;
+        esac
+        return 1
+    }
+
+    if ! _is_off "${TEAMMATE_WHATS_NEW:-}"; then
+        SEEN_VERSION=""
+        if [ -f "${PLUGIN_DATA}/whats-new-seen" ]; then
+            SEEN_VERSION=$(cat "${PLUGIN_DATA}/whats-new-seen" 2>/dev/null) || SEEN_VERSION=""
+        fi
+        INSTALLED_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            "${PLUGIN_ROOT}/.claude-plugin/plugin.json" 2>/dev/null \
+            | head -1 | sed -E 's/.*"([^"]*)"[[:space:]]*$/\1/') || INSTALLED_VERSION=""
+        if [ -z "$SEEN_VERSION" ] || [ "$SEEN_VERSION" != "$INSTALLED_VERSION" ]; then
+            WHATSNEW_NOTE=$(_notice teammate_comms.whats_new) || WHATSNEW_NOTE=""
+        fi
+    fi
+
+    if ! _is_off "${TEAMMATE_UPDATE_NUDGE:-}"; then
+        FIND_BIN="/usr/bin/find"
+        if [ ! -x "$FIND_BIN" ]; then
+            FIND_BIN="find"
+        fi
+        STAMP_FRESH=false
+        if [ -f "${PLUGIN_DATA}/update-check.json" ]; then
+            if [ -n "$("$FIND_BIN" "${PLUGIN_DATA}/update-check.json" -mtime -1 2>/dev/null)" ]; then
+                STAMP_FRESH=true
+            fi
+        fi
+        if [ "$STAMP_FRESH" = false ]; then
+            UPDATE_NOTE=$(_notice teammate_comms.update_check) || UPDATE_NOTE=""
         fi
     fi
 fi
 
 # Identity is established at runtime via the teammate_register tool, so an unset
-# TEAMMATE_AGENT is the normal case — nothing to warn about. (Setting it is still
-# supported: the server auto-registers from it if present.)
-if [ -n "${TEAMMATE_HOOK_NOTE:-}" ]; then
-    emit_context ""
+# TEAMMATE_AGENT is the normal case — nothing to warn about.
+TEXT=""
+for PART in "$FIRST_NOTE" "$WHATSNEW_NOTE" "$UPDATE_NOTE"; do
+    if [ -n "$PART" ]; then
+        if [ -n "$TEXT" ]; then TEXT="${TEXT}\n\n${PART}"; else TEXT="$PART"; fi
+    fi
+done
+if [ -n "$TEXT" ] || [ -n "${TEAMMATE_HOOK_NOTE:-}" ]; then
+    emit_context "$TEXT"
 else
     echo '{}'
 fi

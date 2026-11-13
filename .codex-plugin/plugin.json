@@ -1,7 +1,7 @@
 {
   "name": "teammate-comms",
-  "version": "0.17.2",
-  "description": "Agent-to-agent messaging with idle wake for coding-agent sessions on one machine (Claude Code and Codex).",
+  "version": "0.17.3",
+  "description": "Agent-to-agent messaging between coding-agent sessions, on one machine or between machines linked over Tailscale.",
   "keywords": ["mcp", "agent", "messaging", "teammates", "wake"],
   "skills": ["./adapters/codex/skills/teammate-comms"],
   "hooks": ["./adapters/codex/hooks.json"],

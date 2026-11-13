@@ -55,4 +55,8 @@ jobs:
       - name: Run Codex parity suite (WP-43..WP-46)
         run: uv run --no-sync python tests/test_codex.py
       - name: Run cross-machine relay suite
+        if: ${{ !cancelled() }}
         run: uv run --no-sync python tests/test_relay.py
+      - name: Run agent-surface and update-notice suite
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync python tests/test_notices.py

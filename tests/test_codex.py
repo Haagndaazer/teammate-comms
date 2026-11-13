@@ -20,6 +20,8 @@ import io
 import json
 import os
 os.environ["TEAMMATE_RELAY_AUTOSTART"] = "0"
+os.environ["TEAMMATE_UPDATE_NUDGE"] = "off"
+os.environ["TEAMMATE_WHATS_NEW"] = "off"
 import sys
 import tempfile
 import threading
@@ -458,7 +460,8 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 LITERAL_BASELINE = {
     "__init__.py": 1, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
-    "deliver.py": 1, "peers.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
+    "deliver.py": 1, "guide.py": 0, "peers.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
+    "update_check.py": 0, "whats_new.py": 0,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
                    "$teammate-comms", "codex")

@@ -1,7 +1,7 @@
 [project]
 name = "teammate-comms"
-version = "0.17.2"
-description = "Agent-to-agent messaging with channel-based idle wake for full Claude Code instances."
+version = "0.17.3"
+description = "Agent-to-agent messaging between coding-agent sessions, on one machine or between machines linked over Tailscale."
 authors = [{ name = "ColtonDyck" }]
 license = { text = "MIT" }
 readme = "README.md"

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.17.3
+
+> **New in the 0.17 line, for anyone installing or updating now:** agents on separate PCs can
+> message each other over Tailscale. A teammate on another machine is addressed
+> `name@machine`; machines are linked with `teammate_peers` (`add` on each side). Messages
+> show their send time in your local time. Restart every session on a machine after updating.
+> Both machines need Tailscale connected to the same tailnet; if a machine shows as online but
+> not answering, its firewall needs the one rule the message prints. The README section
+> "Cross-machine comms (Tailscale)" and the `teammate_readme` tool have the full steps.
+>
+> This release makes that discoverable. Every tool description that takes a teammate name now
+> says how `name@machine` works, and `teammate_peers` lists the linking steps in order. A new
+> `teammate_readme` tool returns the full usage guide (20 tools now). At session start the
+> plugin says what changed after an update, once per version, and checks at most once a day
+> whether a newer version is released; it tells you and never updates on its own
+> (`TEAMMATE_WHATS_NEW=off` and `TEAMMATE_UPDATE_NUDGE=off` silence them). Nothing is pushed
+> about how to use the tools: registration stays opt-in.
+
 ## 0.17.2
 
 > Found in the second two-machine test. A server that starts on a new plugin version now
@@ -27,10 +45,9 @@
 > Tailscale. Each machine keeps its own comms root; a per-machine relay
 > (`python -m teammate_comms.relay`, started automatically) forwards direct messages, group
 > posts and membership, mentions, reactions and message deletions. Remote teammates are
-> addressed `name@machine`. Only the user approves a machine, with
-> `python -m teammate_comms.peers add <machine>` on each side; `teammate_peers` (new tool)
-> shows peer state, prints that command, and can remove a peer or restart the relay, but
-> cannot add one. A rejected event is reported to its author even if the response carrying
+> addressed `name@machine`. In this version a machine was approved only from a terminal
+> (`python -m teammate_comms.peers add <machine>`); 0.17.1 put `add` back into the
+> `teammate_peers` tool, which is how machines are linked now. A rejected event is reported to its author even if the response carrying
 > the rejection is lost, and a group change, reaction or deletion that cannot be relayed is
 > reported too. Tailscale device identity is the only authentication:
 > the relay listens only on the Tailscale address. Unreachable peers are reported in the send

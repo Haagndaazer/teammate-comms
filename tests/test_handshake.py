@@ -5,7 +5,7 @@ NO TEAMMATE_AGENT (so identity comes from an explicit teammate_register call, th
 primary path). Asserts both halves of the unified server:
 
   Registration + tool gating:
-    - tools/list returns 19 tools (register + 18), each with a valid object inputSchema
+    - tools/list returns 20 tools (register + 19), each with a valid object inputSchema
     - before registration, messaging tools return isError ("register first")
     - teammate_register (with a profile) establishes identity; teammate_whoami flips
       to registered and echoes the profile
@@ -47,6 +47,8 @@ Run:  uv run --no-dev python tests/test_handshake.py
 import json
 import os
 os.environ["TEAMMATE_RELAY_AUTOSTART"] = "0"
+os.environ["TEAMMATE_UPDATE_NUDGE"] = "off"
+os.environ["TEAMMATE_WHATS_NEW"] = "off"
 import re
 import subprocess
 import sys
@@ -566,7 +568,7 @@ def main():
     if any("id" in m and m["id"] is None and "result" in m for m in msgs):
         failures.append("notification-form ping produced a response frame (WP-16 AC-3, should be silent)")
 
-    # tools/list: 19 tools (WP-42 removed teammate_ack — reading is acking now), each with
+    # tools/list: 20 tools (WP-42 removed teammate_ack — reading is acking now), each with
     # an object inputSchema
     tl = result(2).get("tools")
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
@@ -575,7 +577,8 @@ def main():
                       "teammate_react", "teammate_reincarnate", "teammate_dashboard",
                       "teammate_delete",
                       "project_register", "list_projects", "project_profile", "project_delete",
-                      "teammate_set_avatar", "teammate_request_compact", "teammate_peers"}
+                      "teammate_set_avatar", "teammate_request_compact", "teammate_peers",
+                      "teammate_readme"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")  # WP-42 AC-4: teammate_ack must be absent
     else:

@@ -25,6 +25,7 @@ One row per tool, hook, skill and CLI × harness. Values: `full` | `partial` | `
 | project_delete | full | full | |
 | teammate_request_compact | full | partial | The broker types `/compact` into a WezTerm pane; works on Codex only inside WezTerm. |
 | teammate_peers | full | full | Cross-machine relay over Tailscale; harness-neutral. |
+| teammate_readme | full | full | Usage guide; names the running harness's update command. |
 | idle wake | full | full | Claude: channel push (may be dropped upstream; re-nudge backoff). Codex: `codex queue` on own thread (durable; no re-nudge). |
 | hooks/session-start.sh | full | full | Codex wraps it via `adapters/codex/hooks/session-start.sh`. |
 | skills/teammate-comms | full | full | Invoked as `/teammate-comms` vs `$teammate-comms`. |

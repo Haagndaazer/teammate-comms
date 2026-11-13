@@ -401,9 +401,9 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **19 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
+long-lived server. **20 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
 project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37 + 1
-cross-machine `teammate_peers` tool, §14):**
+cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -1026,3 +1026,42 @@ machine. Message ids are UTC (§8), so cross-machine id ordering needs synced cl
 matching time zones; a peer still on 0.17.0 sends local-time ids. Cross-machine reactions and deletes resolve through the transcript, so they need
 it enabled. Whether a detached relay survives the launching session's exit on every platform
 is unverified; if it dies, the next register or remote send restarts it.
+
+---
+
+## 15. Agent guide and update notices (0.17.3)
+
+**Nothing is pushed about how to use the tools.** WP-41's ruling stands: `initialize` carries
+no `instructions` field, and no hook tells an agent to register. An agent learns usage from
+the tool descriptions and, on request, from `teammate_readme`.
+
+**`teammate_readme`.** No arguments, callable before registering. Returns `guide.py`'s text:
+joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking a machine
+step by step, what each cross-machine warning means, updating, limits. Every tool is named in
+it; `tests/test_notices.py` fails the build if one is missing there, in the README tool table
+or in the skill's tool table.
+
+**What-changed note** (`whats_new.py`, `.claude-plugin/whats-new.json`). The session-start
+hook runs the module when `whats-new-seen` in the plugin data folder differs from the
+installed version. It shows the hand-written bullets for versions after the last one seen
+(at most 3 versions, 9 bullets), then writes the installed version to the marker. A machine
+with no marker gets the most recent entries once, headed "recent changes"; that covers both a
+first install and a machine that had the plugin before the feature existed. This differs from
+vibe-cognition, which stays silent on a first install, because the owner wants a first
+install to say what changed.
+
+**Update notice** (`update_check.py`). At most once per 24 h (gated in bash on the mtime of
+`update-check.json`), the hook reads the marketplace's pinned commit for this plugin and the
+manifest version at that commit, over two unauthenticated GETs bounded to 8 s, and compares
+version strings. A newer pin prints an "Update Available" block that tells the agent to tell
+the human and not to update on their behalf.
+
+**Hook contract.** Each module prints nothing or one ASCII line already JSON-escaped
+(`json.dumps(text)[1:-1]`); the hook strips CR/LF and joins the parts with a literal `\n\n`
+inside `additionalContext`. A failing module is an empty note. With no notes the hook still
+prints `{}`. On the venv-build path the "restart once" message is joined with the notes
+rather than replacing them. Both steps are skipped when the plugin data folder is not
+provided and under Codex, whose context budget is 2000 characters and whose marketplace does
+not list this plugin yet. Kill switches: `TEAMMATE_WHATS_NEW=off`, `TEAMMATE_UPDATE_NUDGE=off`
+(`off`, `0`, `false`, `no`, any case). Harness-specific paths, URLs and environment names
+live in `harness.py`.
