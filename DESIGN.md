@@ -1035,20 +1035,32 @@ is unverified; if it dies, the next register or remote send restarts it.
 no `instructions` field, and no hook tells an agent to register. An agent learns usage from
 the tool descriptions and, on request, from `teammate_readme`.
 
-**`teammate_readme`.** No arguments, callable before registering. Returns `guide.py`'s text:
+**`teammate_readme`.** Callable before registering. With no arguments it returns `guide.py`'s text:
 joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking a machine
 step by step, what each cross-machine warning means, updating, limits. Every tool is named in
 it; `tests/test_notices.py` fails the build if one is missing there, in the README tool table
 or in the skill's tool table.
 
 **What-changed note** (`whats_new.py`, `.claude-plugin/whats-new.json`). The session-start
-hook runs the module when `whats-new-seen` in the plugin data folder differs from the
-installed version. It shows the hand-written bullets for versions after the last one seen
-(at most 3 versions, 9 bullets), then writes the installed version to the marker. A machine
-with no marker gets the most recent entries once, headed "recent changes"; that covers both a
-first install and a machine that had the plugin before the feature existed. This differs from
-vibe-cognition, which stays silent on a first install, because the owner wants a first
-install to say what changed.
+hook runs the module while `whats-new-seen` in the plugin data folder differs from the
+installed version. It shows the hand-written bullets for versions after the last one
+confirmed (at most 3 versions, 9 bullets). A machine with no marker gets the most recent
+entries, headed "recent changes"; that covers both a first install and a machine that had
+the plugin before the feature existed. This differs from vibe-cognition, which stays silent
+on a first install, because the owner wants a first install to say what changed.
+
+**The note is shown until an agent confirms it (0.17.4).** Printing the note does not mark
+it seen. In the field, a session resumed right after an in-session update ran the hook and
+advanced the marker on two machines while the note never reached the model, so "shown once"
+was used up by a showing nobody saw. Now the marker advances only when an agent calls
+`teammate_readme(changes_seen=true)` after telling the user, or after 5 unconfirmed showings
+(`whats-new-pending.json` counts them), or when there is nothing to show. The note's last
+line asks for that call. This is the one approved exception to "nothing pushed says how to
+use the tools", and a test keeps it to that single line. The confirming server writes the
+marker only when the manifest at its plugin root matches the version it is running, so a
+server left over from before an update cannot confirm the new version. Marker and counter
+writes use a unique temporary file each, because two hook runs and a server can write at
+the same moment.
 
 **Update notice** (`update_check.py`). At most once per 24 h (gated in bash on the mtime of
 `update-check.json`), the hook reads the marketplace's pinned commit for this plugin and the

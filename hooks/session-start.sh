@@ -116,11 +116,11 @@ if [ -n "$PLUGIN_DATA" ] && [ "${TEAMMATE_HARNESS:-}" != "codex" ]; then
         PLUGIN_DATA_NATIVE=$(cygpath -m "$PLUGIN_DATA" 2>/dev/null) || PLUGIN_DATA_NATIVE="$PLUGIN_DATA"
     fi
     _notice() {
-        UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
+        { UV_PROJECT_ENVIRONMENT="${VENV_DIR}" \
             CLAUDE_PLUGIN_ROOT="${PLUGIN_ROOT_NATIVE}" \
             CLAUDE_PLUGIN_DATA="${PLUGIN_DATA_NATIVE}" \
             uv run --no-sync --project "${PLUGIN_ROOT}" python -m "$1" </dev/null 2>/dev/null \
-            | tr -d '\r\n'
+            || true; } | tr -d '\r\n'
     }
     _is_off() {
         case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in

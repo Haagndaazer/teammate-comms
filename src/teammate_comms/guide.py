@@ -81,7 +81,8 @@ These are different. The message was NOT queued, so resend once the cause is fix
 
 ## Other tools
 - teammate_profile(agent) reads a teammate's role, status and owned areas; it accepts
-  name@machine. teammate_readme returns this guide.
+  name@machine. teammate_readme returns this guide; teammate_readme(changes_seen=true)
+  confirms you have told your user the what-changed note, so it stops appearing.
 - teammate_dashboard opens a local web view of all conversations for your user.
 - project_register, project_profile, list_projects and project_delete keep a short shared
   description of each project.

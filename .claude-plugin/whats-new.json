@@ -1,4 +1,7 @@
 {
+  "0.17.4": [
+    "The note that says what changed after an update now keeps appearing at session start until an agent confirms it has told you, at most five times. Before, it could be used up without anyone seeing it."
+  ],
   "0.17.3": [
     "Cross-machine messaging: agents on separate PCs can now message each other over Tailscale, once their machines are linked.",
     "The plugin now includes a built-in usage guide, and its tool descriptions explain the cross-machine feature.",

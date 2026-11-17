@@ -67,12 +67,46 @@ def test_whats_new():
         check(bullets == ["- four a", "- four b", "- four c", "- four d", "- three a", "- three b",
                           "- three c", "- two a", "- two b"],
               f"newest first, 3 versions and 9 bullets at most: {bullets}")
-        check(whats_new.OVERFLOW_LINE in lines and lines[-1] == whats_new.FOOTER_LINE,
-              "older versions are summarised in one line, then the footer")
+        check(whats_new.OVERFLOW_LINE in lines and lines[-2:] == [whats_new.FOOTER_LINE, whats_new.CONFIRM_LINE],
+              "older versions are summarised in one line, then the footer and the confirm line")
+        check([ln for ln in lines if "teammate_" in ln] == [whats_new.CONFIRM_LINE],
+              "only the confirm line names a tool")
         check("from the future" not in note, "a version newer than the installed one is not shown")
-        check(marker.read_bytes() == b"1.4.0", f"marker is the bare version: {marker.read_bytes()!r}")
+        check(not marker.exists() and whats_new.read_shown(str(data), "1.4.0") == 1,
+              "showing the note does not mark it seen; the showing is counted")
 
-        check(whats_new.check(str(root), str(data)) == "", "nothing is shown twice")
+        os.environ["CLAUDE_PLUGIN_ROOT"], os.environ["CLAUDE_PLUGIN_DATA"] = str(root), str(data)
+        try:
+            stale = whats_new.confirm("1.3.0")
+            check(stale.startswith("Not recorded") and not marker.exists(),
+                  f"a server older than the installed plugin does not confirm: {stale}")
+            for attempt in (1, 2):
+                said = whats_new.confirm("1.4.0")
+                check(said == whats_new.CONFIRMED.format(version="1.4.0")
+                      and marker.read_bytes() == b"1.4.0"
+                      and not (data / whats_new.PENDING_FILENAME).exists(),
+                      f"confirming marks the bare version seen and clears the count (call {attempt})")
+            os.environ["CLAUDE_PLUGIN_DATA"] = ""
+            check(whats_new.confirm("1.4.0") == whats_new.NOTHING_TO_CONFIRM,
+                  "no data folder: nothing to confirm")
+        finally:
+            os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+        check(whats_new.check(str(root), str(data)) == "", "a confirmed note is not shown again")
+
+        marker.unlink()
+        shown = [bool(whats_new.check(str(root), str(data))) for _ in range(whats_new.MAX_SHOWINGS + 2)]
+        check(shown == [True] * whats_new.MAX_SHOWINGS + [False, False] and marker.read_bytes() == b"1.4.0"
+              and not (data / whats_new.PENDING_FILENAME).exists(),
+              f"an unconfirmed note stops after {whats_new.MAX_SHOWINGS} showings: {shown}")
+        check(not list(data.glob("*.tmp")), "no temporary files are left behind")
+        check(whats_new.MAX_SHOWINGS == 5 and "at most 5 times" in whats_new.FOOTER_LINE,
+              "the cap is five showings, as the note and the docs say")
+
+        (data / whats_new.PENDING_FILENAME).write_text('{"version": "1.4.0", "shown": "lots"}', encoding="utf-8")
+        check(whats_new.read_shown(str(data), "1.4.0") == 0, "a corrupt count reads as zero")
+        (data / whats_new.PENDING_FILENAME).write_text('{"version": "1.3.0", "shown": 4}', encoding="utf-8")
+        check(whats_new.read_shown(str(data), "1.4.0") == 0, "a count for another version is ignored")
 
         marker.write_bytes(b"1.2.0")
         note = whats_new.check(str(root), str(data))
@@ -98,7 +132,8 @@ def test_whats_new():
                   and not (Path(td2) / "data").exists(), "no installed version: nothing shown or written")
 
         for text in (whats_new.INSTRUCTION_LINE, whats_new.UPDATED_HEADER, whats_new.FIRST_HEADER,
-                     whats_new.OVERFLOW_LINE, whats_new.FOOTER_LINE, update_check.NUDGE_TEMPLATE):
+                     whats_new.OVERFLOW_LINE, whats_new.FOOTER_LINE, whats_new.CONFIRM_LINE,
+                     update_check.NUDGE_TEMPLATE):
             check(text.isascii(), f"notice text is ASCII: {text[:40]}")
 
 
@@ -127,6 +162,25 @@ def test_whats_new_cli():
         decoded = json.loads('"' + out.stdout.decode("ascii") + '"')
         check('- say "hi"\\ and\ttab' in decoded.split("\n"),
               f"the line decodes back to the note, quotes and backslashes intact: {decoded!r}")
+        check(not (data / "whats-new-seen").exists() and whats_new.read_shown(str(data), "1.1.0") == 1,
+              "a printed note is counted, not marked seen")
+
+        (data / whats_new.PENDING_FILENAME).unlink()
+        real_emit, real_argv = whats_new.emit, sys.argv
+        os.environ.update(env)
+
+        def broken_emit(note):
+            raise OSError("stdout is gone")
+        whats_new.emit = broken_emit
+        try:
+            code = whats_new.main([])
+        finally:
+            whats_new.emit, sys.argv = real_emit, real_argv
+            for key in env:
+                os.environ.pop(key, None)
+        check(code == 0 and not (data / "whats-new-seen").exists()
+              and whats_new.read_shown(str(data), "1.1.0") == 0,
+              "a note that could not be printed is neither marked seen nor counted")
 
 
 def fake_fetch(marketplace, manifest, calls=None, delay=0):
@@ -327,6 +381,22 @@ def test_readme_tool():
     check("teammate_readme" in names, "teammate_readme is offered")
     text, is_error = tools.dispatch("teammate_readme", {}, {})
     check(not is_error and text == guide.readme_guide(), "it answers before any registration")
+    said, _ = tools.dispatch("teammate_readme", {"changes_seen": "true"}, {})
+    check(said == guide.readme_guide(), "only a real true confirms; anything else returns the guide")
+    with tempfile.TemporaryDirectory() as td:
+        root, data = Path(td) / "plugin", Path(td) / "data"
+        make_plugin(root, teammate_comms.__version__, {teammate_comms.__version__: ["x"]})
+        os.environ["CLAUDE_PLUGIN_ROOT"], os.environ["CLAUDE_PLUGIN_DATA"] = str(root), str(data)
+        try:
+            said, said_error = tools.dispatch("teammate_readme", {"changes_seen": True}, {})
+        finally:
+            os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+        check(not said_error and said == whats_new.CONFIRMED.format(version=teammate_comms.__version__)
+              and (data / "whats-new-seen").read_bytes() == teammate_comms.__version__.encode(),
+              f"changes_seen=true confirms the note before any registration: {said}")
+    said, _ = tools.dispatch("teammate_readme", {"changes_seen": True}, {})
+    check(said == whats_new.NOTHING_TO_CONFIRM, "without a plugin data folder there is nothing to confirm")
     policy = harness.current()
     check(policy.install_cta in text and "{" not in text, "the guide names the update command, no unfilled fields")
     missing = [n for n in names if n not in text]
@@ -378,7 +448,7 @@ def test_release_consistency():
     worst = "\n".join([whats_new.INSTRUCTION_LINE, whats_new.FIRST_HEADER] + [
         "- " + b for _k, group in sorted(((whats_new.version_key(v), bl) for v, bl in notes.items()),
                                          reverse=True)[:whats_new.MAX_VERSIONS] for b in group
-    ][:whats_new.MAX_BULLETS] + [whats_new.OVERFLOW_LINE, whats_new.FOOTER_LINE])
+    ][:whats_new.MAX_BULLETS] + [whats_new.OVERFLOW_LINE, whats_new.FOOTER_LINE, whats_new.CONFIRM_LINE])
     check(len(worst) <= 1800, f"the longest possible note stays short ({len(worst)} characters)")
 
     for rel in ("pyproject.toml", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json", "uv.lock"):

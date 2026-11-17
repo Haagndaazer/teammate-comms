@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.4
+
+> The what-changed note could be lost. When a session was resumed right after an in-session
+> plugin update, the session-start hook ran and marked the new version as seen, but the note
+> never reached the agent, on both test machines. The note is now shown at every session
+> start until an agent confirms it has told the user, by calling
+> `teammate_readme(changes_seen=true)`; the note's last line asks for that. After five
+> showings without a confirmation it stops on its own. Several sessions that start before
+> any confirms will each mention it once.
+
 ## 0.17.3
 
 > **New in the 0.17 line, for anyone installing or updating now:** agents on separate PCs can
@@ -13,7 +23,7 @@
 > This release makes that discoverable. Every tool description that takes a teammate name now
 > says how `name@machine` works, and `teammate_peers` lists the linking steps in order. A new
 > `teammate_readme` tool returns the full usage guide (20 tools now). At session start the
-> plugin says what changed after an update, once per version, and checks at most once a day
+> plugin says what changed after an update and checks at most once a day
 > whether a newer version is released; it tells you and never updates on its own
 > (`TEAMMATE_WHATS_NEW=off` and `TEAMMATE_UPDATE_NUDGE=off` silence them). Nothing is pushed
 > about how to use the tools: registration stays opt-in.

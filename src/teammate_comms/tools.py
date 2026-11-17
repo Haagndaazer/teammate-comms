@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import harness as harness_mod
 from .guide import readme_guide
+from . import __version__, whats_new
 from . import relay as relay_mod
 from .comms import (
     COMMS_SUBDIR,
@@ -650,10 +651,23 @@ TOOL_DEFINITIONS = [
             "Return the full guide to using teammate-comms: joining, addressing (name, "
             "#group, name@machine), messages and groups, how to link another machine step "
             "by step, what each cross-machine warning means and what to tell your user, "
-            "updating, and limits. Read-only, no arguments, works before registering. Call "
-            "it when you are unsure how any teammate_* tool fits together."
+            "updating, and limits. Works before registering. Call it when you are unsure "
+            "how any teammate_* tool fits together. Pass changes_seen=true instead, only "
+            "after you have told your user the what-changed note shown at session start: it "
+            "stops that note and returns a one-line confirmation, not the guide."
         ),
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "changes_seen": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "true = the user has been told the what-changed note; stop showing it."
+                    ),
+                },
+            },
+        },
     },
     {
         "name": "teammate_peers",
@@ -2540,6 +2554,8 @@ def _handle_peers(args, ctx):
 
 
 def _handle_readme(args, ctx):
+    if args.get("changes_seen") is True:
+        return whats_new.confirm(__version__)
     return readme_guide()
 
 

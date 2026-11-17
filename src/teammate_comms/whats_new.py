@@ -1,18 +1,23 @@
-"""Post-update "what changed" note, shown once per version at session start.
+"""Post-update "what changed" note, shown at session start until an agent confirms it.
 
 Run by ``hooks/session-start.sh`` as ``python -m teammate_comms.whats_new``. Content comes
-from a hand-curated ``whats-new.json`` in the plugin manifest folder; the last version shown
-is kept in ``whats-new-seen`` in the plugin's data folder. Stdlib-only, no network, always exits 0,
-and prints either nothing or one line: the note, JSON-escaped for the hook to embed.
+from a hand-curated ``whats-new.json`` in the plugin manifest folder. ``whats-new-seen`` in
+the plugin's data folder holds the last version confirmed; it advances when an agent calls
+teammate_readme(changes_seen=true), or after MAX_SHOWINGS unconfirmed showings. Stdlib-only,
+no network, always exits 0, and prints either nothing or one line: the note, JSON-escaped
+for the hook to embed.
 """
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
 from . import harness
 
 SEEN_MARKER_FILENAME = "whats-new-seen"
+PENDING_FILENAME = "whats-new-pending.json"
+MAX_SHOWINGS = 5
 ENV_VAR = "TEAMMATE_WHATS_NEW"
 OFF_VALUES = frozenset({"off", "0", "false", "no"})
 MAX_VERSIONS = 3
@@ -23,8 +28,16 @@ INSTRUCTION_LINE = "INSTRUCTION: Tell the user what changed in teammate-comms be
 UPDATED_HEADER = "teammate-comms updated (v{seen} -> v{installed}) - new since your last session:"
 FIRST_HEADER = "teammate-comms v{installed} - recent changes:"
 OVERFLOW_LINE = "(...and older versions - see CHANGELOG.md.)"
-FOOTER_LINE = ("(Shown once per update. Full details: the plugin's CHANGELOG.md. "
-               "Disable these notices with TEAMMATE_WHATS_NEW=off.)")
+FOOTER_LINE = (f"(Shown at session start until confirmed, at most {MAX_SHOWINGS} times. Full details: the "
+               "plugin's CHANGELOG.md. Disable these notices with TEAMMATE_WHATS_NEW=off.)")
+CONFIRM_LINE = ("Once the user has been told, call teammate_readme(changes_seen=true) so this "
+                "note stops appearing.")
+
+CONFIRMED = "Recorded: the what-changed note for v{version} will not be shown again."
+NOTHING_TO_CONFIRM = "Nothing to confirm: this session has no what-changed note."
+STALE_SERVER = ("Not recorded: this server is running v{running} but the installed plugin is "
+                "v{installed}. Reconnect or restart the session, then confirm again.")
+NOT_RECORDED = "Could not record the confirmation; the note may appear once more."
 
 
 def version_key(value):
@@ -64,28 +77,106 @@ def read_seen(plugin_data):
     return value or None
 
 
+def _write_atomic(plugin_data, filename, text):
+    data_dir = Path(plugin_data)
+    tmp = data_dir / f"{filename}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(text.encode("utf-8"))
+        os.replace(tmp, data_dir / filename)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
 def write_seen(plugin_data, version):
     """Store the bare version with no trailing newline; the hook compares it as a string."""
+    return _write_atomic(plugin_data, SEEN_MARKER_FILENAME, version)
+
+
+def read_shown(plugin_data, installed):
+    """How many times the note for this version has been printed without confirmation."""
     try:
-        data_dir = Path(plugin_data)
-        data_dir.mkdir(parents=True, exist_ok=True)
-        tmp = data_dir / f"{SEEN_MARKER_FILENAME}.tmp"
-        tmp.write_bytes(version.encode("utf-8"))
-        os.replace(tmp, data_dir / SEEN_MARKER_FILENAME)
+        data = json.loads((Path(plugin_data) / PENDING_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict) or data.get("version") != installed:
+        return 0
+    shown = data.get("shown")
+    if not isinstance(shown, int) or isinstance(shown, bool) or shown < 0:
+        return 0
+    return shown
+
+
+def write_shown(plugin_data, installed, shown):
+    return _write_atomic(plugin_data, PENDING_FILENAME,
+                         json.dumps({"version": installed, "shown": shown}))
+
+
+def clear_shown(plugin_data):
+    try:
+        (Path(plugin_data) / PENDING_FILENAME).unlink()
     except OSError:
         pass
 
 
+def mark_seen(plugin_data, installed):
+    ok = write_seen(plugin_data, installed) or write_seen(plugin_data, installed)
+    if ok:
+        clear_shown(plugin_data)
+    return ok
+
+
 def check(plugin_root, plugin_data):
-    """The note to show, or "" when there is nothing new. Advances the seen marker."""
+    """The note to show, or "" when there is nothing new. Records the showing."""
+    note, commit = plan(plugin_root, plugin_data)
+    commit()
+    return note
+
+
+def plan(plugin_root, plugin_data):
+    """(note, commit). commit() records the showing; call it only once the note is printed."""
     installed = read_installed_version(plugin_root)
     installed_key = version_key(installed)
     if installed_key is None:
-        return ""
+        return "", lambda: None
+
+    def finish():
+        mark_seen(plugin_data, installed)
+
     seen = read_seen(plugin_data)
+    note = _note(plugin_root, seen, installed, installed_key)
+    if not note:
+        return "", finish
+    shown = read_shown(plugin_data, installed) + 1
+    if shown >= MAX_SHOWINGS:
+        return note, finish
+    return note, lambda: write_shown(plugin_data, installed, shown)
+
+
+def confirm(running_version):
+    """Record that the user has been told. Returns the line the tool shows."""
+    plugin_root = os.environ.get(harness.PLUGIN_ROOT_ENV, "")
+    plugin_data = os.environ.get(harness.PLUGIN_DATA_ENV, "")
+    if not plugin_root or not plugin_data:
+        return NOTHING_TO_CONFIRM
+    installed = read_installed_version(plugin_root)
+    if version_key(installed) is None:
+        return NOTHING_TO_CONFIRM
+    if installed != running_version:
+        return STALE_SERVER.format(running=running_version, installed=installed)
+    if not mark_seen(plugin_data, installed):
+        return NOT_RECORDED
+    return CONFIRMED.format(version=installed)
+
+
+def _note(plugin_root, seen, installed, installed_key):
     first = seen is None
     seen_key = version_key(UNSEEN_FLOOR if first else seen)
-    write_seen(plugin_data, installed)
     if seen_key is None or seen_key >= installed_key:
         return ""
 
@@ -108,6 +199,7 @@ def check(plugin_root, plugin_data):
     if len(candidates) > MAX_VERSIONS:
         lines.append(OVERFLOW_LINE)
     lines.append(FOOTER_LINE)
+    lines.append(CONFIRM_LINE)
     return "\n".join(lines)
 
 
@@ -115,6 +207,7 @@ def emit(note):
     """Print a note as one JSON-escaped ASCII line, safe to embed in the hook's JSON."""
     if note:
         sys.stdout.write(json.dumps(note)[1:-1])
+        sys.stdout.flush()
 
 
 def main(argv=None):
@@ -129,7 +222,9 @@ def main(argv=None):
     if not plugin_root or not plugin_data:
         return 0
     try:
-        emit(check(plugin_root, plugin_data))
+        note, commit = plan(plugin_root, plugin_data)
+        emit(note)
+        commit()
     except Exception:
         return 0
     return 0
