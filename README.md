@@ -16,6 +16,8 @@ tools and pushes `notifications/claude/channel` events.
 
 ## Quickstart
 
+What a machine needs before installing is listed under [Requirements](#requirements).
+
 Two full instances (each launched per [Install & launch](#install--launch) below),
 messaging each other:
 
@@ -267,6 +269,8 @@ root; a small **relay** process per machine forwards messages between them over
 is the only thing that proves which machine is talking, so the relay listens only on the
 machine's Tailscale address and never on the local network.
 
+What each machine needs is listed under [Requirements](#requirements).
+
 **Set up** (once per pair of machines, both on the same tailnet):
 
 1. On the desktop, ask any registered session to link the laptop: it calls
@@ -343,10 +347,31 @@ netsh advfirewall firewall add rule name="teammate-comms relay" dir=in action=al
 
 ## Install & launch
 
-Prerequisites: Claude Code **v2.1.80+**, [`uv`](https://docs.astral.sh/uv/), and
-channels enabled (individual Pro/Max: on by default). On Windows the SessionStart
-hook runs under `bash`, so **git-bash must be on PATH** (it is if you already run
-other bash-hooked plugins).
+### Requirements
+
+Needed on every machine:
+
+| Requirement | Why | Check |
+|---|---|---|
+| **Windows 10 or 11** | The only platform tested end to end. macOS and Linux are not supported. | — |
+| **Claude Code v2.1.80 or newer** | Channels, which wake an idle session, need it. | `claude --version` |
+| **Channels enabled** | On by default for individual Pro/Max accounts. On a Team or Enterprise account your organization's `channelsEnabled` policy must allow them. | — |
+| **[`uv`](https://docs.astral.sh/uv/getting-started/installation/) on PATH** | Builds and runs the server. It also supplies Python 3.11+ if the machine has none, so Python does not need to be installed separately. | `uv --version` |
+| **[Git for Windows](https://git-scm.com/download/win), with `bash` on PATH** | The session-start hook is a bash script. | `bash --version` |
+| **Access to GitHub** | The plugin installs from the public marketplace `Haagndaazer/colton-claude-plugins`. No account is needed. | — |
+
+Needed only to link more than one machine (see
+[Cross-machine comms](#cross-machine-comms-tailscale)); a single machine needs none of this:
+
+| Requirement | Why |
+|---|---|
+| **[Tailscale](https://tailscale.com/download) installed and signed in on each machine** | It carries the messages and proves which machine is talking. |
+| **All machines on the same tailnet** | Linking is meant for one person's own machines. Machines on different tailnets, or shared between tailnets, are not supported. |
+| **Inbound TCP 47821 from Tailscale allowed on at least one machine of each pair** | The relay listens there. See [Firewall](#cross-machine-comms-tailscale) for the Windows rule. |
+| **The same plugin version on every machine** | After updating one machine, update the others and restart their sessions. |
+
+Nothing else is required: the server has no third-party dependencies. Pillow is optional and
+only used for [avatars](#avatars-optional).
 
 ### Install from the marketplace (recommended)
 
