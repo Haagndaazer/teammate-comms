@@ -321,7 +321,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "to": {"type": "string", "description": "Recipient: a teammate's name (on this machine), name@machine (a teammate on a linked machine, e.g. 'bob@laptop'), or a '#'-prefixed group name (e.g. '#design')."},
-                "message": {"type": "string", "description": "Message body. Max 64 KB. @name in a group post mentions a member (they get a 🔔 flag in their wake and inbox); use @name@machine for a member on another machine."},
+                "message": {"type": "string", "description": "Message body. Max 65,536 characters. @name in a group post mentions a member (they get a 🔔 flag in their wake and inbox); use @name@machine for a member on another machine."},
                 "priority": {
                     "type": "string",
                     "enum": list(_PRIORITIES),
@@ -424,7 +424,7 @@ TOOL_DEFINITIONS = [
             "every member and wakes them. The full ordered thread is kept in a shared "
             "transcript — use action='history' as the canonical record (it survives inbox "
             "reads). Groups are open: any registered teammate can join, post, and read "
-            "history — do not post secrets expecting privacy. Actions: create, delete "
+            "history — do not post secrets expecting privacy. Actions: create (you become a member), delete "
             "(creator-only), join, leave, add (members), members (list), history (read "
             "the shared transcript; optionally filter by 'sender', 'post_type', and a "
             "'since' id cursor — the decision trail), mute, unmute (silence/restore this "
@@ -497,7 +497,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "Teammate name to start, or name@machine to start it on a linked machine."},
-                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the new session's working directory and project). It must exist on the machine the session starts on."},
+                "project_dir": {"type": "string", "description": "Existing directory to launch in (becomes the new session's working directory and project). It must exist on the machine the session starts on, e.g. C:\\work\\site."},
                 "prompt": {"type": "string", "description": "Optional first instruction (defaults to a register + inbox-drain bootstrap)."},
                 "team": {"type": "string", "description": "Optional team (namespaced inboxes). This machine only."},
                 "comms_dir": {"type": "string", "description": "Optional comms-root override (default: inherit the shared global root). This machine only."},
