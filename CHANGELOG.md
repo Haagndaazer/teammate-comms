@@ -18,7 +18,12 @@
   unreachable and dropped if unconfirmed after 45 seconds, so it is never carried out late.
 - A spawn request from another machine is refused when the folder has never been opened in
   Claude Code there, because the new window would wait at the folder trust question. A
-  launched session that has not registered after 90 seconds is reported to whoever asked.
+  launched session that has not come online after 90 seconds is reported to whoever asked,
+  as is a session still running 20 seconds after its shutdown was accepted.
+- The receiving machine also refuses a spawn or shutdown request older than 45 seconds, and
+  the sender drops an expired one even while the other machine cannot be reached.
+- A process is ended only if it is still the one seen when the session's tree was read, so
+  a reused process id is never ended.
   A local spawn into such a folder warns in its result.
 - **Fixed:** a starting prompt containing `;` was cut at the semicolon by Windows Terminal.
 

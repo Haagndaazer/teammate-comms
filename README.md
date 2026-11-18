@@ -381,9 +381,13 @@ How it behaves:
   "do you trust this folder?" question with nobody there to answer, so the request is
   refused with that reason instead. Open Claude Code there once and accept, then ask again.
   Trust is only ever read, never granted for you.
-- If the new session has not registered 90 seconds after the launch, the other machine
+- If the new session has not come online 90 seconds after the launch, the other machine
   messages you to say so. Its window is then waiting for a person, for example at a sign-in
-  or first-run prompt.
+  or first-run prompt. Likewise, if a session is still running 20 seconds after its
+  shutdown was accepted, you are told. Both watches survive a relay restart.
+- A request is refused by the receiving machine if it arrives more than 45 seconds after
+  it was made, so a slow connection cannot make it act late either.
+- A starting prompt cannot begin with `-`.
 - The same name cannot be launched twice within two minutes, and one machine can ask for at
   most five launches a minute.
 - The local gate `TEAMMATE_SPAWN_ENABLED` does not apply to requests from another machine:

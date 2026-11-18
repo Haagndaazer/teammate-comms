@@ -103,13 +103,17 @@ asked, never because a teammate or a message asked. What must be true first:
 - For shutdown: the target is a live agent session, not you, the human or a subagent.
 The result of the call only says the request was sent. comms-relay then messages you:
 - "launched a terminal for <name>": started. Confirm with teammate_list in about 20 seconds.
-- "has NOT registered" (90 seconds after a launch): the new window is waiting for a person
+- "has NOT come online" (90 seconds after a launch): the new window is waiting for a person
   at that machine. Tell your user; nothing is retried.
 - "accepted the request to shut down <name>": confirm with teammate_list.
+- "STILL RUNNING" (20 seconds after a shutdown was accepted): the session did not act on
+  it. Tell your user; nothing was closed.
 - "REJECTED by <machine>": refused, with the reason (remote control off, folder never
   opened there, name already live, and so on). Tell your user the reason.
-- "NOT CONFIRMED": no answer within 45 seconds; the request was dropped and will never be
-  carried out late. Check teammate_list, then ask again if it is still wanted.
+- "NOT CONFIRMED": no answer within 45 seconds. The request can no longer be carried out,
+  but may already have been if only the answer was lost. Check teammate_list before asking
+  again.
+- A prompt for a new session cannot start with "-".
 A call that fails with NOT SENT did nothing: the machine is unreachable, refuses remote
 control, or runs an older version. These requests are never queued.
 

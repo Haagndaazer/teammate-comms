@@ -391,7 +391,7 @@ def close_own_session(root, team, agent, by, finder=None, kill=None):
     print(f"[teammate-comms] closing this session at the request of {by}",
           file=sys.stderr, flush=True)
     write_agent_record(root, team, agent, channel=False)
-    if not (kill or procs.close_session)(session, protect=protect):
+    if session not in ((kill or procs.close_session)(session, protect=protect) or ()):
         write_agent_record(root, team, agent, channel=True)
         return _not_closed(root, team, agent, by,
                            "its session process could not be ended from here")

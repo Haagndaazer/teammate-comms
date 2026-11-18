@@ -93,10 +93,14 @@ SPAWN_RATE = 5
 SPAWN_RATE_SECONDS = 60
 SPAWN_NAME_COOLDOWN_SECONDS = 120
 REGISTER_WAIT_SECONDS = 90
+SHUTDOWN_CONFIRM_SECONDS = 20
+AWAIT_CHECK_SECONDS = 5
 MAX_PROMPT_BYTES = 8192
 MAX_PROJECT_DIR_CHARS = 1024
 ORIG_PYTHONPATH_ENV = "TEAMMATE_RELAY_ORIG_PYTHONPATH"
 _NO_PYTHONPATH = "-"
+PROMPT_DASH_ERROR = ("a prompt cannot start with '-': the new session would read it as a "
+                     "command-line option. Start it with a word")
 ACCEPT_ACTION = "accept_remote_control"
 REFUSE_ACTION = "refuse_remote_control"
 
@@ -152,6 +156,29 @@ def settings_file(root):
 
 def spawned_file(root):
     return get_relay_dir(root) / "spawned.json"
+
+
+def awaiting_file(root):
+    return get_relay_dir(root) / "awaiting.json"
+
+
+def read_awaiting(root):
+    data = read_json_readonly(awaiting_file(root))
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(v, dict) and isinstance(v.get("by"), str)
+            and v.get("kind") in CONTROL_KINDS}
+
+
+def _await(root, target, by, kind):
+    """Remember a request this machine carried out, so its outcome can be reported."""
+    data = read_awaiting(root)
+    data[target] = {"by": by, "kind": kind, "since": None}
+    try:
+        write_json_atomic(awaiting_file(root), data)
+    except OSError as e:
+        log_line(root, f"could not record the watch on {target}: {e}")
 
 
 def log_line(root, message):
@@ -1007,11 +1034,11 @@ def _spawn_slot(root, src, target):
         since = wall - float(launched.get(key) or 0)
     except (TypeError, ValueError):
         since = SPAWN_NAME_COOLDOWN_SECONDS
-    if 0 <= since < SPAWN_NAME_COOLDOWN_SECONDS:
-        raise RejectEvent(f"{target} was launched here {int(since)} seconds ago; wait for it "
-                          f"to register instead of launching it again")
+    if abs(since) < SPAWN_NAME_COOLDOWN_SECONDS:
+        raise RejectEvent(f"{target} was launched here {max(0, int(since))} seconds ago; wait "
+                          f"for it to register instead of launching it again")
     launched = {k: v for k, v in launched.items()
-                if isinstance(v, (int, float)) and 0 <= wall - v < SPAWN_NAME_COOLDOWN_SECONDS}
+                if isinstance(v, (int, float)) and abs(wall - v) < SPAWN_NAME_COOLDOWN_SECONDS}
     launched[key] = wall
     try:
         write_json_atomic(spawned_file(root), launched)
@@ -1029,9 +1056,6 @@ def _release_spawn_slot(root, target):
             write_json_atomic(spawned_file(root), data)
         except OSError:
             pass
-
-
-_awaiting = {}
 
 
 def _folder_trust(name, project_dir):
@@ -1063,12 +1087,14 @@ def _apply_spawn(root, names, payload):
         prompt = kind.spawn_prompt.format(agent=target, project_dir=project_dir)
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise RejectEvent(f"prompt is larger than {MAX_PROMPT_BYTES} bytes")
+    if prompt.lstrip().startswith("-"):
+        raise RejectEvent(PROMPT_DASH_ERROR)
     if _folder_trust(kind.name, project_dir) is False:
         raise RejectEvent(
-            f"{project_dir} has never been opened in {kind.display_name} on {names.me}, so the "
-            f"new session would stop at the question asking whether to trust that folder, "
-            f"with nobody there to answer. Open {kind.display_name} in that folder once on "
-            f"{names.me} and accept, or pick a folder that has been used there before")
+            f"{kind.display_name} on {names.me} has no record of trusting {project_dir}, so "
+            f"the new session would stop at the question asking whether to trust that "
+            f"folder, with nobody there to answer. Open {kind.display_name} in that folder "
+            f"once on {names.me} and accept, or pick a folder that has been used there before")
     _spawn_slot(root, names.src, target)
     try:
         argv = spawn.build_command(kind.spawn_builder, prompt, project_dir)
@@ -1078,7 +1104,7 @@ def _apply_spawn(root, names, payload):
         _release_spawn_slot(root, target)
         log_line(root, f"spawn of {target} for {by} failed: {type(e).__name__}: {e}")
         raise RejectEvent(f"could not launch on {names.me}: {e}")
-    _awaiting[(str(root), target)] = {"by": by, "since": None}
+    _await(root, target, by, "spawn")
     log_line(root, f"spawned {target} in {project_dir} for {by}; prompt starts "
                    f"{' '.join(prompt.split())[:80]!r}")
 
@@ -1096,6 +1122,7 @@ def _apply_shutdown(root, names, payload):
         raise RejectEvent(f"on {names.me}: {e}")
     except OSError as e:
         raise RejectEvent(f"on {names.me}: could not write the request: {e}")
+    _await(root, target, by, "shutdown")
     log_line(root, f"shutdown of {target} requested by {by}")
 
 
@@ -1214,6 +1241,7 @@ class Relay:
         self.ip = None
         self._tailscale = {}
         self._lock = threading.RLock()
+        self._await_checked = float("-inf")
         self._server = None
         self._server_addr = None
         self._listener_error = ""
@@ -1326,6 +1354,11 @@ class Relay:
                 break
             error = ""
             try:
+                if ev.get("kind") in CONTROL_KINDS:
+                    age = ev.get("age")
+                    if (isinstance(age, bool) or not isinstance(age, (int, float))
+                            or not 0 <= age <= CONTROL_TTL_SECONDS):
+                        raise RejectEvent("the request arrived too late to be carried out safely")
                 apply_event(self.root, self.machine, machine, ev.get("kind"), ev.get("payload"))
                 applied.append(event_id)
             except RejectEvent as e:
@@ -1359,9 +1392,11 @@ class Relay:
             except (OSError, ValueError, KeyError, TypeError):
                 self._quarantine(path)
                 continue
-            if event["kind"] in CONTROL_KINDS and self._control_expired(ev):
-                self._drop_control(machine, st, path, ev)
-                continue
+            if event["kind"] in CONTROL_KINDS:
+                if self._control_expired(ev):
+                    self._drop_control(machine, st, path, ev)
+                    continue
+                event["age"] = max(0.0, self.clock() - float(ev["queued_epoch"]))
             size += len(raw.encode("utf-8"))
             if events and size > MAX_BATCH_BYTES:
                 break
@@ -1374,6 +1409,21 @@ class Relay:
             return self.clock() - float(ev.get("queued_epoch") or 0) > CONTROL_TTL_SECONDS
         except (TypeError, ValueError):
             return True
+
+    def _sweep_control(self, machine, st):
+        """Drop expired control requests whether or not the peer can be reached."""
+        d = outbox_dir(self.root, machine)
+        if not d.exists():
+            return
+        with self._lock:
+            for path in sorted(d.glob("*.json"))[:MAX_EVENTS]:
+                try:
+                    ev = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (isinstance(ev, dict) and ev.get("kind") in CONTROL_KINDS
+                        and self._control_expired(ev)):
+                    self._drop_control(machine, st, path, ev)
 
     def _control_label(self, ev):
         payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
@@ -1396,8 +1446,9 @@ class Relay:
             self._notify(
                 sender,
                 f"⚠️ NOT CONFIRMED: your request to {verb} {name} on {machine} was not "
-                f"confirmed within {CONTROL_TTL_SECONDS} seconds and has been dropped. It "
-                f"will not be retried.{reason} Check teammate_list before asking again.")
+                f"confirmed within {CONTROL_TTL_SECONDS} seconds. It will not be sent "
+                f"again and can no longer be carried out, but it may already have been if "
+                f"only the answer was lost.{reason} Check teammate_list before asking again.")
 
     def _confirm_control(self, machine, path):
         try:
@@ -1412,11 +1463,12 @@ class Relay:
         if ev.get("kind") == "spawn":
             text = (f"✅ {machine} launched a terminal for {name}. This confirms the launch, "
                     f"not registration: check teammate_list in about 20 seconds. If it has "
-                    f"not registered after {REGISTER_WAIT_SECONDS} seconds, {machine} "
+                    f"not come online after {REGISTER_WAIT_SECONDS} seconds, {machine} "
                     f"messages you to say so.")
         else:
             text = (f"✅ {machine} accepted the request to shut down {name}. Check "
-                    f"teammate_list to confirm it is no longer live.")
+                    f"teammate_list to confirm it is no longer live. If it is still running "
+                    f"after {SHUTDOWN_CONFIRM_SECONDS} seconds, {machine} messages you.")
         self._notify(sender, text)
 
     def _quarantine(self, path):
@@ -1562,38 +1614,60 @@ class Relay:
         st["next_due"] = now if progressed else now + (
             POLL_BUSY_SECONDS if busy and not incoming else POLL_IDLE_SECONDS)
 
-    def _check_spawned(self):
-        """Tell whoever asked when a session launched here never registered."""
+    def _check_awaited(self):
+        """Report a launched session that never came online, or a shutdown never acted on."""
         now = self.clock()
-        for key, entry in list(_awaiting.items()):
-            where, target = key
-            if where != str(self.root):
-                continue
-            record = read_agent_record(self.root, None, target)
-            if record and is_channel_alive(record):
-                _awaiting.pop(key, None)
-                continue
-            if entry["since"] is None:
-                entry["since"] = now
-            if now - entry["since"] < REGISTER_WAIT_SECONDS:
-                continue
-            _awaiting.pop(key, None)
-            text = (f"⚠️ {target} was launched on {self.machine} {REGISTER_WAIT_SECONDS} "
-                    f"seconds ago and has NOT registered. Its window is most likely waiting "
-                    f"for a person at {self.machine} to answer a question (folder trust, "
-                    f"sign-in or a first-run prompt). Nothing is retried; someone has to "
-                    f"look at that window.")
-            self.log(f"{target} did not register within {REGISTER_WAIT_SECONDS}s")
+        if now - self._await_checked < AWAIT_CHECK_SECONDS:
+            return
+        self._await_checked = now
+        reports = []
+        with self._lock:
+            data = read_awaiting(self.root)
+            if not data:
+                return
+            keep = {}
+            for target, entry in data.items():
+                record = read_agent_record(self.root, None, target)
+                live = bool(record and is_channel_alive(record))
+                spawn = entry["kind"] == "spawn"
+                if live == spawn:
+                    continue
+                since = entry.get("since")
+                if isinstance(since, bool) or not isinstance(since, (int, float)) or since > now:
+                    since = entry["since"] = now
+                wait = REGISTER_WAIT_SECONDS if spawn else SHUTDOWN_CONFIRM_SECONDS
+                if now - since < wait:
+                    keep[target] = entry
+                    continue
+                reports.append((target, entry["by"], spawn))
             try:
-                _name, machine = split_address(entry["by"])
+                write_json_atomic(awaiting_file(self.root), keep)
+            except OSError as e:
+                self.log(f"could not update the watch list: {e}")
+                return
+        for target, by, spawn in reports:
+            if spawn:
+                text = (f"⚠️ {target} was launched on {self.machine} about "
+                        f"{REGISTER_WAIT_SECONDS} seconds ago and has NOT come online. Its "
+                        f"window is most likely waiting for a person at {self.machine} to "
+                        f"answer a question (folder trust, sign-in or a first-run prompt). "
+                        f"Nothing is retried; someone has to look at that window.")
+            else:
+                text = (f"⚠️ {target} on {self.machine} is STILL RUNNING "
+                        f"{SHUTDOWN_CONFIRM_SECONDS} seconds after its shutdown was accepted. "
+                        f"Its session did not act on the request (it may be on an older "
+                        f"version or not responding). Nothing was closed.")
+            self.log(f"{target}: {'not online after launch' if spawn else 'still running after shutdown'}")
+            try:
+                _name, machine = split_address(by)
                 if machine not in read_peers(self.root):
                     raise CommsError(f"{machine} is no longer an approved peer")
                 record = {"id": new_message_id(self.root), "ts": message_ts(),
                           "from": RELAY_SENDER, "priority": "urgent", "message": text}
-                enqueue(self.root, machine, "dm", {"record": record, "to": entry["by"]},
+                enqueue(self.root, machine, "dm", {"record": record, "to": by},
                         sender=RELAY_SENDER)
             except Exception as e:
-                self.log(f"could not tell {entry['by']}: {type(e).__name__}: {e}")
+                self.log(f"could not tell {by}: {type(e).__name__}: {e}")
 
     def _notify(self, sender, text):
         from . import tools
@@ -1723,8 +1797,9 @@ class Relay:
             elif self.clock() >= st["next_due"]:
                 self._exchange(machine, cfg, st)
                 self._write_status(peers)
+            self._sweep_control(machine, st)
             self._notices(machine, st)
-        self._check_spawned()
+        self._check_awaited()
         self._write_status(peers)
         return peers
 

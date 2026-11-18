@@ -1109,8 +1109,21 @@ harness's own trust record (`harness.folder_trusted`: Claude Code's `.claude.jso
 folder or a parent up to the repository root, never the home folder) and rejects the request
 when it says no. It never writes that record: granting trust stays a person's act. When the
 record cannot be read the launch goes ahead. As the backstop for every other prompt a new
-window can stop at, the receiving relay remembers each launch in memory and, if the name is
-not live 90 seconds later, sends the requester one message saying so.
+window can stop at, the receiving relay records each launch in `relay/awaiting.json` and, if
+the name is not live 90 seconds later, sends the requester one message saying so. A shutdown
+is recorded the same way and reported if the session is still live 20 seconds later. The
+file survives a relay restart; it is checked every five seconds.
+
+**Age travels with the request.** The sender stamps each control event with its age by its
+own clock when it builds a batch, and the receiver rejects one with no age or an age over
+45 seconds. Machines' clocks are never compared. The sender's expiry sweep runs every tick,
+not only when an exchange happens, so a request to an unreachable machine is dropped and
+reported on time. Its report says the request may already have been carried out, because a
+lost answer is indistinguishable from a lost request.
+
+**No reused pid.** `procs.terminate` opens the process, reads its creation time on that
+handle, and ends it on the same handle only if the time matches what was read when the tree
+was built.
 
 **The launched session's environment.** The relay's environment is an old copy of whichever
 session started it. `build_remote_child_env` drops that session's harness variables and

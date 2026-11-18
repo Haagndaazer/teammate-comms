@@ -930,13 +930,11 @@ class Launches:
         spawn_mod.spawn_in_terminal = fake
         relay_mod._folder_trust = lambda name, path: self.trusted
         relay_mod._spawn_times.clear()
-        relay_mod._awaiting.clear()
         return self
 
     def __exit__(self, *exc):
         spawn_mod.spawn_in_terminal = self._real
         relay_mod._folder_trust = self._real_trust
-        relay_mod._awaiting.clear()
 
 
 def _control_ready(w):
@@ -1093,6 +1091,14 @@ def test_remote_spawn():
                   f"the requester is told once that it launched: {notes}")
 
             if event:
+                _a, late = w.rb._apply_events("a", [{**event, "id": "f" * 32}])
+                check(late and "too late" in late[0]["error"] and len(launched.calls) == 1,
+                      f"a request that does not say how old it is is refused: {late}")
+                _a, late = w.rb._apply_events("a", [{
+                    **event, "id": "e" * 32, "age": relay_mod.CONTROL_TTL_SECONDS + 1}])
+                check(late and "too late" in late[0]["error"] and len(launched.calls) == 1,
+                      f"a request older than the limit is refused on arrival: {late}")
+                event = {**event, "age": 0}
                 w.rb._apply_events("a", [event])
                 check(len(launched.calls) == 1, "a resent event does not launch again")
                 w.rb._seen.clear()
@@ -1242,17 +1248,21 @@ def test_control_request_notice():
         path.write_text(json.dumps(ev), encoding="utf-8")
         st = w.ra._peer("b")
         st["fails"], st["next_due"] = 0, 0.0
-        for at in (1, 3, 7, 15, 31, 60.5):
+        for at in (1, 3, 7, 15, 31):
             w.clock.t = start + at
             w.ra.tick()
         check(relay_mod.queued_count(w.root_a, "b") == 1,
-              "setup: the request is still on disk between two attempts")
-        late = relay_notes(w.root_a, "alice")
-        check(not any("NOT DELIVERED" in n for n in late),
-              f"a control request is never described as queued for later: {late}")
+              "setup: the request is still on disk inside its time limit")
+        st["next_due"] = start + 10000
+        w.clock.t = start + relay_mod.CONTROL_TTL_SECONDS + 1
+        w.ra.tick()
+        check(relay_mod.queued_count(w.root_a, "b") == 0,
+              "an expired request is dropped on time with no exchange due")
         w.clock.t = start + 62
         w.ra.tick()
         late = relay_notes(w.root_a, "alice")
+        check(not any("NOT DELIVERED" in n for n in late),
+              f"a control request is never described as queued for later: {late}")
         check(len([n for n in late if "NOT CONFIRMED" in n]) == 1
               and relay_mod.queued_count(w.root_a, "b") == 0,
               f"it is dropped and reported once: {late}")
@@ -1280,6 +1290,13 @@ def test_remote_shutdown():
               f"the request names who asked and the exact session: {req}")
         check(any("accepted the request to shut down bob" in n for n in relay_notes(w.root_a, "alice")),
               "the requester is told it was accepted")
+        watch = relay_mod.read_awaiting(w.root_b).get("bob") or {}
+        check(watch.get("kind") == "shutdown" and watch.get("by") == "alice@a",
+              f"the accepted shutdown is watched on disk, so a relay restart keeps it: {watch}")
+        add_agent(w.root_b, "olde")
+        check_raises(lambda: tools_mod.check_shutdown_target(
+            comms.read_agent_record(w.root_b, None, "olde"), "olde"), CommsError,
+            "a session that could never pick the request up")
 
         take = comms.take_shutdown_request
         check(take(w.root_b, None, "bob", "another-session") is None and path.exists(),
@@ -1306,6 +1323,30 @@ def test_remote_shutdown():
         notes = " | ".join(relay_notes(w.root_a, "alice"))
         check("is not live" in notes, f"the receiver refuses a teammate that is not live: {notes}")
         check("is not on this machine" in notes, "the receiver refuses a name on another machine")
+        def still():
+            return [m["message"] for m in unread(w.root_a, "alice")
+                    if "STILL RUNNING" in m.get("message", "")]
+
+        w.pump(3, step=20)
+        before = len(still())
+        relay_mod.enqueue(w.root_a, "b", "shutdown", {"agent": "bob@b", "by": "alice"},
+                          sender="alice")
+        path = sorted(relay_mod.outbox_dir(w.root_a, "b").glob("*.json"))[-1]
+        ev = json.loads(path.read_text(encoding="utf-8"))
+        ev["queued_epoch"] = w.clock.t
+        path.write_text(json.dumps(ev), encoding="utf-8")
+        w.pump(5, step=1)
+        check(relay_mod.read_awaiting(w.root_b).get("bob", {}).get("kind") == "shutdown",
+              "setup: the second shutdown was accepted and is watched")
+        w.pump(1, step=6)
+        check(len(still()) == before, "no report before the session had time to close")
+        w.pump(4, step=6)
+        told = still()
+        check(len(told) == before + 1 and "bob on b" in told[-1],
+              f"a session that never acted on its shutdown is reported once: {told}")
+        w.pump(3, step=20)
+        check(len(still()) == before + 1 and not relay_mod.read_awaiting(w.root_b),
+              "and only once")
     finally:
         w.close()
 
@@ -1485,15 +1526,22 @@ def test_spawn_stall_guards():
 
         def stalled():
             return [m["message"] for m in unread(w.root_a, "alice")
-                    if "has NOT registered" in m.get("message", "")]
+                    if "has NOT come online" in m.get("message", "")]
 
         with Launches() as launched:
+            check_raises(lambda: tools_mod._handle_spawn(
+                {"agent": "dave@b", "project_dir": str(project), "prompt": " - do this"},
+                ctx_for("alice", w.root_a)), CommsError, "a prompt that starts with a dash")
+            check_raises(lambda: relay_mod.apply_event(w.root_b, "b", "a", "spawn", {
+                "agent": "dave@b", "by": "alice", "project_dir": str(project),
+                "prompt": "-x"}), relay_mod.RejectEvent, "a dash prompt on the receiver")
+            check(not launched.calls, "and neither launches")
             launched.trusted = False
             ask("dave")
             notes = relay_notes(w.root_a, "alice")
-            check(not launched.calls and any("has never been opened" in n for n in notes),
+            check(not launched.calls and any("no record of trusting" in n for n in notes),
                   f"a folder that would stop at the trust question is refused: {notes}")
-            check(not relay_mod._awaiting, "and nothing is waited for")
+            check(not relay_mod.read_awaiting(w.root_b), "and nothing is waited for")
 
             launched.trusted = None
             ask("dave")
@@ -1512,7 +1560,7 @@ def test_spawn_stall_guards():
             check(len(launched.calls) == 2, "a trusted folder launches")
             add_agent(w.root_b, "erin")
             w.pump(4, step=40)
-            check(len(stalled()) == 1 and not relay_mod._awaiting,
+            check(len(stalled()) == 1 and not relay_mod.read_awaiting(w.root_b),
                   "a session that registers is not reported")
     finally:
         if saved is None:

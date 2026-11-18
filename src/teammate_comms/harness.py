@@ -5,6 +5,7 @@ harness.py so the shared renderer stays a verbatim copy."""
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,8 @@ PROCESS_PATH_EXCLUDES = ("anthropicclaude", "windowsapps")
 TRUST_CONFIG_ENV = "CLAUDE_CONFIG_DIR"
 TRUST_CONFIG_NAME = ".claude.json"
 TRUST_KEY = "hasTrustDialogAccepted"
+TRUST_READ_ATTEMPTS = 3
+TRUST_READ_PAUSE = 0.15
 SESSION_ENV_PREFIXES = ("CLAUDE_CODE_",)
 SESSION_ENV_NAMES = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CODEX_THREAD_ID", "WT_SESSION")
 
@@ -120,10 +123,16 @@ def folder_trusted(name, project_dir, env=None, home=None):
     env = os.environ if env is None else env
     home = Path(home) if home else Path.home()
     base = Path(env.get(TRUST_CONFIG_ENV) or home)
-    try:
-        data = json.loads((base / TRUST_CONFIG_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    data = None
+    for attempt in range(TRUST_READ_ATTEMPTS):
+        try:
+            data = json.loads((base / TRUST_CONFIG_NAME).read_text(encoding="utf-8"))
+            break
+        except OSError:
+            return None
+        except ValueError:
+            if attempt + 1 < TRUST_READ_ATTEMPTS:
+                time.sleep(TRUST_READ_PAUSE)
     projects = data.get("projects") if isinstance(data, dict) else None
     if not isinstance(projects, dict):
         return None

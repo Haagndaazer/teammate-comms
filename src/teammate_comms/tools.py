@@ -321,7 +321,7 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "to": {"type": "string", "description": "Recipient: a teammate's name (on this machine), name@machine (a teammate on a linked machine, e.g. 'bob@laptop'), or a '#'-prefixed group name (e.g. '#design')."},
-                "message": {"type": "string", "description": "Message body. Max 65,536 characters. @name in a group post mentions a member (they get a 🔔 flag in their wake and inbox); use @name@machine for a member on another machine."},
+                "message": {"type": "string", "description": "Message body. Max 64 KB (65,536 characters). @name in a group post mentions a member (they get a 🔔 flag in their wake and inbox); use @name@machine for a member on another machine."},
                 "priority": {
                     "type": "string",
                     "enum": list(_PRIORITIES),
@@ -2200,6 +2200,8 @@ def _spawn_remote(root, agent, name, machine, args):
     if isinstance(prompt, str) and prompt.strip():
         if len(prompt.encode("utf-8")) > relay_mod.MAX_PROMPT_BYTES:
             raise CommsError(f"'prompt' is larger than {relay_mod.MAX_PROMPT_BYTES} bytes.")
+        if prompt.lstrip().startswith("-"):
+            raise CommsError(f"Not sent: {relay_mod.PROMPT_DASH_ERROR}.")
         payload["prompt"] = prompt
     if args.get("harness"):
         harness = harness_mod.by_name(args.get("harness"))
@@ -2231,9 +2233,16 @@ def check_shutdown_target(record, name):
         raise CommsError(f"{name!r} has no session of its own to close.")
     if not is_channel_alive(record):
         raise CommsError(f"{name!r} is not live, so there is no session to shut down.")
+    if not record.get("instance_id"):
+        raise CommsError(f"{name!r} runs a version too old to be shut down this way.")
 
 
 SHUTDOWN_WAIT_SECONDS = 5
+
+
+def _server_running(pid):
+    from . import comms
+    return comms._pid_alive(pid) is not False
 
 
 def _handle_shutdown(args, ctx):
@@ -2264,7 +2273,8 @@ def _handle_shutdown(args, ctx):
     deadline = time.monotonic() + SHUTDOWN_WAIT_SECONDS
     while time.monotonic() < deadline:
         time.sleep(0.25)
-        if not is_channel_alive(read_agent_record(root, team, name)):
+        if (not is_channel_alive(read_agent_record(root, team, name))
+                and not _server_running(record.get("pid"))):
             return (f"{name}'s session was closed. Its conversation is kept and can be "
                     f"resumed on its machine.")
     return (f"Shutdown requested for {name}, but it has not closed yet. Check teammate_list "
@@ -2330,6 +2340,8 @@ def _handle_spawn(args, ctx):
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = harness.spawn_prompt.format(agent=target, project_dir=project_dir)
+    if prompt.lstrip().startswith("-"):
+        raise CommsError(f"Not launched: {relay_mod.PROMPT_DASH_ERROR}.")
     team_arg = (args.get("team") or "").strip() or team
     comms_dir = args.get("comms_dir")
 
@@ -2361,7 +2373,7 @@ def _handle_spawn(args, ctx):
                          f"line with {harness.launch_args_var}.")
     if harness_mod.folder_trusted(harness.name, project_dir) is False:
         override_note += (
-            f"\nWARNING: {project_dir} has never been opened in {harness.display_name} on this "
+            f"\nWARNING: {project_dir} is not a folder {harness.display_name} has a record of trusting on this "
             f"machine, so the new window is waiting at the question asking whether to trust "
             f"that folder. It will not register until a person answers it.")
     return durable_warning + (

@@ -107,14 +107,24 @@ def image_path(pid):
         k.CloseHandle(handle)
 
 
-def terminate(pid, exit_code=1):
+def terminate(pid, exit_code=1, born=None):
+    """End ``pid``. With ``born``, only if the process holding that pid was created then,
+    checked on the same handle that ends it, so a reused pid is never ended."""
     if not SUPPORTED:
         return False
+    import ctypes
+    from ctypes import wintypes
     k = _kernel32()
-    handle = k.OpenProcess(_TERMINATE, False, pid)
+    handle = k.OpenProcess(_TERMINATE | _QUERY_LIMITED, False, pid)
     if not handle:
         return False
     try:
+        if born is not None:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not k.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                return False
+            if ((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime) != born:
+                return False
         return bool(k.TerminateProcess(handle, exit_code))
     finally:
         k.CloseHandle(handle)
@@ -184,26 +194,37 @@ def descendants(table, pid, created_fn=created, protect=()):
     return out[::-1]
 
 
-def close_session(session_pid, self_pid=None, table=None, kill=terminate, created_fn=created,
+def close_session(session_pid, self_pid=None, table=None, kill=None, created_fn=created,
                   protect=(), can=can_terminate):
-    """Terminate the session's process tree, this process last. Returns the pids signalled,
-    or [] having touched nothing when the session process cannot be terminated.
+    """Terminate the session's process tree, this process last. Returns the pids ended; the
+    session was closed only if ``session_pid`` is among them. Nothing is touched when the
+    session process cannot be terminated.
 
     ``protect`` names processes that must outlive the session although they were started
     from inside it, such as this machine's relay. The session process itself is ended with
     exit code 0: a terminal tab whose own program was that process then closes by itself,
-    and no other process is touched to make it so.
+    and no other process is touched to make it so. Each process is ended only if it is
+    still the one seen when the tree was read.
     """
     self_pid = os.getpid() if self_pid is None else self_pid
     if session_pid in protect or not can(session_pid):
         return []
     table = snapshot() if table is None else table
     below = [p for p in descendants(table, session_pid, created_fn, protect) if p != self_pid]
+    own = kill is None
+    if own:
+        born = {p: created_fn(p) for p in below + [session_pid]}
+        if born[session_pid] is None:
+            return []
+
+        def kill(pid, exit_code=1):
+            return born.get(pid) is not None and terminate(pid, exit_code, born[pid])
     done = [p for p in below if kill(p)]
-    if kill(session_pid, 0):
-        done.append(session_pid)
+    if not kill(session_pid, 0):
+        return done
+    done.append(session_pid)
     if self_pid != session_pid:
-        kill(self_pid)
+        (terminate if own else kill)(self_pid)
     return done
 
 
