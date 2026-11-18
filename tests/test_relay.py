@@ -1106,6 +1106,11 @@ def test_remote_spawn():
                 applied, failed = w.rb._apply_events("a", [event])
                 check(len(launched.calls) == 1 and failed and "launched here" in failed[0]["error"],
                       f"a relay that forgot the event still does not launch the name twice: {failed}")
+                stamped = comms.read_json_readonly(relay_mod.spawned_file(w.root_b)) or {}
+                comms.write_json_atomic(relay_mod.spawned_file(w.root_b),
+                                        {**stamped, "zed": time.time() + 60})
+                check_raises(lambda: relay_mod._spawn_slot(w.root_b, "a", "zed"),
+                             relay_mod.RejectEvent, "a launch stamped in the future (clock moved back)")
 
             comms.write_agent_record(w.root_b, None, "boss", type="human", presence="online")
             relay_mod.enqueue(w.root_a, "b", "spawn", {
@@ -1219,6 +1224,10 @@ def test_control_never_late():
             except CommsError as e:
                 check("NOT SENT" in str(e) and "never held for later" in str(e),
                       f"an unreachable machine refuses up front: {e}")
+            check(w.ra._control_expired({"queued_epoch": w.clock.t + 30})
+                  and w.ra._control_expired({"queued_epoch": float("nan")})
+                  and not w.ra._control_expired({"queued_epoch": w.clock.t - 1}),
+                  "a request stamped in the future (clock moved back) counts as expired")
             check(w.ra._control_expired({"queued_epoch": "garbled"})
                   and w.ra._control_expired({}),
                   "a request with no readable age counts as expired")
@@ -1394,6 +1403,11 @@ def test_local_shutdown():
             told = [m["message"] for m in unread(root, "alice") if m.get("from") == "bob"]
             check(len(told) == 2 and "could not be ended" in told[1], f"and says so: {told}")
 
+            check(channel_mod.close_own_session(
+                root, None, "bob", "alice", finder=lambda: 4242,
+                kill=lambda pid, protect=(): [999]) is False,
+                "ending only child processes is not reported as closed")
+
             relay_mod.status_file(root).parent.mkdir(parents=True, exist_ok=True)
             comms.write_json_atomic(relay_mod.status_file(root), {"pid": 777})
             spared = []
@@ -1504,6 +1518,18 @@ def test_session_process_selection():
     check(procs_mod.close_session(7, self_pid=10, table=table, kill=kill,
                                   created_fn=lambda p: born.get(p), can=lambda p: False) == []
           and not killed, "a session that cannot be ended leaves everything running")
+    killed.clear()
+
+    def partial(pid, exit_code=1):
+        if pid == 7:
+            return False
+        killed.append(pid)
+        return True
+    done = procs_mod.close_session(7, self_pid=10, table=table, kill=partial,
+                                   created_fn=lambda p: born.get(p), can=lambda p: True)
+    check(7 not in done and 10 not in killed,
+          f"when the session itself will not end, it is not reported closed and this "
+          f"server stays up to say so: {done} {killed}")
 
 
 def test_spawn_stall_guards():
@@ -1588,6 +1614,11 @@ def test_spawn_stall_guards():
                 str(f).replace(chr(92), "/"): {harness_mod.TRUST_KEY: True} for f in folders}}),
                 encoding="utf-8")
 
+        import threading
+        fixer = threading.Timer(0.05, lambda: write(repo))
+        fixer.start()
+        check(trust(repo) is True, "a record caught mid-rewrite is read again")
+        fixer.join()
         write(repo)
         check(trust(repo) is True and trust(repo / "sub") is True,
               "a trusted folder and the folders inside it are trusted")

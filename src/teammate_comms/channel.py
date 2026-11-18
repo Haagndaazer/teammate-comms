@@ -367,7 +367,7 @@ def _not_closed(root, team, agent, by, reason):
     try:
         from . import tools
         tools.send_dm(root, team, agent, by,
-                      f"{agent} was not shut down: {reason}. Nothing was closed.",
+                      f"{agent} was not shut down: {reason}.",
                       priority="urgent")
     except Exception:
         pass
@@ -384,8 +384,10 @@ def close_own_session(root, team, agent, by, finder=None, kill=None):
     session = find()
     if session is None:
         return _not_closed(root, team, agent, by,
-                           "this platform is not supported" if not procs.SUPPORTED else
-                           "its session process could not be identified safely")
+                           "this platform is not supported. Nothing was closed"
+                           if not procs.SUPPORTED else
+                           "its session process could not be identified safely. Nothing "
+                           "was closed")
     relay_pid = relay.read_status(root).get("pid")
     protect = (relay_pid,) if isinstance(relay_pid, int) else ()
     print(f"[teammate-comms] closing this session at the request of {by}",
@@ -394,7 +396,8 @@ def close_own_session(root, team, agent, by, finder=None, kill=None):
     if session not in ((kill or procs.close_session)(session, protect=protect) or ()):
         write_agent_record(root, team, agent, channel=True)
         return _not_closed(root, team, agent, by,
-                           "its session process could not be ended from here")
+                           "its session process could not be ended from here. It is still "
+                           "running, though programs it had started may have been stopped")
     try:
         from . import dashboard
         dashboard.shutdown_dashboard()

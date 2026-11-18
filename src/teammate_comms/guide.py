@@ -115,7 +115,7 @@ The result of the call only says the request was sent. comms-relay then messages
   again.
 - A prompt for a new session cannot start with "-".
 A call that fails with NOT SENT did nothing: the machine is unreachable, refuses remote
-control, or runs an older version. These requests are never queued.
+control, or runs an older version. Such a request is never held for later.
 
 ## Other tools
 - teammate_profile(agent) reads a teammate's role, status and owned areas; it accepts

@@ -89,6 +89,7 @@ MAX_BACKOFF_SECONDS = 30
 LOG_ROTATE_BYTES = 1024 * 1024
 CONTROL_KINDS = ("spawn", "shutdown")
 CONTROL_TTL_SECONDS = 45
+CLOCK_SLACK_SECONDS = 2
 SPAWN_RATE = 5
 SPAWN_RATE_SECONDS = 60
 SPAWN_NAME_COOLDOWN_SECONDS = 120
@@ -174,6 +175,11 @@ def read_awaiting(root):
 def _await(root, target, by, kind):
     """Remember a request this machine carried out, so its outcome can be reported."""
     data = read_awaiting(root)
+    for _ in range(3):
+        if data or not awaiting_file(root).exists():
+            break
+        time.sleep(0.05)
+        data = read_awaiting(root)
     data[target] = {"by": by, "kind": kind, "since": None}
     try:
         write_json_atomic(awaiting_file(root), data)
@@ -1406,9 +1412,10 @@ class Relay:
 
     def _control_expired(self, ev):
         try:
-            return self.clock() - float(ev.get("queued_epoch") or 0) > CONTROL_TTL_SECONDS
+            age = self.clock() - float(ev.get("queued_epoch") or 0)
         except (TypeError, ValueError):
             return True
+        return not -CLOCK_SLACK_SECONDS <= age <= CONTROL_TTL_SECONDS
 
     def _sweep_control(self, machine, st):
         """Drop expired control requests whether or not the peer can be reached."""
@@ -1620,15 +1627,20 @@ class Relay:
         if now - self._await_checked < AWAIT_CHECK_SECONDS:
             return
         self._await_checked = now
-        reports = []
+        reports, alive = [], {}
+        for target in read_awaiting(self.root):
+            record = read_agent_record(self.root, None, target)
+            alive[target] = bool(record and is_channel_alive(record))
+        if not alive:
+            return
         with self._lock:
             data = read_awaiting(self.root)
-            if not data:
-                return
             keep = {}
             for target, entry in data.items():
-                record = read_agent_record(self.root, None, target)
-                live = bool(record and is_channel_alive(record))
+                if target not in alive:
+                    keep[target] = entry
+                    continue
+                live = alive[target]
                 spawn = entry["kind"] == "spawn"
                 if live == spawn:
                     continue
