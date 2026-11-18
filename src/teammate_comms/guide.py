@@ -86,7 +86,15 @@ These are different. The message was NOT queued, so resend once the cause is fix
 - teammate_dashboard opens a local web view of all conversations for your user.
 - project_register, project_profile, list_projects and project_delete keep a short shared
   description of each project.
-- teammate_reincarnate starts a fresh session to take over from one whose context is full.
+- teammate_spawn starts a fresh session in a new terminal, for example to take over from
+  one whose context is full. teammate_shutdown closes another teammate's whole session at
+  once: use it to retire a session that is finished, stuck or no longer wanted, not to stop
+  a task (message them for that). Its conversation is kept and can be resumed.
+- Both accept name@machine to act on a linked machine, but only if that machine's user
+  turned on remote control with teammate_peers(action="accept_remote_control"); it is off
+  by default and lets every approved peer start and close agent sessions there. Such a
+  request is refused, not held, when the machine is unreachable, and comms-relay messages
+  you the outcome. Use either across machines only when your user asked.
 - teammate_set_avatar and teammate_request_compact are legacy and scheduled for removal.
 
 ## Updating

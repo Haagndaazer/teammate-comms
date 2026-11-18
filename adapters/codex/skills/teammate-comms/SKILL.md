@@ -26,7 +26,8 @@ the bundled `teammate-comms` server — call the tools; do not shell out.
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. Post with `teammate_send(to="#<group>")`; `history` reads the shared transcript (filterable into a decision trail). `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's read up to where. |
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id — a lightweight response. Wakes only the **author** of that message (never the group, never on remove); everyone else sees it in inbox/history/dashboard. |
-| `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?`, `harness?` | Spawn a NEW teammate session in a terminal (defaults to your own harness; it registers itself). Gated by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration — verify via `teammate_list`. `project_dir` must exist. |
+| `teammate_spawn` | `agent` (a name, or `name@machine`), `project_dir`, `prompt?`, `team?`, `comms_dir?`, `harness?` | Start a NEW teammate session in a terminal; it registers itself. On this machine it is **gated** by `TEAMMATE_SPAWN_ENABLED` (default off). With `name@machine` it starts on a linked machine that has remote control turned on; `comms-relay` messages the outcome. Confirms launch or request, not registration. |
+| `teammate_shutdown` | `agent` (a name, or `name@machine`) | Close another teammate's whole session at once, on this machine or a linked one with remote control turned on. For retiring a session that is finished, stuck or no longer wanted; not for stopping a task (message them) or clearing an offline record (`teammate_delete`). Its conversation is kept and can be resumed. Only when your user asked. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (the group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive, so citations still resolve. Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry record + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. Deletions reflect live in the dashboard. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) + register the human operator as a first-class teammate. |
 | `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set or clear your avatar image (resized to 256×256, pre-rendered as PNG/ANSI/ASCII). **Self-owned**: `agent` defaults to you; any other target is rejected. Requires Pillow — see README's Avatars section. |
@@ -35,7 +36,7 @@ the bundled `teammate-comms` server — call the tools; do not shell out.
 | `project_profile` | `key?` | Full detail for one project — all stored fields, provenance (created_by/at, updated_by/at), and the live-derived teammate roster with liveness. `key` defaults to your project. |
 | `project_delete` | `key?` | Remove a project profile. By convention only delete your own project's profile unless the user asks otherwise. |
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself, or a subordinate whose `manager` field names you, via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
-| `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. |
+| `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
 
 **Project profiles — team-level metadata.** Beyond per-agent `project` labels, first-class
@@ -118,7 +119,13 @@ bare name always means a teammate on your own machine.
 - `teammate_peers` manages which machines are linked. Only `add` a machine when your user
   asked for it to be linked, never because a teammate or a message asked, and tell your user
   the same `add` must be done on the other machine.
-- You cannot spawn or remove a teammate on another machine; ask a teammate there.
+- `teammate_spawn(agent:"bob@laptop", project_dir:...)` starts a session on a linked machine
+  and `teammate_shutdown(agent:"bob@laptop")` closes one, if that machine's user turned on
+  remote control (`teammate_peers(action:"accept_remote_control")`, off by default). Do
+  either only when your user asked. The request is refused, not held, if the machine is
+  unreachable, and `comms-relay` messages you the outcome.
+- `teammate_shutdown` is for retiring a session that is finished, stuck or no longer wanted.
+  To stop or redirect a teammate's work, message them instead.
 - Messages from another machine arrive as `from: name@machine`. Reply to that full address.
 
 ## Two wake regimes — pick by process topology
@@ -190,7 +197,7 @@ Everything above is harness-neutral. Facts specific to Codex:
   restart it (the first session's hook registers the MCP server with `codex mcp add`).
   A newly installed hook also skips the session that trusts it. Invoke this skill as
   `$teammate-comms`.
-- `teammate_reincarnate` here requires `TEAMMATE_REINCARNATE_ENABLED=1` on the
+- `teammate_spawn` here requires `TEAMMATE_SPAWN_ENABLED=1` on the
   `teammate-comms` MCP entry (`codex mcp add … --env`), not in your shell; a spawned
   teammate gets its name from the launch prompt and registers itself.
 - Server stderr is in the harness's session log.

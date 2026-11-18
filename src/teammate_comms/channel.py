@@ -47,6 +47,7 @@ from .comms import (
     read_json_readonly,
     read_json_safe,
     read_reactions,
+    take_shutdown_request,
     write_agent_record,
     write_json_atomic,
 )
@@ -361,8 +362,49 @@ def merge_pending_into_unread(root, team, agent):
     return True
 
 
+def _not_closed(root, team, agent, by, reason):
+    print(f"[teammate-comms] shutdown asked by {by} refused: {reason}", file=sys.stderr, flush=True)
+    try:
+        from . import tools
+        tools.send_dm(root, team, agent, by,
+                      f"{agent} was not shut down: {reason}. Nothing was closed.",
+                      priority="urgent")
+    except Exception:
+        pass
+    return False
+
+
+def close_own_session(root, team, agent, by, finder=None, kill=None):
+    """Close this server's whole session because a teammate asked. True once the close was
+    issued; False, after telling the requester why, when nothing was closed."""
+    from . import procs, relay
+    harness = harness_mod.current()
+    find = finder or (lambda: procs.own_session(
+        harness_mod.PROCESS_NAMES.get(harness.name, ()), harness_mod.PROCESS_PATH_EXCLUDES))
+    session = find()
+    if session is None:
+        return _not_closed(root, team, agent, by,
+                           "this platform is not supported" if not procs.SUPPORTED else
+                           "its session process could not be identified safely")
+    relay_pid = relay.read_status(root).get("pid")
+    protect = (relay_pid,) if isinstance(relay_pid, int) else ()
+    print(f"[teammate-comms] closing this session at the request of {by}",
+          file=sys.stderr, flush=True)
+    write_agent_record(root, team, agent, channel=False)
+    if not (kill or procs.close_session)(session, protect=protect):
+        write_agent_record(root, team, agent, channel=True)
+        return _not_closed(root, team, agent, by,
+                           "its session process could not be ended from here")
+    try:
+        from . import dashboard
+        dashboard.shutdown_dashboard()
+    except Exception:
+        pass
+    return True
+
+
 def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_evt,
-                waker_factory=None):
+                waker_factory=None, closer=None):
     """Heartbeat + inbox poll loop. Dormant until initialized AND registered.
 
     ``identity`` is the server's shared Identity object (thread-safe snapshot).
@@ -448,6 +490,10 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                     last_hb = 0.0
                 last_waker_generation = waker_generation
                 wake_disabled_logged = False
+
+            asked_by = take_shutdown_request(root, team, agent, identity.get_instance_id())
+            if asked_by and (closer or close_own_session)(root, team, agent, asked_by):
+                return
 
             now = time.monotonic()
             if now - last_hb >= HEARTBEAT_SECONDS:

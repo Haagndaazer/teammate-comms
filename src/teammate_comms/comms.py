@@ -336,7 +336,7 @@ def validate_profile_field(name, value):
 def validate_project_dir(path):
     """Resolve + validate a project directory (exists + is a dir). Raises CommsError.
 
-    Used by teammate_reincarnate to validate the spawn target in the PARENT before
+    Used by teammate_spawn to validate the spawn target in the PARENT before
     launching. Resolves ``..``/symlinks so the value can't smuggle traversal.
     """
     if not isinstance(path, str) or not path.strip():
@@ -2182,6 +2182,47 @@ MACHINE_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 def get_relay_dir(root):
     """``<root>/TeammateComms/relay`` — not team-namespaced."""
     return Path(root) / "TeammateComms" / "relay"
+
+
+SHUTDOWN_REQUEST_TTL_SECONDS = 60
+
+
+def shutdown_request_file(root, team, name):
+    return get_agents_dir(root, team).parent / "control" / f"{name}.shutdown.json"
+
+
+def write_shutdown_request(root, team, name, by, instance_id):
+    """Ask the live session registered as ``name`` to close itself."""
+    path = shutdown_request_file(root, team, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, {"by": by, "instance_id": instance_id})
+
+
+def take_shutdown_request(root, team, name, instance_id):
+    """The requester, if a fresh request addressed to this exact instance is waiting.
+
+    A request for another instance of the name is left alone; a stale one is removed.
+    """
+    path = shutdown_request_file(root, team, name)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+    if age > SHUTDOWN_REQUEST_TTL_SECONDS:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    data = read_json_readonly(path)
+    if not isinstance(data, dict) or not instance_id or data.get("instance_id") != instance_id:
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        return None
+    by = data.get("by")
+    return by if isinstance(by, str) and by else "an unnamed teammate"
 
 
 def validate_machine_name(name, param=None):

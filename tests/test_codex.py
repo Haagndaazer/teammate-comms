@@ -460,7 +460,7 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 LITERAL_BASELINE = {
     "__init__.py": 1, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
-    "deliver.py": 1, "guide.py": 0, "peers.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
+    "deliver.py": 1, "guide.py": 0, "peers.py": 0, "procs.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
     "update_check.py": 0, "whats_new.py": 0,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",
@@ -710,7 +710,7 @@ def test_wp46_ac3_reincarnate_codex_prompt():
             proj.mkdir()
             ctx = _ctx_for("Lead", None, root)
             text, is_error = tools_mod.dispatch(
-                "teammate_reincarnate",
+                "teammate_spawn",
                 {"agent": "Codex1", "project_dir": str(proj), "harness": "codex"}, ctx)
             check(not is_error, f"AC-3: codex reincarnate dispatches ({text[:200]})")
             check(launched and os.path.basename(launched[-1][0][0]).lower().startswith("codex"),
@@ -720,12 +720,12 @@ def test_wp46_ac3_reincarnate_codex_prompt():
                   and str(proj) in prompt, f"AC-3: prompt carries the register call ({prompt[:160]})")
             check("Launched on Codex as '" in text, "AC-3: result names the harness")
             text, is_error = tools_mod.dispatch(
-                "teammate_reincarnate",
+                "teammate_spawn",
                 {"agent": "Claude1", "project_dir": str(proj)}, ctx)
             check(not is_error and launched[-1][0][0] == "claude", "AC-3: default harness spawns claude")
             check("plugin spec" in text, "AC-3: claude result keeps the plugin-spec note")
             text, is_error = tools_mod.dispatch(
-                "teammate_reincarnate",
+                "teammate_spawn",
                 {"agent": "X", "project_dir": str(proj), "harness": "hermes"}, ctx)
             check(is_error and "'harness' must be one of" in text, "AC-3: unknown harness rejected")
     finally:

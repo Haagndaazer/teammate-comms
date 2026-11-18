@@ -51,7 +51,8 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to you). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, history filters `sender?`/`post_type?`/`since?`/`reply_to?` | Manage group chats. `history` reads the shared transcript (filterable into a decision trail); `mute`/`unmute` silence a group's wakes (messages still arrive); `reads` shows who's read up to where. |
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (shown in inbox/history/dashboard). Wakes only the **author** of the reacted-to message (never the group, never on remove). |
-| `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude teammate in a terminal (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED` (default off); confirms launch, not registration. |
+| `teammate_spawn` | `agent` (a name, or `name@machine`), `project_dir`, `prompt?`, `team?`, `comms_dir?`, `harness?` | Start a NEW teammate session in a terminal; it registers itself. On this machine it is **gated** by `TEAMMATE_SPAWN_ENABLED` (default off). With `name@machine` it starts on a linked machine that has remote control turned on; `comms-relay` messages the outcome. Confirms launch or request, not registration. |
+| `teammate_shutdown` | `agent` (a name, or `name@machine`) | Close another teammate's whole session at once, on this machine or a linked one with remote control turned on. For retiring a session that is finished, stuck or no longer wanted; not for stopping a task (message them) or clearing an offline record (`teammate_delete`). Its conversation is kept and can be resumed. Only when your user asked. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Open the local web console (Slack-style) and register the human operator as a first-class teammate. |
 | `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set (or clear) your avatar image — resized to 256×256 and pre-rendered as PNG/ANSI/ASCII. **Self-owned**: always targets you (omit `agent`, or pass your own name; any other target is rejected). Requires Pillow (see [Avatars](#avatars-optional)). |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one | Delete a message **or** remove a teammate. A message is **tombstoned** everywhere it was written (group transcript + every member's inbox copy, or the DM recipient's inbox): the body becomes "— message deleted —" but its id/author/reply threads survive (citations still resolve). Allowed for the message **author** (or the operator via the dashboard). `teammate` hard-removes an **offline** teammate (registry + inbox + group memberships); their past messages stay attributed. A **live** teammate or yourself can't be removed. |
@@ -60,7 +61,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `project_profile` | `key?` | Full detail for one project: all fields, provenance, live roster with liveness. `key` defaults to your project. |
 | `project_delete` | `key?` | Remove a project profile. |
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
-| `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. |
+| `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
@@ -228,38 +229,47 @@ fresh token, so a bookmarked URL from a previous instance will 403 (expected, no
 bug); just re-run `teammate_dashboard()` to get a live URL (idempotent while the same
 instance keeps running — a second call in the same session returns the same URL).
 
-## Reincarnate — spawn a teammate
+## Spawn — start a teammate
 
-`teammate_reincarnate(agent:"Echo", project_dir:"…")` launches a **new Claude Code
+`teammate_spawn(agent:"Echo", project_dir:"…")` launches a **new Claude Code
 instance** in a new terminal window, in that directory, as a named teammate — it
 auto-registers (via `TEAMMATE_AGENT` + `CLAUDE_PROJECT_DIR` in the child env), arms its
 channel, and is reachable on the shared comms. It is **opt-in**: disabled unless
-`TEAMMATE_REINCARNATE_ENABLED` is truthy (it spawns OS processes). Windows-first
+`TEAMMATE_SPAWN_ENABLED` is truthy (it spawns OS processes). Windows-first
 (`wt.exe`), best-effort elsewhere; it confirms *launch*, not registration — verify with
 `teammate_list` a few seconds later. The new window may need one human approval to arm the
 custom channel — **unless** you've installed the managed-settings allowlist
-([Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)), which reincarnate
+([Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)), which spawn
 auto-detects to launch the child with `--channels` (no prompt). A fork/rehost published
 under a different marketplace should set `$TEAMMATE_PLUGIN_MARKETPLACE` so the child's
 plugin spec resolves correctly (or override the whole spawn line with
 `$TEAMMATE_LAUNCH_ARGS`).
 
-### Enabling reincarnate safely (per-OS)
+### Enabling spawn safely (per-OS)
 
-`TEAMMATE_REINCARNATE_ENABLED` must exist **before** Claude Code launches — it's read
+`TEAMMATE_SPAWN_ENABLED` must exist **before** Claude Code launches — it's read
 once at process start, so setting it *inside* a running session has no effect. Set it
 for **one session only**, never durably:
 
-- **PowerShell:** `$env:TEAMMATE_REINCARNATE_ENABLED = "1"; claude ...`
-- **bash / git-bash:** `TEAMMATE_REINCARNATE_ENABLED=1 claude ...`
+- **PowerShell:** `$env:TEAMMATE_SPAWN_ENABLED = "1"; claude ...`
+- **bash / git-bash:** `TEAMMATE_SPAWN_ENABLED=1 claude ...`
 
 **Do not** use `setx` (Windows) or export it from a shell profile (`.bashrc`/`.zshrc`) —
 that sets it **durably** (registry or user-profile scope), silently enabling
 process-spawning for *every future session on this machine*, forever, until manually
 unset — this happened once via a `setx` demo, which is exactly why this warning exists.
-If the gate ends up durably set anyway, `teammate_reincarnate` detects it (Windows-only,
+If the gate ends up durably set anyway, `teammate_spawn` detects it (Windows-only,
 best-effort via the registry) and warns on every call naming the fix — but detection
-isn't prevention, so the safe habit is: set it per-launch, never durably.
+isn't prevention, so the safe habit is: set it per-launch, never durably. The gate's old
+name, `TEAMMATE_REINCARNATE_ENABLED`, still works.
+
+`teammate_shutdown(agent:"Echo")` closes another teammate's whole session at once. A terminal
+tab that spawn opened for it closes too, unless your Windows Terminal profile is set never to
+close on exit; a session you started yourself inside a shell leaves that shell open. It is for retiring a session that is finished, stuck
+or no longer wanted. Any registered teammate can do this to any other on the same machine;
+the closed session's conversation is kept and can be resumed. Starting or closing a session
+on another machine is covered under
+[Remote control](#remote-control-start-and-shut-down-agents-on-another-machine).
 
 ## Cross-machine comms (Tailscale)
 
@@ -336,7 +346,60 @@ netsh advfirewall firewall add rule name="teammate-comms relay" dir=in action=al
 - After updating, restart every session on the machine. A session still on an older version
   keeps writing local-time ids, and "since" filters, unread badges and reaction wakes can
   skip across the two kinds for a few hours.
-- Spawning or removing a teammate on another machine is deliberately not possible.
+- Removing an offline teammate's record on another machine is not possible.
+
+### Remote control: start and shut down agents on another machine
+
+From one machine you can start an agent on another and close it again, without touching
+that machine:
+
+```
+teammate_spawn(agent:"bob@laptop", project_dir:"C:\\Projects\\thing")
+teammate_shutdown(agent:"bob@laptop")
+```
+
+**It is off until you turn it on, per machine.** On the machine that should obey, ask a
+session to run `teammate_peers(action:"accept_remote_control")`, or from a terminal
+`<python> -m teammate_comms.peers accept_remote_control`. Turn it off with
+`refuse_remote_control`. `teammate_peers()` shows the setting and whether each peer accepts
+control from this machine.
+
+**What turning it on means.** Every approved peer machine, including any approved later, can
+start an agent session on this machine in any folder, with any starting prompt and with
+permission prompts bypassed, and can close agent sessions here. That is full control of the
+machine as the logged-in user. Only turn it on for machines you control.
+
+How it behaves:
+
+- A request is sent only if the other machine is reachable at that moment. It is never held
+  for later: if it is not confirmed within 45 seconds it is dropped and you are told, so a
+  laptop waking up an hour later does not suddenly start or close an agent.
+- `comms-relay` messages you the outcome: the terminal was launched, the shutdown was
+  accepted, or why it was refused.
+- `project_dir` is a folder on the other machine and must exist there. It must also be a
+  folder Claude Code has been opened in on that machine before: a first visit stops at the
+  "do you trust this folder?" question with nobody there to answer, so the request is
+  refused with that reason instead. Open Claude Code there once and accept, then ask again.
+  Trust is only ever read, never granted for you.
+- If the new session has not registered 90 seconds after the launch, the other machine
+  messages you to say so. Its window is then waiting for a person, for example at a sign-in
+  or first-run prompt.
+- The same name cannot be launched twice within two minutes, and one machine can ask for at
+  most five launches a minute.
+- The local gate `TEAMMATE_SPAWN_ENABLED` does not apply to requests from another machine:
+  the remote control switch is what allows them. A session started this way uses the
+  launch settings (`TEAMMATE_LAUNCH_ARGS`, `TEAMMATE_PLUGIN_MARKETPLACE`) of whichever
+  session started the relay on that machine.
+- Teammates registered inside a team namespace cannot be started or shut down from another
+  machine.
+- The other machine needs a running relay (it starts when any session there registers), a
+  logged-in desktop, and the same plugin version. The new window may need one click there
+  unless the [channel allowlist](#trusting-the-channel-skip-the-dangerous-flag) is installed.
+- Shutdown closes the session's whole process tree, except this machine's relay, which
+  keeps running for the other sessions. It works for sessions started from the native
+  Claude Code or Codex program (not a Microsoft Store or desktop-app install); if a session
+  cannot identify its own program safely, or cannot end it, it refuses and tells whoever
+  asked rather than risk closing something else.
 
 ## Two wake regimes
 
@@ -442,9 +505,9 @@ Notes:
   trusted. Both are required.
 - On Windows, save as UTF-8 — if Notepad writes a BOM and the channel later fails to parse,
   re-save without one.
-- **`teammate_reincarnate` auto-detects this file** and spawns child teammates with
+- **`teammate_spawn` auto-detects this file** and spawns child teammates with
   `--channels` (no prompt) when present, falling back to the dangerous flag otherwise — so
-  reincarnated windows arm silently once the allowlist is in place. (Override the whole
+  spawned windows arm silently once the allowlist is in place. (Override the whole
   spawn line with `$TEAMMATE_LAUNCH_ARGS` if you need to.)
 
 ## Codex CLI
@@ -479,12 +542,12 @@ poll ceiling is 10 s); a busy one takes the message as its next turn. The queue 
 durable, so there is no re-nudge backoff on Codex.
 Wake breadcrumbs (`wake-emit harness=codex rc=…`) go to the server's stderr.
 
-`teammate_reincarnate` on Codex needs `TEAMMATE_REINCARNATE_ENABLED=1` on the
+`teammate_spawn` on Codex needs `TEAMMATE_SPAWN_ENABLED=1` on the
 `teammate-comms` MCP entry (`codex mcp add … --env`), because Codex's MCP child
 environment is an allowlist; the spawned Codex teammate gets its name from the launch
 prompt and registers itself. The plugin hook re-runs `codex mcp add` whenever its launch
 line changes (a version bump, a moved data dir) and re-passes any env keys you added to
-the entry, so a `TEAMMATE_REINCARNATE_ENABLED=1` you set survives plugin updates.
+the entry, so a `TEAMMATE_SPAWN_ENABLED=1` you set survives plugin updates.
 
 Uninstall:
 
@@ -512,7 +575,7 @@ Per-surface parity is tracked in [docs/PARITY.md](docs/PARITY.md).
 | A teammate never receives your messages | **Comms-root divergence** — you and they resolved *different* comms roots (different files on disk; they can never exchange a message, and it looks identical to a genuinely offline recipient) | Compare `comms_root` in **both sides'** `teammate_whoami`. Also check `teammate_list` for their liveness, and the debug log at `~/.claude/debug/<session-id>.txt`. |
 | Dashboard shows "message history disabled" or a suspiciously empty conversation | `TEAMMATE_TRANSCRIPT=0` — the observability firehose is off | Expected; live tombstones/reactions still work, just no browsable history. Unset the env var for full history in the console. |
 | Dashboard stops updating / shows "connection lost" or "session token expired" | The hosting instance restarted — its per-launch token died with it (a bookmarked URL 403s, by design) | Re-run `teammate_dashboard()` for a fresh URL while the (new) instance is running. |
-| A `teammate_reincarnate`'d window never registers | It's waiting on a one-time trust prompt for the custom channel (a headless/no-click context may never get it — confirming *launch*, not registration, looks identical to success) | Check the new window for a prompt; or pre-trust the channel (see [Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)) so children launch with `--channels` and no prompt. `teammate_whoami` reports `launch_args_override` if `$TEAMMATE_LAUNCH_ARGS` is overriding the spawn line entirely. |
+| A `teammate_spawn`'d window never registers | It's waiting on a one-time trust prompt for the custom channel (a headless/no-click context may never get it — confirming *launch*, not registration, looks identical to success) | Check the new window for a prompt; or pre-trust the channel (see [Trusting the channel](#trusting-the-channel-skip-the-dangerous-flag)) so children launch with `--channels` and no prompt. `teammate_whoami` reports `launch_args_override` if `$TEAMMATE_LAUNCH_ARGS` is overriding the spawn line entirely. |
 
 See also: [SKILL.md](skills/teammate-comms/SKILL.md)'s Reliability contract, for the honest
 wake-delivery guarantee (a dropped push is not silently lost — but it's not silently
@@ -554,9 +617,9 @@ recovered either, past a capped number of retries).
 | `TEAMMATE_COMMS_DIR` | Overrides the resolved comms root (see precedence above) — the per-project-isolation knob. |
 | `TEAMMATE_HUMAN_NAME` | Default display name for the dashboard's human operator when `human_name` isn't passed to `teammate_dashboard`. |
 | `TEAMMATE_TRANSCRIPT=0` | Disables the observability firehose (`transcript.jsonl`) only — reactions/deletions keep recording. |
-| `TEAMMATE_REINCARNATE_ENABLED` | Opt-in gate for `teammate_reincarnate` (spawns OS processes) — set **per-session**, never durably; see [Enabling reincarnate safely](#enabling-reincarnate-safely-per-os). |
-| `TEAMMATE_LAUNCH_ARGS` | Overrides the ENTIRE `claude` spawn line `teammate_reincarnate` uses for a child, verbatim — bypasses managed-settings/allowlist auto-detection. |
-| `TEAMMATE_PLUGIN_MARKETPLACE` | Overrides the marketplace name `teammate_reincarnate` uses when building a child's plugin spec (`plugin:teammate-comms@<marketplace>`) — for a fork/rehost published under a different marketplace than `coltondyck`. Falls back to a best-effort guess from `$CLAUDE_PLUGIN_ROOT`, then to `coltondyck`. |
+| `TEAMMATE_SPAWN_ENABLED` | Opt-in gate for `teammate_spawn` (spawns OS processes) — set **per-session**, never durably; see [Enabling spawn safely](#enabling-spawn-safely-per-os). |
+| `TEAMMATE_LAUNCH_ARGS` | Overrides the ENTIRE `claude` spawn line `teammate_spawn` uses for a child, verbatim — bypasses managed-settings/allowlist auto-detection. |
+| `TEAMMATE_PLUGIN_MARKETPLACE` | Overrides the marketplace name `teammate_spawn` uses when building a child's plugin spec (`plugin:teammate-comms@<marketplace>`) — for a fork/rehost published under a different marketplace than `coltondyck`. Falls back to a best-effort guess from `$CLAUDE_PLUGIN_ROOT`, then to `coltondyck`. |
 | `TEAMMATE_AVATARS_ENABLED=1` | Set before Claude Code launches to sync Pillow (the `images` extra) so `teammate_set_avatar` works — see [Avatars](#avatars-optional). |
 | `CLAUDE_CONFIG_DIR` | No longer selects the comms root (since 0.16.0). Read only as a legacy migration source; set `TEAMMATE_COMMS_DIR` if you relocated your comms. |
 | `TEAMMATE_RELAY_PORT` | Port the cross-machine relay listens on and dials (default 47821). A peer on a different port is set per peer in `relay/peers.json` (`{"port": N}`). |

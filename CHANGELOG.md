@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.18.0
+
+> Manage agents on every machine from one machine. `teammate_spawn` (the new name for
+> `teammate_reincarnate`) and the new `teammate_shutdown` accept `name@machine`. A machine
+> obeys such requests only after its user turns remote control on with
+> `teammate_peers(action="accept_remote_control")`; it is off by default, and turning it on
+> gives every approved peer full control of that machine.
+
+- **Renamed:** `teammate_reincarnate` is now `teammate_spawn`. The gate is
+  `TEAMMATE_SPAWN_ENABLED`; `TEAMMATE_REINCARNATE_ENABLED` still works.
+- **New:** `teammate_shutdown` closes another teammate's whole session immediately. Any
+  registered teammate can use it on its own machine.
+- **New:** remote control switch, `accept_remote_control` / `refuse_remote_control`, in
+  `teammate_peers` and the peers terminal command. The peers listing shows it.
+- A spawn or shutdown request for another machine is refused when that machine is
+  unreachable and dropped if unconfirmed after 45 seconds, so it is never carried out late.
+- A spawn request from another machine is refused when the folder has never been opened in
+  Claude Code there, because the new window would wait at the folder trust question. A
+  launched session that has not registered after 90 seconds is reported to whoever asked.
+  A local spawn into such a folder warns in its result.
+- **Fixed:** a starting prompt containing `;` was cut at the semicolon by Windows Terminal.
+
 ## 0.17.4
 
 > The what-changed note could be lost. When a session was resumed right after an in-session

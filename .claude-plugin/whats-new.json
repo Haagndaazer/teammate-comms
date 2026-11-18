@@ -1,4 +1,9 @@
 {
+  "0.18.0": [
+    "You can now start an agent on another of your machines and shut one down from where you are, once that machine has remote control turned on. It is off by default.",
+    "Starting an agent on another machine is refused for a folder never opened there, since the new window would wait at the trust question. If a started agent is not online after 90 seconds you are told.",
+    "A new tool closes another agent's session, on this machine or a linked one. The tool that starts a new agent session, formerly called reincarnate, is now called spawn."
+  ],
   "0.17.4": [
     "The note that says what changed after an update now keeps appearing at session start until an agent confirms it has told you, at most five times. Before, it could be used up without anyone seeing it."
   ],

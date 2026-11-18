@@ -58,7 +58,7 @@ teammate-comms/
 │   ├── comms.py                # storage / registry / liveness / transcript (§8)
 │   ├── channel.py              # background inbox watcher + push (§7)
 │   ├── tools.py                # MCP tool definitions + handlers (§9)
-│   ├── spawn.py                # teammate_reincarnate launcher (argv/env builders + spawn)
+│   ├── spawn.py                # teammate_spawn launcher (argv/env builders + spawn)
 │   ├── dashboard.py            # stdlib web console server (§9, teammate_dashboard)
 │   ├── avatars.py              # teammate_set_avatar ingest/render pipeline (§9, lazy Pillow import)
 │   └── static/index.html       # single-file Slack-style UI (inline CSS/JS, no CDN)
@@ -401,9 +401,9 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **20 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
+long-lived server. **21 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
 project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37 + 1
-cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15):**
+cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15, + 1 `teammate_shutdown`, §16):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -416,7 +416,8 @@ cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §1
 | `teammate_profile` | `agent?` | Read a teammate's full profile (defaults to self). |
 | `teammate_group` | `action` (`create`/`delete`/`join`/`leave`/`add`/`members`/`history`/`mute`/`unmute`/`reads`), `group`, `members?`, `limit?`, `sender?`/`post_type?`/`since?`/`reply_to?` (history filters) | Manage group chats (see below) + mute/unmute a group's wakes + `reads` (read receipts). |
 | `teammate_react` | `to_message`, `emoji` (`thumbsup`/`rofl`/`smile`/`cry`/`100`/`fire`), `remove?` | React to a message by id (recorded in `reactions.jsonl`, shown in inbox/history/dashboard). **Wakes only the author** of the reacted-to message (never the group, never on remove). |
-| `teammate_reincarnate` | `agent`, `project_dir`, `prompt?`, `team?`, `comms_dir?` | Spawn a NEW Claude instance in a terminal as a named teammate (auto-registers via env). **Gated** by `TEAMMATE_REINCARNATE_ENABLED`; confirms launch, not registration. |
+| `teammate_spawn` | `agent` (a name, or `name@machine`), `project_dir`, `prompt?`, `team?`, `comms_dir?`, `harness?` | Start a NEW teammate session in a terminal; it registers itself. On this machine it is **gated** by `TEAMMATE_SPAWN_ENABLED` (default off). With `name@machine` it starts on a linked machine that has remote control turned on; `comms-relay` messages the outcome. Confirms launch or request, not registration. |
+| `teammate_shutdown` | `agent` (a name, or `name@machine`) | Close another teammate's whole session at once, on this machine or a linked one with remote control turned on. For retiring a session that is finished, stuck or no longer wanted; not for stopping a task (message them) or clearing an offline record (`teammate_delete`). Its conversation is kept and can be resumed. Only when your user asked. |
 | `teammate_dashboard` | `port?`, `open_browser?`, `human_name?` | Launch the local web console + register the human as a teammate (see below). |
 | `teammate_set_avatar` | `agent?`, `path?` or `image_base64?`, `clear?` | Set/clear a profile avatar (see §9b below). **Self-only** (WP-28 T1): `agent`, if given, must equal the caller — any other target raises. |
 | `teammate_delete` | `message?` (a message id) **or** `teammate?` (an agent name) — exactly one (XOR, enforced in the handler) | Delete a message (**tombstone**) or remove an **offline** teammate (see below). |
@@ -615,9 +616,9 @@ watcher with **no `channel.py` change**.
   registration return still echoes it), not every wake — cuts per-message token waste.
   (Superseded in WP-11a: the reminder was removed from the wake entirely, not just
   throttled — see §7's signal-only wake.)
-- **`teammate_reincarnate` + `spawn.py`:** spawns a new `claude` in a terminal with
+- **`teammate_spawn` + `spawn.py`:** spawns a new `claude` in a terminal with
   `TEAMMATE_AGENT` + `CLAUDE_PROJECT_DIR` in the child env (auto-register handoff).
-  Default-off gate `TEAMMATE_REINCARNATE_ENABLED`; list-form exec only (the `prompt` is a
+  Default-off gate `TEAMMATE_SPAWN_ENABLED`; list-form exec only (the `prompt` is a
   single trailing argv element — no shell injection); child stdio = DEVNULL; Windows
   `wt.exe` primary / `CREATE_NEW_CONSOLE`+`BREAKAWAY_FROM_JOB` fallback; best-effort
   live-name collision guard (refuse only if already live). The dev channel flag stays in
@@ -895,7 +896,7 @@ subheads with the profile `summary`/`status`. No second grouping structure.
 5. Profile fields (0.2.0 → 0.3.1) + global-default comms root (0.3.0).
 6. Group chat via `#sigil` fan-out + typed posts + @mentions + mute + read receipts (0.4.x–0.5).
 7. `teammate_dashboard` web console + human-as-teammate + NDJSON observability transcript (0.5.0).
-8. Reactions (author-wake) + `teammate_reincarnate` + managed-settings channel auto-detect (0.6.x).
+8. Reactions (author-wake) + `teammate_spawn` + managed-settings channel auto-detect (0.6.x).
 9. `teammate_delete` (message tombstones + offline-teammate removal) + deletions sub-stream (0.7.0).
 10. Missed-event hardening (0.7.1): poll-cursor forward pagination, reaction-wake high-water
     cursor, durable (blocking) reaction/deletion appends — see §7/§8.
@@ -1077,3 +1078,66 @@ provided and under Codex, whose context budget is 2000 characters and whose mark
 not list this plugin yet. Kill switches: `TEAMMATE_WHATS_NEW=off`, `TEAMMATE_UPDATE_NUDGE=off`
 (`off`, `0`, `false`, `no`, any case). Harness-specific paths, URLs and environment names
 live in `harness.py`.
+
+## 16. Remote control: spawn and shutdown across machines (0.18.0)
+
+`teammate_reincarnate` was renamed `teammate_spawn`; the local gate is
+`TEAMMATE_SPAWN_ENABLED` and the old variable name is still honoured. `teammate_shutdown`
+is new. Both accept `name@machine`.
+
+**The switch.** A machine obeys spawn and shutdown requests from its peers only when its
+own user turned remote control on: `teammate_peers(action="accept_remote_control")`, stored
+in `relay/settings.json` and read fresh on every request, with anything unreadable meaning
+off. It is one switch per machine, not per peer: the owner manages the tailnet and the peer
+list already, and naming peers again was friction without control. It is settable from the
+tool as well as the terminal because an agent that can call the tool on that machine can
+already run commands there; the switch protects a machine from other machines. Each roster
+carries `accepts_remote_control`, so a sender refuses early with the exact fix.
+
+**Never late, never twice.** A control request is sent only when the peer is reachable now,
+and the sending relay drops any `spawn` or `shutdown` event older than 45 seconds by its own
+clock, telling the requester; a sleeping laptop therefore never acts on a stale request.
+On the receiver every failure before the launch is a rejection, never a retry,
+including a failure to record the launch. A second
+launch of one name is refused for two minutes, recorded in `relay/spawned.json` before the
+launch so a relay crash between launching and remembering the event cannot launch again.
+At most five launches a minute are accepted from one machine.
+
+**No silent stall.** A session launched in a folder the harness has not trusted stops at its
+trust question, which nobody at an unattended machine answers. The receiver reads the
+harness's own trust record (`harness.folder_trusted`: Claude Code's `.claude.json`, the
+folder or a parent up to the repository root, never the home folder) and rejects the request
+when it says no. It never writes that record: granting trust stays a person's act. When the
+record cannot be read the launch goes ahead. As the backstop for every other prompt a new
+window can stop at, the receiving relay remembers each launch in memory and, if the name is
+not live 90 seconds later, sends the requester one message saying so.
+
+**The launched session's environment.** The relay's environment is an old copy of whichever
+session started it. `build_remote_child_env` drops that session's harness variables and
+`TEAMMATE_TEAM`/`TEAMMATE_TRANSCRIPT`, pins `TEAMMATE_COMMS_DIR` to the relay's root, and the
+relay restores the `PYTHONPATH` it was started with. The harness defaults to the receiving
+machine's default, not the sender's.
+
+**Outcome.** No reply event exists. The sending relay already learns which of its events
+were applied, so `_settle` messages the requester from there; a rejection uses the existing
+notice. A peer therefore cannot inject text as `comms-relay`.
+
+**Shutdown is done by the target's own server.** The requester (or the receiving relay)
+writes `control/<name>.shutdown.json` holding the target record's `instance_id`. The
+target's watcher acts only on a request under 60 seconds old addressed to its own instance,
+so a request for an earlier session of the name cannot close a new one. It marks its record
+offline, then `procs.py` walks its ancestors past the launchers (`uv`, `python`) to the
+first other process, which must carry one of the harness's process names
+(`harness.PROCESS_NAMES`) and be older than its child; otherwise it refuses, tells the
+requester and closes nothing. It then terminates that process's descendants, the process,
+and itself. The machine's relay is left out although it is usually a descendant of the
+session that started it, so closing one session never takes cross-machine comms down for
+the rest. If the session process cannot be opened for termination nothing is touched, the
+record is put back to live and the requester is told. The session process alone is ended with exit code 0: Windows Terminal closes a
+tab whose own program exits with 0, so a tab that spawn opened disappears without anything
+else being touched, while a session started inside a shell leaves that shell alone. Any registered teammate may shut down any other on its own machine (owner
+ruling); across machines the switch applies. Not covered: a server whose watcher thread is
+hung, node-based harness installs, and platforms other than Windows.
+
+**Windows Terminal.** `wt.exe` treats `;` in its arguments as a command separator, which cut
+a prompt at its first semicolon. `spawn_in_terminal` now escapes it.

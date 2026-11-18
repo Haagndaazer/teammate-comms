@@ -36,6 +36,8 @@ from .comms import (
     human_presence_online,
     is_channel_alive,
     is_remote,
+    message_ts,
+    new_message_id,
     now_timestamp,
     read_agent_record,
     read_group_meta,
@@ -46,8 +48,10 @@ from .comms import (
     validate_agent_name,
     validate_group_name,
     validate_machine_name,
+    validate_project_dir,
     write_group_meta,
     write_json_atomic,
+    write_shutdown_request,
 )
 
 PROTOCOL = 1
@@ -83,6 +87,18 @@ NOTICE_AFTER_SECONDS = 60
 NOTICE_CHECK_SECONDS = 5
 MAX_BACKOFF_SECONDS = 30
 LOG_ROTATE_BYTES = 1024 * 1024
+CONTROL_KINDS = ("spawn", "shutdown")
+CONTROL_TTL_SECONDS = 45
+SPAWN_RATE = 5
+SPAWN_RATE_SECONDS = 60
+SPAWN_NAME_COOLDOWN_SECONDS = 120
+REGISTER_WAIT_SECONDS = 90
+MAX_PROMPT_BYTES = 8192
+MAX_PROJECT_DIR_CHARS = 1024
+ORIG_PYTHONPATH_ENV = "TEAMMATE_RELAY_ORIG_PYTHONPATH"
+_NO_PYTHONPATH = "-"
+ACCEPT_ACTION = "accept_remote_control"
+REFUSE_ACTION = "refuse_remote_control"
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _STAMP = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}"
@@ -128,6 +144,79 @@ def roster_file(root, machine):
 
 def seen_file(root, machine):
     return get_relay_dir(root) / "seen" / f"{machine}.log"
+
+
+def settings_file(root):
+    return get_relay_dir(root) / "settings.json"
+
+
+def spawned_file(root):
+    return get_relay_dir(root) / "spawned.json"
+
+
+def log_line(root, message):
+    try:
+        path = log_file(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
+            os.replace(path, path.with_suffix(".log.1"))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{now_timestamp()} {message}\n")
+    except OSError:
+        pass
+
+
+def accepts_remote_control(root):
+    """True only when this machine's user turned remote control on. Unreadable means off."""
+    data = read_json_readonly(settings_file(root))
+    return isinstance(data, dict) and data.get("accept_remote_control") is True
+
+
+def set_remote_control(root, on):
+    path = settings_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        write_json_atomic(path, {"accept_remote_control": bool(on)})
+    log_line(root, f"remote control turned {'ON' if on else 'off'}")
+    if not on:
+        return ("Remote control is OFF: no other machine can start or shut down agent "
+                "sessions on this one.")
+    peers = sorted(read_peers(root))
+    return ("⚠️ Remote control is ON. Every approved peer machine, and any machine approved "
+            "later, can now start agent sessions on this machine in any folder with any "
+            "starting prompt and with permission prompts bypassed, and can shut down agent "
+            f"sessions here. Approved peers: {', '.join(peers) or '(none yet)'}. Turn it off "
+            f"with teammate_peers(action=\"{REFUSE_ACTION}\").")
+
+
+def peer_accepts_control(root, machine):
+    """True/False as the peer last reported, or None when it has not said (older version)."""
+    value = (read_roster(root, machine) or {}).get("accepts_remote_control")
+    return value if isinstance(value, bool) else None
+
+
+def require_remote_control(root, machine):
+    """Raise unless a control request to ``machine`` can be sent right now."""
+    view = peer_view(root, machine)
+    if not view["ok"]:
+        raise CommsError(
+            f"NOT SENT: {machine} cannot be reached right now, and a request like this is "
+            f"never held for later. {view['text']}")
+    roster = read_roster(root, machine)
+    if not roster_fresh(roster):
+        raise CommsError(
+            f"NOT SENT: nothing current has been received from {machine} yet. Retry in "
+            f"about {ROSTER_SECONDS} seconds.")
+    accepts = peer_accepts_control(root, machine)
+    if accepts is None:
+        raise CommsError(
+            f"NOT SENT: {machine} runs an older teammate-comms that cannot be controlled "
+            f"from another machine. Update the plugin there and restart its sessions.")
+    if not accepts:
+        raise CommsError(
+            f"NOT SENT: {machine} does not accept remote control. Its user can turn it on "
+            f"from a session on {machine}: teammate_peers(action=\"{ACCEPT_ACTION}\"). If "
+            f"that was just done, retry in about {ROSTER_SECONDS} seconds.")
 
 
 def default_port():
@@ -389,6 +478,10 @@ def approve_peer(root, machine, net=None):
         raise CommsError(f"{machine!r} is this machine. Add the OTHER machine's name.")
     update_peers(root, lambda peers: {**peers, machine: peers.get(machine, {})})
     lines = [f"Approved {machine!r} as a peer machine.", start_line(ensure_relay(root))]
+    if accepts_remote_control(root):
+        lines.append(f"⚠️ WARNING: remote control is ON for this machine, so {machine} can now "
+                     f"start and shut down agent sessions here. Turn it off with "
+                     f"teammate_peers(action=\"{REFUSE_ACTION}\") if that is not wanted.")
     if me["state"] != "running":
         lines.append(f"⚠️ WARNING: Tailscale is not connected on this machine "
                      f"({me['detail']}). Nothing is exchanged until it is.")
@@ -433,13 +526,23 @@ def peers_report(root, net=None):
         lines.append(f"Tailscale: ⚠️ NOT CONNECTED on this machine ({me['detail']}).")
     else:
         lines.append(f"Tailscale: connected as {me['machine']}.")
+    if accepts_remote_control(root):
+        lines.append("Remote control: ⚠️ ON. Every approved peer can start and shut down "
+                     "agent sessions on this machine.")
+    else:
+        lines.append("Remote control: off. No other machine can start or shut down agent "
+                     "sessions on this one.")
     if peers:
         lines.append("Approved peers:")
         for machine in sorted(peers):
             view = peer_view(root, machine, status)
             known = len((read_roster(root, machine) or {}).get("agents") or [])
             if view["ok"]:
-                lines.append(f"  - {machine}: reachable, {known} teammate(s) known.")
+                accepts = peer_accepts_control(root, machine)
+                control = ("accepts remote control from this machine" if accepts else
+                           "does not accept remote control" if accepts is False else
+                           "older version, cannot be remote controlled")
+                lines.append(f"  - {machine}: reachable, {known} teammate(s) known; {control}.")
             else:
                 waiting = f" {view['queued']} event(s) waiting." if view["queued"] else ""
                 lines.append(f"  - {machine}: ⚠️ {view['text']}{waiting}")
@@ -471,6 +574,7 @@ def ensure_relay(root):
         if relay_alive(root, status):
             stop_and_wait(root, pid=status.get("pid"))
         env = dict(os.environ)
+        env[ORIG_PYTHONPATH_ENV] = env.get("PYTHONPATH") or _NO_PYTHONPATH
         src = str(Path(__file__).resolve().parents[1])
         env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         cmd = [sys.executable, "-m", "teammate_comms.relay", "--comms-dir", str(root)]
@@ -864,7 +968,140 @@ def _apply_deletion(root, names, payload):
     tools.delete_message(root, None, actor, target, _relay=False)
 
 
+def _child_base_env():
+    """The relay's environment without the PYTHONPATH entry it was started with."""
+    env = dict(os.environ)
+    orig = env.pop(ORIG_PYTHONPATH_ENV, None)
+    if orig is not None:
+        if orig == _NO_PYTHONPATH:
+            env.pop("PYTHONPATH", None)
+        else:
+            env["PYTHONPATH"] = orig
+    return env
+
+
+def _require_control(root, names):
+    if not accepts_remote_control(root) or names.src not in read_peers(root):
+        raise RejectEvent(
+            f"{names.me} does not accept remote control. Its user can turn it on from a "
+            f"session on {names.me}: teammate_peers(action=\"{ACCEPT_ACTION}\")")
+
+
+_spawn_times = {}
+
+
+def _spawn_slot(root, src, target):
+    """Refuse a burst from one machine or a second launch of one name; else record this one."""
+    now = time.monotonic()
+    recent = _spawn_times.setdefault(src, collections.deque())
+    while recent and now - recent[0] > SPAWN_RATE_SECONDS:
+        recent.popleft()
+    if len(recent) >= SPAWN_RATE:
+        raise RejectEvent(f"more than {SPAWN_RATE} spawn requests from {src} in a minute; "
+                          f"wait before asking again")
+    data = read_json_readonly(spawned_file(root))
+    launched = data if isinstance(data, dict) else {}
+    wall = time.time()
+    key = target.lower()
+    try:
+        since = wall - float(launched.get(key) or 0)
+    except (TypeError, ValueError):
+        since = SPAWN_NAME_COOLDOWN_SECONDS
+    if 0 <= since < SPAWN_NAME_COOLDOWN_SECONDS:
+        raise RejectEvent(f"{target} was launched here {int(since)} seconds ago; wait for it "
+                          f"to register instead of launching it again")
+    launched = {k: v for k, v in launched.items()
+                if isinstance(v, (int, float)) and 0 <= wall - v < SPAWN_NAME_COOLDOWN_SECONDS}
+    launched[key] = wall
+    try:
+        write_json_atomic(spawned_file(root), launched)
+    except OSError as e:
+        raise RejectEvent(f"could not record the launch: {e}")
+    recent.append(now)
+
+
+def _release_spawn_slot(root, target):
+    target = target.lower()
+    data = read_json_readonly(spawned_file(root))
+    if isinstance(data, dict) and target in data:
+        data.pop(target)
+        try:
+            write_json_atomic(spawned_file(root), data)
+        except OSError:
+            pass
+
+
+_awaiting = {}
+
+
+def _folder_trust(name, project_dir):
+    from . import harness
+    return harness.folder_trusted(name, project_dir)
+
+
+def _apply_spawn(root, names, payload):
+    from . import harness, spawn
+    _require_control(root, names)
+    by = names.actor(payload.get("by"))
+    target = names.target(payload.get("agent"))
+    record = read_agent_record(root, None, target)
+    if record and record.get("type") == "human":
+        raise RejectEvent(f"{target} is the human operator on {names.me}")
+    if record and is_channel_alive(record):
+        raise RejectEvent(f"{target} is already live on {names.me}")
+    try:
+        project_dir = validate_project_dir(payload.get("project_dir"))
+    except CommsError as e:
+        raise RejectEvent(f"on {names.me}: {e}")
+    kind = harness.HARNESSES[harness.DEFAULT]
+    if payload.get("harness"):
+        kind = harness.by_name(payload.get("harness"))
+        if kind is None:
+            raise RejectEvent(f"unknown harness {payload.get('harness')!r}")
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = kind.spawn_prompt.format(agent=target, project_dir=project_dir)
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise RejectEvent(f"prompt is larger than {MAX_PROMPT_BYTES} bytes")
+    if _folder_trust(kind.name, project_dir) is False:
+        raise RejectEvent(
+            f"{project_dir} has never been opened in {kind.display_name} on {names.me}, so the "
+            f"new session would stop at the question asking whether to trust that folder, "
+            f"with nobody there to answer. Open {kind.display_name} in that folder once on "
+            f"{names.me} and accept, or pick a folder that has been used there before")
+    _spawn_slot(root, names.src, target)
+    try:
+        argv = spawn.build_command(kind.spawn_builder, prompt, project_dir)
+        env = spawn.build_remote_child_env(_child_base_env(), target, str(project_dir), root, by)
+        spawn.spawn_in_terminal(argv, project_dir, env)
+    except Exception as e:
+        _release_spawn_slot(root, target)
+        log_line(root, f"spawn of {target} for {by} failed: {type(e).__name__}: {e}")
+        raise RejectEvent(f"could not launch on {names.me}: {e}")
+    _awaiting[(str(root), target)] = {"by": by, "since": None}
+    log_line(root, f"spawned {target} in {project_dir} for {by}; prompt starts "
+                   f"{' '.join(prompt.split())[:80]!r}")
+
+
+def _apply_shutdown(root, names, payload):
+    from . import tools
+    _require_control(root, names)
+    by = names.actor(payload.get("by"))
+    target = names.target(payload.get("agent"))
+    record = read_agent_record(root, None, target)
+    try:
+        tools.check_shutdown_target(record, target)
+        write_shutdown_request(root, None, target, by, record.get("instance_id"))
+    except CommsError as e:
+        raise RejectEvent(f"on {names.me}: {e}")
+    except OSError as e:
+        raise RejectEvent(f"on {names.me}: could not write the request: {e}")
+    log_line(root, f"shutdown of {target} requested by {by}")
+
+
 _APPLIERS = {
+    "spawn": _apply_spawn,
+    "shutdown": _apply_shutdown,
     "dm": _apply_dm,
     "group_post": _apply_group_post,
     "group_members": _apply_group_members,
@@ -901,7 +1138,7 @@ def build_roster(root):
                 if record.get(field):
                     entry[field] = str(record[field])[:600]
             agents.append(entry)
-    return {"agents": agents}
+    return {"agents": agents, "accepts_remote_control": accepts_remote_control(root)}
 
 
 def _clean_roster(roster):
@@ -990,15 +1227,7 @@ class Relay:
         self._rejected_at = {}
 
     def log(self, message):
-        try:
-            path = log_file(self.root)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
-                os.replace(path, path.with_suffix(".log.1"))
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"{now_timestamp()} {message}\n")
-        except OSError:
-            pass
+        log_line(self.root, message)
 
     def _peer(self, machine):
         with self._lock:
@@ -1130,12 +1359,65 @@ class Relay:
             except (OSError, ValueError, KeyError, TypeError):
                 self._quarantine(path)
                 continue
+            if event["kind"] in CONTROL_KINDS and self._control_expired(ev):
+                self._drop_control(machine, st, path, ev)
+                continue
             size += len(raw.encode("utf-8"))
             if events and size > MAX_BATCH_BYTES:
                 break
             events.append(event)
             st["inflight"][event["id"]] = path
         return events
+
+    def _control_expired(self, ev):
+        try:
+            return self.clock() - float(ev.get("queued_epoch") or 0) > CONTROL_TTL_SECONDS
+        except (TypeError, ValueError):
+            return True
+
+    def _control_label(self, ev):
+        payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        name = split_address(str(payload.get("agent") or "the teammate"))[0]
+        return name, ("start" if ev.get("kind") == "spawn" else "shut down")
+
+    def _drop_control(self, machine, st, path, ev):
+        """A control request is never delivered late: drop it and tell whoever asked."""
+        st["inflight"].pop(ev.get("id"), None)
+        try:
+            path.unlink()
+        except OSError:
+            return
+        name, verb = self._control_label(ev)
+        self.log(f"dropped unconfirmed {ev.get('kind')} {ev.get('id')} for {machine}")
+        sender = ev.get("sender")
+        if isinstance(sender, str) and not is_remote(sender) and sender != RELAY_SENDER:
+            reason = ("" if st["state"] == "ok" else " Reason: " + describe_state(
+                st["state"], machine, st["detail"], st["port"], self.machine))
+            self._notify(
+                sender,
+                f"⚠️ NOT CONFIRMED: your request to {verb} {name} on {machine} was not "
+                f"confirmed within {CONTROL_TTL_SECONDS} seconds and has been dropped. It "
+                f"will not be retried.{reason} Check teammate_list before asking again.")
+
+    def _confirm_control(self, machine, path):
+        try:
+            ev = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        sender = ev.get("sender")
+        if (ev.get("kind") not in CONTROL_KINDS or not isinstance(sender, str)
+                or is_remote(sender) or sender == RELAY_SENDER):
+            return
+        name, _verb = self._control_label(ev)
+        if ev.get("kind") == "spawn":
+            text = (f"✅ {machine} launched a terminal for {name}. This confirms the launch, "
+                    f"not registration: check teammate_list in about 20 seconds. If it has "
+                    f"not registered after {REGISTER_WAIT_SECONDS} seconds, {machine} "
+                    f"messages you to say so.")
+        else:
+            text = (f"✅ {machine} accepted the request to shut down {name}. Check "
+                    f"teammate_list to confirm it is no longer live.")
+        self._notify(sender, text)
 
     def _quarantine(self, path):
         try:
@@ -1162,11 +1444,14 @@ class Relay:
                 self._notify(sender, f"⚠️ REJECTED by {machine}: your {ev.get('kind')} was not "
                                      f"applied there. Reason: {error}")
         ids = [i for i in (applied if isinstance(applied, list) else []) if isinstance(i, str)]
+        confirmed = set(ids)
         ids += [i.get("id") for i in (failed if isinstance(failed, list) else [])
                 if isinstance(i, dict)]
         for event_id in ids:
             path = st["inflight"].pop(event_id, None)
             if path is not None:
+                if event_id in confirmed:
+                    self._confirm_control(machine, path)
                 try:
                     path.unlink()
                 except OSError:
@@ -1175,8 +1460,11 @@ class Relay:
     def _store_roster(self, machine, roster):
         path = roster_file(self.root, machine)
         path.parent.mkdir(parents=True, exist_ok=True)
+        accepts = roster.get("accepts_remote_control")
         write_json_atomic(path, {"machine": machine, "received_epoch": time.time(),
-                                 "agents": _clean_roster(roster)})
+                                 "agents": _clean_roster(roster),
+                                 "accepts_remote_control": accepts
+                                 if isinstance(accepts, bool) else None})
 
     def authorize(self, source_ip):
         """The approved machine a connection came from, or None."""
@@ -1274,6 +1562,39 @@ class Relay:
         st["next_due"] = now if progressed else now + (
             POLL_BUSY_SECONDS if busy and not incoming else POLL_IDLE_SECONDS)
 
+    def _check_spawned(self):
+        """Tell whoever asked when a session launched here never registered."""
+        now = self.clock()
+        for key, entry in list(_awaiting.items()):
+            where, target = key
+            if where != str(self.root):
+                continue
+            record = read_agent_record(self.root, None, target)
+            if record and is_channel_alive(record):
+                _awaiting.pop(key, None)
+                continue
+            if entry["since"] is None:
+                entry["since"] = now
+            if now - entry["since"] < REGISTER_WAIT_SECONDS:
+                continue
+            _awaiting.pop(key, None)
+            text = (f"⚠️ {target} was launched on {self.machine} {REGISTER_WAIT_SECONDS} "
+                    f"seconds ago and has NOT registered. Its window is most likely waiting "
+                    f"for a person at {self.machine} to answer a question (folder trust, "
+                    f"sign-in or a first-run prompt). Nothing is retried; someone has to "
+                    f"look at that window.")
+            self.log(f"{target} did not register within {REGISTER_WAIT_SECONDS}s")
+            try:
+                _name, machine = split_address(entry["by"])
+                if machine not in read_peers(self.root):
+                    raise CommsError(f"{machine} is no longer an approved peer")
+                record = {"id": new_message_id(self.root), "ts": message_ts(),
+                          "from": RELAY_SENDER, "priority": "urgent", "message": text}
+                enqueue(self.root, machine, "dm", {"record": record, "to": entry["by"]},
+                        sender=RELAY_SENDER)
+            except Exception as e:
+                self.log(f"could not tell {entry['by']}: {type(e).__name__}: {e}")
+
     def _notify(self, sender, text):
         from . import tools
         try:
@@ -1305,6 +1626,8 @@ class Relay:
             except (OSError, ValueError):
                 continue
             sender = ev.get("sender")
+            if ev.get("kind") in CONTROL_KINDS:
+                continue
             try:
                 waited = now - float(ev.get("queued_epoch") or now)
             except (TypeError, ValueError):
@@ -1401,6 +1724,7 @@ class Relay:
                 self._exchange(machine, cfg, st)
                 self._write_status(peers)
             self._notices(machine, st)
+        self._check_spawned()
         self._write_status(peers)
         return peers
 

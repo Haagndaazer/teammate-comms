@@ -448,7 +448,7 @@ def main():
     # reincarnate is GATED off by default (env has no TEAMMATE_REINCARNATE_ENABLED) → isError,
     # and must NOT spawn anything.
     send(proc, {"jsonrpc": "2.0", "id": 52, "method": "tools/call",
-                "params": {"name": "teammate_reincarnate",
+                "params": {"name": "teammate_spawn",
                            "arguments": {"agent": "Echo", "project_dir": str(REPO)}}})
     time.sleep(0.5)
 
@@ -574,7 +574,8 @@ def main():
     expected_names = {"teammate_register", "teammate_send", "teammate_inbox",
                       "teammate_list", "teammate_whoami",
                       "teammate_update", "teammate_profile", "teammate_group",
-                      "teammate_react", "teammate_reincarnate", "teammate_dashboard",
+                      "teammate_react", "teammate_spawn", "teammate_shutdown",
+                      "teammate_dashboard",
                       "teammate_delete",
                       "project_register", "list_projects", "project_profile", "project_delete",
                       "teammate_set_avatar", "teammate_request_compact", "teammate_peers",
@@ -896,7 +897,7 @@ def main():
         if not any(r.get("from") == AGENT and r.get("target_from") == AGENT and r.get("op") == "add" for r in revs2):
             failures.append("react() did not stamp target_from on a self-reaction")
 
-    # ── teammate_reincarnate (v0.6.0) ──
+    # ── teammate_spawn (v0.6.0) ──
     # gate-off path (no TEAMMATE_REINCARNATE_ENABLED) is isError + spawns nothing
     if not is_error(52) or "disabled" not in text(52):
         failures.append(f"reincarnate gate-off not isError/disabled: {by_id.get(52)}")
@@ -3565,7 +3566,7 @@ def main():
 
     # ── WP-20 AC-5 (I2) — reincarnate refuses a human-typed target; gate-off still checks first ──
     try:
-        from teammate_comms.tools import _handle_reincarnate as _hr20e, CommsError as _CE20e
+        from teammate_comms.tools import _handle_spawn as _hr20e, CommsError as _CE20e
         from teammate_comms.comms import write_agent_record as _war20e
 
         _t20e_root = tempfile.mkdtemp(prefix="tc-20-ac5-")
@@ -4099,7 +4100,7 @@ def main():
         # Reincarnate text carries the warning iff gate on + durably set (hermetic monkeypatch);
         # Popen/shutil.which mocked so this never opens a real terminal window (G-2 pattern).
         _real_gate_check24a = _sp24a._gate_durably_set
-        _real_reincarnate_enabled24a = os.environ.get("TEAMMATE_REINCARNATE_ENABLED")
+        _real_spawn_enabled24a = os.environ.get("TEAMMATE_REINCARNATE_ENABLED")
         _real_popen24a = _sp24a.subprocess.Popen
         _real_which24a = _sp24a.shutil.which
         try:
@@ -4118,12 +4119,12 @@ def main():
 
             _sp24a._gate_durably_set = lambda: True
             _t24a._gate_durable_stderr_logged = False  # reset the once-per-process log flag
-            _msg24a = _t24a._handle_reincarnate({"agent": "child24a", "project_dir": str(REPO)}, _ctx24a)
+            _msg24a = _t24a._handle_spawn({"agent": "child24a", "project_dir": str(REPO)}, _ctx24a)
             if "DURABLY" not in _msg24a:
                 failures.append(f"WP-24 AC-1: reincarnate text missing the durable-set warning: {_msg24a[:200]!r}")
 
             _sp24a._gate_durably_set = lambda: False
-            _msg24a2 = _t24a._handle_reincarnate({"agent": "child24a2", "project_dir": str(REPO)}, _ctx24a)
+            _msg24a2 = _t24a._handle_spawn({"agent": "child24a2", "project_dir": str(REPO)}, _ctx24a)
             if "DURABLY" in _msg24a2:
                 failures.append(f"WP-24 AC-1: reincarnate text wrongly warned when NOT durably set: {_msg24a2[:200]!r}")
 
@@ -4132,7 +4133,7 @@ def main():
             # end-to-end; confirmed here too for a hermetic pin.
             os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
             try:
-                _t24a._handle_reincarnate({"agent": "child24a3", "project_dir": str(REPO)}, _ctx24a)
+                _t24a._handle_spawn({"agent": "child24a3", "project_dir": str(REPO)}, _ctx24a)
                 failures.append("WP-24 AC-2: reincarnate should still raise when gated off")
             except Exception as _e24a:
                 if "disabled" not in str(_e24a):
@@ -4141,10 +4142,10 @@ def main():
             _sp24a._gate_durably_set = _real_gate_check24a
             _sp24a.subprocess.Popen = _real_popen24a
             _sp24a.shutil.which = _real_which24a
-            if _real_reincarnate_enabled24a is None:
+            if _real_spawn_enabled24a is None:
                 os.environ.pop("TEAMMATE_REINCARNATE_ENABLED", None)
             else:
-                os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _real_reincarnate_enabled24a
+                os.environ["TEAMMATE_REINCARNATE_ENABLED"] = _real_spawn_enabled24a
     except Exception as e:
         failures.append(f"WP-24 AC-1/AC-2 unit checks errored: {e}")
 

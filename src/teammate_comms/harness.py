@@ -2,9 +2,11 @@
 runs under, resolved once from TEAMMATE_HARNESS. Field names track vibe-cognition's
 harness.py so the shared renderer stays a verbatim copy."""
 
+import json
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 CLAUDE_CODE = "claude-code"
 CODEX = "codex"
@@ -18,6 +20,17 @@ WHATS_NEW_PATH = ".claude-plugin/whats-new.json"
 MARKETPLACE_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/Haagndaazer/colton-claude-plugins/main/{path}")
 PLUGIN_URL_TEMPLATE = "https://raw.githubusercontent.com/Haagndaazer/teammate-comms/{sha}/{path}"
+
+PROCESS_NAMES = {
+    CLAUDE_CODE: ("claude.exe",),
+    CODEX: ("codex.exe",),
+}
+PROCESS_PATH_EXCLUDES = ("anthropicclaude", "windowsapps")
+TRUST_CONFIG_ENV = "CLAUDE_CONFIG_DIR"
+TRUST_CONFIG_NAME = ".claude.json"
+TRUST_KEY = "hasTrustDialogAccepted"
+SESSION_ENV_PREFIXES = ("CLAUDE_CODE_",)
+SESSION_ENV_NAMES = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CODEX_THREAD_ID", "WT_SESSION")
 
 
 @dataclass(frozen=True)
@@ -90,6 +103,41 @@ HARNESSES = {
 }
 
 _warned = set()
+
+
+def _folder_key(path):
+    return str(path).replace(chr(92), "/").rstrip("/").lower()
+
+
+def folder_trusted(name, project_dir, env=None, home=None):
+    """Whether the harness would open ``project_dir`` without asking its trust question.
+
+    True or False from the harness's own record; None when that cannot be told. Read only:
+    trust is never granted from here.
+    """
+    if name != CLAUDE_CODE:
+        return None
+    env = os.environ if env is None else env
+    home = Path(home) if home else Path.home()
+    base = Path(env.get(TRUST_CONFIG_ENV) or home)
+    try:
+        data = json.loads((base / TRUST_CONFIG_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    projects = data.get("projects") if isinstance(data, dict) else None
+    if not isinstance(projects, dict):
+        return None
+    trusted = {_folder_key(k) for k, v in projects.items()
+               if isinstance(v, dict) and v.get(TRUST_KEY) is True}
+    folder = Path(project_dir)
+    for cur in (folder, *folder.parents):
+        if _folder_key(cur) == _folder_key(home):
+            break
+        if _folder_key(cur) in trusted:
+            return True
+        if (cur / ".git").exists():
+            break
+    return False
 
 
 def current(env=None):

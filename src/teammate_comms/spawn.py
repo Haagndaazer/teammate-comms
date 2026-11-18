@@ -1,4 +1,4 @@
-"""Launch a new Claude Code teammate in a terminal window (for ``teammate_reincarnate``).
+"""Launch a new teammate session in a terminal window (for ``teammate_spawn``).
 
 Pure command/env builders (unit-tested without spawning) + a cross-platform detached
 terminal launcher. Design rules:
@@ -77,7 +77,16 @@ def plugin_spec():
     return f"plugin:{PLUGIN_NAME}@{resolve_marketplace()}"
 
 
-_GATE_ENV_VAR = "TEAMMATE_REINCARNATE_ENABLED"
+GATE_ENV_VAR = "TEAMMATE_SPAWN_ENABLED"
+LEGACY_GATE_ENV_VAR = "TEAMMATE_REINCARNATE_ENABLED"
+GATE_ENV_VARS = (GATE_ENV_VAR, LEGACY_GATE_ENV_VAR)
+_OFF = ("", "0", "false", "no", "off")
+
+
+def gate_enabled(env=None):
+    """True when the local spawn gate is set under its current or its legacy name."""
+    env = os.environ if env is None else env
+    return any(str(env.get(name) or "").strip().lower() not in _OFF for name in GATE_ENV_VARS)
 
 
 def _gate_durably_set():
@@ -102,13 +111,15 @@ def _gate_durably_set():
     for hive, subkey in hives:
         try:
             with winreg.OpenKey(hive, subkey) as key:
-                value, _ = winreg.QueryValueEx(key, _GATE_ENV_VAR)
-                if value:
-                    return True
-        except OSError:
-            continue
+                for name in GATE_ENV_VARS:
+                    try:
+                        value, _ = winreg.QueryValueEx(key, name)
+                    except OSError:
+                        continue
+                    if value:
+                        return True
         except Exception:
-            continue  # never let a registry quirk raise out of a courtesy check
+            continue
     return False
 
 
@@ -287,10 +298,25 @@ def build_child_env(base, agent, project_dir, team=None, comms_dir=None, spawned
     # explicitly opts back in (the reincarnate gate is opt-in-default-off by design, F-1). This
     # is the gate ONLY — TEAMMATE_LAUNCH_ARGS is a launch override the child SHOULD inherit so
     # it spawns the same (e.g. allowlisted --channels), so it is deliberately NOT stripped.
-    env.pop("TEAMMATE_REINCARNATE_ENABLED", None)
+    for name in GATE_ENV_VARS:
+        env.pop(name, None)
     if not (env.get("TEAMMATE_AGENT") and env.get("CLAUDE_PROJECT_DIR")):
         raise CommsError("build_child_env requires a non-empty agent and project_dir.")
     return env
+
+
+def build_remote_child_env(base, agent, project_dir, root, spawned_by):
+    """Child env for a session a peer machine asked for, launched by the relay.
+
+    The relay's environment is an old copy of whichever session started it, so everything
+    that belonged to that session is dropped and the comms root is pinned to the relay's.
+    """
+    env = {k: v for k, v in base.items()
+           if k not in harness_mod.SESSION_ENV_NAMES
+           and not k.startswith(harness_mod.SESSION_ENV_PREFIXES)}
+    for name in ("TEAMMATE_TEAM", "TEAMMATE_TRANSCRIPT", harness_mod.ENV_VAR):
+        env.pop(name, None)
+    return build_child_env(env, agent, project_dir, None, str(root), spawned_by=spawned_by)
 
 
 # W5: Popen handles were never collected, so completed spawn children accumulated as zombies
@@ -343,7 +369,7 @@ def spawn_in_terminal(argv, cwd, env):
     if not exe or shutil.which(exe) is None:
         raise FileNotFoundError(
             f"{exe or '<empty argv>'} CLI not on PATH — the spawned teammate cannot launch. "
-            f"Install it or fix PATH before retrying teammate_reincarnate."
+            f"Install it or fix PATH before retrying teammate_spawn."
         )
     dn = subprocess.DEVNULL
     cwd = str(cwd)
@@ -352,6 +378,7 @@ def spawn_in_terminal(argv, cwd, env):
         # re-parse) and wt is its own top-level process, so the child outlives the server.
         try:
             wt = ["wt.exe", "-d", cwd, "--"] + argv
+            wt = [part.replace(";", "\\;") for part in wt]
             p = subprocess.Popen(wt, env=env, stdin=dn, stdout=dn, stderr=dn)
             _children.append(p)
             return wt

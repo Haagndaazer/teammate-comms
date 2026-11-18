@@ -15,7 +15,8 @@ One row per tool, hook, skill and CLI × harness. Values: `full` | `partial` | `
 | teammate_profile | full | full | |
 | teammate_group | full | full | |
 | teammate_react | full | full | Reaction wakes go through the harness waker. |
-| teammate_reincarnate | full | partial | Codex child gets its identity from the launch prompt; `spawned_by` is not recorded; the gate must be set on the MCP entry env. |
+| teammate_spawn | full | partial | Codex child gets its identity from the launch prompt; `spawned_by` is not recorded; the gate must be set on the MCP entry env. `name@machine` starts it on a linked machine with remote control on. |
+| teammate_shutdown | full | full | The target's own server closes its harness process tree; Windows only. `name@machine` needs remote control on that machine. |
 | teammate_dashboard | full | full | |
 | teammate_set_avatar | full | full | |
 | teammate_delete | full | full | |

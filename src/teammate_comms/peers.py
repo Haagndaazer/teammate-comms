@@ -1,4 +1,5 @@
-"""Terminal command that approves, removes or lists peer machines for cross-machine comms.
+"""Terminal command that approves, removes or lists peer machines for cross-machine comms,
+and turns remote control of this machine on or off.
 
 ``python -m teammate_comms.peers add <machine>``. The same actions are available to agents
 through the ``teammate_peers`` tool.
@@ -16,8 +17,11 @@ def main(argv=None, net=None):
             stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         prog="python -m teammate_comms.peers",
-        description="Approve, remove or list the machines this one exchanges messages with.")
-    parser.add_argument("action", nargs="?", choices=("list", "add", "remove"), default="list")
+        description="Approve, remove or list the machines this one exchanges messages with, "
+                    "and choose whether they may start and shut down agent sessions here.")
+    parser.add_argument("action", nargs="?", default="list",
+                        choices=("list", "add", "remove", relay.ACCEPT_ACTION,
+                                 relay.REFUSE_ACTION))
     parser.add_argument("machine", nargs="?", help="Tailscale machine name (for add/remove).")
     parser.add_argument("--comms-dir", dest="comms_dir", default=None)
     args = parser.parse_args(argv)
@@ -27,6 +31,8 @@ def main(argv=None, net=None):
             print(relay.approve_peer(root, args.machine, net))
         elif args.action == "remove":
             print(relay.remove_peer(root, args.machine))
+        elif args.action in (relay.ACCEPT_ACTION, relay.REFUSE_ACTION):
+            print(relay.set_remote_control(root, args.action == relay.ACCEPT_ACTION))
         else:
             print(relay.peers_report(root, net))
     except CommsError as e:

@@ -23,7 +23,11 @@ os.environ["TEAMMATE_RELAY_AUTOSTART"] = "0"
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
+from teammate_comms import channel as channel_mod  # noqa: E402
 from teammate_comms import comms  # noqa: E402
+from teammate_comms import harness as harness_mod  # noqa: E402
+from teammate_comms import procs as procs_mod  # noqa: E402
+from teammate_comms import spawn as spawn_mod  # noqa: E402
 from teammate_comms import peers as peers_mod  # noqa: E402
 from teammate_comms import relay as relay_mod  # noqa: E402
 from teammate_comms import server as server_mod  # noqa: E402
@@ -894,8 +898,703 @@ def test_lifecycle_guards():
                  "the relay's sender name is reserved")
 
 
+def relay_notes(root, name):
+    return [m["message"] for m in unread(root, name) if m.get("from") == comms.RELAY_SENDER]
+
+
+REAL_LAUNCH = spawn_mod.spawn_in_terminal
+
+
+def _no_real_launch(argv, cwd, env):
+    failures.append(f"a test tried to open a real terminal in {cwd}")
+    raise OSError("real launches are disabled in tests")
+
+
+spawn_mod.spawn_in_terminal = _no_real_launch
+
+
+class Launches:
+    """Stands in for the terminal launcher and records what would have been started."""
+
+    def __init__(self):
+        self.calls, self.fail, self.trusted = [], None, True
+        self._real = spawn_mod.spawn_in_terminal
+        self._real_trust = relay_mod._folder_trust
+
+    def __enter__(self):
+        def fake(argv, cwd, env):
+            if self.fail:
+                raise self.fail
+            self.calls.append({"argv": list(argv), "cwd": str(cwd), "env": dict(env)})
+            return argv
+        spawn_mod.spawn_in_terminal = fake
+        relay_mod._folder_trust = lambda name, path: self.trusted
+        relay_mod._spawn_times.clear()
+        relay_mod._awaiting.clear()
+        return self
+
+    def __exit__(self, *exc):
+        spawn_mod.spawn_in_terminal = self._real
+        relay_mod._folder_trust = self._real_trust
+        relay_mod._awaiting.clear()
+
+
+def _control_ready(w):
+    tools_mod._handle_peers({"action": "accept_remote_control"}, ctx_for("bob", w.root_b))
+    w.pump(2, step=11)
+
+
+def test_remote_control_switch():
+    w = World()
+    try:
+        check(not relay_mod.accepts_remote_control(w.root_b), "remote control is off by default")
+        relay_mod.settings_file(w.root_b).write_text("{not json", encoding="utf-8")
+        check(not relay_mod.accepts_remote_control(w.root_b), "an unreadable setting means off")
+        relay_mod.settings_file(w.root_b).write_text('{"accept_remote_control": "yes"}',
+                                                     encoding="utf-8")
+        check(not relay_mod.accepts_remote_control(w.root_b), "only a real true turns it on")
+        relay_mod.settings_file(w.root_b).unlink()
+        w.pump(2, step=11)
+        check(relay_mod.peer_accepts_control(w.root_a, "b") is False, "the roster says b refuses")
+        alice = ctx_for("alice", w.root_a)
+        with Launches() as launched:
+            try:
+                tools_mod._handle_spawn({"agent": "dave@b", "project_dir": str(w.root_b)}, alice)
+                failures.append("spawn to a machine that refuses was not refused")
+            except CommsError as e:
+                check("does not accept remote control" in str(e) and "accept_remote_control" in str(e),
+                      f"the sender is told the exact fix: {e}")
+            check_raises(lambda: tools_mod._handle_shutdown({"agent": "bob@b"}, alice), CommsError,
+                         "shutdown to a machine that refuses")
+            check(relay_mod.queued_count(w.root_a, "b") == 0, "a refused request queues nothing")
+
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "dave@b", "by": "alice", "project_dir": str(w.root_b)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "shutdown", {"agent": "bob@b", "by": "alice"},
+                              sender="alice")
+            w.pump(5, step=1)
+            notes = relay_notes(w.root_a, "alice")
+            check(not launched.calls, "the receiver refuses even when the sender did not check")
+            check(len([n for n in notes if "REJECTED by b" in n and "accept_remote_control" in n]) == 2,
+                  f"both requests come back rejected with the fix: {notes}")
+            check(not comms.shutdown_request_file(w.root_b, None, "bob").exists(),
+                  "no shutdown request was written while the switch is off")
+
+        out = tools_mod._handle_peers({"action": "accept_remote_control"}, ctx_for("bob", w.root_b))
+        check("Remote control is ON" in out and "permission prompts bypassed" in out
+              and "Approved peers: a" in out, f"turning it on says what it means: {out}")
+        check(relay_mod.accepts_remote_control(w.root_b), "the tool turns it on")
+        report = relay_mod.peers_report(w.root_b, w.net_b)
+        check("Remote control: ⚠️ ON" in report, f"the peers listing shows it loudly: {report}")
+        warned = relay_mod.approve_peer(w.root_b, "c", w.net_b)
+        check("remote control is ON" in warned and "c can now start and shut down" in warned,
+              f"approving a peer while it is on warns: {warned}")
+        relay_mod.remove_peer(w.root_b, "c")
+        w.pump(2, step=11)
+        check(relay_mod.peer_accepts_control(w.root_a, "b") is True, "the roster says b accepts")
+        check("accepts remote control from this machine" in relay_mod.peers_report(w.root_a, w.net_a),
+              "the other side's listing shows it may control b")
+
+        roster = comms.read_json_readonly(relay_mod.roster_file(w.root_a, "b"))
+        roster.pop("accepts_remote_control")
+        comms.write_json_atomic(relay_mod.roster_file(w.root_a, "b"), roster)
+        try:
+            tools_mod._handle_shutdown({"agent": "bob@b"}, alice)
+            failures.append("a peer that never said whether it accepts was not refused")
+        except CommsError as e:
+            check("older teammate-comms" in str(e), f"an older peer is named as such: {e}")
+
+        w.pump(2, step=11)
+        stale = comms.read_json_readonly(relay_mod.roster_file(w.root_a, "b"))
+        stale["received_epoch"] = time.time() - relay_mod.ROSTER_FRESH_SECONDS - 5
+        comms.write_json_atomic(relay_mod.roster_file(w.root_a, "b"), stale)
+        try:
+            relay_mod.require_remote_control(w.root_a, "b")
+            failures.append("an out-of-date roster was trusted for a control request")
+        except CommsError as e:
+            check("nothing current" in str(e), f"an out-of-date roster refuses: {e}")
+        w.ra._store_roster("b", {"agents": [], "accepts_remote_control": "yes"})
+        kept = comms.read_json_readonly(relay_mod.roster_file(w.root_a, "b"))
+        check(kept.get("accepts_remote_control") is None
+              and relay_mod.peer_accepts_control(w.root_a, "b") is None,
+              f"only a real true or false is kept from a peer's roster: {kept}")
+        check_raises(lambda: relay_mod.apply_event(
+            w.root_b, "b", "c", "shutdown", {"agent": "bob@b", "by": "zed"}),
+            relay_mod.RejectEvent, "a machine that is not an approved peer, switch on")
+        with Launches() as never:
+            check_raises(lambda: relay_mod.apply_event(
+                w.root_b, "b", "c", "spawn",
+                {"agent": "x@b", "by": "zed", "project_dir": str(w.root_b)}),
+                relay_mod.RejectEvent, "a spawn from a machine that is not an approved peer")
+            check(not never.calls, "and nothing is launched for it")
+
+        check(peers_mod.main(["refuse_remote_control", "--comms-dir", str(w.root_b)], net=w.net_b) == 0
+              and not relay_mod.accepts_remote_control(w.root_b), "the terminal command turns it off")
+        check(peers_mod.main(["accept_remote_control", "--comms-dir", str(w.root_b)], net=w.net_b) == 0
+              and relay_mod.accepts_remote_control(w.root_b), "the terminal command turns it on")
+        check("off" in tools_mod._handle_peers({"action": "refuse_remote_control"},
+                                               ctx_for("bob", w.root_b)).lower()
+              and not relay_mod.accepts_remote_control(w.root_b), "the tool turns it off")
+    finally:
+        w.close()
+
+
+def test_remote_spawn():
+    w = World()
+    saved = {k: os.environ.get(k) for k in ("TEAMMATE_TEAM", "CLAUDE_CODE_SESSION_ID",
+                                            "TEAMMATE_TRANSCRIPT", "TEAMMATE_SPAWN_ENABLED")}
+    os.environ.update(TEAMMATE_TEAM="stale-team", CLAUDE_CODE_SESSION_ID="stale-session",
+                      TEAMMATE_TRANSCRIPT="0", TEAMMATE_SPAWN_ENABLED="1")
+    try:
+        _control_ready(w)
+        alice = ctx_for("alice", w.root_a)
+        project = Path(w.root_b) / "proj"
+        project.mkdir()
+        with Launches() as launched:
+            out = tools_mod._handle_spawn({"agent": "dave@b", "project_dir": str(project),
+                                           "prompt": "first; second"}, alice)
+            check("Asked b to start dave" in out and "not the launch" in out,
+                  f"the result confirms the request only: {out}")
+            for bad in ({"team": "t"}, {"comms_dir": "x"}):
+                check_raises(lambda bad=bad: tools_mod._handle_spawn(
+                    {"agent": "erin@b", "project_dir": str(project), **bad}, alice),
+                    CommsError, f"{list(bad)[0]} is refused for another machine")
+            check_raises(lambda: tools_mod._handle_spawn(
+                {"agent": "erin@b", "project_dir": "a\nb"}, alice), CommsError, "multi-line folder")
+            check_raises(lambda: tools_mod._handle_spawn(
+                {"agent": "erin@b", "project_dir": str(project),
+                 "prompt": "x" * (relay_mod.MAX_PROMPT_BYTES + 1)}, alice), CommsError, "huge prompt")
+            check_raises(lambda: tools_mod._handle_spawn(
+                {"agent": "bob@b", "project_dir": str(project)}, alice), CommsError,
+                "a name that is live there")
+            check_raises(lambda: tools_mod._handle_spawn(
+                {"agent": "dave@zzz", "project_dir": str(project)}, alice), CommsError,
+                "a machine that is not a peer")
+            sent = sorted(relay_mod.outbox_dir(w.root_a, "b").glob("*.json"))
+            event = json.loads(sent[0].read_text(encoding="utf-8")) if sent else {}
+            w.pump(5, step=1)
+            check(len(launched.calls) == 1, f"exactly one launch: {len(launched.calls)}")
+            if launched.calls:
+                call = launched.calls[0]
+                env = call["env"]
+                check(call["argv"][-1] == "first; second", f"the prompt arrives whole: {call['argv'][-1]!r}")
+                check(Path(call["cwd"]) == project.resolve(), f"launched in the folder: {call['cwd']}")
+                check(env.get("TEAMMATE_AGENT") == "dave"
+                      and env.get("TEAMMATE_SPAWNED_BY") == "alice@a",
+                      f"name and origin handed to the new session: {env.get('TEAMMATE_SPAWNED_BY')}")
+                check(env.get("TEAMMATE_COMMS_DIR") == str(w.root_b), "comms root pinned to the relay's")
+                check("TEAMMATE_TEAM" not in env and "TEAMMATE_TRANSCRIPT" not in env
+                      and "CLAUDE_CODE_SESSION_ID" not in env,
+                      "the starting session's own variables are not inherited")
+                check(not any(g in env for g in spawn_mod.GATE_ENV_VARS),
+                      "the local spawn gate is not handed down")
+            notes = relay_notes(w.root_a, "alice")
+            check(len([n for n in notes if "launched a terminal for dave" in n]) == 1,
+                  f"the requester is told once that it launched: {notes}")
+
+            if event:
+                w.rb._apply_events("a", [event])
+                check(len(launched.calls) == 1, "a resent event does not launch again")
+                w.rb._seen.clear()
+                relay_mod.seen_file(w.root_b, "a").unlink()
+                applied, failed = w.rb._apply_events("a", [event])
+                check(len(launched.calls) == 1 and failed and "launched here" in failed[0]["error"],
+                      f"a relay that forgot the event still does not launch the name twice: {failed}")
+
+            comms.write_agent_record(w.root_b, None, "boss", type="human", presence="online")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "boss@b", "by": "alice", "project_dir": str(project)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "erin@b", "by": "alice", "project_dir": str(project),
+                "prompt": "x" * (relay_mod.MAX_PROMPT_BYTES + 1)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "DAVE@b", "by": "alice", "project_dir": str(project)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "bob@b", "by": "alice", "project_dir": str(project)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "erin@b", "by": "alice", "project_dir": str(project / "missing")},
+                sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "erin@b", "by": "bob@b", "project_dir": str(project)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "erin@b", "by": "alice", "project_dir": str(project),
+                "harness": "nonsense"}, sender="alice")
+            w.pump(5, step=1)
+            notes = " | ".join(relay_notes(w.root_a, "alice"))
+            check(len(launched.calls) == 1, "none of the invalid requests launched")
+            check("already live on b" in notes, f"a live name is refused there: {notes}")
+            check("boss is the human operator" in notes, "the human operator's name is refused there")
+            check(f"larger than {relay_mod.MAX_PROMPT_BYTES} bytes" in notes,
+                  "the receiver enforces the prompt size itself")
+            check("DAVE was launched here" in notes,
+                  "the same name in another letter case cannot be launched again")
+            check("project_dir does not exist" in notes, "a missing folder is refused there")
+            check("must be a bare name" in notes, "a requester name from another machine is refused")
+            check("unknown harness" in notes, "an unknown harness is refused")
+
+            launched.fail = FileNotFoundError("no launcher")
+            tools_mod._handle_spawn({"agent": "erin@b", "project_dir": str(project)}, alice)
+            w.pump(5, step=1)
+            check(any("could not launch on b" in n for n in relay_notes(w.root_a, "alice")),
+                  "a launch failure is reported as a refusal")
+            cooled = comms.read_json_readonly(relay_mod.spawned_file(w.root_b)) or {}
+            check("erin" not in cooled and "dave" in cooled,
+                  f"a failed launch does not hold the name; a real one does: {sorted(cooled)}")
+            launched.fail = None
+
+            relay_mod._spawn_times.clear()
+            before = len(launched.calls)
+            keep = {k: os.environ.get(k) for k in ("PYTHONPATH", relay_mod.ORIG_PYTHONPATH_ENV)}
+            try:
+                os.environ["PYTHONPATH"] = "relay-added"
+                os.environ[relay_mod.ORIG_PYTHONPATH_ENV] = "-"
+                check("PYTHONPATH" not in relay_mod._child_base_env(),
+                      "the relay's own PYTHONPATH is not handed to the session")
+                os.environ[relay_mod.ORIG_PYTHONPATH_ENV] = "users-own"
+                base = relay_mod._child_base_env()
+                check(base.get("PYTHONPATH") == "users-own"
+                      and relay_mod.ORIG_PYTHONPATH_ENV not in base,
+                      "the PYTHONPATH from before the relay started is restored")
+                os.environ.pop(relay_mod.ORIG_PYTHONPATH_ENV)
+                check(relay_mod._child_base_env().get("PYTHONPATH") == "relay-added",
+                      "with no marker the environment is left alone")
+            finally:
+                for k, v in keep.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+            for n in range(relay_mod.SPAWN_RATE + 1):
+                relay_mod.enqueue(w.root_a, "b", "spawn", {
+                    "agent": f"burst{n}@b", "by": "alice", "project_dir": str(project)},
+                    sender="alice")
+            w.pump(6, step=1)
+            check(len(launched.calls) - before == relay_mod.SPAWN_RATE,
+                  f"at most {relay_mod.SPAWN_RATE} launches a minute from one machine: "
+                  f"{len(launched.calls) - before}")
+            check(any("spawn requests from a in a minute" in n for n in relay_notes(w.root_a, "alice")),
+                  "the one over the limit is refused with the reason")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        w.close()
+
+
+def test_control_never_late():
+    w = World()
+    try:
+        _control_ready(w)
+        alice = ctx_for("alice", w.root_a)
+        with Launches() as launched:
+            w.rb._close_listener()
+            check(wait_closed(IPS["b"], w.port_b), "setup: B's listener closed")
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": "dave@b", "by": "alice", "project_dir": str(w.root_b)}, sender="alice")
+            relay_mod.enqueue(w.root_a, "b", "shutdown", {"agent": "bob@b", "by": "alice"},
+                              sender="alice")
+            kept = tools_mod.send_dm(w.root_a, None, "alice", "bob@b", "ordinary message")
+            w.pump(1, step=10, b=False)
+            check(relay_mod.queued_count(w.root_a, "b") == 3, "nothing is dropped before the limit")
+            w.pump(2, step=20, b=False)
+            check(relay_mod.queued_count(w.root_a, "b") == 1,
+                  f"both control requests were dropped, the message kept: "
+                  f"{relay_mod.queued_count(w.root_a, 'b')}")
+            notes = relay_notes(w.root_a, "alice")
+            check(len([n for n in notes if "NOT CONFIRMED" in n]) == 2
+                  and any("start dave" in n for n in notes) and any("shut down bob" in n for n in notes),
+                  f"the requester is told about each dropped request: {notes}")
+            try:
+                tools_mod._handle_spawn({"agent": "dave@b", "project_dir": str(w.root_b)}, alice)
+                failures.append("a spawn to an unreachable machine was queued")
+            except CommsError as e:
+                check("NOT SENT" in str(e) and "never held for later" in str(e),
+                      f"an unreachable machine refuses up front: {e}")
+            check(w.ra._control_expired({"queued_epoch": "garbled"})
+                  and w.ra._control_expired({}),
+                  "a request with no readable age counts as expired")
+
+            w.pump(4, step=40)
+            check(not launched.calls, "nothing launches when the machine comes back")
+            check(not comms.shutdown_request_file(w.root_b, None, "bob").exists(),
+                  "nothing is shut down when the machine comes back")
+            check([m["id"] for m in unread(w.root_b, "bob") if m.get("message") == "ordinary message"]
+                  == [kept["id"]], "the ordinary message is still delivered late")
+    finally:
+        w.close()
+
+
+def test_control_request_notice():
+    w = World()
+    try:
+        _control_ready(w)
+        w.rb._close_listener()
+        check(wait_closed(IPS["b"], w.port_b), "setup: B's listener closed")
+        relay_mod.enqueue(w.root_a, "b", "shutdown", {"agent": "bob@b", "by": "alice"},
+                          sender="alice")
+        path = sorted(relay_mod.outbox_dir(w.root_a, "b").glob("*.json"))[-1]
+        ev = json.loads(path.read_text(encoding="utf-8"))
+        start = w.clock.t
+        ev["queued_epoch"] = start
+        path.write_text(json.dumps(ev), encoding="utf-8")
+        st = w.ra._peer("b")
+        st["fails"], st["next_due"] = 0, 0.0
+        for at in (1, 3, 7, 15, 31, 60.5):
+            w.clock.t = start + at
+            w.ra.tick()
+        check(relay_mod.queued_count(w.root_a, "b") == 1,
+              "setup: the request is still on disk between two attempts")
+        late = relay_notes(w.root_a, "alice")
+        check(not any("NOT DELIVERED" in n for n in late),
+              f"a control request is never described as queued for later: {late}")
+        w.clock.t = start + 62
+        w.ra.tick()
+        late = relay_notes(w.root_a, "alice")
+        check(len([n for n in late if "NOT CONFIRMED" in n]) == 1
+              and relay_mod.queued_count(w.root_a, "b") == 0,
+              f"it is dropped and reported once: {late}")
+    finally:
+        w.close()
+
+
+def test_remote_shutdown():
+    w = World()
+    try:
+        comms.write_agent_record(w.root_b, None, "bob", instance_id="inst-bob")
+        comms.write_agent_record(w.root_b, None, "carol", channel=False)
+        _control_ready(w)
+        alice = ctx_for("alice", w.root_a)
+        check_raises(lambda: tools_mod._handle_shutdown({"agent": "carol@b"}, alice), CommsError,
+                     "a teammate that is not live there")
+        check_raises(lambda: tools_mod._handle_shutdown({"agent": "nobody@b"}, alice), CommsError,
+                     "a name unknown there")
+        out = tools_mod._handle_shutdown({"agent": "bob@b"}, alice)
+        check("Asked b to shut down bob" in out and "not the result" in out, f"request only: {out}")
+        w.pump(5, step=1)
+        path = comms.shutdown_request_file(w.root_b, None, "bob")
+        req = comms.read_json_readonly(path) or {}
+        check(req.get("by") == "alice@a" and req.get("instance_id") == "inst-bob",
+              f"the request names who asked and the exact session: {req}")
+        check(any("accepted the request to shut down bob" in n for n in relay_notes(w.root_a, "alice")),
+              "the requester is told it was accepted")
+
+        take = comms.take_shutdown_request
+        check(take(w.root_b, None, "bob", "another-session") is None and path.exists(),
+              "a different session of the name leaves the request alone")
+        check(take(w.root_b, None, "bob", None) is None and path.exists(),
+              "a session with no id never takes a request")
+        check(take(w.root_b, None, "bob", "inst-bob") == "alice@a" and not path.exists(),
+              "the addressed session takes it exactly once")
+        comms.write_shutdown_request(w.root_b, None, "bob", "alice@a", None)
+        check(take(w.root_b, None, "bob", "inst-bob") is None
+              and take(w.root_b, None, "bob", None) is None and path.exists(),
+              "a request that names no session is taken by nobody")
+        comms.write_shutdown_request(w.root_b, None, "bob", "alice@a", "inst-bob")
+        old = time.time() - comms.SHUTDOWN_REQUEST_TTL_SECONDS - 5
+        os.utime(path, (old, old))
+        check(take(w.root_b, None, "bob", "inst-bob") is None and not path.exists(),
+              "a stale request is discarded, not acted on")
+
+        relay_mod.enqueue(w.root_a, "b", "shutdown", {"agent": "carol@b", "by": "alice"},
+                          sender="alice")
+        relay_mod.enqueue(w.root_a, "b", "shutdown", {"agent": "alice@a", "by": "alice"},
+                          sender="alice")
+        w.pump(5, step=1)
+        notes = " | ".join(relay_notes(w.root_a, "alice"))
+        check("is not live" in notes, f"the receiver refuses a teammate that is not live: {notes}")
+        check("is not on this machine" in notes, "the receiver refuses a name on another machine")
+    finally:
+        w.close()
+
+
+def test_local_shutdown():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        for name in ("alice", "bob", "sub"):
+            add_agent(root, name)
+        comms.write_agent_record(root, None, "bob", instance_id="inst-bob")
+        comms.write_agent_record(root, None, "sub", type="subagent")
+        comms.write_agent_record(root, None, "boss", type="human", presence="online")
+        alice = ctx_for("alice", root)
+        for target, why in (("alice", "own session"), ("ghost", "unknown name"),
+                            ("boss", "the human operator"), ("sub", "no session of its own")):
+            check_raises(lambda target=target: tools_mod._handle_shutdown({"agent": target}, alice),
+                         CommsError, why)
+        real_wait = tools_mod.SHUTDOWN_WAIT_SECONDS
+        tools_mod.SHUTDOWN_WAIT_SECONDS = 0.6
+        try:
+            out = tools_mod._handle_shutdown({"agent": "bob"}, alice)
+            check("has not closed yet" in out, f"an unanswered request is not called a success: {out}")
+            req = comms.read_json_readonly(comms.shutdown_request_file(root, None, "bob")) or {}
+            check(req == {"by": "alice", "instance_id": "inst-bob"}, f"local request written: {req}")
+
+            seen = []
+
+            def finder_none():
+                return None
+
+            check(channel_mod.close_own_session(
+                root, None, "bob", "alice", finder=finder_none,
+                kill=lambda pid, protect=(): seen.append(pid)) is False and not seen,
+                  "a session that cannot identify its program closes nothing")
+            check(comms.is_channel_alive(comms.read_agent_record(root, None, "bob")),
+                  "and stays live")
+            told = [m["message"] for m in unread(root, "alice") if m.get("from") == "bob"]
+            check(len(told) == 1 and "was not shut down" in told[0], f"and says so to who asked: {told}")
+
+            check(channel_mod.close_own_session(root, None, "bob", "alice", finder=lambda: 4242,
+                                                kill=lambda pid, protect=(): []) is False,
+                  "a session that cannot be ended reports failure")
+            check(comms.is_channel_alive(comms.read_agent_record(root, None, "bob")),
+                  "and is put back to live")
+            told = [m["message"] for m in unread(root, "alice") if m.get("from") == "bob"]
+            check(len(told) == 2 and "could not be ended" in told[1], f"and says so: {told}")
+
+            relay_mod.status_file(root).parent.mkdir(parents=True, exist_ok=True)
+            comms.write_json_atomic(relay_mod.status_file(root), {"pid": 777})
+            spared = []
+
+            def closing(pid, protect=()):
+                seen.append(pid)
+                spared.extend(protect)
+                return [pid]
+
+            check(channel_mod.close_own_session(root, None, "bob", "alice", finder=lambda: 4242,
+                                                kill=closing) is True and seen == [4242],
+                  f"an identified session is closed: {seen}")
+            check(spared == [777], f"this machine's relay is named as the process to spare: {spared}")
+            check(not comms.is_channel_alive(comms.read_agent_record(root, None, "bob")),
+                  "the record is marked offline before the close")
+            check_raises(lambda: tools_mod._handle_shutdown({"agent": "bob"}, alice), CommsError,
+                         "a teammate that is no longer live")
+        finally:
+            tools_mod.SHUTDOWN_WAIT_SECONDS = real_wait
+
+        comms.write_agent_record(root, None, "bob", channel=True)
+        import threading
+
+        class Identity:
+            def snapshot_all(self):
+                return ("bob", None, root, comms.get_inboxes_dir(root, None) / "bob_unread.json",
+                        1, None, 1)
+
+            def get_instance_id(self):
+                return "inst-bob"
+
+            def get_epoch(self):
+                return 1
+
+        asked = []
+
+        def closer(r, team, agent, by):
+            asked.append((agent, by))
+            return True
+
+        ready = threading.Event()
+        ready.set()
+        stop = threading.Event()
+        comms.write_shutdown_request(root, None, "bob", "alice", "inst-bob")
+        t = threading.Thread(target=channel_mod.run_watcher, daemon=True, kwargs=dict(
+            send_message=lambda *a, **k: None, identity=Identity(), initialized_evt=ready,
+            registered_evt=ready, stop_evt=stop, closer=closer))
+        t.start()
+        t.join(5)
+        stop.set()
+        check(asked == [("bob", "alice")] and not t.is_alive(),
+              f"the watcher acts on a request and stops: {asked}")
+
+
+def test_session_process_selection():
+    table = {10: (9, "python3.13.exe"), 9: (8, "python.exe"), 8: (7, "uv.exe"),
+             7: (6, "claude.exe"), 6: (5, "powershell.exe"), 5: (0, "windowsterminal.exe"),
+             20: (7, "bash.exe"), 21: (20, "node.exe"), 30: (6, "notepad.exe")}
+    born = {pid: pid for pid in table}
+    names = harness_mod.PROCESS_NAMES[harness_mod.CLAUDE_CODE]
+
+    def find(t=table, b=born, path=lambda pid: "c:\\users\\x\\.local\\bin\\claude.exe", pid=10):
+        return procs_mod.find_session(t, pid, names, harness_mod.PROCESS_PATH_EXCLUDES,
+                                      created_fn=lambda p: b.get(p), path_fn=path)
+
+    check(find() == 7, f"the harness above the launchers is chosen: {find()}")
+    check(find(pid=21) is None, "a server started from a shell is never matched to that shell")
+    shell_only = {10: (9, "python.exe"), 9: (8, "uv.exe"), 8: (7, "powershell.exe"),
+                  7: (0, "windowsterminal.exe")}
+    check(find(t=shell_only, b={p: p for p in shell_only}) is None,
+          "a chain with no harness closes nothing")
+    check(find(path=lambda pid: "c:\\users\\x\\appdata\\local\\anthropicclaude\\claude.exe") is None,
+          "the desktop app is not treated as the session")
+    check(find(b={**born, 7: 99}) is None, "a parent newer than its child is a reused pid: refuse")
+    check(find(b={**born, 8: None}) is None, "an unreadable start time refuses")
+    check(find(t={10: (9, "python.exe")}) is None, "a missing parent refuses")
+    loop = {10: (10, "python.exe")}
+    check(find(t=loop, b={10: 10}) is None, "a self-parent refuses")
+
+    below = procs_mod.descendants(table, 7, created_fn=lambda p: born.get(p))
+    check(set(below) == {8, 9, 10, 20, 21} and below.index(10) < below.index(9) < below.index(8),
+          f"everything below the session, deepest first: {below}")
+    killed, codes = [], {}
+
+    def kill(pid, exit_code=1):
+        killed.append(pid)
+        codes[pid] = exit_code
+        return True
+
+    done = procs_mod.close_session(7, self_pid=10, table=table, kill=kill,
+                                   created_fn=lambda p: born.get(p), can=lambda p: True)
+    check(done and 7 in done, f"the pids ended are reported: {done}")
+    check(codes.get(7) == 0 and all(c == 1 for p, c in codes.items() if p != 7),
+          f"only the session process ends with code 0, so its own terminal tab closes: {codes}")
+    check(killed[-1] == 10 and killed[-2] == 7 and set(killed) == {7, 8, 9, 10, 20, 21}
+          and killed.count(10) == 1,
+          f"children first, then the session, this process last: {killed}")
+    check(30 not in killed and 6 not in killed, "nothing outside the session is touched")
+
+    with_relay = {**table, 40: (10, "python.exe"), 41: (40, "tailscale.exe")}
+    ages = {pid: pid for pid in with_relay}
+    killed.clear()
+    procs_mod.close_session(7, self_pid=10, table=with_relay, kill=kill, protect=(40,),
+                            created_fn=lambda p: ages.get(p), can=lambda p: True)
+    check(40 not in killed and 41 not in killed and 7 in killed,
+          f"the relay started from this session, and what it started, survive: {killed}")
+    killed.clear()
+    check(procs_mod.close_session(7, self_pid=10, table=table, kill=kill,
+                                  created_fn=lambda p: born.get(p), can=lambda p: False) == []
+          and not killed, "a session that cannot be ended leaves everything running")
+
+
+def test_spawn_stall_guards():
+    w = World()
+    saved = os.environ.get("TEAMMATE_SPAWN_ENABLED")
+    os.environ["TEAMMATE_SPAWN_ENABLED"] = "1"
+    try:
+        _control_ready(w)
+        project = Path(w.root_b) / "proj"
+        project.mkdir()
+
+        def ask(name):
+            relay_mod.enqueue(w.root_a, "b", "spawn", {
+                "agent": f"{name}@b", "by": "alice", "project_dir": str(project)}, sender="alice")
+            path = sorted(relay_mod.outbox_dir(w.root_a, "b").glob("*.json"))[-1]
+            ev = json.loads(path.read_text(encoding="utf-8"))
+            ev["queued_epoch"] = w.clock.t
+            path.write_text(json.dumps(ev), encoding="utf-8")
+            w.pump(5, step=1)
+
+        def stalled():
+            return [m["message"] for m in unread(w.root_a, "alice")
+                    if "has NOT registered" in m.get("message", "")]
+
+        with Launches() as launched:
+            launched.trusted = False
+            ask("dave")
+            notes = relay_notes(w.root_a, "alice")
+            check(not launched.calls and any("has never been opened" in n for n in notes),
+                  f"a folder that would stop at the trust question is refused: {notes}")
+            check(not relay_mod._awaiting, "and nothing is waited for")
+
+            launched.trusted = None
+            ask("dave")
+            check(len(launched.calls) == 1, "a folder whose trust cannot be told still launches")
+            w.pump(3, step=20)
+            check(not stalled(), "no stall report before the wait is over")
+            w.pump(3, step=20)
+            told = stalled()
+            check(len(told) == 1 and "dave was launched on b" in told[0],
+                  f"a session that never registers is reported once: {told}")
+            w.pump(3, step=40)
+            check(len(stalled()) == 1, "and only once")
+
+            launched.trusted = True
+            ask("erin")
+            check(len(launched.calls) == 2, "a trusted folder launches")
+            add_agent(w.root_b, "erin")
+            w.pump(4, step=40)
+            check(len(stalled()) == 1 and not relay_mod._awaiting,
+                  "a session that registers is not reported")
+    finally:
+        if saved is None:
+            os.environ.pop("TEAMMATE_SPAWN_ENABLED", None)
+        else:
+            os.environ["TEAMMATE_SPAWN_ENABLED"] = saved
+        w.close()
+
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        repo = home / "work" / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "sub").mkdir()
+        loose = home / "loose" / "deep"
+        loose.mkdir(parents=True)
+        trust = lambda path, name=harness_mod.CLAUDE_CODE: harness_mod.folder_trusted(
+            name, path, env={}, home=home)
+        check(trust(repo) is None, "no record to read means it cannot be told")
+        cfg = home / harness_mod.TRUST_CONFIG_NAME
+        cfg.write_text("{broken", encoding="utf-8")
+        check(trust(repo) is None, "an unreadable record means it cannot be told")
+
+        def write(*folders):
+            cfg.write_text(json.dumps({"projects": {
+                str(f).replace(chr(92), "/"): {harness_mod.TRUST_KEY: True} for f in folders}}),
+                encoding="utf-8")
+
+        write(repo)
+        check(trust(repo) is True and trust(repo / "sub") is True,
+              "a trusted folder and the folders inside it are trusted")
+        check(trust(Path(str(repo).upper())) is True, "letter case does not matter")
+        check(trust(loose) is False, "a folder never opened is not trusted")
+        check(trust(repo, harness_mod.CODEX) is None, "another harness is not guessed at")
+        write(home / "work")
+        check(trust(repo) is False, "trust above a repository does not reach into it")
+        write(home / "loose", home)
+        check(trust(loose) is True, "outside a repository a trusted parent counts")
+        check(trust(home) is False, "the home folder is never counted as trusted")
+        write(home)
+        check(trust(loose) is False, "and its trust does not reach the folders under it")
+        cfg.write_text(json.dumps({"projects": {
+            str(loose).replace(chr(92), "/"): {harness_mod.TRUST_KEY: "yes"}}}), encoding="utf-8")
+        check(trust(loose) is False, "only a real true counts")
+
+
+def test_spawn_gate_and_terminal():
+    check(spawn_mod.gate_enabled({"TEAMMATE_SPAWN_ENABLED": "1"}), "the gate's new name works")
+    check(spawn_mod.gate_enabled({"TEAMMATE_REINCARNATE_ENABLED": "true"}), "its old name works")
+    check(not spawn_mod.gate_enabled({"TEAMMATE_SPAWN_ENABLED": "0"})
+          and not spawn_mod.gate_enabled({}), "off and unset are off")
+    env = spawn_mod.build_child_env({"TEAMMATE_SPAWN_ENABLED": "1",
+                                     "TEAMMATE_REINCARNATE_ENABLED": "1"}, "Echo", "/proj")
+    check(not any(g in env for g in spawn_mod.GATE_ENV_VARS), "neither gate name is handed down")
+    if os.name == "nt":
+        real_popen, real_which = spawn_mod.subprocess.Popen, spawn_mod.shutil.which
+        seen = []
+
+        class FakeProc:
+            def poll(self):
+                return 0
+
+        spawn_mod.subprocess.Popen = lambda argv, **kw: seen.append(argv) or FakeProc()
+        spawn_mod.shutil.which = lambda exe: exe
+        try:
+            REAL_LAUNCH(["claude", "do this; then that"], "C:\\work", {})
+        finally:
+            spawn_mod.subprocess.Popen, spawn_mod.shutil.which = real_popen, real_which
+        check(seen and seen[0][-1] == "do this\\; then that" and seen[0][0] == "wt.exe",
+              f"a semicolon is escaped for the terminal: {seen}")
+
+
 def main():
     sections = [
+        ("remote control switch", test_remote_control_switch),
+        ("spawn on another machine", test_remote_spawn),
+        ("control requests are never carried out late", test_control_never_late),
+        ("a control request is never reported as queued", test_control_request_notice),
+        ("shutdown on another machine", test_remote_shutdown),
+        ("shutdown on this machine", test_local_shutdown),
+        ("session process selection", test_session_process_selection),
+        ("spawn stall guards", test_spawn_stall_guards),
+        ("spawn gate names and terminal escaping", test_spawn_gate_and_terminal),
         ("names and mentions (AC-8)", test_names_and_mentions),
         ("DM round trip (AC-1, AC-2)", test_dm_round_trip),
         ("unapproved machine and team namespace (AC-3)", test_unapproved_and_team),
