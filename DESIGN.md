@@ -1154,3 +1154,60 @@ hung, node-based harness installs, and platforms other than Windows.
 
 **Windows Terminal.** `wt.exe` treats `;` in its arguments as a command separator, which cut
 a prompt at its first semicolon. `spawn_in_terminal` now escapes it.
+
+## 17. Cloud mailbox: cloud agents as teammates (0.19.0)
+
+Plan and field findings: `docs/cloud-mailbox-plan.md`. A cloud agent (first: xAI Grok Bot)
+cannot reach the user's machines and they have no public address, so both sides call out to
+a mailbox Worker (`mailbox-worker/`) the user deploys to their own Cloudflare account.
+
+**Why a mailbox and not the webhook.** Grok Bot's routine webhook starts a run but cannot
+carry content: it drops a field named `context`, cuts a body somewhere between 2 KB and 8 KB,
+returns only a run id, and there is no official API to read a bot's output. So the webhook
+is used only as a doorbell with a tiny fixed body, and the bot fetches and sends mail over
+MCP. The Worker rings the doorbell, so webhook keys live in Cloudflare secrets, not on PCs.
+
+**A mailbox is a virtual machine name with fewer rights.** `relay.read_peers` still means
+real peer machines only. `read_mailboxes` and `read_links` are separate, and each call site
+that should accept a mailbox was moved deliberately (address resolution for send and profile,
+queueing a direct message, the list rows, starting and keeping the relay alive, status).
+Everything else treats a mailbox name as not a peer, so the default is refusal:
+`authorize`, `_require_control`, `_relay_out` and the remote-control checks never accept one.
+A mailbox that shares a name with an approved peer is ignored.
+
+**Only direct messages, enforced on the machine.** `_mailbox_batch` sends nothing but `dm`
+events and drops anything else found in a mailbox outbox. Inbound mail never goes through
+`apply_event`: `deliver_cloud_message` accepts only a message to a registered agent session
+(`type == "full"`), from a bot name the mailbox reported in the same answer, forces normal
+priority, drops any post type, prefixes a fixed line saying it comes from outside the user's
+machines, and breaks any line that imitates the inbox's own message header. Inbound volume
+is capped at 60 messages per 10 minutes per mailbox; the rest wait in the mailbox.
+
+**Identity is the key.** The Worker's config maps each key to one machine name or one bot
+name; a caller never states its own name, and the two kinds are separate sets. The machine
+stores its key in `relay/mailboxes.json` and nowhere else. `link_mailbox` takes a key *file*
+whose whole content must be one key-shaped token, accepts only an https address of a named
+host, and its client never follows a redirect, so the action cannot be used to send an
+arbitrary file's content somewhere.
+
+**Delivery.** Machine to bot: the existing outbox file, sent until the Worker lists its id
+as accepted (kept), rejected (dropped, sender told by `comms-relay`) or deferred (mailbox
+full, kept and retried). The Worker remembers event ids for 30 days, so a resend is not
+stored twice. Bot to machine: the Worker returns each message on every sync until its id is
+acked; the relay's seen ring and the message id (minted by the Worker in the usual UTC
+format, accepted only within 15 days back and 2 minutes ahead of the local clock) both stop
+a duplicate. A bot's `mail_check` hands each message over once; an empty check within an
+hour reports the previous batch so a fresh run can re-read it.
+
+**Threading.** Mailbox syncs run on their own thread (`_mailbox_loop`), so an unreachable
+mailbox cannot delay exchanges with peer machines. Tests call `mailbox_tick` directly.
+
+**Doorbell limits.** At most one ring per `DOORBELL_MIN_SECONDS` (60) and
+`DOORBELL_MAX_PER_DAY` (100) per bot; two retries (5 and 30 minutes) for uncollected mail,
+then silence until the bot collects, because every ring spends the user's allowance.
+
+**Testing.** The Worker's logic takes its storage, clock, fetch and alarm setter as
+arguments and runs under `node --test` with a Map-backed store. `tests/test_mailbox.py`
+drives the relay against an in-process fake of the same protocol.
+`mailbox-worker/test/integration.py` runs the real relay code against the real Worker under
+`wrangler dev`; it needs npm access and is run by hand.

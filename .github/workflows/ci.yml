@@ -60,3 +60,10 @@ jobs:
       - name: Run agent-surface and update-notice suite
         if: ${{ !cancelled() }}
         run: uv run --no-sync python tests/test_notices.py
+      - name: Run cloud mailbox suite
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync python tests/test_mailbox.py
+      # The mailbox Worker's logic has no npm dependencies; the runner's own Node runs it.
+      - name: Run mailbox Worker suite
+        if: ${{ !cancelled() }}
+        run: node --test mailbox-worker/test/mailbox.test.mjs

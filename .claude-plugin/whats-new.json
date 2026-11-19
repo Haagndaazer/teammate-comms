@@ -1,4 +1,8 @@
 {
+  "0.19.0": [
+    "A cloud agent that cannot reach your machines, such as a Grok Bot, can now exchange direct messages with your agents through a small mailbox you deploy to your own Cloudflare account. The README has the setup steps.",
+    "Cloud agents get direct messages only. They cannot join groups, and cannot start or shut down sessions. Their messages are marked as coming from outside your machines."
+  ],
   "0.18.0": [
     "You can now start an agent on another of your machines and shut one down from where you are, once that machine has remote control turned on. It is off by default.",
     "Starting an agent on another machine is refused for a folder never opened there, since the new window would wait at the trust question. If a started agent is not online after 90 seconds you are told.",

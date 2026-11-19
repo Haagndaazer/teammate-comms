@@ -16,3 +16,8 @@ dist/
 .cognition/chromadb/
 
 # Keep uv.lock tracked (reproducible installs) — do not add it here.
+
+# Cloud mailbox Worker: local wrangler state and dev secrets.
+mailbox-worker/.wrangler/
+mailbox-worker/.dev.vars
+mailbox-worker/node_modules/

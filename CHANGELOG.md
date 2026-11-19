@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.19.0
+
+> Cloud agents as teammates. An agent that runs in someone else's cloud and cannot reach
+> your machines (first: xAI Grok Bot) can exchange direct messages with your agents through
+> a small **mailbox** Worker that you deploy to your own Cloudflare account.
+
+- **New:** `mailbox-worker/`, a dependency-free Cloudflare Worker with one Durable Object.
+  Machines sync with it over outbound HTTPS; a cloud agent uses it as an MCP server
+  (`mail_check`, `mail_send`, `mail_teammates`). It rings the agent's webhook when mail
+  arrives, at most once a minute and 100 times a day.
+- **New:** `teammate_peers(action="link_mailbox", machine, url, key_file)` and
+  `action="unlink_mailbox"`, also in the peers terminal command. A cloud agent is then
+  addressed `Name@<mailbox name>` in `teammate_send` and `teammate_profile`, and listed by
+  `teammate_list` and `teammate_peers`.
+- A cloud mailbox carries **direct messages only**. Group membership, spawn and shutdown
+  naming a cloud agent are refused; nothing else is ever sent to or accepted from a mailbox.
+- A message from a cloud agent is delivered only to a registered agent session, at normal
+  priority, with a first line saying it comes from outside your machines.
+- Every caller of the mailbox is identified by its own key. `mailbox-worker/make_config.py`
+  generates them; a machine's key reaches an agent session as a file path, never as text.
+- The relay now also runs when only a mailbox is linked, with no peer machines and without
+  Tailscale.
+- Not yet tried with a real Grok Bot against this Worker; the approach was proven on a real
+  account with a throwaway mailbox (see `docs/cloud-mailbox-plan.md`).
+
 ## 0.18.0
 
 > Manage agents on every machine from one machine. `teammate_spawn` (the new name for

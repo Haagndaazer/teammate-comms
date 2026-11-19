@@ -1,0 +1,13 @@
+{
+  "name": "teammate-mailbox",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "vars": { "DOORBELL_MIN_SECONDS": "60", "DOORBELL_MAX_PER_DAY": "100" },
+  "durable_objects": {
+    "bindings": [{ "name": "MAILBOX", "class_name": "MailboxObject" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MailboxObject"] }]
+}
