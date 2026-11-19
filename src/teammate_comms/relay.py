@@ -1285,6 +1285,17 @@ def _apply_shutdown(root, names, payload):
     log_line(root, f"shutdown of {target} requested by {by}")
 
 
+def cloud_matches(root, short):
+    """The agent sessions on this machine whose name a mailbox carries as ``short``."""
+    out = []
+    for path in sorted(get_agents_dir(root, None).glob(f"{short}*.json")):
+        if mailbox_mod.cloud_name(path.stem) == short:
+            record = read_agent_record(root, None, path.stem)
+            if record and record.get("type") == "full":
+                out.append(path.stem)
+    return out
+
+
 def deliver_cloud_message(root, mailbox, me, bots, msg, now=None):
     """Put one message from a cloud agent into a local inbox.
 
@@ -1300,16 +1311,13 @@ def deliver_cloud_message(root, mailbox, me, bots, msg, now=None):
         text = tools._clean_message(msg.get("message"))
     except CommsError as e:
         raise RejectEvent(str(e))
-    record = read_agent_record(root, None, to)
-    if not record and len(to) == mailbox_mod.CLOUD_NAME_CHARS:
-        longer = [p.stem for p in get_agents_dir(root, None).glob(f"{to}*.json")
-                  if mailbox_mod.cloud_name(p.stem) == to]
-        if len(longer) > 1:
+    if len(to) == mailbox_mod.CLOUD_NAME_CHARS:
+        matches = cloud_matches(root, to)
+        if len(matches) > 1:
             raise RejectEvent(f"{to} is the shortened form of more than one teammate on {me}, "
                               f"so it is not clear who this is for")
-        if longer:
-            to = longer[0]
-            record = read_agent_record(root, None, to)
+        to = matches[0] if matches else to
+    record = read_agent_record(root, None, to)
     if not record or record.get("type") != "full":
         raise RejectEvent(f"no teammate named {to} is registered on {me}")
     msg_id = _clean_id(msg.get("msg_id"))
@@ -1873,13 +1881,12 @@ class Relay:
                                  f"agents there.")
 
     def _mailbox_roster(self):
-        agents, seen = [], set()
+        by_short = {}
         for entry in build_roster(self.root)["agents"]:
-            short = mailbox_mod.cloud_name(entry["name"])
-            if entry.get("type") == "full" and short not in seen:
-                seen.add(short)
-                agents.append({"name": short, "live": bool(entry.get("live"))})
-        return agents
+            if entry.get("type") == "full":
+                by_short.setdefault(mailbox_mod.cloud_name(entry["name"]), []).append(entry)
+        return [{"name": short, "live": bool(found[0].get("live"))}
+                for short, found in by_short.items() if len(found) == 1]
 
     def _inbound_room(self, name, sender):
         """Whether one cloud agent, and its mailbox as a whole, may deliver another message."""
@@ -1973,6 +1980,11 @@ class Relay:
             state, detail = (mailbox_mod.sync_failure(status, resp) if status != 200 else
                              ("mailbox_error", "it did not answer like a teammate-comms mailbox"))
             return self._contact_failed(st, state, detail)
+        if _version_key(resp.get("worker")) < _version_key(mailbox_mod.MIN_WORKER):
+            return self._contact_failed(
+                st, "mailbox_error",
+                "the deployed mailbox is older than this plugin. Your user deploys "
+                "cloud-mailbox-worker again from the plugin folder (npx wrangler deploy)")
         if resp.get("you_are") != cfg["you_are"]:
             return self._contact_failed(
                 st, "mailbox_error",
@@ -2272,6 +2284,10 @@ class Relay:
 
     def run_forever(self):
         self.log(f"relay {__version__} starting (pid {os.getpid()}, root {self.root})")
+        try:
+            mailbox_mod.protect_stored(self.root)
+        except Exception as e:
+            self.log(f"could not protect stored mailbox keys: {type(e).__name__}")
         threading.Thread(target=self._mailbox_loop, daemon=True).start()
         empty_since = None
         while not self._stop.is_set():

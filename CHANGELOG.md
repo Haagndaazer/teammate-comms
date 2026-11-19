@@ -11,7 +11,10 @@
   other's names: they are one trust unit.
 - `make_config.py` takes `--account`, `--add-account` and `--add-bot NAME --account LABEL`,
   and writes one `account-<label>.token.txt` per account. A config in the 0.19.1
-  one-key-per-bot layout is converted in place with its keys kept.
+  one-key-per-bot layout is converted in place with its keys kept. `--new-key NAME` gives a
+  machine or an account a new key and keeps its doorbells.
+- **Upgrading a deployed mailbox:** run `npx wrangler deploy` in `cloud-mailbox-worker`
+  first, then upload secrets. The relay reports a mailbox still on the older Worker.
 - **Full mailbox:** a message for a cloud agent holding 5,000 uncollected messages (was
   500) is rejected and the sender told why, instead of being held and retried. The
   hold-and-retry path and the `mailbox_full` state are gone.

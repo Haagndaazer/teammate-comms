@@ -19,9 +19,8 @@ The folder then holds:
     account-<name>.token.txt  one per account: the bearer token for its mailbox connection
 
 A machine name is a lowercase label of your choice; a cloud agent sees your agents as
-name@<that label>. To replace a key, delete that entry from config.json, add it again with
---add-machine or --add-account, then upload again and relink the machine or update the
-connection's token. Keep the folder out of any project or synced folder. Standard library only.
+name@<that label>. To replace a key use --new-key NAME (a machine or an account), then
+upload again and relink the machine or update the connection's token. Keep the folder out of any project or synced folder. Standard library only.
 """
 import argparse
 import json
@@ -46,9 +45,11 @@ def fail(message):
 
 
 def private_write(path, text):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
+    os.replace(tmp, path)
 
 
 def in_repository(folder):
@@ -56,7 +57,7 @@ def in_repository(folder):
 
 
 def slug(name):
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "bot"
+    return re.sub(r"[^a-z0-9]+", "-", name.lower())[:63].strip("-") or "bot"
 
 
 def load(path):
@@ -164,6 +165,11 @@ def write_all(out, config, converted=()):
     for label in converted:
         for name in config["accounts"][label]["bots"]:
             (out / f"bot-{name}.secret.txt").unlink(missing_ok=True)
+    wanted = {f"machine-{n}.key" for n in config["machines"]}
+    wanted |= {f"account-{n}.token.txt" for n in config["accounts"]}
+    for stale in [*out.glob("machine-*.key"), *out.glob("account-*.token.txt")]:
+        if stale.name not in wanted:
+            stale.unlink()
 
 
 def new_bot():
@@ -188,6 +194,9 @@ def main(argv=None):
                         help="Add an account with its own token; name its agents with --bot.")
     parser.add_argument("--add-bot", action="append", default=[],
                         help="Add a cloud agent to an existing account; needs --account.")
+    parser.add_argument("--new-key", action="append", default=[], metavar="NAME",
+                        help="Give a machine or an account a new key, keeping everything "
+                             "else about it. The old key stops working once uploaded.")
     parser.add_argument("--rebuild", action="store_true",
                         help="Rewrite the upload and key files from an edited config.json.")
     parser.add_argument("--allow-repository", action="store_true",
@@ -199,7 +208,10 @@ def main(argv=None):
              f"keys cannot be committed.")
     path = out / "config.json"
     converted = []
-    updating = args.rebuild or args.add_machine or args.add_bot or args.add_account
+    updating = (args.rebuild or args.add_machine or args.add_bot or args.add_account
+                or args.new_key)
+    if args.account and not (args.add_bot or (not updating and args.bot)):
+        fail("--account goes with --add-bot, or with --bot on the first run")
     if updating:
         if args.machine:
             fail("use --add-machine to extend an existing mailbox")
@@ -222,6 +234,15 @@ def main(argv=None):
                 if name in config["accounts"][label]["bots"]:
                     fail(f"bot {name!r} is already in account {label!r}")
                 config["accounts"][label]["bots"][name] = new_bot()
+        for name in args.new_key:
+            if name in config["machines"]:
+                config["machines"][name] = "tcm_" + secrets.token_urlsafe(32)
+            elif name in config["accounts"]:
+                config["accounts"][name]["key"] = "tcb_" + secrets.token_urlsafe(32)
+            else:
+                fail(f"{name!r} is not a machine or an account in this mailbox")
+            print(f"  new key for {name}: relink that machine, or paste the new token into "
+                  f"that account's connection, after uploading")
     else:
         if path.exists():
             fail(f"{path} already exists. Use --add-machine, --add-account, --add-bot or "

@@ -44,6 +44,7 @@ KEY_FILE_MAX_BYTES = 256
 ID_FUTURE_SECONDS = 900
 ROSTER_REFRESH_SECONDS = 300
 CLOUD_NAME_CHARS = 64
+MIN_WORKER = "1.1.0"
 PROTECT_KEYS = os.name == "nt"
 ID_PAST_SECONDS = 15 * 86400
 NOTE_CHARS = 200
@@ -123,13 +124,26 @@ def _stored(root):
                 and isinstance(cfg.get("you_are"), str)
                 and MACHINE_NAME_PATTERN.fullmatch(cfg["you_are"])):
             continue
-        key = cfg.get("key")
-        if isinstance(cfg.get("key_protected"), str):
-            key = unseal(cfg["key_protected"]) if PROTECT_KEYS else None
+        key = None
+        if isinstance(cfg.get("key_protected"), str) and PROTECT_KEYS:
+            key = unseal(cfg["key_protected"])
+        if key is None:
+            key = cfg.get("key")
         if not isinstance(key, str) or not _KEY_RE.fullmatch(key):
             key = None
         out[name] = {"url": cfg["url"], "key": key, "you_are": cfg["you_are"]}
     return out
+
+
+def protect_stored(root):
+    """Seal any key still stored as plain text. Does nothing where keys are not sealed."""
+    path = mailboxes_file(root)
+    if not PROTECT_KEYS or not path.exists():
+        return
+    boxes = (read_json_readonly(path) or {}).get("mailboxes") or {}
+    if any(isinstance(cfg, dict) and "key" in cfg for cfg in boxes.values()):
+        with file_lock(path):
+            _write(root, _stored(root))
 
 
 def read_mailboxes(root):

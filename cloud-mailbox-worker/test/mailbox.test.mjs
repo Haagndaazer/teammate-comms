@@ -186,8 +186,16 @@ test("agents sharing one connection each have their own inbox, chosen by name", 
   const tools = (await w.box.rpc("space-one", { jsonrpc: "2.0", id: 2, method: "tools/list" })).result.tools;
   assert.ok(tools.every((t) => t.inputSchema.required.includes("me") && t.inputSchema.properties.me));
   const solo = (await w.box.rpc("space-two", { jsonrpc: "2.0", id: 2, method: "tools/list" })).result.tools;
-  assert.ok(solo.every((t) => !t.inputSchema.required.includes("me") && t.inputSchema.properties.me));
-  assert.deepEqual(solo[1].inputSchema.required, ["to", "message"]);
+  assert.ok(solo.every((t) => t.inputSchema.properties.me));
+  assert.deepEqual(solo.map((t) => t.inputSchema.required), [undefined, ["to", "message"], undefined]);
+  assert.deepEqual(tools.map((t) => t.inputSchema.required), [["me"], ["me", "to", "message"], ["me"]]);
+  assert.match(init.result.instructions, /do not guess: ask your owner/);
+  assert.equal(init.result.serverInfo.version, "1.1.0");
+  const proto = parseConfig({ machines: { desk: KEYS.desk }, accounts: { constructor: { key: KEYS.bot, bots: { toString: {}, hasOwnProperty: {} } } } });
+  assert.deepEqual(proto.accounts.constructor.bots, ["toString", "hasOwnProperty"]);
+  assert.throws(() => parseConfig({ machines: { desk: KEYS.desk }, accounts: { a: { key: KEYS.bot, bots: { __proto__: {} } } } }), ConfigError);
+  assert.equal(await identify(config, "accounts", KEYS.desk), null);
+  assert.equal(await identify(config, "machines", KEYS.bot2), null);
 });
 
 test("account configuration is validated", () => {

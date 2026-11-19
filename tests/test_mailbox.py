@@ -92,7 +92,7 @@ class FakeMailbox:
         self.calls, self.for_bots, self.for_pc, self.notes = [], [], [], []
         self.seen, self.rosters = {}, []
         self.status, self.raises, self.full, self.bot_extra = 200, None, (), {}
-        self.reject_text, self.raw = None, {}
+        self.reject_text, self.raw, self.worker = None, {}, "1.1.0"
 
     def post(self, url, key, body):
         self.calls.append({"url": url, "key": key, "body": json.loads(json.dumps(body))})
@@ -132,7 +132,7 @@ class FakeMailbox:
                 accepted.append(ev["id"])
         bots = [{"name": b, "last_seen": None, "waiting": 0, "doorbell": True,
                  "doorbell_error": "", **self.bot_extra} for b in self.bots]
-        return 200, {"v": 1, "worker": "1.0.0", "you_are": self.you_are, "accepted": accepted,
+        return 200, {"v": 1, "worker": self.worker, "you_are": self.you_are, "accepted": accepted,
                      "rejected": rejected,
                      "messages": list(self.for_pc)[:50], "bots": bots, **self.raw}
 
@@ -566,6 +566,12 @@ def test_states_and_notices():
         check("now calls this machine" in relay_mod.peer_view(w.root, "cloudbot")["text"],
               "a changed identity is not accepted silently")
         w.box.you_are = "desk"
+        w.box.worker = "1.0.0"
+        w.pump(3, step=40)
+        w.relay.tick()
+        check("older than this plugin" in relay_mod.peer_view(w.root, "cloudbot")["text"],
+              f"an older deployed mailbox is named as the cause: {relay_mod.peer_view(w.root, 'cloudbot')}")
+        w.box.worker = "1.1.0"
 
         w.box.full = ("Grok",)
         w.box.bots.append("Quiet")
@@ -754,6 +760,7 @@ def test_make_config():
               "one token for the account, both agents under it")
         check(run("--machine", "desk", "--bot", "Grok") == 1, "a second first-run is refused")
         check(run("--add-machine", "lap") == 0 and run("--rebuild") == 0, "extend and rebuild")
+        first_token = token
         check(run("--add-bot", "Scribe") == 0 and "Scribe" in stored()["accounts"]["space-one"]["bots"],
               "a bot joins the only account without naming it")
         check(run("--add-account", "space-two", "--bot", "Lone") == 0, "a second account")
@@ -762,10 +769,29 @@ def test_make_config():
         check(run("--add-bot", "grok", "--account", "space-two") == 1, "a name used in another account is refused")
         check(run("--add-account", "space-two", "--bot", "Other") == 1, "an existing account is not replaced")
         check(run("--add-account", "space-three") == 1, "an account needs at least one bot")
+        check(run("--rebuild", "--account", "space-one") == 1, "--account on its own is refused, not ignored")
+        before = stored()
+        before["accounts"]["space-one"]["bots"]["Grok"] = {"doorbell_url": "https://x.example/h", "doorbell_key": "dk"}
+        (out / "config.json").write_text(json.dumps(before), encoding="utf-8")
+        check(run("--new-key", "space-one", "--new-key", "lap") == 0, "new keys for an account and a machine")
+        after = stored()
+        check(after["accounts"]["space-one"]["key"] != before["accounts"]["space-one"]["key"]
+              and after["accounts"]["space-one"]["bots"] == before["accounts"]["space-one"]["bots"]
+              and after["machines"]["lap"] != before["machines"]["lap"]
+              and after["machines"]["desk"] == before["machines"]["desk"],
+              "only the named keys change; doorbells and other keys are kept")
+        check(run("--new-key", "nobody") == 1, "a new key for an unknown name is refused")
+        token = after["accounts"]["space-one"]["key"]
+        gone = stored()
+        gone["machines"].pop("lap")
+        (out / "config.json").write_text(json.dumps(gone), encoding="utf-8")
+        check(run("--rebuild") == 0 and not (out / "machine-lap.key").exists()
+              and (out / "machine-desk.key").exists(), "a removed machine's key file is removed too")
+        check(not list(out.glob("*.tmp")), "no temporary files are left behind")
         again = stored()
-        check(again["machines"]["desk"] == key and again["accounts"]["space-one"]["key"] == token
-              and again["accounts"]["space-two"]["key"] != token, "existing keys are kept, the new account has its own")
-        check(uploaded()["accounts"]["space-one"]["bots"]["Grok"] == {}, "an empty doorbell is left out")
+        check(again["machines"]["desk"] == key and again["accounts"]["space-one"]["key"] != first_token
+              and again["accounts"]["space-two"]["key"] != token, "other keys are kept, the new account has its own")
+        check(uploaded()["accounts"]["space-one"]["bots"]["Scout"] == {}, "an empty doorbell is left out")
         check(list(uploaded()["accounts"]["space-two"]["bots"]) == ["Lone", "Extra"], "the upload lists every bot")
 
         def broken(mutate, label):
@@ -789,7 +815,7 @@ def test_make_config():
         broken(lambda c: c["accounts"]["space-one"].update(bots={}), "an account with no bots")
         broken(lambda c: c["accounts"].update({"Bad Name": c["accounts"].pop("space-two")}), "a bad account name")
         broken(lambda c: grok(c).update(doorbell_url="http://x.example/h", doorbell_key="k"), "an http doorbell")
-        broken(lambda c: grok(c).update(doorbell_url="https://x.example/h"), "a doorbell with no key")
+        broken(lambda c: grok(c).update(doorbell_url="https://x.example/h", doorbell_key=""), "a doorbell with no key")
         broken(lambda c: grok(c).update(doorbell_url="https://", doorbell_key="k"), "a doorbell with no host")
         broken(lambda c: grok(c).update(doorbell_url="https://x.example/h", doorbell_key="  "), "a blank doorbell key")
         broken(lambda c: grok(c).update(doorbell_url=5, doorbell_key="k"), "a doorbell that is not text")
@@ -823,12 +849,25 @@ def test_long_names_and_key_storage():
     try:
         long_a, long_b = "a" * 64 + "-first", "a" * 64 + "-second"
         longer = "b" * 70
-        for name in (long_a, long_b, longer):
+        exact, exact_plus = "c" * 64, "c" * 64 + "-more"
+        for name in (long_a, long_b, longer, exact, exact_plus):
             add_agent(w.root, name)
+        add_agent(w.root, "d" * 64, kind="human")
+        add_agent(w.root, "d" * 64 + "-agent")
         w.pump()
         names = [e["name"] for e in w.box.rosters[-1]]
-        check("b" * 64 in names and names.count("a" * 64) == 1 and all(len(n) <= 64 for n in names),
+        check("b" * 64 in names and "d" * 64 in names and all(len(n) <= 64 for n in names),
               f"names are shortened to 64 characters for the mailbox: {[len(n) for n in names]}")
+        check("a" * 64 not in names and "c" * 64 not in names,
+              "a shortened name that stands for more than one agent is not offered at all")
+        clash = w.box.from_bot("c" * 64, "exact or longer")
+        human = w.box.from_bot("d" * 64, "the human shares the short form")
+        w.pump(3)
+        reasons = {n["id"]: n["error"] for n in w.box.notes}
+        check("more than one teammate" in reasons.get(clash["id"], "") and not unread(w.root, exact),
+              "an exact 64-character name does not win over a longer one that shortens to it")
+        check(any(x.get("id") == human["msg_id"] for x in unread(w.root, "d" * 64 + "-agent")),
+              "only agent sessions count, so a human record with the short name does not block it")
         tools_mod.send_dm(w.root, None, longer, "Grok@cloudbot", "from a long name")
         w.pump()
         sent = [e for e in w.events() if e["message"] == "from a long name"]
@@ -862,6 +901,12 @@ def test_long_names_and_key_storage():
         check("Unlinked" in relay_mod.unlink_mailbox(w.root, "copied"), "it can be unlinked")
         check(mailbox_mod.read_mailboxes(w.root)["cloudbot"]["key"] == KEY and not mailbox_mod.unreadable(w.root),
               "and the working link is untouched by that")
+        plain = {"mailboxes": {"cloudbot": {"url": URL, "you_are": "desk", "key": KEY}}}
+        path.write_text(json.dumps(plain), encoding="utf-8")
+        mailbox_mod.protect_stored(w.root)
+        after = path.read_text(encoding="utf-8")
+        check((KEY not in after) == (os.name == "nt") and mailbox_mod.read_mailboxes(w.root)["cloudbot"]["key"] == KEY,
+              "a key left in plain text is sealed when the relay starts, on Windows")
     finally:
         w.close()
 

@@ -176,9 +176,13 @@ function toolsFor(names) {
     inputSchema: {
       ...tool.inputSchema,
       properties: { me: ME, ...tool.inputSchema.properties },
-      required: [...(names.length > 1 ? ["me"] : []), ...(tool.inputSchema.required || [])],
     },
-  }));
+  })).map((tool) => {
+    const required = [...(names.length > 1 ? ["me"] : []), ...(TOOLS.find((t) => t.name === tool.name).inputSchema.required || [])];
+    if (required.length) tool.inputSchema.required = required;
+    else delete tool.inputSchema.required;
+    return tool;
+  });
 }
 
 async function digest(text) {
@@ -687,7 +691,7 @@ export class Mailbox {
     const list = names.join(", ");
     if (me === undefined || me === null || me === "") {
       if (names.length === 1) return { bot: names[0] };
-      return { error: `Several agents share this connection, so say which one you are: pass me as one of ${list}` };
+      return { error: `Several agents share this connection, so say which one you are: pass me as one of ${list}. If you do not know which is yours, ask your owner instead of guessing` };
     }
     if (typeof me !== "string") return { error: `me must be your own name, one of ${list}` };
     const wanted = me.trim();
@@ -714,7 +718,8 @@ export class Mailbox {
     if (names.length === 1) return `You are ${names[0]}.`;
     return `This connection is shared by these agents: ${names.join(", ")}. You are the one ` +
       "whose name is your own. Pass that name as me on every call; it selects your inbox, and " +
-      "using another agent's name would take its mail.";
+      "using another agent's name would take its mail. If you do not know which of these " +
+      "names is yours, do not guess: ask your owner.";
   }
 
   async rpcOne(account, msg) {
@@ -730,7 +735,7 @@ export class Mailbox {
       return done({
         protocolVersion: typeof wanted === "string" && /^\d{4}-\d{2}-\d{2}$/.test(wanted) ? wanted : "2025-03-26",
         capabilities: { tools: {} },
-        serverInfo: { name: "teammate-mailbox", version: "1.0.0" },
+        serverInfo: { name: "teammate-mailbox", version: WORKER_VERSION },
         instructions: [
           `${this.intro(account)} This mailbox carries direct messages between you and AI agents ` +
             "working on your owner's own computers. It is your only link to them.",

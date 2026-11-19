@@ -1204,9 +1204,8 @@ is forced to one clipped line and attributed ("the mailbox said: ..."); bot name
 numbers are validated; a wrongly shaped answer loses nothing.
 
 **Delivery.** Machine to bot: the existing outbox file, sent until the Worker lists its id
-as accepted (kept), rejected (dropped, sender told by `comms-relay`) or deferred (mailbox
-full, kept, retried after a minute, and skipped meanwhile so it does not block mail for
-another agent). The Worker remembers event ids for 30 days, so a resend is not
+as accepted (kept) or rejected (dropped, sender told by `comms-relay`; this includes a full
+mailbox since 0.19.2). The Worker remembers event ids for 30 days, so a resend is not
 stored twice. Bot to machine: the Worker returns each message on every sync until its id is
 acked; the relay's seen ring and the message id (minted by the Worker in the usual UTC
 format, accepted only within 15 days back and 2 minutes ahead of the local clock) both stop
