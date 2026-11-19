@@ -33,7 +33,10 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 INBOUND_PER_WINDOW = 60
 INBOUND_WINDOW_SECONDS = 600
 KEY_FILE_MAX_BYTES = 256
-ID_FUTURE_SECONDS = 120
+ID_FUTURE_SECONDS = 900
+ROSTER_REFRESH_SECONDS = 300
+DEFER_SECONDS = 60
+SCAN_FILES = 200
 ID_PAST_SECONDS = 15 * 86400
 NOTE_CHARS = 200
 LINK_ACTION = "link_mailbox"
@@ -46,7 +49,8 @@ CLOUD_ONLY_DM = ("is a cloud agent reached through a mailbox. A cloud agent can 
 
 ALLOW_INSECURE = False
 
-_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+KEY_PREFIX = "tcm_"
+_KEY_RE = re.compile(r"tcm_[A-Za-z0-9_-]{32,124}")
 _HEADER_LOOKALIKE = re.compile(r"(?m)^(\s*)---(?=\s*id:)")
 
 
@@ -60,10 +64,11 @@ def read_mailboxes(root):
     boxes = data.get("mailboxes") if isinstance(data, dict) else None
     out = {}
     for name, cfg in (boxes.items() if isinstance(boxes, dict) else ()):
-        if (isinstance(name, str) and MACHINE_NAME_PATTERN.match(name) and isinstance(cfg, dict)
+        if (isinstance(name, str) and MACHINE_NAME_PATTERN.fullmatch(name)
+                and isinstance(cfg, dict)
                 and isinstance(cfg.get("url"), str) and isinstance(cfg.get("key"), str)
-                and _KEY_RE.match(cfg["key"]) and isinstance(cfg.get("you_are"), str)
-                and MACHINE_NAME_PATTERN.match(cfg["you_are"])):
+                and _KEY_RE.fullmatch(cfg["key"]) and isinstance(cfg.get("you_are"), str)
+                and MACHINE_NAME_PATTERN.fullmatch(cfg["you_are"])):
             out[name] = {"url": cfg["url"], "key": cfg["key"], "you_are": cfg["you_are"]}
     return out
 
@@ -125,7 +130,7 @@ def read_key_file(value):
         text = path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
         raise CommsError(f"{path} could not be read as a mailbox key file.")
-    if not _KEY_RE.match(text):
+    if not _KEY_RE.fullmatch(text):
         raise CommsError(f"{path} is not a mailbox key file.")
     return text
 
@@ -170,7 +175,7 @@ def clean_bots(raw):
             validate_agent_name(name)
         except CommsError:
             continue
-        if name in seen:
+        if name in seen or name != name.strip():
             continue
         seen.add(name)
         last = entry.get("last_seen")
@@ -178,9 +183,9 @@ def clean_bots(raw):
         bots.append({
             "name": name, "type": "cloud", "live": False,
             "last_seen": last if isinstance(last, (int, float)) and not isinstance(last, bool)
-            else None,
+            and 0 < last < 4e9 else None,
             "waiting": waiting if isinstance(waiting, int) and not isinstance(waiting, bool)
-            and waiting >= 0 else 0,
+            and 0 <= waiting <= 100000 else 0,
             "doorbell": entry.get("doorbell") is True,
             "doorbell_error": clean_note(entry.get("doorbell_error")),
         })
@@ -211,6 +216,9 @@ def link(root, name, url, key_file, taken, post=None):
     if name in taken:
         raise CommsError(f"{name!r} cannot be used as a mailbox name: {taken[name]}. Pick "
                          f"another short name, for example 'grok'.")
+    if name in read_mailboxes(root):
+        raise CommsError(f"{name!r} is already a linked mailbox. Unlink it first if it should "
+                         f"point somewhere else or use a new key.")
     base = clean_url(url)
     key = read_key_file(key_file)
     try:
@@ -225,7 +233,8 @@ def link(root, name, url, key_file, taken, post=None):
                if state == "mailbox_refused" else detail)
         raise CommsError(f"NOT LINKED: {why}.")
     me = resp.get("you_are")
-    if resp.get("v") != PROTOCOL or not isinstance(me, str) or not MACHINE_NAME_PATTERN.match(me):
+    if (resp.get("v") != PROTOCOL or not isinstance(me, str)
+            or not MACHINE_NAME_PATTERN.fullmatch(me)):
         raise CommsError(f"NOT LINKED: {base} did not answer like a teammate-comms mailbox.")
     path = mailboxes_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)

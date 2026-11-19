@@ -1180,19 +1180,31 @@ events and drops anything else found in a mailbox outbox. Inbound mail never goe
 `apply_event`: `deliver_cloud_message` accepts only a message to a registered agent session
 (`type == "full"`), from a bot name the mailbox reported in the same answer, forces normal
 priority, drops any post type, prefixes a fixed line saying it comes from outside the user's
-machines, and breaks any line that imitates the inbox's own message header. Inbound volume
-is capped at 60 messages per 10 minutes per mailbox; the rest wait in the mailbox.
+machines, breaks any line that imitates the inbox's own message header, and forces the
+reply reference onto one line. Inbound volume is capped at 60 messages per 10 minutes per
+cloud agent; the rest wait in the mailbox.
 
 **Identity is the key.** The Worker's config maps each key to one machine name or one bot
 name; a caller never states its own name, and the two kinds are separate sets. The machine
-stores its key in `relay/mailboxes.json` and nowhere else. `link_mailbox` takes a key *file*
-whose whole content must be one key-shaped token, accepts only an https address of a named
-host, and its client never follows a redirect, so the action cannot be used to send an
-arbitrary file's content somewhere.
+stores its key in `relay/mailboxes.json` and nowhere else.
+
+**Linking is terminal-only.** The peer review showed that a link action exposed to agents is
+a confused deputy: a prompt-injected agent could link a mailbox it controls and gain a
+channel into every agent, or repoint an existing name and capture its mail. So
+`teammate_peers` has no link action; the user runs `python -m teammate_comms.peers
+link_mailbox`, and the tool only prints that command. As defence in depth the key file must
+hold exactly one token starting `tcm_` (so a file holding some other secret is never sent
+anywhere), the address must be https to a named host, the client never follows a redirect,
+and a name that is already linked cannot be linked again without unlinking first.
+
+**Nothing the mailbox says is trusted as text.** Everything it returns that reaches an agent
+is forced to one clipped line and attributed ("the mailbox said: ..."); bot names, ids and
+numbers are validated; a wrongly shaped answer loses nothing.
 
 **Delivery.** Machine to bot: the existing outbox file, sent until the Worker lists its id
 as accepted (kept), rejected (dropped, sender told by `comms-relay`) or deferred (mailbox
-full, kept and retried). The Worker remembers event ids for 30 days, so a resend is not
+full, kept, retried after a minute, and skipped meanwhile so it does not block mail for
+another agent). The Worker remembers event ids for 30 days, so a resend is not
 stored twice. Bot to machine: the Worker returns each message on every sync until its id is
 acked; the relay's seen ring and the message id (minted by the Worker in the usual UTC
 format, accepted only within 15 days back and 2 minutes ahead of the local clock) both stop
@@ -1204,7 +1216,8 @@ mailbox cannot delay exchanges with peer machines. Tests call `mailbox_tick` dir
 
 **Doorbell limits.** At most one ring per `DOORBELL_MIN_SECONDS` (60) and
 `DOORBELL_MAX_PER_DAY` (100) per bot; two retries (5 and 30 minutes) for uncollected mail,
-then silence until the bot collects, because every ring spends the user's allowance.
+then one every 6 hours until the bot collects, because every ring spends the user's
+allowance but a doorbell that was broken for a while must still recover.
 
 **Testing.** The Worker's logic takes its storage, clock, fetch and alarm setter as
 arguments and runs under `node --test` with a Map-backed store. `tests/test_mailbox.py`

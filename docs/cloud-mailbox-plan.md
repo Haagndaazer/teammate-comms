@@ -216,3 +216,25 @@ Left open for the user (section 4 stands otherwise):
 - Whether a cloud agent may write to any registered agent session (current behaviour) or
   only to names on a per-link allow list.
 - The default daily doorbell limit.
+
+## 8. Changes after the code review
+
+- **Linking moved out of the agent tool.** Section 3.4's `teammate_peers(action=
+  "link_mailbox")` no longer exists. The user links in a terminal; the tool prints the
+  command. Reason: a prompt-injected local agent could otherwise link or repoint a mailbox.
+- Machine keys start `tcm_` and bot keys `tcb_`, so a file holding another secret is never
+  accepted as a key file. A linked name cannot be relinked without unlinking.
+- Text returned by the mailbox is cleaned and attributed before any agent sees it; answer
+  shapes, ids, names and numbers are validated.
+- The reply reference is forced onto one line on both sides.
+- The Worker's name lookups no longer match names inherited from Object.
+- A deferred message no longer blocks mail queued behind it for another agent.
+- The inbound cap is per cloud agent, so one cannot starve another.
+- The doorbell keeps trying every 6 hours after its retries; a failure notice rings it.
+- The key generator validates an edited config before writing anything.
+
+Known and left as is: the mailbox key is stored in plain text in the comms folder; the
+Worker has no request rate limit of its own; a mailbox name is not checked against tailnet
+devices when Tailscale is not running; one slow mailbox can delay other mailboxes (not peer
+machines); a message can be duplicated if the transcript write fails after the inbox write,
+as with peer machines today.

@@ -24,6 +24,7 @@ export const RETAIN = {
 export const DOORBELL = {
   minSeconds: 60,
   retrySeconds: [300, 1800],
+  slowRetrySeconds: 6 * 3600,
   timeoutMs: 10000,
   maxPerDay: 100,
 };
@@ -94,8 +95,8 @@ export function parseConfig(raw) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new ConfigError("MAILBOX_CONFIG must be a JSON object");
   }
-  const machines = {};
-  const bots = {};
+  const machines = Object.create(null);
+  const bots = Object.create(null);
   const keys = new Set();
   const takeKey = (key, label) => {
     if (typeof key !== "string" || key.length < LIMITS.minKeyChars) {
@@ -158,6 +159,10 @@ export async function identify(config, kind, token) {
 
 function pad(n) {
   return String(n).padStart(14, "0");
+}
+
+function oneLine(value, max) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, max) : "";
 }
 
 function clip(value, max) {
@@ -249,7 +254,7 @@ export class Mailbox {
   }
 
   checkEvent(ev) {
-    if (!this.config.bots[ev.to]) {
+    if (typeof ev.to !== "string" || !Object.hasOwn(this.config.bots, ev.to)) {
       const known = Object.keys(this.config.bots).join(", ");
       return `no cloud agent named ${clip(ev.to, 80) || "(missing)"} uses this mailbox (agents: ${known})`;
     }
@@ -265,6 +270,7 @@ export class Mailbox {
     if (!body || typeof body !== "object" || body.v !== PROTOCOL) {
       return { status: 400, body: { error: "bad_request" } };
     }
+    const rung = new Set();
     for (const id of (Array.isArray(body.ack) ? body.ack : []).slice(0, 1000)) {
       if (typeof id === "string" && EVENT_ID_RE.test(id)) await this.removeForMachine(machine, id);
     }
@@ -274,6 +280,7 @@ export class Mailbox {
       if (record) {
         await this.notice(record.from, `Your message to ${record.to}@${machine} was not ` +
           `delivered. Reason: ${clip(item.error, LIMITS.errorChars) || "no reason given"}`);
+        rung.add(record.from);
       }
     }
     if (Array.isArray(body.roster)) {
@@ -282,7 +289,6 @@ export class Mailbox {
     const accepted = [];
     const rejected = [];
     const deferred = [];
-    const rung = new Set();
     for (const ev of (Array.isArray(body.events) ? body.events : []).slice(0, LIMITS.eventsPerSync)) {
       if (!ev || typeof ev.id !== "string" || !EVENT_ID_RE.test(ev.id)) continue;
       const known = await this.storage.get(`e:${machine}:${ev.id}`);
@@ -307,9 +313,7 @@ export class Mailbox {
           priority: ev.priority === "urgent" ? "urgent" : "normal",
           sent: new Date(Number.isFinite(ev.ts) ? ev.ts * 1000 : this.now()).toISOString(),
         };
-        if (typeof ev.reply_to === "string" && ev.reply_to.trim()) {
-          record.reply_to = ev.reply_to.trim().slice(0, 128);
-        }
+        if (oneLine(ev.reply_to, 128)) record.reply_to = oneLine(ev.reply_to, 128);
         await this.putForBot(ev.to, record);
         rung.add(ev.to);
         accepted.push(ev.id);
@@ -368,8 +372,8 @@ export class Mailbox {
     const day = this.ringsToday(state);
     if (day.length >= this.maxPerDay) return day[0] + 86400;
     if (state.rings === 0) return Math.max(this.seconds(), state.last_ring + this.minSeconds);
-    const wait = DOORBELL.retrySeconds[state.rings - 1];
-    return wait === undefined ? null : state.last_ring + wait;
+    const wait = DOORBELL.retrySeconds[state.rings - 1] ?? DOORBELL.slowRetrySeconds;
+    return state.last_ring + Math.max(wait, this.minSeconds);
   }
 
   async scheduleRings() {
@@ -405,7 +409,7 @@ export class Mailbox {
     }
     const after = await this.botState(bot);
     if (!error && after.rings >= DOORBELL.retrySeconds.length + 1 && (await this.count(`b:${bot}`)) > 0) {
-      error = `rung ${after.rings} times without the agent collecting its mail; not ringing again until it does`;
+      error = `rung ${after.rings} times without the agent collecting its mail; now ringing only every 6 hours until it does`;
     }
     await this.storage.put(`s:${bot}`, { ...after, ring_error: error });
   }
@@ -547,7 +551,7 @@ export class Mailbox {
     let machine;
     if (machinePart !== undefined) {
       machine = machinePart.toLowerCase();
-      if (!this.config.machines[machine]) {
+      if (!Object.hasOwn(this.config.machines, machine)) {
         return { error: `no machine named ${JSON.stringify(machinePart)} is linked to this mailbox (machines: ${machines.join(", ")})` };
       }
     } else {
@@ -586,9 +590,7 @@ export class Mailbox {
       id, msg_id: messageId(this.now()), from: bot, to: target.name, message,
       ts: Math.round(this.now()) / 1000, at: this.seconds(), event: `pi:${target.machine}:${id}`,
     };
-    if (typeof args.reply_to === "string" && args.reply_to.trim()) {
-      record.reply_to = args.reply_to.trim().slice(0, 128);
-    }
+    if (oneLine(args.reply_to, 128)) record.reply_to = oneLine(args.reply_to, 128);
     const seq = await this.nextSeq();
     await this.storage.put(`p:${target.machine}:${seq}`, record);
     await this.storage.put(`pi:${target.machine}:${id}`, seq);

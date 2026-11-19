@@ -457,19 +457,20 @@ npx wrangler secret bulk ~/teammate-mailbox/wrangler-secrets.json
 
 ### 3. Link each machine
 
-Ask a registered session on the machine, naming the key **file**, not the key:
+Linking is done **by you, in a terminal**. Agents cannot do it, so no message can talk one
+into linking a mailbox. Any registered session will print the exact command for your
+install if you ask it for `teammate_peers()`; it has this shape:
 
 ```
-teammate_peers(action:"link_mailbox", machine:"grok",
-               url:"https://teammate-mailbox.<you>.workers.dev",
-               key_file:"~/teammate-mailbox/machine-desktop.key")
+uv run --no-sync --directory "<plugin folder>" python -m teammate_comms.peers link_mailbox grok https://teammate-mailbox.<you>.workers.dev ~/teammate-mailbox/machine-desktop.key
 ```
 
-`machine` is a short name you choose for the mailbox; the bot is then `CommsTest@grok`. The
-same thing from a terminal: `<python> -m teammate_comms.peers link_mailbox grok <url> <key file>`.
-The key is copied into this machine's comms data, so the key file can then be deleted or moved
-to a password manager. For a second machine run `make_config.py --out ... --add-machine laptop`,
-upload the secrets again, and link it there with its own key file.
+`grok` is a short name you choose for the mailbox; the bot is then `CommsTest@grok`. The key
+is copied into this machine's comms data (`relay/mailboxes.json`, readable by programs
+running as you), so the key file can then be deleted or moved to a password manager. A
+linked name cannot be pointed at a different address: unlink it first. For a second machine
+run `make_config.py --out ... --add-machine laptop`, upload the secrets again, and link it
+there with its own key file.
 
 ### 4. Connect the Grok Bot
 
@@ -511,7 +512,7 @@ first, from a chat or a scheduled routine.
 - Every doorbell ring starts a bot run, which uses your Grok Bot allowance. The mailbox rings at
   most once a minute and 100 times in 24 hours (`DOORBELL_MIN_SECONDS` and
   `DOORBELL_MAX_PER_DAY` in `mailbox-worker/wrangler.jsonc`). If the bot does not collect its
-  mail it rings again after 5 and 30 minutes, then stops until the bot next checks.
+  mail it rings again after 5 and 30 minutes, then only every 6 hours until the bot checks.
 - Each linked machine calls the mailbox about every 10 seconds, roughly 8,600 requests a day.
   Check that against your Cloudflare plan.
 - Messages pass through Cloudflare and through the cloud agent's provider. Do not send
@@ -521,6 +522,8 @@ first, from a chat or a scheduled routine.
   delivered mail for 7.
 - A bot run that stops after fetching its mail has still been handed that mail. The next run is
   told a batch was handed over recently and can re-read it, but nothing forces it to.
+- The mailbox has no request limit of its own. If strangers hammering its address could use
+  up your Cloudflare plan's daily requests, add a rate limiting rule for it in Cloudflare.
 - One bot name can exist once per mailbox. Machines are not forwarded through each other: each
   machine that should reach the bot links to the mailbox itself.
 

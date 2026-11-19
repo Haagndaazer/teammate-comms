@@ -10,8 +10,10 @@
   Machines sync with it over outbound HTTPS; a cloud agent uses it as an MCP server
   (`mail_check`, `mail_send`, `mail_teammates`). It rings the agent's webhook when mail
   arrives, at most once a minute and 100 times a day.
-- **New:** `teammate_peers(action="link_mailbox", machine, url, key_file)` and
-  `action="unlink_mailbox"`, also in the peers terminal command. A cloud agent is then
+- **New:** a mailbox is linked by the user in a terminal
+  (`python -m teammate_comms.peers link_mailbox <name> <url> <key file>`); agents cannot
+  link one, and `teammate_peers()` prints the command. `teammate_peers(action=
+  "unlink_mailbox")` removes a link. A cloud agent is then
   addressed `Name@<mailbox name>` in `teammate_send` and `teammate_profile`, and listed by
   `teammate_list` and `teammate_peers`.
 - A cloud mailbox carries **direct messages only**. Group membership, spawn and shutdown
@@ -19,7 +21,7 @@
 - A message from a cloud agent is delivered only to a registered agent session, at normal
   priority, with a first line saying it comes from outside your machines.
 - Every caller of the mailbox is identified by its own key. `mailbox-worker/make_config.py`
-  generates them; a machine's key reaches an agent session as a file path, never as text.
+  generates them.
 - The relay now also runs when only a mailbox is linked, with no peer machines and without
   Tailscale.
 - Not yet tried with a real Grok Bot against this Worker; the approach was proven on a real
