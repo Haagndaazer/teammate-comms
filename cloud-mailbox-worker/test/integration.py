@@ -82,13 +82,13 @@ def main():
     shutil.copy(HERE.parent / "wrangler.jsonc", worker / "wrangler.jsonc")
     make_config.main(["--out", str(secrets_dir), "--machine", "desk", "--bot", "Grok", "--bot", "Bell"])
     config = json.loads((secrets_dir / "config.json").read_text(encoding="utf-8"))
-    config["bots"]["Bell"].update(doorbell_url="https://127.0.0.1:9/ring", doorbell_key="ring-key")
+    config["accounts"]["main"]["bots"]["Bell"].update(doorbell_url="https://127.0.0.1:9/ring", doorbell_key="ring-key")
     (secrets_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     make_config.main(["--out", str(secrets_dir), "--rebuild"])
     upload = json.loads((secrets_dir / "wrangler-secrets.json").read_text(encoding="utf-8"))
     (worker / ".dev.vars").write_text(
         "MAILBOX_CONFIG='" + upload["MAILBOX_CONFIG"] + "'\nDOORBELL_MIN_SECONDS=20\n", encoding="utf-8")
-    bot_key = config["bots"]["Grok"]["key"]
+    bot_key = config["accounts"]["main"]["key"]
     port = free_port()
     npx = shutil.which("npx") or "npx"
     log = open(work / "wrangler.log", "w", encoding="utf-8")
@@ -131,7 +131,7 @@ def main():
             return call(port, "POST", "/mcp", key=bot_key, body=body)
 
         def tool(name, args=None):
-            status, reply = rpc("tools/call", {"name": name, "arguments": args or {}})
+            status, reply = rpc("tools/call", {"name": name, "arguments": {"me": "Grok", **(args or {})}})
             out = reply["result"]
             return (out["content"][0]["text"] if out.get("isError") else json.loads(out["content"][0]["text"]))
 

@@ -421,9 +421,6 @@ def describe_state(state, machine, detail="", port=None, me=None):
         return (f"the {machine} mailbox does not accept this machine's key. The key was "
                 f"changed or removed in the mailbox configuration; link again with "
                 f"the new key file (your user runs: {link_command()}).")
-    if state == "mailbox_full":
-        return (f"the {machine} mailbox is holding mail the cloud agent has not collected: "
-                f"{detail or 'it is full'}.")
     if state == "mailbox_error":
         return f"the {machine} mailbox answered with an error: {detail or 'no detail'}."
     if state == "not_approved":
@@ -661,9 +658,14 @@ def _mailbox_lines(root, status):
     boxes = read_mailboxes(root)
     hint = ("A cloud mailbox (for a cloud agent such as a Grok Bot) is linked by your user, "
             "who runs this in their own terminal; an agent never does: " + link_command(root))
-    if not boxes:
+    broken = [f"  - {name}: ⚠️ its stored key cannot be read by this user on this machine (the "
+              f"comms folder was copied or restored from elsewhere). Unlink it with "
+              f"teammate_peers(action=\"{mailbox_mod.UNLINK_ACTION}\", machine=\"{name}\"), "
+              f"then your user links it again."
+              for name in mailbox_mod.unreadable(root)]
+    if not boxes and not broken:
         return ["Cloud mailboxes: none. " + hint]
-    lines = ["Cloud mailboxes (direct messages only):"]
+    lines = ["Cloud mailboxes (direct messages only):"] + broken
     for name in sorted(boxes):
         view = peer_view(root, name, status)
         lines.append(f"  - {name}: " + (f"reachable as {boxes[name]['you_are']}." if view["ok"]
@@ -1299,6 +1301,15 @@ def deliver_cloud_message(root, mailbox, me, bots, msg, now=None):
     except CommsError as e:
         raise RejectEvent(str(e))
     record = read_agent_record(root, None, to)
+    if not record and len(to) == mailbox_mod.CLOUD_NAME_CHARS:
+        longer = [p.stem for p in get_agents_dir(root, None).glob(f"{to}*.json")
+                  if mailbox_mod.cloud_name(p.stem) == to]
+        if len(longer) > 1:
+            raise RejectEvent(f"{to} is the shortened form of more than one teammate on {me}, "
+                              f"so it is not clear who this is for")
+        if longer:
+            to = longer[0]
+            record = read_agent_record(root, None, to)
     if not record or record.get("type") != "full":
         raise RejectEvent(f"no teammate named {to} is registered on {me}")
     msg_id = _clean_id(msg.get("msg_id"))
@@ -1821,15 +1832,7 @@ class Relay:
         if not d.exists():
             return []
         events, size = [], 0
-        now = self.clock()
-        held = st.setdefault("deferred", {})
-        for held_name in [i for i, until in held.items() if until <= now]:
-            held.pop(held_name)
-        for path in sorted(d.glob("*.json")):
-            if len(events) >= mailbox_mod.BATCH_EVENTS:
-                break
-            if path.name in held:
-                continue
+        for path in sorted(d.glob("*.json"))[:mailbox_mod.BATCH_EVENTS]:
             try:
                 raw = path.read_text(encoding="utf-8")
                 ev = json.loads(raw)
@@ -1837,7 +1840,7 @@ class Relay:
                 record = payload["record"] if kind == "dm" else None
                 to = split_address(payload["to"])[0] if kind == "dm" else None
                 wire = None if kind != "dm" else {
-                    "id": event_id, "to": to, "from": record["from"],
+                    "id": event_id, "to": to, "from": mailbox_mod.cloud_name(record["from"]),
                     "message": record["message"], "priority": record.get("priority"),
                     "msg_id": record["id"], "ts": record.get("ts")}
             except (OSError, ValueError, KeyError, TypeError):
@@ -1870,10 +1873,12 @@ class Relay:
                                  f"agents there.")
 
     def _mailbox_roster(self):
-        agents = []
+        agents, seen = [], set()
         for entry in build_roster(self.root)["agents"]:
-            if entry.get("type") == "full":
-                agents.append({"name": entry["name"], "live": bool(entry.get("live"))})
+            short = mailbox_mod.cloud_name(entry["name"])
+            if entry.get("type") == "full" and short not in seen:
+                seen.add(short)
+                agents.append({"name": short, "live": bool(entry.get("live"))})
         return agents
 
     def _inbound_room(self, name, sender):
@@ -1993,11 +1998,6 @@ class Relay:
                                                           or "no reason given")}
                         for i in items("rejected") if isinstance(i, dict) and known_id(i.get("id"))]
             self._settle(st, accepted, rejected, name)
-            deferred = [d for d in items("deferred") if isinstance(d, dict) and known_id(d.get("id"))]
-            for item in deferred:
-                path = st["inflight"].pop(item["id"], None)
-                if path is not None:
-                    st.setdefault("deferred", {})[path.name] = now + mailbox_mod.DEFER_SECONDS
             unanswered = [e["id"] for e in batch if e["id"] in st["inflight"]]
             for event_id in unanswered:
                 st["inflight"].pop(event_id, None)
@@ -2016,12 +2016,7 @@ class Relay:
                 self.log(f"could not store the roster of mailbox {name}: {e}")
             st["last_contact"] = self.clock()
             st["fails"] = 0
-            if deferred:
-                st["full_detail"] = mailbox_mod.said(deferred[0].get("error"))
-            if st.get("deferred"):
-                self._set_state(st, "mailbox_full", st.get("full_detail", ""))
-            else:
-                self._set_state(st, "ok")
+            self._set_state(st, "ok")
             waiting = queued_count(self.root, name)
         progressed = bool(applied or failed)
         st["synced_at"] = now
@@ -2035,8 +2030,7 @@ class Relay:
         if self.clock() - st.get("synced_at", 0.0) < mailbox_mod.BUSY_SECONDS:
             return False
         d = outbox_dir(self.root, name)
-        held = st.get("deferred") or {}
-        return d.exists() and any(p.name not in held for p in d.glob("*.json"))
+        return d.exists() and any(d.glob("*.json"))
 
     def mailbox_tick(self):
         """One pass over the linked mailboxes: exchange with each one that is due."""

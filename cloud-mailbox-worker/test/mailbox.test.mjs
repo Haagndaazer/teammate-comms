@@ -25,12 +25,12 @@ test("config: weak, shared or malformed entries are refused", () => {
 test("identity comes from the key and the two kinds never cross", async () => {
   const config = parseConfig(baseConfig());
   assert.equal(await identify(config, "machines", KEYS.desk), "desk");
-  assert.equal(await identify(config, "bots", KEYS.bot), "Grok");
-  assert.equal(await identify(config, "bots", KEYS.desk), null);
+  assert.equal(await identify(config, "accounts", KEYS.bot), "grok");
+  assert.equal(await identify(config, "accounts", KEYS.desk), null);
   assert.equal(await identify(config, "machines", KEYS.bot), null);
   assert.equal(await identify(config, "machines", ""), null);
   assert.equal(await identify(config, "machines", undefined), null);
-  assert.equal(await identify(config, "bots", KEYS.bot + "x"), null);
+  assert.equal(await identify(config, "accounts", KEYS.bot + "x"), null);
 });
 
 test("a message from a machine reaches the bot once, with the machine added to the sender", async () => {
@@ -144,6 +144,67 @@ test("a delivery failure notice also rings the doorbell", async () => {
   assert.equal(w.rings.length, 1);
 });
 
+test("agents sharing one connection each have their own inbox, chosen by name", async () => {
+  const w = world({
+    machines: { desk: KEYS.desk },
+    accounts: {
+      "space-one": { key: KEYS.bot, bots: { Chief: { doorbell_url: "https://bell.example/chief", doorbell_key: "k1" }, Scout: {} } },
+      "space-two": { key: KEYS.bot2, bots: { Lone: {} } },
+    },
+  });
+  const config = w.box.config;
+  assert.equal(await identify(config, "accounts", KEYS.bot), "space-one");
+  assert.deepEqual(config.accounts["space-one"].bots, ["Chief", "Scout"]);
+  const call = (account, name, args) => w.box.rpc(account, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+  const text = (reply) => reply.result.content[0].text;
+  await w.sync("desk", { events: [event("Chief", "for chief"), event("Scout", "for scout"), event("Lone", "for lone")] });
+  await w.advance(1);
+  assert.deepEqual(w.rings.map((r) => r.url), ["https://bell.example/chief"], "only an agent with a doorbell is rung, at its own address");
+
+  const none = await call("space-one", "mail_check", {});
+  assert.equal(none.result.isError, true);
+  assert.match(text(none), /say which one you are: pass me as one of Chief, Scout/);
+  const wrong = await call("space-one", "mail_check", { me: "Lone" });
+  assert.match(text(wrong), /"Lone" is not an agent on this connection.*one of Chief, Scout.*Nothing was read/);
+  assert.match(text(await call("space-one", "mail_send", { me: 5, to: "a@desk", message: "x" })), /me must be your own name/);
+  assert.equal((await w.sync("desk")).bots.find((b) => b.name === "Chief").waiting, 1, "a refused call takes nothing");
+
+  const chief = JSON.parse(text(await call("space-one", "mail_check", { me: "chief" })));
+  assert.equal(chief.inbox, "Chief");
+  assert.deepEqual(chief.messages.map((m) => m.message), ["for chief"]);
+  const scout = JSON.parse(text(await call("space-one", "mail_check", { me: "Scout" })));
+  assert.deepEqual([scout.inbox, scout.messages[0].message], ["Scout", "for scout"]);
+  const lone = JSON.parse(text(await call("space-two", "mail_check", {})));
+  assert.deepEqual([lone.inbox, lone.messages[0].message], ["Lone", "for lone"], "a single agent need not say its name");
+
+  await call("space-one", "mail_send", { me: "Scout", to: "alice@desk", message: "from scout" });
+  assert.equal((await w.sync("desk")).messages[0].from, "Scout");
+  assert.equal(w.rings.length, 1);
+
+  const init = await w.box.rpc("space-one", { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  assert.match(init.result.instructions, /shared by these agents: Chief, Scout.*Pass that name as me on every call/);
+  const tools = (await w.box.rpc("space-one", { jsonrpc: "2.0", id: 2, method: "tools/list" })).result.tools;
+  assert.ok(tools.every((t) => t.inputSchema.required.includes("me") && t.inputSchema.properties.me));
+  const solo = (await w.box.rpc("space-two", { jsonrpc: "2.0", id: 2, method: "tools/list" })).result.tools;
+  assert.ok(solo.every((t) => !t.inputSchema.required.includes("me") && t.inputSchema.properties.me));
+  assert.deepEqual(solo[1].inputSchema.required, ["to", "message"]);
+});
+
+test("account configuration is validated", () => {
+  const bad = (cfg) => assert.throws(() => parseConfig({ machines: { desk: KEYS.desk }, ...cfg }), ConfigError);
+  bad({ accounts: { "Bad Name": { key: KEYS.bot, bots: { A: {} } } } });
+  bad({ accounts: { one: { key: KEYS.bot, bots: {} } } });
+  bad({ accounts: { one: { key: KEYS.bot } } });
+  bad({ accounts: { one: { key: KEYS.bot, bots: { A: {} } }, two: { key: KEYS.bot, bots: { B: {} } } } });
+  bad({ accounts: { one: { key: KEYS.bot, bots: { A: {} } }, two: { key: KEYS.bot2, bots: { A: {} } } } });
+  bad({ accounts: { one: { key: KEYS.bot, bots: { A: {} } }, two: { key: KEYS.bot2, bots: { a: {} } } } });
+  bad({ accounts: { one: { key: KEYS.bot, bots: { A: {} } } }, bots: { One: { key: KEYS.bot2 } } });
+  bad({ accounts: [] });
+  const ok = parseConfig({ machines: { desk: KEYS.desk }, accounts: { one: { key: KEYS.bot, bots: { A: {}, B: {} } } }, bots: { "My.Bot": { key: KEYS.bot2 } } });
+  assert.deepEqual(Object.keys(ok.accounts), ["one", "my-bot"]);
+  assert.equal(ok.bots["My.Bot"].account, "my-bot");
+});
+
 test("recipient addresses are resolved against the machines and their rosters", async () => {
   const w = world();
   const send = (to) => w.tool("Grok", "mail_send", { to, message: "x" });
@@ -178,12 +239,12 @@ test("limits are errors, never silent drops", async () => {
   assert.ok((await send("after the minute")).id);
   w.storage.map.set("c:p:desk", LIMITS.waitingPerRecipient);
   await w.advance(61);
-  assert.match((await send("full")).error, /500 messages it has not collected/);
+  assert.match((await send("full")).error, /5000 messages it has not collected/);
   w.storage.map.set("c:p:desk", 40);
   const mine = await w.storage.get("c:pb:desk:Grok");
   assert.equal(mine, LIMITS.sendsPerMinute + 1, "each bot's uncollected mail is counted");
   w.storage.map.set("c:pb:desk:Grok", LIMITS.waitingPerSender);
-  assert.match((await send("too many of mine")).error, /has not collected 200 of your messages/);
+  assert.match((await send("too many of mine")).error, /has not collected 2000 of your messages/);
   assert.equal((await w.tool("Quiet", "mail_send", { to: "alice@desk", message: "x" })).to, "alice@desk",
     "one bot's backlog does not block another bot");
   w.storage.map.set("c:pb:desk:Grok", mine);
@@ -193,10 +254,13 @@ test("limits are errors, never silent drops", async () => {
   w.storage.map.set("c:b:Grok", LIMITS.waitingPerRecipient);
   const waits = event("Grok", "hi");
   const out = await w.sync("desk", { events: [waits] });
-  assert.deepEqual(out.rejected, []);
-  assert.match(out.deferred[0].error, /has not collected 500 messages/);
+  assert.deepEqual(out.accepted, []);
+  assert.match(out.rejected[0].error, /Grok has 5000 messages it has not collected, so its mailbox is full/);
+  assert.equal(out.deferred, undefined);
   w.storage.map.set("c:b:Grok", 0);
-  assert.deepEqual((await w.sync("desk", { events: [waits] })).accepted, [waits.id], "a deferred event is taken later");
+  assert.match((await w.sync("desk", { events: [waits] })).rejected[0].error, /mailbox is full/, "a refused message stays refused");
+  const later = event("Grok", "hi again");
+  assert.deepEqual((await w.sync("desk", { events: [later] })).accepted, [later.id], "a new one is taken once there is room");
 });
 
 test("a large mailbox is handed over in batches", async () => {
@@ -337,7 +401,7 @@ test("only the most recent delivered messages are kept for rereading", async () 
 
 test("MCP framing", async () => {
   const w = world();
-  const call = (body) => w.box.rpc("Grok", body);
+  const call = (body) => w.box.rpc("grok", body);
   const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(init.result.protocolVersion, "2025-11-25");
   assert.match(init.result.instructions, /You are Grok/);

@@ -3,11 +3,11 @@
 // under `node --test`.
 
 export const PROTOCOL = 1;
-export const WORKER_VERSION = "1.0.0";
+export const WORKER_VERSION = "1.1.0";
 export const LIMITS = {
   messageChars: 65536,
-  waitingPerRecipient: 500,
-  waitingPerSender: 200,
+  waitingPerRecipient: 5000,
+  waitingPerSender: 2000,
   sendsPerMinute: 30,
   eventsPerSync: 200,
   rosterAgents: 500,
@@ -37,6 +37,10 @@ const PURGE_STEP = 50;
 const AGENT_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const MACHINE_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const EVENT_ID_RE = /^[0-9a-f]{32}$/;
+const ME = {
+  type: "string",
+  description: "Your own agent name, exactly as your owner named you. It selects your inbox.",
+};
 const TOOLS = [
   {
     name: "mail_check",
@@ -101,6 +105,7 @@ export function parseConfig(raw) {
   }
   const machines = Object.create(null);
   const bots = Object.create(null);
+  const accounts = Object.create(null);
   const keys = new Set();
   const takeKey = (key, label) => {
     if (typeof key !== "string" || key.length < LIMITS.minKeyChars) {
@@ -114,11 +119,34 @@ export function parseConfig(raw) {
     if (!MACHINE_RE.test(name)) throw new ConfigError(`machine name ${JSON.stringify(name)} is not valid`);
     machines[name] = takeKey(key, `machine ${name}`);
   }
+  const isObject = (v) => v && typeof v === "object" && !Array.isArray(v);
+  const source = Object.create(null);
+  if (data.accounts !== undefined && !isObject(data.accounts)) throw new ConfigError("accounts must be an object");
+  for (const [label, entry] of Object.entries(data.accounts || {})) {
+    if (!MACHINE_RE.test(label)) throw new ConfigError(`account name ${JSON.stringify(label)} is not valid`);
+    if (!isObject(entry) || !isObject(entry.bots)) throw new ConfigError(`account ${label}: must have a key and bots`);
+    source[label] = { key: entry.key, bots: entry.bots };
+  }
   for (const [name, entry] of Object.entries(data.bots || {})) {
+    const label = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "bot";
+    if (!isObject(entry)) throw new ConfigError(`bot ${name}: must be an object`);
+    if (label in source) throw new ConfigError(`bot ${name}: its name clashes with account ${label}`);
+    source[label] = { key: entry.key, bots: { [name]: entry } };
+  }
+  for (const [label, account] of Object.entries(source)) {
+    accounts[label] = { key: takeKey(account.key, `account ${label}`), bots: [] };
+    if (!Object.keys(account.bots).length) throw new ConfigError(`account ${label}: has no bots`);
+    for (const [name, entry] of Object.entries(account.bots)) {
+      addBot(label, name, entry);
+    }
+  }
+  function addBot(label, name, entry) {
     if (!AGENT_RE.test(name)) throw new ConfigError(`bot name ${JSON.stringify(name)} is not valid`);
     if (name.toLowerCase() === SYSTEM_SENDER) throw new ConfigError(`bot name ${name} is reserved`);
-    if (!entry || typeof entry !== "object") throw new ConfigError(`bot ${name}: must be an object`);
-    const bot = { key: takeKey(entry.key, `bot ${name}`) };
+    if (!isObject(entry)) throw new ConfigError(`bot ${name}: must be an object`);
+    if (name in bots) throw new ConfigError(`bot name ${name} is used more than once`);
+    const bot = { account: label };
+    accounts[label].bots.push(name);
     if (entry.doorbell_url || entry.doorbell_key) {
       let url;
       try {
@@ -139,14 +167,25 @@ export function parseConfig(raw) {
   if (!Object.keys(bots).length) throw new ConfigError("no bots are configured");
   const lower = Object.keys(bots).map((n) => n.toLowerCase());
   if (new Set(lower).size !== lower.length) throw new ConfigError("bot names differ only by case");
-  return { machines, bots };
+  return { machines, bots, accounts };
+}
+
+function toolsFor(names) {
+  return TOOLS.map((tool) => ({
+    ...tool,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: { me: ME, ...tool.inputSchema.properties },
+      required: [...(names.length > 1 ? ["me"] : []), ...(tool.inputSchema.required || [])],
+    },
+  }));
 }
 
 async function digest(text) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
 }
 
-// The name that owns `token` among `kind` ("machines" | "bots"), or null. Every candidate
+// The name that owns `token` among `kind` ("machines" | "accounts"), or null. Every candidate
 // is compared in full so timing does not reveal which one matched.
 export async function identify(config, kind, token) {
   if (typeof token !== "string" || !token) return null;
@@ -293,7 +332,6 @@ export class Mailbox {
     }
     const accepted = [];
     const rejected = [];
-    const deferred = [];
     for (const ev of (Array.isArray(body.events) ? body.events : []).slice(0, LIMITS.eventsPerSync)) {
       if (!ev || typeof ev.id !== "string" || !EVENT_ID_RE.test(ev.id)) continue;
       const known = await this.storage.get(`e:${machine}:${ev.id}`);
@@ -302,13 +340,10 @@ export class Mailbox {
         else accepted.push(ev.id);
         continue;
       }
-      const error = this.checkEvent(ev);
+      let error = this.checkEvent(ev);
       if (!error && (await this.count(`b:${ev.to}`)) >= LIMITS.waitingPerRecipient) {
-        deferred.push({
-          id: ev.id,
-          error: `${ev.to} has not collected ${LIMITS.waitingPerRecipient} messages already in the mailbox`,
-        });
-        continue;
+        error = `${ev.to} has ${LIMITS.waitingPerRecipient} messages it has not collected, so its ` +
+          "mailbox is full. Nothing more is accepted for it until it collects some";
       }
       if (!error) {
         const record = {
@@ -357,7 +392,7 @@ export class Mailbox {
     }
     return {
       status: 200,
-      body: { v: PROTOCOL, worker: WORKER_VERSION, you_are: machine, accepted, rejected, deferred, messages, bots },
+      body: { v: PROTOCOL, worker: WORKER_VERSION, you_are: machine, accepted, rejected, messages, bots },
     };
   }
 
@@ -512,7 +547,7 @@ export class Mailbox {
         messages.push({ ...this.shown(record), answered });
       }
       await this.touch(bot, false);
-      return { value: { reread: true, count: messages.length, messages } };
+      return { value: { inbox: bot, reread: true, count: messages.length, messages } };
     }
     const batch = await this.storage.list({ prefix: `b:${bot}:`, limit: LIMITS.batchMessages });
     const messages = [];
@@ -536,7 +571,7 @@ export class Mailbox {
       }
     }
     const state = await this.botState(bot);
-    const value = { count: messages.length, messages };
+    const value = { inbox: bot, count: messages.length, messages };
     if (remaining > 0) value.more_waiting = remaining;
     const last = state.last_batch;
     if (!messages.length && last && this.seconds() - last.at < PREVIOUS_BATCH_SECONDS) {
@@ -647,16 +682,42 @@ export class Mailbox {
     return { value: { you_are: bot, machines } };
   }
 
-  async callTool(bot, params) {
+  whoIs(account, me) {
+    const names = this.config.accounts[account].bots;
+    const list = names.join(", ");
+    if (me === undefined || me === null || me === "") {
+      if (names.length === 1) return { bot: names[0] };
+      return { error: `Several agents share this connection, so say which one you are: pass me as one of ${list}` };
+    }
+    if (typeof me !== "string") return { error: `me must be your own name, one of ${list}` };
+    const wanted = me.trim();
+    const found = names.includes(wanted) ? [wanted] : names.filter((n) => n.toLowerCase() === wanted.toLowerCase());
+    if (found.length === 1) return { bot: found[0] };
+    return { error: `${JSON.stringify(clip(me, 80))} is not an agent on this connection. Pass me as your own name, one of ${list}. Nothing was read or sent` };
+  }
+
+  async callTool(account, params) {
     const args = params && params.arguments && typeof params.arguments === "object" ? params.arguments : {};
     const name = params && params.name;
+    if (!["mail_check", "mail_send", "mail_teammates"].includes(name)) return null;
+    const who = this.whoIs(account, args.me);
+    if (who.error) return who;
+    const bot = who.bot;
     if (name === "mail_check") return this.mailCheck(bot, args);
     if (name === "mail_send") return this.mailSend(bot, args);
     if (name === "mail_teammates") return this.mailTeammates(bot);
     return null;
   }
 
-  async rpcOne(bot, msg) {
+  intro(account) {
+    const names = this.config.accounts[account].bots;
+    if (names.length === 1) return `You are ${names[0]}.`;
+    return `This connection is shared by these agents: ${names.join(", ")}. You are the one ` +
+      "whose name is your own. Pass that name as me on every call; it selects your inbox, and " +
+      "using another agent's name would take its mail.";
+  }
+
+  async rpcOne(account, msg) {
     if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
       return { jsonrpc: "2.0", id: msg && msg.id !== undefined ? msg.id : null, error: { code: -32600, message: "invalid request" } };
     }
@@ -671,7 +732,7 @@ export class Mailbox {
         capabilities: { tools: {} },
         serverInfo: { name: "teammate-mailbox", version: "1.0.0" },
         instructions: [
-          `You are ${bot}. This mailbox carries direct messages between you and AI agents ` +
+          `${this.intro(account)} This mailbox carries direct messages between you and AI agents ` +
             "working on your owner's own computers. It is your only link to them.",
           "A run may start with no memory of earlier runs, so call mail_check first. If it " +
             "returns count 0, nothing is waiting: say so in one line and stop. Do not keep " +
@@ -692,9 +753,9 @@ export class Mailbox {
       });
     }
     if (msg.method === "ping") return done({});
-    if (msg.method === "tools/list") return done({ tools: TOOLS });
+    if (msg.method === "tools/list") return done({ tools: toolsFor(this.config.accounts[account].bots) });
     if (msg.method === "tools/call") {
-      const out = await this.callTool(bot, params);
+      const out = await this.callTool(account, params);
       if (out === null) return fail(-32602, "unknown tool");
       if (out.error) return done({ isError: true, content: [{ type: "text", text: out.error }] });
       return done({ content: [{ type: "text", text: JSON.stringify(out.value) }] });
@@ -702,15 +763,15 @@ export class Mailbox {
     return fail(-32601, "method not found");
   }
 
-  async rpc(bot, body) {
+  async rpc(account, body) {
     if (Array.isArray(body)) {
       const out = [];
       for (const one of body.slice(0, 20)) {
-        const reply = await this.rpcOne(bot, one);
+        const reply = await this.rpcOne(account, one);
         if (reply !== null) out.push(reply);
       }
       return out.length ? out : null;
     }
-    return this.rpcOne(bot, body);
+    return this.rpcOne(account, body);
   }
 }

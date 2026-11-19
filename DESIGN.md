@@ -1226,3 +1226,33 @@ arguments and runs under `node --test` with a Map-backed store. `tests/test_mail
 drives the relay against an in-process fake of the same protocol.
 `cloud-mailbox-worker/test/integration.py` runs the real relay code against the real Worker under
 `wrangler dev`; it needs npm access and is run by hand.
+
+### 0.19.2: accounts, full mailbox, long names, key storage
+
+**Accounts.** Field use showed that Grok Bot and Rakazo both share a connector, and its
+secret, across every agent in an account or space. A token per agent therefore cannot
+separate agents: a second agent used the first one's connector and took its mail. The
+mailbox now maps a token to an *account* that lists named agents, each with its own inbox
+and doorbell, and the agent passes its own name as `me` on every call. `me` selects the
+inbox; it is not authentication, since agents sharing a connector can claim any name in the
+account. An unknown or missing name (with more than one agent) is refused before anything
+is read. Names and doorbells are declared in the user's config, never registered by an
+agent, because a self-registered doorbell would be an address of the agent's choosing that
+the mailbox then calls. Agent names stay unique across the mailbox, so the machine side is
+unchanged: an agent is still `Name@<mailbox name>`.
+
+**Full mailbox.** Hold-and-retry was replaced by rejection with a reason. The limit is high
+enough (5,000, with 14-day expiry) that only an agent that stopped collecting hits it, and a
+plain refusal is easier to reason about than a held queue and a mailbox-wide state.
+
+**Long names.** The mailbox caps names at 64 characters. The relay shortens a longer local
+name when it sends a message or the roster, and maps a reply to the shortened name back to
+the one registered agent it stands for; if it stands for more than one, the reply is
+refused.
+
+**Key storage.** On Windows the stored key is sealed with Windows data protection (DPAPI,
+current user, via ctypes) as `key_protected`. This protects a copied, synced or backed-up
+comms folder. It does not protect against a program running as the same user on the same
+machine, and nothing that lets an unattended relay read the key could. A Worker secret is
+the mailbox's own copy and cannot serve as the machine's. Elsewhere the key stays plain
+with owner-only permissions.

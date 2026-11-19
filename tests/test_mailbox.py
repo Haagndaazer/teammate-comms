@@ -91,7 +91,7 @@ class FakeMailbox:
         self.key = KEY
         self.calls, self.for_bots, self.for_pc, self.notes = [], [], [], []
         self.seen, self.rosters = {}, []
-        self.status, self.raises, self.defer, self.bot_extra = 200, None, (), {}
+        self.status, self.raises, self.full, self.bot_extra = 200, None, (), {}
         self.reject_text, self.raw = None, {}
 
     def post(self, url, key, body):
@@ -111,15 +111,17 @@ class FakeMailbox:
             self.notes.append(item)
         if "roster" in body:
             self.rosters.append(body["roster"])
-        accepted, rejected, deferred = [], [], []
+        accepted, rejected = [], []
         for ev in body.get("events") or []:
             if ev["id"] in self.seen:
                 (rejected if self.seen[ev["id"]] else accepted).append(
                     {"id": ev["id"], "error": self.seen[ev["id"]]} if self.seen[ev["id"]]
                     else ev["id"])
-            elif ev["to"] in self.defer:
-                deferred.append({"id": ev["id"], "error": f"{ev['to']} has not collected 500 "
-                                                          f"messages already in the mailbox"})
+            elif ev["to"] in self.full:
+                self.seen[ev["id"]] = (f"{ev['to']} has 5000 messages it has not collected, so its "
+                                       f"mailbox is full. Nothing more is accepted for it until it "
+                                       f"collects some")
+                rejected.append({"id": ev["id"], "error": self.seen[ev["id"]]})
             elif ev["to"] not in self.bots:
                 self.seen[ev["id"]] = (self.reject_text
                                        or f"no cloud agent named {ev['to']} uses this mailbox")
@@ -131,7 +133,7 @@ class FakeMailbox:
         bots = [{"name": b, "last_seen": None, "waiting": 0, "doorbell": True,
                  "doorbell_error": "", **self.bot_extra} for b in self.bots]
         return 200, {"v": 1, "worker": "1.0.0", "you_are": self.you_are, "accepted": accepted,
-                     "rejected": rejected, "deferred": deferred,
+                     "rejected": rejected,
                      "messages": list(self.for_pc)[:50], "bots": bots, **self.raw}
 
     def from_bot(self, to, message, sender="Grok", n=[0], **extra):
@@ -565,24 +567,19 @@ def test_states_and_notices():
               "a changed identity is not accepted silently")
         w.box.you_are = "desk"
 
-        w.box.defer = ("Grok",)
+        w.box.full = ("Grok",)
         w.box.bots.append("Quiet")
-        for i in range(mailbox_mod.BATCH_EVENTS + 5):
-            tools_mod.send_dm(w.root, None, "alice", "Grok@cloudbot", f"mailbox is full {i}")
-        tools_mod.send_dm(w.root, None, "alice", "Quiet@cloudbot", "behind the full ones")
+        tools_mod.send_dm(w.root, None, "alice", "Grok@cloudbot", "the mailbox is full")
+        tools_mod.send_dm(w.root, None, "alice", "Quiet@cloudbot", "behind the full one")
         w.pump(3, step=20)
         w.relay.tick()
         view = relay_mod.peer_view(w.root, "cloudbot")
-        check(view["state"] == "mailbox_full" and view["queued"] == mailbox_mod.BATCH_EVENTS + 5
-              and "has not collected 500 messages" in view["text"], f"full state keeps the messages: {view}")
-        check(any(e["to"] == "Quiet" for e in w.box.for_bots),
-              "mail for another agent is not stuck behind the full one")
-        check("the mailbox said: Grok has not collected" in view["text"], "the reason is attributed")
-        w.box.defer = ()
-        w.pump(6, step=40)
-        w.relay.tick()
-        check(relay_mod.peer_view(w.root, "cloudbot")["ok"] and relay_mod.queued_count(w.root, "cloudbot") == 0,
-              "a deferred message is delivered later")
+        check(view["ok"] and view["queued"] == 0, f"a full mailbox does not hold the message or the link: {view}")
+        check(any("REJECTED by cloudbot: your direct message was not" in n
+                  and "the mailbox said: Grok has 5000 messages it has not collected, so its mailbox is full" in n
+                  for n in notes(w.root, "alice")), f"the sender is told why: {notes(w.root, 'alice')[-2:]}")
+        check(any(e["to"] == "Quiet" for e in w.box.for_bots), "mail for another agent goes through")
+        w.box.full = ()
         check(KEY not in everything_written(w.root), "the key is in no log, status or roster file")
     finally:
         w.close()
@@ -740,20 +737,36 @@ def test_make_config():
             except SystemExit as e:
                 return e.code
 
-        check(run("--machine", "desk", "--bot", "Grok") == 0, "first run")
-        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        def stored():
+            return json.loads((out / "config.json").read_text(encoding="utf-8"))
+
+        def uploaded():
+            return json.loads(json.loads((out / "wrangler-secrets.json").read_text(encoding="utf-8"))["MAILBOX_CONFIG"])
+
+        check(run("--machine", "desk", "--account", "space-one", "--bot", "Grok", "--bot", "Scout") == 0, "first run")
+        config = stored()
         key = (out / "machine-desk.key").read_text(encoding="utf-8").strip()
         check(mailbox_mod.read_key_file(str(out / "machine-desk.key")) == key == config["machines"]["desk"],
               "the machine key file is one the relay accepts")
-        check((out / "bot-Grok.secret.txt").read_text(encoding="utf-8").strip()
-              == "Bearer " + config["bots"]["Grok"]["key"] and config["bots"]["Grok"]["key"].startswith("tcb_"),
-              "the bot secret is the whole header value")
+        token = config["accounts"]["space-one"]["key"]
+        check((out / "account-space-one.token.txt").read_text(encoding="utf-8").strip() == token
+              and token.startswith("tcb_") and list(config["accounts"]["space-one"]["bots"]) == ["Grok", "Scout"],
+              "one token for the account, both agents under it")
         check(run("--machine", "desk", "--bot", "Grok") == 1, "a second first-run is refused")
         check(run("--add-machine", "lap") == 0 and run("--rebuild") == 0, "extend and rebuild")
-        again = json.loads((out / "config.json").read_text(encoding="utf-8"))
-        check(again["machines"]["desk"] == key and again["bots"] == config["bots"], "existing keys are kept")
-        upload = json.loads(json.loads((out / "wrangler-secrets.json").read_text(encoding="utf-8"))["MAILBOX_CONFIG"])
-        check(upload["bots"]["Grok"] == {"key": config["bots"]["Grok"]["key"]}, "an empty doorbell is left out")
+        check(run("--add-bot", "Scribe") == 0 and "Scribe" in stored()["accounts"]["space-one"]["bots"],
+              "a bot joins the only account without naming it")
+        check(run("--add-account", "space-two", "--bot", "Lone") == 0, "a second account")
+        check(run("--add-bot", "Extra") == 1, "with two accounts a new bot must name its account")
+        check(run("--add-bot", "Extra", "--account", "space-two") == 0, "and joins the one named")
+        check(run("--add-bot", "grok", "--account", "space-two") == 1, "a name used in another account is refused")
+        check(run("--add-account", "space-two", "--bot", "Other") == 1, "an existing account is not replaced")
+        check(run("--add-account", "space-three") == 1, "an account needs at least one bot")
+        again = stored()
+        check(again["machines"]["desk"] == key and again["accounts"]["space-one"]["key"] == token
+              and again["accounts"]["space-two"]["key"] != token, "existing keys are kept, the new account has its own")
+        check(uploaded()["accounts"]["space-one"]["bots"]["Grok"] == {}, "an empty doorbell is left out")
+        check(list(uploaded()["accounts"]["space-two"]["bots"]) == ["Lone", "Extra"], "the upload lists every bot")
 
         def broken(mutate, label):
             saved = (out / "config.json").read_text(encoding="utf-8")
@@ -766,17 +779,21 @@ def test_make_config():
                   f"and leaves the upload file alone ({label})")
             (out / "config.json").write_text(saved, encoding="utf-8")
 
+        def grok(c):
+            return c["accounts"]["space-one"]["bots"]["Grok"]
+
         broken(lambda c: c["machines"].update(desk="short"), "a short key")
         broken(lambda c: c["machines"].update(lap=c["machines"]["desk"]), "a shared key")
-        broken(lambda c: c["bots"].update(Grok="oops"), "a bot that is not an object")
-        broken(lambda c: c["bots"]["Grok"].update(doorbell_url="http://x.example/h", doorbell_key="k"),
-               "an http doorbell")
-        broken(lambda c: c["bots"]["Grok"].update(doorbell_url="https://x.example/h"), "a doorbell with no key")
-        broken(lambda c: c["bots"]["Grok"].update(doorbell_url="https://", doorbell_key="k"), "a doorbell with no host")
-        broken(lambda c: c["bots"]["Grok"].update(doorbell_url="https://x.example/h", doorbell_key="  "),
-               "a blank doorbell key")
-        broken(lambda c: c["bots"]["Grok"].update(doorbell_url=5, doorbell_key="k"), "a doorbell that is not text")
-        broken(lambda c: c["bots"].update(grok=dict(c["bots"]["Grok"], key="tcb_" + "q" * 43)), "names differing by case")
+        broken(lambda c: c["accounts"]["space-two"].update(key=c["accounts"]["space-one"]["key"]), "a shared account key")
+        broken(lambda c: c["accounts"]["space-one"]["bots"].update(Grok="oops"), "a bot that is not an object")
+        broken(lambda c: c["accounts"]["space-one"].update(bots={}), "an account with no bots")
+        broken(lambda c: c["accounts"].update({"Bad Name": c["accounts"].pop("space-two")}), "a bad account name")
+        broken(lambda c: grok(c).update(doorbell_url="http://x.example/h", doorbell_key="k"), "an http doorbell")
+        broken(lambda c: grok(c).update(doorbell_url="https://x.example/h"), "a doorbell with no key")
+        broken(lambda c: grok(c).update(doorbell_url="https://", doorbell_key="k"), "a doorbell with no host")
+        broken(lambda c: grok(c).update(doorbell_url="https://x.example/h", doorbell_key="  "), "a blank doorbell key")
+        broken(lambda c: grok(c).update(doorbell_url=5, doorbell_key="k"), "a doorbell that is not text")
+        broken(lambda c: c["accounts"]["space-two"]["bots"].update(grok={}), "names differing by case")
         inside = REPO / "cloud-mailbox-worker" / "never-written"
         try:
             code = make_config.main(["--out", str(inside), "--machine", "desk", "--bot", "Grok"])
@@ -784,10 +801,75 @@ def test_make_config():
             code = e.code
         check(code == 1 and not inside.exists(), "a folder inside the repository is refused")
 
+        old = Path(td) / "old"
+        old.mkdir()
+        legacy = {"machines": {"desk": key}, "bots": {"Chief": {"key": token, "doorbell_url": "", "doorbell_key": ""}}}
+        (old / "config.json").write_text(json.dumps(legacy), encoding="utf-8")
+        (old / "bot-Chief.secret.txt").write_text("Bearer " + token, encoding="utf-8")
+        try:
+            code = make_config.main(["--out", str(old), "--add-bot", "Scout"])
+        except SystemExit as e:
+            code = e.code
+        new = json.loads((old / "config.json").read_text(encoding="utf-8"))
+        empty = {"doorbell_url": "", "doorbell_key": ""}
+        check(code == 0 and new["accounts"] == {"chief": {"key": token, "bots": {"Chief": empty, "Scout": empty}}}
+              and "bots" not in new, f"the one-key-per-bot layout is converted with its key kept: {new}")
+        check((old / "account-chief.token.txt").exists() and not (old / "bot-Chief.secret.txt").exists(),
+              "and its token file replaces the old secret file")
+
+
+def test_long_names_and_key_storage():
+    w = World()
+    try:
+        long_a, long_b = "a" * 64 + "-first", "a" * 64 + "-second"
+        longer = "b" * 70
+        for name in (long_a, long_b, longer):
+            add_agent(w.root, name)
+        w.pump()
+        names = [e["name"] for e in w.box.rosters[-1]]
+        check("b" * 64 in names and names.count("a" * 64) == 1 and all(len(n) <= 64 for n in names),
+              f"names are shortened to 64 characters for the mailbox: {[len(n) for n in names]}")
+        tools_mod.send_dm(w.root, None, longer, "Grok@cloudbot", "from a long name")
+        w.pump()
+        sent = [e for e in w.events() if e["message"] == "from a long name"]
+        check(sent and sent[0]["from"] == "b" * 64, f"the sender's name is shortened on the wire: {sent}")
+        ok = w.box.from_bot("b" * 64, "reply to the short form")
+        unclear = w.box.from_bot("a" * 64, "who is this for")
+        w.pump(3)
+        check(any(x.get("id") == ok["msg_id"] for x in unread(w.root, longer)),
+              "a reply to the shortened name reaches the one teammate it stands for")
+        reasons = {n["id"]: n["error"] for n in w.box.notes}
+        check("more than one teammate" in reasons.get(unclear["id"], ""),
+              f"a shortened name that fits two teammates is refused: {reasons.get(unclear['id'])!r}")
+        check(not unread(w.root, long_a) and not unread(w.root, long_b), "and delivered to neither")
+
+        path = mailbox_mod.mailboxes_file(w.root)
+        raw = path.read_text(encoding="utf-8")
+        if os.name == "nt":
+            check(KEY not in raw and "key_protected" in raw, "on Windows the stored key is not readable text")
+            check(KEY not in everything_written(w.root), "nor is it anywhere else on disk")
+        check(mailbox_mod.read_mailboxes(w.root)["cloudbot"]["key"] == KEY, "and is read back for use")
+        stored = json.loads(raw)
+        stored["mailboxes"]["copied"] = {"url": URL, "you_are": "desk", "key_protected": "QUJDRA=="}
+        path.write_text(json.dumps(stored), encoding="utf-8")
+        check(mailbox_mod.unreadable(w.root) == ["copied"] and "copied" not in relay_mod.read_mailboxes(w.root),
+              f"a key that cannot be opened here is not used: {mailbox_mod.unreadable(w.root)}")
+        report = relay_mod.peers_report(w.root, w.net)
+        check("copied: ⚠️ its stored key cannot be read" in report, f"and the listing says so: {report}")
+        calls = len(w.box.calls)
+        w.pump()
+        check(all(c["key"] == KEY for c in w.box.calls[calls:]), "nothing is sent with an unreadable key")
+        check("Unlinked" in relay_mod.unlink_mailbox(w.root, "copied"), "it can be unlinked")
+        check(mailbox_mod.read_mailboxes(w.root)["cloudbot"]["key"] == KEY and not mailbox_mod.unreadable(w.root),
+              "and the working link is untouched by that")
+    finally:
+        w.close()
+
 
 def main():
     tests = [
         ("key generator", test_make_config),
+        ("long names and key storage", test_long_names_and_key_storage),
         ("link rules and name collisions", test_link_rules),
         ("send to a cloud agent", test_send_to_cloud_agent),
         ("receive from a cloud agent", test_receive_from_cloud_agent),

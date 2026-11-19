@@ -77,7 +77,8 @@ export function world(config = baseConfig()) {
   };
   w.sync = async (machine, body = {}) => (await w.box.sync(machine, { v: 1, ...body })).body;
   w.tool = async (bot, name, args = {}) => {
-    const reply = await w.box.rpc(bot, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+    const account = w.box.config.bots[bot].account;
+    const reply = await w.box.rpc(account, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: { me: bot, ...args } } });
     const text = reply.result.content[0].text;
     return reply.result.isError ? { error: text } : JSON.parse(text);
   };

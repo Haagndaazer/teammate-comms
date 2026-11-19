@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.19.2
+
+- **Several cloud agents per connection.** Products such as Grok Bot and Rakazo share a
+  connector across every agent in an account or space, so one token cannot stand for one
+  agent. The mailbox now has **accounts**: one token per account, any number of named
+  agents under it, each with its own inbox and its own doorbell. An agent states its own
+  name (`me`) on each call; a name that is not in that account is refused and nothing is
+  read. An account with a single agent needs no `me`. Agents in one account can claim each
+  other's names: they are one trust unit.
+- `make_config.py` takes `--account`, `--add-account` and `--add-bot NAME --account LABEL`,
+  and writes one `account-<label>.token.txt` per account. A config in the 0.19.1
+  one-key-per-bot layout is converted in place with its keys kept.
+- **Full mailbox:** a message for a cloud agent holding 5,000 uncollected messages (was
+  500) is rejected and the sender told why, instead of being held and retried. The
+  hold-and-retry path and the `mailbox_full` state are gone.
+- **Long names:** an agent name longer than 64 characters is shortened to 64 for the
+  mailbox, and a reply to the shortened name reaches that agent. If it fits more than one
+  agent the reply is refused with the reason.
+- **Key storage:** on Windows the machine's mailbox key is encrypted with Windows data
+  protection for the logged-in user, so a copied or backed-up comms folder does not expose
+  it. A link whose key cannot be opened is listed as such and can be unlinked.
+
 ## 0.19.1
 
 - **Renamed:** the mailbox Worker's folder is now `cloud-mailbox-worker/` (it was

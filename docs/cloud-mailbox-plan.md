@@ -256,3 +256,12 @@ as with peer machines today.
 - A reply marks the message it answers; re-read output shows answered or not.
 - Open: `mailbox_full` is a state of the whole mailbox, so one full agent makes sends to
   other agents there show a warning although they are delivered.
+
+## 10. Changes in 0.19.2
+
+Sections 3.2 and 3.3 describe one key per bot. That is superseded: a key belongs to an
+account, an account lists its bots, and a bot states its name (`me`) on each call. See
+DESIGN.md, "0.19.2". The full-mailbox deferral added in section 7 was removed in favour of
+rejection with a reason; limits are 5,000 uncollected per bot and per machine, 2,000 per bot
+per machine. Open questions from sections 7 and 9 about the mailbox-wide full state are
+closed by that removal.

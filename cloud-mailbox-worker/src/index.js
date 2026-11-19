@@ -52,7 +52,7 @@ export default {
     if (!isSync && path !== "/mcp") return json({ error: "not_found" }, 404);
     const config = loadConfig(env);
     if (!config) return json({ error: "not_configured" }, 503);
-    const who = await identify(config, isSync ? "machines" : "bots", bearer(request));
+    const who = await identify(config, isSync ? "machines" : "accounts", bearer(request));
     if (!who) return json({ error: "unauthorized" }, 401, { "www-authenticate": "Bearer" });
     if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
     const body = await readJson(request, isSync ? MAX_SYNC_BYTES : MAX_MCP_BYTES);

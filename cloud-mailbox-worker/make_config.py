@@ -1,20 +1,27 @@
 """Create and maintain the secrets for a teammate-comms cloud mailbox.
 
-    python make_config.py --out <folder> --machine desktop --bot CommsTest
+    python make_config.py --out <folder> --machine desktop --account rakazo --bot Chief --bot Scout
     python make_config.py --out <folder> --add-machine laptop
+    python make_config.py --out <folder> --add-bot Scribe --account rakazo
+    python make_config.py --out <folder> --add-account grok --bot CommsTest
     python make_config.py --out <folder> --rebuild
 
-The folder then holds:
-    config.json            readable source of truth; paste each bot's doorbell here
-    wrangler-secrets.json  what to upload: npx wrangler secret bulk <folder>/wrangler-secrets.json
-    machine-<name>.key     one per machine, named in the terminal command that links it
-                           (python -m teammate_comms.peers link_mailbox <name> <url> <key file>)
-    bot-<name>.secret.txt  one per cloud agent, pasted into its masked secret
+An account is one place your cloud agents live that shares a single connection to the
+mailbox: a space, a workspace or a whole login, whatever the product shares connectors
+across. Every agent in it uses the account's one token and says its own name on each call.
+Agent names are unique across the whole mailbox.
 
-A machine name is a lowercase label of your choice; the cloud agent sees your agents as
+The folder then holds:
+    config.json               readable source of truth; paste each agent's doorbell here
+    wrangler-secrets.json     what to upload: npx wrangler secret bulk <folder>/wrangler-secrets.json
+    machine-<name>.key        one per machine, named in the terminal command that links it
+                              (python -m teammate_comms.peers link_mailbox <name> <url> <key file>)
+    account-<name>.token.txt  one per account: the bearer token for its mailbox connection
+
+A machine name is a lowercase label of your choice; a cloud agent sees your agents as
 name@<that label>. To replace a key, delete that entry from config.json, add it again with
---add-machine or --add-bot, then upload again and relink the machine or update the bot's
-secret. Keep the folder out of any project or synced folder. Standard library only.
+--add-machine or --add-account, then upload again and relink the machine or update the
+connection's token. Keep the folder out of any project or synced folder. Standard library only.
 """
 import argparse
 import json
@@ -25,11 +32,12 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-MACHINE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-BOT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+BOT_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}")
 MACHINE_KEY_RE = re.compile(r"tcm_[A-Za-z0-9_-]{32,124}")
-BOT_KEY_RE = re.compile(r"tcb_[A-Za-z0-9_-]{32,124}")
+ACCOUNT_KEY_RE = re.compile(r"tcb_[A-Za-z0-9_-]{32,124}")
 MAX_UPLOAD_BYTES = 4500
+DEFAULT_ACCOUNT = "main"
 
 
 def fail(message):
@@ -47,7 +55,51 @@ def in_repository(folder):
     return any((parent / ".git").exists() for parent in (folder, *folder.parents))
 
 
-def check_names(config):
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "bot"
+
+
+def load(path):
+    """The stored configuration, with the older one-key-per-bot layout converted."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        config = {"machines": dict(raw["machines"]), "accounts": {}}
+        for label, account in dict(raw.get("accounts") or {}).items():
+            config["accounts"][label] = {"key": account["key"], "bots": dict(account["bots"])}
+        for name, bot in dict(raw.get("bots") or {}).items():
+            label = slug(name)
+            if label in config["accounts"]:
+                fail(f"bot {name!r} in the old layout clashes with account {label!r}")
+            config["accounts"][label] = {"key": bot["key"], "bots": {name: {
+                "doorbell_url": bot.get("doorbell_url") or "",
+                "doorbell_key": bot.get("doorbell_key") or ""}}}
+        return config, [slug(n) for n in dict(raw.get("bots") or {})]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        fail(f"{path} is missing or not readable; create the mailbox first with --machine and --bot")
+
+
+def check_bot(name, bot):
+    if not BOT_RE.fullmatch(name) or name.lower() == "comms-relay":
+        fail(f"bot name {name!r} is not usable")
+    if not isinstance(bot, dict):
+        fail(f"bot {name!r} must be an object")
+    url, key = bot.get("doorbell_url") or "", bot.get("doorbell_key") or ""
+    if not isinstance(url, str) or not isinstance(key, str):
+        fail(f"bot {name!r}: doorbell_url and doorbell_key must be text")
+    url, key = url.strip(), key.strip()
+    if bool(url) != bool(key):
+        fail(f"bot {name!r}: doorbell_url and doorbell_key must both be set or both be empty")
+    if url:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:
+            parts, host = None, None
+        if not host or parts.scheme != "https":
+            fail(f"bot {name!r}: doorbell_url must be a full https:// address")
+
+
+def check(config):
     keys = set()
 
     def take(key, pattern, label):
@@ -58,63 +110,64 @@ def check_names(config):
             fail(f"{label}: its key is also used by another entry")
         keys.add(key)
 
-    if not isinstance(config.get("machines"), dict) or not isinstance(config.get("bots"), dict):
-        fail("config.json must have a 'machines' object and a 'bots' object")
+    if not isinstance(config.get("machines"), dict) or not isinstance(config.get("accounts"), dict):
+        fail("config.json must have a 'machines' object and an 'accounts' object")
     for name, key in config["machines"].items():
-        if not MACHINE_RE.fullmatch(name):
+        if not LABEL_RE.fullmatch(name):
             fail(f"machine name {name!r} must be lowercase letters, digits and hyphens")
         take(key, MACHINE_KEY_RE, f"machine {name!r}")
-    lowered = set()
-    for name, bot in config["bots"].items():
-        if not BOT_RE.fullmatch(name) or name.lower() == "comms-relay":
-            fail(f"bot name {name!r} is not usable")
-        if not isinstance(bot, dict):
-            fail(f"bot {name!r} must be an object with a key")
-        take(bot.get("key"), BOT_KEY_RE, f"bot {name!r}")
-        if name.lower() in lowered:
-            fail(f"two bot names differ only by case: {name!r}")
-        lowered.add(name.lower())
-        url, key = bot.get("doorbell_url") or "", bot.get("doorbell_key") or ""
-        if not isinstance(url, str) or not isinstance(key, str):
-            fail(f"bot {name!r}: doorbell_url and doorbell_key must be text")
-        url, key = url.strip(), key.strip()
-        if bool(url) != bool(key):
-            fail(f"bot {name!r}: doorbell_url and doorbell_key must both be set or both be empty")
-        if url:
-            try:
-                parts = urlsplit(url)
-                host = parts.hostname
-            except ValueError:
-                host = None
-            if parts.scheme != "https" or not host:
-                fail(f"bot {name!r}: doorbell_url must be a full https:// address")
-    if not config["machines"] or not config["bots"]:
+    seen = {}
+    for label, account in config["accounts"].items():
+        if not LABEL_RE.fullmatch(label):
+            fail(f"account name {label!r} must be lowercase letters, digits and hyphens")
+        if not isinstance(account, dict) or not isinstance(account.get("bots"), dict):
+            fail(f"account {label!r} must have a key and a 'bots' object")
+        take(account.get("key"), ACCOUNT_KEY_RE, f"account {label!r}")
+        if not account["bots"]:
+            fail(f"account {label!r} has no bots")
+        for name, bot in account["bots"].items():
+            check_bot(name, bot)
+            if name.lower() in seen:
+                fail(f"bot name {name!r} is used twice (also in account {seen[name.lower()]!r}); "
+                     f"names must be unique across the mailbox, ignoring capitals")
+            seen[name.lower()] = label
+    if not config["machines"] or not config["accounts"]:
         fail("at least one machine and one bot are needed")
 
 
 def upload_form(config):
-    bots = {}
-    for name, bot in config["bots"].items():
-        entry = {"key": bot["key"]}
-        if bot.get("doorbell_url"):
-            entry["doorbell_url"] = bot["doorbell_url"].strip()
-            entry["doorbell_key"] = bot["doorbell_key"].strip()
-        bots[name] = entry
-    return {"machines": config["machines"], "bots": bots}
+    accounts = {}
+    for label, account in config["accounts"].items():
+        bots = {}
+        for name, bot in account["bots"].items():
+            entry = {}
+            if (bot.get("doorbell_url") or "").strip():
+                entry = {"doorbell_url": bot["doorbell_url"].strip(),
+                         "doorbell_key": bot["doorbell_key"].strip()}
+            bots[name] = entry
+        accounts[label] = {"key": account["key"], "bots": bots}
+    return {"machines": config["machines"], "accounts": accounts}
 
 
-def write_all(out, config):
-    check_names(config)
+def write_all(out, config, converted=()):
     upload = json.dumps(upload_form(config))
     if len(upload.encode("utf-8")) > MAX_UPLOAD_BYTES:
         fail(f"the configuration is {len(upload.encode('utf-8'))} bytes, more than a Worker "
              f"secret can hold ({MAX_UPLOAD_BYTES}). Use a second mailbox for more bots.")
+    out.mkdir(parents=True, exist_ok=True)
     private_write(out / "config.json", json.dumps(config, indent=2) + "\n")
     private_write(out / "wrangler-secrets.json", json.dumps({"MAILBOX_CONFIG": upload}) + "\n")
     for name, key in config["machines"].items():
         private_write(out / f"machine-{name}.key", key + "\n")
-    for name, bot in config["bots"].items():
-        private_write(out / f"bot-{name}.secret.txt", f"Bearer {bot['key']}\n")
+    for label, account in config["accounts"].items():
+        private_write(out / f"account-{label}.token.txt", account["key"] + "\n")
+    for label in converted:
+        for name in config["accounts"][label]["bots"]:
+            (out / f"bot-{name}.secret.txt").unlink(missing_ok=True)
+
+
+def new_bot():
+    return {"doorbell_url": "", "doorbell_key": ""}
 
 
 def main(argv=None):
@@ -122,14 +175,21 @@ def main(argv=None):
         description="Create the secrets for a teammate-comms cloud mailbox.",
         epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True, help="Folder for the secret files, outside any project.")
-    parser.add_argument("--machine", action="append", default=[], help="Name for one of your machines.")
-    parser.add_argument("--bot", action="append", default=[], help="Name of a cloud agent.")
+    parser.add_argument("--machine", action="append", default=[],
+                        help="First run: a lowercase label for one of your machines.")
+    parser.add_argument("--account", default=None,
+                        help="The account the --bot or --add-bot names belong to "
+                             f"(lowercase label; default '{DEFAULT_ACCOUNT}' on the first run).")
+    parser.add_argument("--bot", action="append", default=[],
+                        help="A cloud agent's name, for the first run or with --add-account.")
     parser.add_argument("--add-machine", action="append", default=[],
                         help="Add a machine to an existing mailbox (lowercase label).")
+    parser.add_argument("--add-account", default=None,
+                        help="Add an account with its own token; name its agents with --bot.")
     parser.add_argument("--add-bot", action="append", default=[],
-                        help="Add a cloud agent to an existing mailbox.")
+                        help="Add a cloud agent to an existing account; needs --account.")
     parser.add_argument("--rebuild", action="store_true",
-                        help="Rewrite wrangler-secrets.json and key files from an edited config.json.")
+                        help="Rewrite the upload and key files from an edited config.json.")
     parser.add_argument("--allow-repository", action="store_true",
                         help="Write even though the folder is inside a git repository.")
     args = parser.parse_args(argv)
@@ -138,40 +198,54 @@ def main(argv=None):
         fail(f"{out} is inside a git repository. Choose a folder outside any project so the "
              f"keys cannot be committed.")
     path = out / "config.json"
-    updating = args.rebuild or args.add_machine or args.add_bot
+    converted = []
+    updating = args.rebuild or args.add_machine or args.add_bot or args.add_account
     if updating:
-        if args.machine or args.bot:
-            fail("use --add-machine/--add-bot to extend an existing mailbox")
-        try:
-            config = json.loads(path.read_text(encoding="utf-8"))
-            config["machines"], config["bots"] = dict(config["machines"]), dict(config["bots"])
-        except (OSError, ValueError, KeyError, TypeError):
-            fail(f"{path} is missing or not readable; create the mailbox first with --machine and --bot")
+        if args.machine:
+            fail("use --add-machine to extend an existing mailbox")
+        config, converted = load(path)
+        if args.add_account:
+            if args.add_account in config["accounts"]:
+                fail(f"account {args.add_account!r} is already in the mailbox")
+            if not args.bot:
+                fail("--add-account needs at least one --bot")
+            config["accounts"][args.add_account] = {
+                "key": "tcb_" + secrets.token_urlsafe(32), "bots": {n: new_bot() for n in args.bot}}
+        elif args.bot:
+            fail("--bot is for the first run or with --add-account; use --add-bot NAME --account LABEL")
+        if args.add_bot:
+            label = args.account or (next(iter(config["accounts"])) if len(config["accounts"]) == 1 else None)
+            if label not in config["accounts"]:
+                fail("say which account the new bot joins with --account; accounts: "
+                     + ", ".join(config["accounts"]))
+            for name in args.add_bot:
+                if name in config["accounts"][label]["bots"]:
+                    fail(f"bot {name!r} is already in account {label!r}")
+                config["accounts"][label]["bots"][name] = new_bot()
     else:
         if path.exists():
-            fail(f"{path} already exists. Use --add-machine, --add-bot or --rebuild; making new "
-                 f"keys would cut off everything already linked.")
+            fail(f"{path} already exists. Use --add-machine, --add-account, --add-bot or "
+                 f"--rebuild; making new keys would cut off everything already linked.")
         if not args.machine or not args.bot:
             fail("give at least one --machine and one --bot")
-        config = {"machines": {}, "bots": {}}
+        config = {"machines": {}, "accounts": {args.account or DEFAULT_ACCOUNT: {
+            "key": "tcb_" + secrets.token_urlsafe(32), "bots": {n: new_bot() for n in args.bot}}}}
     for name in args.machine + args.add_machine:
         if name in config["machines"]:
             fail(f"machine {name!r} is already in the mailbox")
         config["machines"][name] = "tcm_" + secrets.token_urlsafe(32)
-    for name in args.bot + args.add_bot:
-        if name in config["bots"]:
-            fail(f"bot {name!r} is already in the mailbox")
-        config["bots"][name] = {"key": "tcb_" + secrets.token_urlsafe(32), "doorbell_url": "",
-                                "doorbell_key": ""}
-    check_names(config)
-    out.mkdir(parents=True, exist_ok=True)
-    write_all(out, config)
+    check(config)
+    write_all(out, config, converted)
     print(f"Wrote the mailbox secrets to {out}")
     print(f"  machines: {', '.join(config['machines'])}")
-    print(f"  bots:     {', '.join(config['bots'])}")
-    missing = [n for n, b in config["bots"].items() if not b.get("doorbell_url")]
+    for label, account in config["accounts"].items():
+        print(f"  account {label}: {', '.join(account['bots'])}")
+    missing = [n for a in config["accounts"].values() for n, b in a["bots"].items()
+               if not (b.get("doorbell_url") or "").strip()]
     if missing:
         print(f"  no doorbell yet for: {', '.join(missing)} (paste it into config.json, then --rebuild)")
+    if converted:
+        print("  converted from the one-key-per-bot layout; keys are unchanged")
     print(f"Upload with: npx wrangler secret bulk \"{out / 'wrangler-secrets.json'}\"")
     return 0
 

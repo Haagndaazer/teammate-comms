@@ -4,6 +4,7 @@ and cloud agents that cannot reach it (see docs/cloud-mailbox-plan.md).
 This module owns the link file, the key file rules and the HTTPS client. The relay drives
 the exchange; nothing here listens for connections.
 """
+import base64
 import http.client
 import ipaddress
 import json
@@ -42,8 +43,8 @@ RATE_REFUSAL = (f"refused: more than {INBOUND_PER_WINDOW} messages from one clou
 KEY_FILE_MAX_BYTES = 256
 ID_FUTURE_SECONDS = 900
 ROSTER_REFRESH_SECONDS = 300
-DEFER_SECONDS = 60
-SCAN_FILES = 200
+CLOUD_NAME_CHARS = 64
+PROTECT_KEYS = os.name == "nt"
 ID_PAST_SECONDS = 15 * 86400
 NOTE_CHARS = 200
 LINK_ACTION = "link_mailbox"
@@ -66,25 +67,95 @@ def mailboxes_file(root):
     return get_relay_dir(root) / "mailboxes.json"
 
 
-def read_mailboxes(root):
-    """Linked mailboxes as ``{name: {"url", "key", "you_are"}}``."""
+def cloud_name(name):
+    """An agent's name as a mailbox carries it: at most 64 characters."""
+    return name[:CLOUD_NAME_CHARS]
+
+
+def _dpapi(data, protect):
+    """Encrypt or decrypt bytes for the current Windows user on this machine."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = Blob(len(data), buf), Blob()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(src), None, None, None, None, 1, ctypes.byref(out)):
+        raise OSError("Windows data protection refused")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+_unsealed = {}
+
+
+def seal(key):
+    return base64.b64encode(_dpapi(key.encode("utf-8"), True)).decode("ascii")
+
+
+def unseal(blob):
+    """The key inside a stored blob, or None when this user on this machine cannot open it."""
+    if blob not in _unsealed:
+        try:
+            _unsealed[blob] = _dpapi(base64.b64decode(blob, validate=True), False).decode("utf-8")
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if len(_unsealed) > 64:
+            _unsealed.pop(next(iter(_unsealed)))
+    return _unsealed[blob]
+
+
+def _stored(root):
+    """Every well-formed stored link as ``{name: {"url", "you_are", "key" or None}}``."""
     data = read_json_readonly(mailboxes_file(root))
     boxes = data.get("mailboxes") if isinstance(data, dict) else None
     out = {}
     for name, cfg in (boxes.items() if isinstance(boxes, dict) else ()):
-        if (isinstance(name, str) and MACHINE_NAME_PATTERN.fullmatch(name)
-                and isinstance(cfg, dict)
-                and isinstance(cfg.get("url"), str) and isinstance(cfg.get("key"), str)
-                and _KEY_RE.fullmatch(cfg["key"]) and isinstance(cfg.get("you_are"), str)
+        if not (isinstance(name, str) and MACHINE_NAME_PATTERN.fullmatch(name)
+                and isinstance(cfg, dict) and isinstance(cfg.get("url"), str)
+                and isinstance(cfg.get("you_are"), str)
                 and MACHINE_NAME_PATTERN.fullmatch(cfg["you_are"])):
-            out[name] = {"url": cfg["url"], "key": cfg["key"], "you_are": cfg["you_are"]}
+            continue
+        key = cfg.get("key")
+        if isinstance(cfg.get("key_protected"), str):
+            key = unseal(cfg["key_protected"]) if PROTECT_KEYS else None
+        if not isinstance(key, str) or not _KEY_RE.fullmatch(key):
+            key = None
+        out[name] = {"url": cfg["url"], "key": key, "you_are": cfg["you_are"]}
     return out
+
+
+def read_mailboxes(root):
+    """Linked mailboxes as ``{name: {"url", "key", "you_are"}}``."""
+    return {name: cfg for name, cfg in _stored(root).items() if cfg["key"]}
+
+
+def unreadable(root):
+    """Linked names whose stored key cannot be opened here, for example a copied comms folder."""
+    return sorted(name for name, cfg in _stored(root).items() if not cfg["key"])
 
 
 def _write(root, boxes):
     path = mailboxes_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(path, {"mailboxes": boxes})
+    kept = (read_json_readonly(path) or {}).get("mailboxes") or {}
+    out = {}
+    for name, cfg in boxes.items():
+        if not cfg["key"]:
+            out[name] = kept[name]
+        elif PROTECT_KEYS:
+            out[name] = {"url": cfg["url"], "you_are": cfg["you_are"],
+                         "key_protected": seal(cfg["key"])}
+        else:
+            out[name] = cfg
+    write_json_atomic(path, {"mailboxes": out})
     if os.name != "nt":
         try:
             os.chmod(path, 0o600)
@@ -244,7 +315,7 @@ def link(root, name, url, key_file, taken, post=None):
     if name in taken:
         raise CommsError(f"{name!r} cannot be used as a mailbox name: {taken[name]}. Pick "
                          f"another short name, for example 'cloudbot'.")
-    if name in read_mailboxes(root):
+    if name in _stored(root):
         raise CommsError(f"{name!r} is already a linked mailbox. Unlink it first if it should "
                          f"point somewhere else or use a new key.")
     base = clean_url(url)
@@ -267,7 +338,7 @@ def link(root, name, url, key_file, taken, post=None):
     path = mailboxes_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
-        boxes = read_mailboxes(root)
+        boxes = _stored(root)
         if name in boxes:
             raise CommsError(f"{name!r} is already a linked mailbox.")
         boxes[name] = {"url": base, "key": key, "you_are": me}
@@ -281,7 +352,7 @@ def unlink(root, name):
     path = mailboxes_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
-        boxes = read_mailboxes(root)
+        boxes = _stored(root)
         if name not in boxes:
             raise CommsError(f"{name!r} is not a linked mailbox.")
         boxes.pop(name)
