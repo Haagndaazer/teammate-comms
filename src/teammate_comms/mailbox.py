@@ -215,7 +215,7 @@ def link(root, name, url, key_file, taken, post=None):
     name = validate_machine_name(name, param="machine")
     if name in taken:
         raise CommsError(f"{name!r} cannot be used as a mailbox name: {taken[name]}. Pick "
-                         f"another short name, for example 'grok'.")
+                         f"another short name, for example 'cloudbot'.")
     if name in read_mailboxes(root):
         raise CommsError(f"{name!r} is already a linked mailbox. Unlink it first if it should "
                          f"point somewhere else or use a new key.")

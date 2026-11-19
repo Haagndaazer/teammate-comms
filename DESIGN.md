@@ -1159,7 +1159,7 @@ a prompt at its first semicolon. `spawn_in_terminal` now escapes it.
 
 Plan and field findings: `docs/cloud-mailbox-plan.md`. A cloud agent (first: xAI Grok Bot)
 cannot reach the user's machines and they have no public address, so both sides call out to
-a mailbox Worker (`mailbox-worker/`) the user deploys to their own Cloudflare account.
+a mailbox Worker (`cloud-mailbox-worker/`) the user deploys to their own Cloudflare account.
 
 **Why a mailbox and not the webhook.** Grok Bot's routine webhook starts a run but cannot
 carry content: it drops a field named `context`, cuts a body somewhere between 2 KB and 8 KB,
@@ -1222,5 +1222,5 @@ allowance but a doorbell that was broken for a while must still recover.
 **Testing.** The Worker's logic takes its storage, clock, fetch and alarm setter as
 arguments and runs under `node --test` with a Map-backed store. `tests/test_mailbox.py`
 drives the relay against an in-process fake of the same protocol.
-`mailbox-worker/test/integration.py` runs the real relay code against the real Worker under
+`cloud-mailbox-worker/test/integration.py` runs the real relay code against the real Worker under
 `wrangler dev`; it needs npm access and is run by hand.

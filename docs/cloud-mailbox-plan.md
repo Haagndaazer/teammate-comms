@@ -59,7 +59,7 @@ teammate session --> local relay --HTTPS (outbound only)--> mailbox Worker <--MC
 - Keys are generated on the user's machine and reach the agent session only as a file
   path, never as text in the conversation.
 
-### 3.3 The mailbox Worker (`mailbox-worker/` in the repo)
+### 3.3 The mailbox Worker (`cloud-mailbox-worker/` in the repo)
 
 Plain JavaScript, no npm dependencies. One Durable Object holds all state through the
 key-value storage API, so the logic can be tested under `node --test` with a Map-backed
@@ -149,7 +149,7 @@ is refused. The relay's connection check accepts real peers only.
 
 ### 3.6 Setup tooling and documentation
 
-- `mailbox-worker/make_config.py` (stdlib): given machine and bot names, writes a readable
+- `cloud-mailbox-worker/make_config.py` (stdlib): given machine and bot names, writes a readable
   `config.json`, the `wrangler-secrets.json` to upload, and one key file per machine and
   bot. `--rebuild` regenerates the upload file after the doorbell is pasted in.
 - README section "Cloud agents: Grok Bot through a mailbox" with the full walkthrough:
@@ -169,7 +169,7 @@ is refused. The relay's connection check accepts real peers only.
 
 ## 5. Tests
 
-- `mailbox-worker/test/*.test.mjs` under `node --test`: auth separation, config
+- `cloud-mailbox-worker/test/*.test.mjs` under `node --test`: auth separation, config
   validation, sync idempotence, ack and redelivery, limits, name resolution, rate limit,
   doorbell debounce and retries with a fake clock and fake fetch, retention, MCP framing.
 - `tests/test_mailbox.py`: relay side against an in-process fake mailbox. Link and unlink

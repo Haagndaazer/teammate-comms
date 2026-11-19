@@ -1,6 +1,6 @@
 """End to end: the real relay code against the real Worker under `wrangler dev`.
 
-    python mailbox-worker/test/integration.py
+    python cloud-mailbox-worker/test/integration.py
 
 Needs Node and network access to fetch wrangler. Not part of the default test run.
 """
@@ -118,9 +118,9 @@ def main():
             comms.write_agent_record(root, None, name, type="full", channel=True, pid=os.getpid(),
                                      host=socket.gethostname(), lastHeartbeat=comms.now_timestamp())
         relay = relay_mod.Relay(root, net=NoTailscale(), port=1)
-        text = relay_mod.link_mailbox(root, "grok", f"http://127.0.0.1:{port}",
+        text = relay_mod.link_mailbox(root, "cloudbot", f"http://127.0.0.1:{port}",
                                       str(secrets_dir / "machine-desk.key"), net=NoTailscale())
-        check("Grok@grok" in text and "Bell@grok" in text, "linked; the mailbox reports its cloud agents")
+        check("Grok@cloudbot" in text and "Bell@cloudbot" in text, "linked; the mailbox reports its cloud agents")
 
         def rpc(method, params=None, rid=1):
             body = {"jsonrpc": "2.0", "method": method}
@@ -143,10 +143,10 @@ def main():
               == ["mail_check", "mail_send", "mail_teammates"], "three tools listed")
 
         big = ("\U0001F600" * (tools_mod.MAX_MESSAGE_CHARS // 2 - 20)) + " end-marker-quartz"
-        sent = tools_mod.send_dm(root, None, "alice", "Grok@grok", big)
-        tools_mod.send_dm(root, None, "alice", "Bell@grok", "ring please")
+        sent = tools_mod.send_dm(root, None, "alice", "Grok@cloudbot", big)
+        tools_mod.send_dm(root, None, "alice", "Bell@cloudbot", "ring please")
         relay.mailbox_tick()
-        check(relay_mod.queued_count(root, "grok") == 0, "outbox drained into the real mailbox")
+        check(relay_mod.queued_count(root, "cloudbot") == 0, "outbox drained into the real mailbox")
         mates = tool("mail_teammates")
         check(mates["machines"][0]["teammates"] == [{"address": "alice@desk", "running": True}],
               f"the bot sees the roster: {mates}")
@@ -160,14 +160,14 @@ def main():
         check(reply["to"] == "alice@desk", f"bare name resolved by the roster: {reply}")
         check("no teammate named ghost" in tool("mail_send", {"to": "ghost@desk", "message": "x"}),
               "an unknown recipient is refused at once")
-        relay._peer("grok")["next_due"] = 0
+        relay._peer("cloudbot")["next_due"] = 0
         relay.mailbox_tick()
         inbox = comms.read_json_readonly(comms.get_inboxes_dir(root, None) / "alice_unread.json") or []
-        mine = [m for m in inbox if m.get("from") == "Grok@grok"]
+        mine = [m for m in inbox if m.get("from") == "Grok@cloudbot"]
         check(len(mine) == 1 and mine[0]["message"] == mailbox_mod.CLOUD_BANNER + "\nhello from the cloud"
               and mine[0]["id"] == reply["sent"] and mine[0].get("reply_to") == sent["id"],
               f"the reply lands in alice's inbox with the banner: {mine}")
-        st = relay._peer("grok")
+        st = relay._peer("cloudbot")
         st["next_due"] = 0
         relay.mailbox_tick()
         st["next_due"] = 0

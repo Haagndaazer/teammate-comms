@@ -122,7 +122,7 @@ A cloud agent runs outside your user's machines and cannot reach them. Your user
 small mailbox to their own Cloudflare account and link this machine to it. Then:
 - teammate_list shows it under "Cloud agents" as Name@<mailbox name>, with when it last
   checked its mail and how much is waiting.
-- teammate_send(to="Name@<mailbox name>", ...) sends it a direct message. It is not woken
+- teammate_send(to="Name@<mailbox name>", ...), for example CommsTest@cloudbot, sends it a direct message. It is not woken
   like a local teammate: the mailbox rings its doorbell and it reads the message when its
   next run starts, usually within a minute. Its answer arrives as a normal message.
 - Direct messages are all it can do. It cannot be added to a group, and cannot be started or

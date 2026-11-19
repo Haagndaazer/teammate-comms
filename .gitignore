@@ -18,6 +18,6 @@ dist/
 # Keep uv.lock tracked (reproducible installs) — do not add it here.
 
 # Cloud mailbox Worker: local wrangler state and dev secrets.
-mailbox-worker/.wrangler/
-mailbox-worker/.dev.vars
-mailbox-worker/node_modules/
+cloud-mailbox-worker/.wrangler/
+cloud-mailbox-worker/.dev.vars
+cloud-mailbox-worker/node_modules/

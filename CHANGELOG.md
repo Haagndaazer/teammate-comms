@@ -1,12 +1,21 @@
 # Changelog
 
+## 0.19.1
+
+- **Renamed:** the mailbox Worker's folder is now `cloud-mailbox-worker/` (it was
+  `mailbox-worker/` in 0.19.0) and it deploys under the name `cloud-mailbox-worker`.
+- The documentation and examples name the mailbox `cloudbot`, so a cloud agent reads
+  `CommsTest@cloudbot`. The mailbox is not specific to one product; Grok Bot is the first
+  one documented. The name is still whatever you choose when linking, and an existing link
+  is unaffected.
+
 ## 0.19.0
 
 > Cloud agents as teammates. An agent that runs in someone else's cloud and cannot reach
 > your machines (first: xAI Grok Bot) can exchange direct messages with your agents through
 > a small **mailbox** Worker that you deploy to your own Cloudflare account.
 
-- **New:** `mailbox-worker/`, a dependency-free Cloudflare Worker with one Durable Object.
+- **New:** `cloud-mailbox-worker/`, a dependency-free Cloudflare Worker with one Durable Object.
   Machines sync with it over outbound HTTPS; a cloud agent uses it as an MCP server
   (`mail_check`, `mail_send`, `mail_teammates`). It rings the agent's webhook when mail
   arrives, at most once a minute and 100 times a day.
@@ -20,7 +29,7 @@
   naming a cloud agent are refused; nothing else is ever sent to or accepted from a mailbox.
 - A message from a cloud agent is delivered only to a registered agent session, at normal
   priority, with a first line saying it comes from outside your machines.
-- Every caller of the mailbox is identified by its own key. `mailbox-worker/make_config.py`
+- Every caller of the mailbox is identified by its own key. `cloud-mailbox-worker/make_config.py`
   generates them.
 - The relay now also runs when only a mailbox is linked, with no peer machines and without
   Tailscale.

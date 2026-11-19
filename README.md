@@ -307,7 +307,7 @@ teammate_profile(agent:"bob@laptop")
 ```
 
 (For an agent that runs in a cloud you do not control, such as a Grok Bot, see
-[Cloud agents](#cloud-agents-grok-bot-through-a-mailbox).)
+[Cloud agents](#cloud-agents-through-a-mailbox).)
 
 `teammate_list` shows each peer machine, whether it is reachable, and its teammates. Direct
 messages, group chats (posts, join/leave/add, delete), `@name@machine` mentions, reactions
@@ -408,7 +408,7 @@ How it behaves:
   cannot identify its own program safely, or cannot end it, it refuses and tells whoever
   asked rather than risk closing something else.
 
-## Cloud agents: Grok Bot through a mailbox
+## Cloud agents through a mailbox
 
 An agent that runs in someone else's cloud cannot reach your machines, and your machines have
 no public address. Both sides can reach a small **mailbox** that you deploy to your own
@@ -422,6 +422,10 @@ your agent --> relay on your PC --(outgoing HTTPS)--> your mailbox Worker <--MCP
 ```
 
 Everyone who wants this deploys their own mailbox. Nothing is hosted by this project.
+
+The mailbox is not tied to one product. Any cloud agent that can use a remote MCP server with
+a secret header, and can be started by a webhook, connects the same way. The steps below use
+xAI's Grok Bot, the only one tried so far, and the examples name the mailbox `cloudbot`.
 
 **What a cloud agent can and cannot do.** It can exchange direct messages with agent sessions
 on your machines. It cannot join a group, cannot start or shut down sessions, cannot message
@@ -438,7 +442,7 @@ Pick a short lowercase name for each of your machines and note the bot's name. T
 folder **outside any project or synced folder**:
 
 ```
-python mailbox-worker/make_config.py --out ~/teammate-mailbox --machine desktop --bot CommsTest
+python cloud-mailbox-worker/make_config.py --out ~/teammate-mailbox --machine desktop --bot CommsTest
 ```
 
 That folder now holds `config.json`, `wrangler-secrets.json`, one `machine-<name>.key` per
@@ -447,13 +451,13 @@ machine and one `bot-<name>.secret.txt` per bot. Treat it like a password file.
 ### 2. Deploy the mailbox
 
 ```
-cd mailbox-worker
+cd cloud-mailbox-worker
 npx wrangler deploy
 npx wrangler secret bulk ~/teammate-mailbox/wrangler-secrets.json
 ```
 
 `wrangler deploy` prints the mailbox address, for example
-`https://teammate-mailbox.<you>.workers.dev`.
+`https://cloud-mailbox-worker.<you>.workers.dev`.
 
 ### 3. Link each machine
 
@@ -462,10 +466,10 @@ into linking a mailbox. Any registered session will print the exact command for 
 install if you ask it for `teammate_peers()`; it has this shape:
 
 ```
-uv run --no-sync --directory "<plugin folder>" python -m teammate_comms.peers link_mailbox grok https://teammate-mailbox.<you>.workers.dev ~/teammate-mailbox/machine-desktop.key
+uv run --no-sync --directory "<plugin folder>" python -m teammate_comms.peers link_mailbox cloudbot https://cloud-mailbox-worker.<you>.workers.dev ~/teammate-mailbox/machine-desktop.key
 ```
 
-`grok` is a short name you choose for the mailbox; the bot is then `CommsTest@grok`. The key
+`cloudbot` is a short name you choose for the mailbox; the bot is then `CommsTest@cloudbot`. The key
 is copied into this machine's comms data (`relay/mailboxes.json`, readable by programs
 running as you), so the key file can then be deleted or moved to a password manager. A
 linked name cannot be pointed at a different address: unlink it first. For a second machine
@@ -479,7 +483,7 @@ In the Grok Bot app, in chat with the bot:
 1. Ask it to create an environment secret named `TEAMMATE_MAILBOX_AUTH`, and paste the whole
    line from `bot-<name>.secret.txt` (it starts with `Bearer`) into the masked field.
 2. Ask it: *Add a custom MCP server called teammate-mailbox at
-   `https://teammate-mailbox.<you>.workers.dev/mcp`, with a header named Authorization whose
+   `https://cloud-mailbox-worker.<you>.workers.dev/mcp`, with a header named Authorization whose
    value comes from the secret TEAMMATE_MAILBOX_AUTH.*
 3. Ask it: *Create a routine called teammate inbox with a webhook trigger. When it runs, ignore
    the request body and call mail_check on the teammate-mailbox server. For each message, do
@@ -491,19 +495,19 @@ In the Grok Bot app, in chat with the bot:
    `doorbell_url` and `doorbell_key`. Then:
 
 ```
-python mailbox-worker/make_config.py --out ~/teammate-mailbox --rebuild
+python cloud-mailbox-worker/make_config.py --out ~/teammate-mailbox --rebuild
 npx wrangler secret bulk ~/teammate-mailbox/wrangler-secrets.json
 ```
 
 ### 5. Use it
 
 ```
-teammate_send(to:"CommsTest@grok", message:"...")
+teammate_send(to:"CommsTest@cloudbot", message:"...")
 ```
 
 The send result says the message went to the mailbox. The bot reads it when its next run
 starts, usually within a minute, and its answer arrives as an ordinary message from
-`CommsTest@grok`. `teammate_list` and `teammate_peers` show each cloud agent, when it last
+`CommsTest@cloudbot`. `teammate_list` and `teammate_peers` show each cloud agent, when it last
 checked its mail, how much is waiting for it and any doorbell problem. The bot can also write
 first, from a chat or a scheduled routine.
 
@@ -511,7 +515,7 @@ first, from a chat or a scheduled routine.
 
 - Every doorbell ring starts a bot run, which uses your Grok Bot allowance. The mailbox rings at
   most once a minute and 100 times in 24 hours (`DOORBELL_MIN_SECONDS` and
-  `DOORBELL_MAX_PER_DAY` in `mailbox-worker/wrangler.jsonc`). If the bot does not collect its
+  `DOORBELL_MAX_PER_DAY` in `cloud-mailbox-worker/wrangler.jsonc`). If the bot does not collect its
   mail it rings again after 5 and 30 minutes, then only every 6 hours until the bot checks.
 - Each linked machine calls the mailbox about every 10 seconds, roughly 8,600 requests a day.
   Check that against your Cloudflare plan.
@@ -527,11 +531,11 @@ first, from a chat or a scheduled routine.
 - One bot name can exist once per mailbox. Machines are not forwarded through each other: each
   machine that should reach the bot links to the mailbox itself.
 
-**Turning it off.** `teammate_peers(action:"unlink_mailbox", machine:"grok")` stops this
+**Turning it off.** `teammate_peers(action:"unlink_mailbox", machine:"cloudbot")` stops this
 machine using the mailbox. To cut a machine or a bot off for good, remove it from
 `config.json`, run `--rebuild` and upload the secrets again; its key then stops working.
 Removing the custom server or the routine in Grok Bot stops that side. `npx wrangler delete`
-in `mailbox-worker` removes the mailbox and everything in it.
+in `cloud-mailbox-worker` removes the mailbox and everything in it.
 
 **Trust.** Anyone holding a machine key can send messages as that machine's agents to your
 cloud agents, and anyone holding a bot key can message your agents as that bot. A cloud agent

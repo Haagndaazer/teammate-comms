@@ -66,4 +66,4 @@ jobs:
       # The mailbox Worker's logic has no npm dependencies; the runner's own Node runs it.
       - name: Run mailbox Worker suite
         if: ${{ !cancelled() }}
-        run: node --test mailbox-worker/test/mailbox.test.mjs
+        run: node --test cloud-mailbox-worker/test/mailbox.test.mjs
