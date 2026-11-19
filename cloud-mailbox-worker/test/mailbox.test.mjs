@@ -163,7 +163,7 @@ test("agents sharing one connection each have their own inbox, chosen by name", 
 
   const none = await call("space-one", "mail_check", {});
   assert.equal(none.result.isError, true);
-  assert.match(text(none), /say which one you are: pass me as one of Chief, Scout/);
+  assert.match(text(none), /give your own name: set me to one of Chief, Scout/);
   const wrong = await call("space-one", "mail_check", { me: "Lone" });
   assert.match(text(wrong), /"Lone" is not an agent on this connection.*one of Chief, Scout.*Nothing was read/);
   assert.match(text(await call("space-one", "mail_send", { me: 5, to: "a@desk", message: "x" })), /me must be your own name/);

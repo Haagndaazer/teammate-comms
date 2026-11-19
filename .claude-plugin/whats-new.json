@@ -1,4 +1,7 @@
 {
+  "0.19.3": [
+    "Bringing a cloud agent onto the mailbox is now one sentence to paste to it, with its own name: Use the teammate-comms server to check for mail with your name set to Sam, and do what the message asks."
+  ],
   "0.19.2": [
     "Several cloud agents can now share one mailbox connection, each with its own inbox and its own wake-up call. This suits products where a connector is shared by every agent in a space or account.",
     "On Windows the mailbox key is now stored encrypted for your Windows login. A message for a cloud agent whose mailbox is full is refused with the reason, and the mailbox holds ten times more."

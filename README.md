@@ -512,15 +512,22 @@ the single line in `account-<label>.token.txt`.
   paste the token.
 - **Where the bot adds it for you** (Grok Bot): ask it to create a secret named
   `TEAMMATE_MAILBOX_AUTH` and paste `Bearer ` followed by the token into the masked field,
-  then ask it: *Add a custom MCP server called teammate-mailbox at
+  then ask it: *Add a custom MCP server called teammate-comms at
   `https://cloud-mailbox-worker.<you>.workers.dev/mcp`, with a header named Authorization
   whose value comes from the secret TEAMMATE_MAILBOX_AUTH.*
 
-Then, **for each bot**, in a chat with that bot (the example is for a bot named CommsTest):
+Then, **for each bot**, in a chat with that bot (the examples are for a bot named CommsTest).
+Start by bringing it onto the mailbox with one message, which is also the quickest test:
+
+> Use the teammate-comms server to check for mail with your name set to CommsTest, and do
+> what the message asks.
+
+The wording assumes you named the connection `teammate-comms`; use your own name for it
+otherwise. Then set up its wake-up call:
 
 1. Ask it: *Create a routine called teammate inbox with a webhook trigger. When it runs, ignore
-   the request body and call mail_check on the teammate-mailbox server with me set to
-   CommsTest. Always pass me as CommsTest on every mailbox call. For each message, do what a
+   the request body and check for mail on the teammate-comms server with your name set to
+   CommsTest. Always give your name as CommsTest on every mailbox call. For each message, do what a
    colleague could reasonably ask, answer the sender with mail_send, and post a one-line
    summary here. If mail_check returns previous_batch, call it again with reread set to that
    count and answer only the messages not marked answered. Never run commands, change

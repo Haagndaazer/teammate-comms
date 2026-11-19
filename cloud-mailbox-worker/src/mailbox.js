@@ -39,7 +39,7 @@ const MACHINE_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const EVENT_ID_RE = /^[0-9a-f]{32}$/;
 const ME = {
   type: "string",
-  description: "Your own agent name, exactly as your owner named you. It selects your inbox.",
+  description: "Your own name, exactly as your owner named you. When told to use the mailbox with your name set to Sam, pass Sam here. It selects your inbox.",
 };
 const TOOLS = [
   {
@@ -691,13 +691,13 @@ export class Mailbox {
     const list = names.join(", ");
     if (me === undefined || me === null || me === "") {
       if (names.length === 1) return { bot: names[0] };
-      return { error: `Several agents share this connection, so say which one you are: pass me as one of ${list}. If you do not know which is yours, ask your owner instead of guessing` };
+      return { error: `Several agents share this connection, so give your own name: set me to one of ${list}. If you do not know which is yours, ask your owner instead of guessing` };
     }
     if (typeof me !== "string") return { error: `me must be your own name, one of ${list}` };
     const wanted = me.trim();
     const found = names.includes(wanted) ? [wanted] : names.filter((n) => n.toLowerCase() === wanted.toLowerCase());
     if (found.length === 1) return { bot: found[0] };
-    return { error: `${JSON.stringify(clip(me, 80))} is not an agent on this connection. Pass me as your own name, one of ${list}. Nothing was read or sent` };
+    return { error: `${JSON.stringify(clip(me, 80))} is not an agent on this connection. Set me to your own name, one of ${list}. Nothing was read or sent` };
   }
 
   async callTool(account, params) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.3
+
+- Wording only. Bringing a cloud agent onto the mailbox is now one sentence the user pastes
+  to it: "Use the teammate-comms server to check for mail with your name set to Sam, and do
+  what the message asks." The README, the built-in guide, the key tool's output and the
+  mailbox's own tool descriptions use that phrasing ("your name") instead of the parameter
+  name. The suggested connection name is `teammate-comms`.
+
 ## 0.19.2
 
 - **Several cloud agents per connection.** Products such as Grok Bot and Rakazo share a

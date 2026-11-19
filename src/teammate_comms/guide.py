@@ -143,6 +143,9 @@ mailbox calls to start the agent's next run. Once your user has linked this mach
   one mailbox the same trust.
 - The mailbox is told only the names of the agent sessions on this machine, in every
   project, and whether each is running. Message text you send goes through the mailbox.
+To bring a new cloud agent onto the mailbox, your user pastes this to it, with its own name
+and the name they gave the connection: "Use the teammate-comms server to check for mail with
+your name set to Sam, and do what the message asks." Offer them that sentence when asked.
 No answer after several minutes: call teammate_list. "N message(s) waiting for it" counts
 everything it has not collected, not only yours. Nothing waiting means it collected your
 message and may still be working, or answer much later. Mail still waiting, a doorbell

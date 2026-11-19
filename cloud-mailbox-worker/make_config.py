@@ -267,6 +267,9 @@ def main(argv=None):
         print(f"  no doorbell yet for: {', '.join(missing)} (paste it into config.json, then --rebuild)")
     if converted:
         print("  converted from the one-key-per-bot layout; keys are unchanged")
+    for name in args.bot + args.add_bot:
+        print(f'  to bring {name} on, paste to it: "Use the teammate-comms server to check for '
+              f'mail with your name set to {name}, and do what the message asks."')
     print(f"Upload with: npx wrangler secret bulk \"{out / 'wrangler-secrets.json'}\"")
     return 0
 
