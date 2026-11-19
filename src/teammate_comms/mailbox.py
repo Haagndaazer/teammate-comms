@@ -9,6 +9,8 @@ import ipaddress
 import json
 import os
 import re
+import time
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
@@ -31,7 +33,12 @@ BATCH_EVENTS = 20
 BATCH_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 INBOUND_PER_WINDOW = 60
+INBOUND_MAILBOX_PER_WINDOW = 180
 INBOUND_WINDOW_SECONDS = 600
+APPLY_BUDGET_SECONDS = 5
+SYNC_DEADLINE_SECONDS = 30
+RATE_REFUSAL = (f"refused: more than {INBOUND_PER_WINDOW} messages from one cloud agent in "
+                f"{INBOUND_WINDOW_SECONDS // 60} minutes. Send fewer messages")
 KEY_FILE_MAX_BYTES = 256
 ID_FUTURE_SECONDS = 900
 ROSTER_REFRESH_SECONDS = 300
@@ -51,7 +58,8 @@ ALLOW_INSECURE = False
 
 KEY_PREFIX = "tcm_"
 _KEY_RE = re.compile(r"tcm_[A-Za-z0-9_-]{32,124}")
-_HEADER_LOOKALIKE = re.compile(r"(?m)^(\s*)---(?=\s*id:)")
+_HEADER_LOOKALIKE = re.compile(r"-{3,}(?=\s*id\s*:)", re.IGNORECASE)
+_BOT_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}")
 
 
 def mailboxes_file(root):
@@ -147,7 +155,17 @@ def post_sync(url, key, body, timeout=HTTP_TIMEOUT_SECONDS):
                               "Authorization": "Bearer " + key,
                               "User-Agent": "teammate-comms-relay"})
         resp = conn.getresponse()
-        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        deadline = time.monotonic() + SYNC_DEADLINE_SECONDS
+        chunks, size = [], 0
+        while size <= MAX_RESPONSE_BYTES:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if time.monotonic() > deadline:
+                raise TimeoutError("the mailbox answered too slowly")
+        raw = b"".join(chunks)
     finally:
         conn.close()
     if len(raw) > MAX_RESPONSE_BYTES:
@@ -164,6 +182,12 @@ def clean_note(value):
     return " ".join(str(value or "").split())[:NOTE_CHARS]
 
 
+def said(value):
+    """Mailbox-supplied text, attributed so it is never read as teammate-comms speaking."""
+    note = clean_note(value)
+    return f"the mailbox said: {note}" if note else ""
+
+
 def clean_bots(raw):
     """The cloud agents a mailbox reported, as roster entries."""
     bots, seen = [], set()
@@ -175,7 +199,8 @@ def clean_bots(raw):
             validate_agent_name(name)
         except CommsError:
             continue
-        if name in seen or name != name.strip():
+        if (name in seen or not _BOT_NAME_RE.fullmatch(name)
+                or name.lower() == "comms-relay"):
             continue
         seen.add(name)
         last = entry.get("last_seen")
@@ -187,14 +212,17 @@ def clean_bots(raw):
             "waiting": waiting if isinstance(waiting, int) and not isinstance(waiting, bool)
             and 0 <= waiting <= 100000 else 0,
             "doorbell": entry.get("doorbell") is True,
-            "doorbell_error": clean_note(entry.get("doorbell_error")),
+            "doorbell_error": said(entry.get("doorbell_error")),
         })
     return bots
 
 
 def neutralise(text):
     """Stop message text from imitating the inbox's own message header."""
-    return _HEADER_LOOKALIKE.sub(r"\1- - -", text)
+    text = "\n".join(text.splitlines())
+    text = "".join(ch for ch in text
+                   if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+    return _HEADER_LOOKALIKE.sub("- - -", text)
 
 
 def sync_failure(status, resp):
@@ -206,7 +234,7 @@ def sync_failure(status, resp):
     if status == 400:
         return "mailbox_error", ("it did not understand this version of teammate-comms; "
                                  "redeploy the mailbox from the same version as the plugin")
-    return "mailbox_error", f"HTTP {status} {clean_note(resp.get('error'))}".strip()
+    return "mailbox_error", f"HTTP {status}. {said(resp.get('error'))}".strip()
 
 
 def link(root, name, url, key_file, taken, post=None):
@@ -240,6 +268,8 @@ def link(root, name, url, key_file, taken, post=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
         boxes = read_mailboxes(root)
+        if name in boxes:
+            raise CommsError(f"{name!r} is already a linked mailbox.")
         boxes[name] = {"url": base, "key": key, "you_are": me}
         _write(root, boxes)
     bots = [b["name"] for b in clean_bots(resp.get("bots"))]

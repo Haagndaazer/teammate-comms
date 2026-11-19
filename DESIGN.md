@@ -1182,7 +1182,9 @@ events and drops anything else found in a mailbox outbox. Inbound mail never goe
 priority, drops any post type, prefixes a fixed line saying it comes from outside the user's
 machines, breaks any line that imitates the inbox's own message header, and forces the
 reply reference onto one line. Inbound volume is capped at 60 messages per 10 minutes per
-cloud agent; the rest wait in the mailbox.
+cloud agent and 180 per mailbox; anything over is refused back to the mailbox, which tells
+the agent, so it cannot sit at the head of the queue and block others. Mail is applied
+outside the relay lock, at most 5 seconds per pass.
 
 **Identity is the key.** The Worker's config maps each key to one machine name or one bot
 name; a caller never states its own name, and the two kinds are separate sets. The machine

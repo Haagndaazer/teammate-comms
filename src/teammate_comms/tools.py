@@ -316,7 +316,11 @@ TOOL_DEFINITIONS = [
             "another machine linked with teammate_peers is addressed name@machine. If that "
             "machine is unreachable the message is queued and the result says why in a "
             "WARNING: tell your user, and do not resend a queued message. A WARNING that says "
-            "NOT SENT or NOT QUEUED means it was not queued: resend once the cause is fixed."
+            "NOT SENT or NOT QUEUED means it was not queued: resend once the cause is fixed. "
+            "A cloud agent (an outside AI service such as a Grok Bot, listed under 'Cloud "
+            "agents' in teammate_list) is addressed name@<mailbox name>, for example "
+            "CommsTest@cloudbot, and answers when its next run starts. If you cannot find the "
+            "agent your user means, check teammate_list and teammate_peers before sending."
         ),
         "inputSchema": {
             "type": "object",
@@ -366,7 +370,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "teammate_list",
-        "description": "List registered teammates with their type and liveness. Defaults to your project only; pass all=True for a global view. Also lists each machine linked with teammate_peers, whether it is reachable, and the teammates on it (address them name@machine).",
+        "description": "List registered teammates with their type and liveness. Defaults to your project only; pass all=True for a global view. Also lists each machine linked with teammate_peers, whether it is reachable, and the teammates on it (address them name@machine). Also lists cloud agents (outside AI services reached through a mailbox, addressed name@<mailbox name>, direct messages only), when each last contacted its mailbox and how much mail is waiting for it.",
         "inputSchema": {"type": "object", "properties": {
             "all": {
                 "type": "boolean",
@@ -870,8 +874,11 @@ def _resolve_address(root, team, value, param, cloud=False):
     if machine not in peers:
         raise CommsError(
             f"{machine!r} is not an approved peer machine (approved: "
-            f"{', '.join(sorted(peers)) or 'none'}). "
-            f"{relay_mod.approval_hint(machine)}"
+            f"{', '.join(sorted(peers)) or 'none'}) and not a linked cloud mailbox (linked: "
+            f"{', '.join(sorted(relay_mod.read_mailboxes(root))) or 'none'}). If it is another "
+            f"computer: {relay_mod.approval_hint(machine)} If it is the mailbox of a cloud "
+            f"agent, only your user can link it, in a terminal; teammate_peers() prints the "
+            f"command."
         )
     return name, machine
 
@@ -930,8 +937,11 @@ def _relay_out(root, team, machines, kind, payload, sender, report=True):
     return failed
 
 
-def deliver_dm_record(root, team, record, to):
-    """Write a prepared DM record into ``to``'s local inbox, then tee the transcript."""
+def deliver_dm_record(root, team, record, to, report_live=True):
+    """Write a prepared DM record into ``to``'s local inbox, then tee the transcript.
+
+    ``report_live`` False skips the recipient liveness probe, for callers that ignore it.
+    """
     inboxes_dir = get_inboxes_dir(root, team)
     ensure_inbox(inboxes_dir, to)
     unread_file = inboxes_dir / f"{to}_unread.json"
@@ -943,7 +953,7 @@ def deliver_dm_record(root, team, record, to):
 
     to_record = read_agent_record(root, team, to)
     to_type = to_record.get("type") if to_record else None
-    live = bool(to_record and to_type == "full" and is_channel_alive(to_record))
+    live = bool(report_live and to_record and to_type == "full" and is_channel_alive(to_record))
 
     append_transcript(root, team, {**record, "to": to, "kind": "dm"})  # tee LAST
     return {"id": record["id"], "to": to, "to_type": to_type, "live": live}
@@ -1024,7 +1034,9 @@ def _handle_send(args, ctx):
             f"name — a typo'd recipient queues silently. If {to} is a spawned subagent, their "
             f"lead must SendMessage-nudge them to read it. If {to} believes they ARE registered, "
             f"compare 'comms_root' in both sides' teammate_whoami — different roots cannot "
-            f"exchange messages (G4)."
+            f"exchange messages (G4). If {to} is a cloud agent (an outside AI service such as "
+            f"a Grok Bot), a bare name never reaches it: it is addressed {to}@<mailbox name> "
+            f"once your user has linked its mailbox; teammate_peers() shows how."
         )
     return "\n".join(lines)
 
@@ -2744,8 +2756,9 @@ def _handle_peers(args, ctx):
     action = args.get("action") or "list"
     if action == mailbox_mod.LINK_ACTION:
         raise CommsError("A cloud mailbox can only be linked by your user, in a terminal, so "
-                         "that no message can talk an agent into it. Give them this command: "
-                         + relay_mod.link_command())
+                         "that no message can talk an agent into it. Give them this command "
+                         "to run themselves, with the three placeholders filled in: "
+                         + relay_mod.link_command(root))
     if action not in _PEER_ACTIONS:
         raise CommsError(f"'action' must be one of {list(_PEER_ACTIONS)}.")
     if team:

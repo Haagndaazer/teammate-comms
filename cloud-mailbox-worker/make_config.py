@@ -7,10 +7,14 @@
 The folder then holds:
     config.json            readable source of truth; paste each bot's doorbell here
     wrangler-secrets.json  what to upload: npx wrangler secret bulk <folder>/wrangler-secrets.json
-    machine-<name>.key     one per machine, given to teammate_peers(action="link_mailbox")
+    machine-<name>.key     one per machine, named in the terminal command that links it
+                           (python -m teammate_comms.peers link_mailbox <name> <url> <key file>)
     bot-<name>.secret.txt  one per cloud agent, pasted into its masked secret
 
-Keep the folder out of any project or synced folder. Standard library only.
+A machine name is a lowercase label of your choice; the cloud agent sees your agents as
+name@<that label>. To replace a key, delete that entry from config.json, add it again with
+--add-machine or --add-bot, then upload again and relink the machine or update the bot's
+secret. Keep the folder out of any project or synced folder. Standard library only.
 """
 import argparse
 import json
@@ -19,6 +23,7 @@ import re
 import secrets
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 MACHINE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 BOT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
@@ -70,10 +75,19 @@ def check_names(config):
             fail(f"two bot names differ only by case: {name!r}")
         lowered.add(name.lower())
         url, key = bot.get("doorbell_url") or "", bot.get("doorbell_key") or ""
+        if not isinstance(url, str) or not isinstance(key, str):
+            fail(f"bot {name!r}: doorbell_url and doorbell_key must be text")
+        url, key = url.strip(), key.strip()
         if bool(url) != bool(key):
             fail(f"bot {name!r}: doorbell_url and doorbell_key must both be set or both be empty")
-        if url and not url.startswith("https://"):
-            fail(f"bot {name!r}: doorbell_url must start with https://")
+        if url:
+            try:
+                parts = urlsplit(url)
+                host = parts.hostname
+            except ValueError:
+                host = None
+            if parts.scheme != "https" or not host:
+                fail(f"bot {name!r}: doorbell_url must be a full https:// address")
     if not config["machines"] or not config["bots"]:
         fail("at least one machine and one bot are needed")
 
@@ -104,12 +118,16 @@ def write_all(out, config):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Create the secrets for a teammate-comms cloud mailbox.")
+    parser = argparse.ArgumentParser(
+        description="Create the secrets for a teammate-comms cloud mailbox.",
+        epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True, help="Folder for the secret files, outside any project.")
     parser.add_argument("--machine", action="append", default=[], help="Name for one of your machines.")
     parser.add_argument("--bot", action="append", default=[], help="Name of a cloud agent.")
-    parser.add_argument("--add-machine", action="append", default=[])
-    parser.add_argument("--add-bot", action="append", default=[])
+    parser.add_argument("--add-machine", action="append", default=[],
+                        help="Add a machine to an existing mailbox (lowercase label).")
+    parser.add_argument("--add-bot", action="append", default=[],
+                        help="Add a cloud agent to an existing mailbox.")
     parser.add_argument("--rebuild", action="store_true",
                         help="Rewrite wrangler-secrets.json and key files from an edited config.json.")
     parser.add_argument("--allow-repository", action="store_true",
@@ -145,6 +163,7 @@ def main(argv=None):
             fail(f"bot {name!r} is already in the mailbox")
         config["bots"][name] = {"key": "tcb_" + secrets.token_urlsafe(32), "doorbell_url": "",
                                 "doorbell_key": ""}
+    check_names(config)
     out.mkdir(parents=True, exist_ok=True)
     write_all(out, config)
     print(f"Wrote the mailbox secrets to {out}")

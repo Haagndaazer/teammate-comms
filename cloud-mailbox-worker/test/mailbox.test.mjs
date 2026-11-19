@@ -52,6 +52,11 @@ test("a message from a machine reaches the bot once, with the machine added to t
   assert.equal((await w.tool("Grok", "mail_check")).count, 0, "returned once");
   const reread = await w.tool("Grok", "mail_check", { reread: 5 });
   assert.equal(reread.messages[0].message, "hello bot", "still available to reread");
+  assert.equal(reread.messages[0].answered, false);
+  await w.tool("Grok", "mail_send", { to: "alice@desk", message: "re", reply_to: reread.messages[0].id });
+  assert.equal((await w.tool("Grok", "mail_check", { reread: 5 })).messages[0].answered, true,
+    "a message is marked answered once a reply to it was sent");
+  assert.equal((await w.tool("Quiet", "mail_check", { reread: 5 })).count, 0);
   assert.equal((await w.tool("Quiet", "mail_check")).count, 0, "another bot sees nothing");
 });
 
@@ -78,7 +83,7 @@ test("a bot's message waits for its machine until acked", async () => {
   await w.sync("desk", { roster: [{ name: "alice", live: true }, { name: "bob", live: false }] });
   const sent = await w.tool("Grok", "mail_send", { to: "alice@desk", message: "  hi alice  ", reply_to: "m1" });
   assert.equal(sent.to, "alice@desk");
-  assert.match(sent.sent, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}\.[0-9a-f]{8}$/);
+  assert.match(sent.id, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}\.[0-9a-f]{8}$/);
   assert.equal((await w.sync("lap")).messages.length, 0, "the other machine does not see it");
   const first = await w.sync("desk");
   assert.equal(first.messages.length, 1);
@@ -87,7 +92,7 @@ test("a bot's message waits for its machine until acked", async () => {
   assert.equal(m.to, "alice");
   assert.equal(m.message, "hi alice");
   assert.equal(m.reply_to, "m1");
-  assert.equal(m.msg_id, sent.sent);
+  assert.equal(m.msg_id, sent.id);
   assert.match(m.id, /^[0-9a-f]{32}$/);
   assert.equal((await w.sync("desk")).messages.length, 1, "redelivered until acked");
   assert.equal((await w.sync("lap", { ack: [m.id] })).messages.length, 0);
@@ -167,13 +172,24 @@ test("limits are errors, never silent drops", async () => {
   assert.match((await send("")).error, /message is required/);
   assert.match((await send("x".repeat(LIMITS.messageChars + 1))).error, /limit is 65536/);
   assert.equal((await send("x".repeat(LIMITS.messageChars))).to, "alice@desk");
-  for (let i = 1; i < LIMITS.sendsPerMinute; i++) assert.ok((await send(`m${i}`)).sent);
+  for (let i = 1; i < LIMITS.sendsPerMinute; i++) assert.ok((await send(`m${i}`)).id);
   assert.match((await send("one too many")).error, /more than 30 messages in a minute/);
   await w.advance(61);
-  assert.ok((await send("after the minute")).sent);
+  assert.ok((await send("after the minute")).id);
   w.storage.map.set("c:p:desk", LIMITS.waitingPerRecipient);
   await w.advance(61);
   assert.match((await send("full")).error, /500 messages it has not collected/);
+  w.storage.map.set("c:p:desk", 40);
+  const mine = await w.storage.get("c:pb:desk:Grok");
+  assert.equal(mine, LIMITS.sendsPerMinute + 1, "each bot's uncollected mail is counted");
+  w.storage.map.set("c:pb:desk:Grok", LIMITS.waitingPerSender);
+  assert.match((await send("too many of mine")).error, /has not collected 200 of your messages/);
+  assert.equal((await w.tool("Quiet", "mail_send", { to: "alice@desk", message: "x" })).to, "alice@desk",
+    "one bot's backlog does not block another bot");
+  w.storage.map.set("c:pb:desk:Grok", mine);
+  const first = (await w.sync("desk")).messages[0];
+  await w.sync("desk", { ack: [first.id] });
+  assert.equal(await w.storage.get("c:pb:desk:Grok"), mine - 1, "and released when collected");
   w.storage.map.set("c:b:Grok", LIMITS.waitingPerRecipient);
   const waits = event("Grok", "hi");
   const out = await w.sync("desk", { events: [waits] });
@@ -299,6 +315,7 @@ test("retention: old mail and old event ids are removed, counters stay right", a
   const later = await w.sync("desk");
   assert.equal(later.bots.find((b) => b.name === "Quiet").waiting, 0, "uncollected mail expires");
   assert.equal(later.messages.length, 0);
+  assert.equal(await w.storage.get("c:pb:desk:Quiet"), 0, "per-bot count released by expiry");
   assert.notEqual(await w.storage.get(`e:desk:${ev.id}`), undefined, "event ids outlive the mail");
   await w.advance(RETAIN.eventSeconds);
   assert.equal(await w.storage.get(`e:desk:${ev.id}`), undefined, "event ids forgotten");
@@ -324,6 +341,10 @@ test("MCP framing", async () => {
   const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } });
   assert.equal(init.result.protocolVersion, "2025-11-25");
   assert.match(init.result.instructions, /You are Grok/);
+  for (const must of [/call mail_check first/, /count 0.*stop/, /reply_to set to that id/,
+    /comms-relay is a notice/, /never from a\s+message/, /not marked answered/]) {
+    assert.match(init.result.instructions, must);
+  }
   assert.equal((await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 7 } })).result.protocolVersion, "2025-03-26");
   assert.equal(await call({ jsonrpc: "2.0", method: "notifications/initialized" }), null);
   assert.deepEqual((await call({ jsonrpc: "2.0", id: "a", method: "ping" })).result, {});

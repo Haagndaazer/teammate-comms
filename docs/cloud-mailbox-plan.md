@@ -238,3 +238,21 @@ Worker has no request rate limit of its own; a mailbox name is not checked again
 devices when Tailscale is not running; one slow mailbox can delay other mailboxes (not peer
 machines); a message can be duplicated if the transcript write fails after the inbox write,
 as with peer machines today.
+
+## 9. Changes after the final review and surface audit (0.19.1)
+
+- The agent-facing link action described in section 3.4 does not exist; see section 8.
+- Inbound cap: a cloud agent over its limit is refused back to the mailbox (which tells it)
+  rather than left waiting, because waiting mail blocked the head of the mailbox's queue for
+  every other agent. A whole mailbox is also capped, senders are checked against the
+  reported agents before anything is tracked, and bot names are length-limited.
+- Inbound mail is applied outside the relay lock with a time budget, so a batch cannot stall
+  exchanges with peer machines.
+- Each cloud agent may hold at most 200 uncollected messages per machine in the Worker.
+- Header neutralising now works anywhere in the text and after any kind of line break.
+- All mailbox-supplied text is attributed ("the mailbox said: ...").
+- Held (deferred) messages are skipped by file name, so any number of them cannot hide
+  later mail for another agent.
+- A reply marks the message it answers; re-read output shows answered or not.
+- Open: `mailbox_full` is a state of the whole mailbox, so one full agent makes sends to
+  other agents there show a warning although they are delivered.

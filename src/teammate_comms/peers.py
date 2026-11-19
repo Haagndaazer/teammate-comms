@@ -2,8 +2,9 @@
 turns remote control of this machine on or off, and links or unlinks a cloud mailbox.
 
 ``python -m teammate_comms.peers add <machine>``;
-``python -m teammate_comms.peers link_mailbox <name> <url> <key_file>``. The same actions are
-available to agents through the ``teammate_peers`` tool.
+``python -m teammate_comms.peers link_mailbox <name> <url> <key_file>``. Agents have the same
+actions through the ``teammate_peers`` tool, except linking a mailbox, which only this
+command does.
 """
 import argparse
 import sys

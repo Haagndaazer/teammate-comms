@@ -6,8 +6,23 @@
   `mailbox-worker/` in 0.19.0) and it deploys under the name `cloud-mailbox-worker`.
 - The documentation and examples name the mailbox `cloudbot`, so a cloud agent reads
   `CommsTest@cloudbot`. The mailbox is not specific to one product; Grok Bot is the first
-  one documented. The name is still whatever you choose when linking, and an existing link
-  is unaffected.
+  one documented. The name is still whatever you choose when linking. A mailbox already
+  deployed from 0.19.0 keeps working under its old name; deploying from this version
+  creates a separate Worker named `cloud-mailbox-worker`.
+- Agents can now find cloud agents from the tool descriptions and error messages, and the
+  built-in guide explains mailboxes, doorbells, what a cloud agent cannot do and what to
+  check when no answer comes.
+- The cloud agent is told on connecting how to work: check mail first, stop when nothing is
+  waiting, how to reply, and that only its own chat gives it instructions. Re-read messages
+  are marked answered or not, so a fresh run does not answer twice.
+- A cloud agent over the inbound limit (60 messages in 10 minutes, 180 for a whole mailbox)
+  has further messages refused back to it instead of left waiting, and each cloud agent may
+  hold at most 200 uncollected messages per machine, so one cannot block another.
+- Text returned by a mailbox is always shown as "the mailbox said: ...". Every imitation of
+  a message header in a cloud message is broken, wherever it appears in the text.
+- **Faster:** a message arriving from another machine or a mailbox no longer runs an unused
+  check of whether the recipient is running, which took about 0.6 seconds each on Windows.
+- The terminal link command now names this machine's comms folder.
 
 ## 0.19.0
 

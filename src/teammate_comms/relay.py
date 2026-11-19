@@ -462,6 +462,8 @@ def delivery_report(root, name, machine, started=None):
                      "sent until it runs; see teammate_peers(action=\"list\").")
     view = peer_view(root, machine)
     if is_mailbox(root, machine):
+        if started == "started":
+            view = {**view, "ok": False, "state": "connecting"}
         return lines + _cloud_report(root, name, machine, view)
     if view["ok"]:
         entry = remote_agent(root, name, machine)
@@ -632,14 +634,19 @@ def link_mailbox(root, machine, url, key_file, net=None, post=None):
     return "\n".join(line for line in lines if line)
 
 
-def link_command():
+def link_command(root=None):
     """The terminal command a user runs to link a mailbox. Agents cannot link one."""
     plugin_root = Path(__file__).resolve().parents[2]
+    where = f' --comms-dir "{root}"' if root else ""
     return (f'uv run --no-sync --directory "{plugin_root}" python -m teammate_comms.peers '
-            f'{mailbox_mod.LINK_ACTION} <short name> <mailbox https address> <key file>')
+            f'{mailbox_mod.LINK_ACTION} <short name, e.g. cloudbot> <mailbox https address> '
+            f'"<path of this machine\'s key file>"{where}')
 
 
 def unlink_mailbox(root, machine):
+    if not isinstance(machine, str) or not machine.strip():
+        raise CommsError("'machine' is required: the name of a linked cloud mailbox, for "
+                         "example cloudbot. teammate_peers() lists them.")
     name = mailbox_mod.unlink(root, machine)
     dropped = queued_count(root, name)
     forget_peer(root, name)
@@ -652,8 +659,8 @@ def unlink_mailbox(root, machine):
 
 def _mailbox_lines(root, status):
     boxes = read_mailboxes(root)
-    hint = ("A cloud mailbox is linked by your user in a terminal, never by an agent: "
-            + link_command())
+    hint = ("A cloud mailbox (for a cloud agent such as a Grok Bot) is linked by your user, "
+            "who runs this in their own terminal; an agent never does: " + link_command(root))
     if not boxes:
         return ["Cloud mailboxes: none. " + hint]
     lines = ["Cloud mailboxes (direct messages only):"]
@@ -669,8 +676,8 @@ def _mailbox_lines(root, status):
 def cloud_agent_state(entry, now=None):
     now = time.time() if now is None else now
     last = entry.get("last_seen")
-    seen = (f"last checked its mail {_duration(now - last)} ago" if isinstance(last, (int, float))
-            else "has never checked its mail")
+    seen = (f"last contacted its mailbox {_duration(now - last)} ago"
+            if isinstance(last, (int, float)) else "has never contacted its mailbox")
     waiting = entry.get("waiting") or 0
     parts = [seen, f"{waiting} message(s) waiting for it" if waiting else "nothing waiting"]
     if entry.get("doorbell_error"):
@@ -1030,7 +1037,7 @@ def _apply_dm(root, names, payload):
     record = _clean_record(names, payload.get("record"))
     if _already_here(root, record):
         return
-    tools.deliver_dm_record(root, None, record, to)
+    tools.deliver_dm_record(root, None, record, to, report_live=False)
 
 
 def _apply_group_post(root, names, payload):
@@ -1313,7 +1320,7 @@ def deliver_cloud_message(root, mailbox, me, bots, msg, now=None):
     out["ts"] = ts if ts is not None else message_ts()
     if _already_here(root, out):
         return
-    tools.deliver_dm_record(root, None, out, to)
+    tools.deliver_dm_record(root, None, out, to, report_live=False)
 
 
 _APPLIERS = {
@@ -1686,7 +1693,8 @@ class Relay:
                 continue
             sender = ev.get("sender")
             if isinstance(sender, str) and not is_remote(sender) and sender != RELAY_SENDER:
-                self._notify(sender, f"⚠️ REJECTED by {machine}: your {ev.get('kind')} was not "
+                what = "direct message" if ev.get("kind") == "dm" else ev.get("kind")
+                self._notify(sender, f"⚠️ REJECTED by {machine}: your {what} was not "
                                      f"applied there. Reason: {error}")
         ids = [i for i in (applied if isinstance(applied, list) else []) if isinstance(i, str)]
         confirmed = set(ids)
@@ -1815,17 +1823,17 @@ class Relay:
         events, size = [], 0
         now = self.clock()
         held = st.setdefault("deferred", {})
-        for event_id in [i for i, until in held.items() if until <= now]:
-            held.pop(event_id)
-        for path in sorted(d.glob("*.json"))[:mailbox_mod.SCAN_FILES]:
+        for held_name in [i for i, until in held.items() if until <= now]:
+            held.pop(held_name)
+        for path in sorted(d.glob("*.json")):
             if len(events) >= mailbox_mod.BATCH_EVENTS:
                 break
+            if path.name in held:
+                continue
             try:
                 raw = path.read_text(encoding="utf-8")
                 ev = json.loads(raw)
                 event_id, kind, payload = ev["id"], ev["kind"], ev["payload"]
-                if event_id in held:
-                    continue
                 record = payload["record"] if kind == "dm" else None
                 to = split_address(payload["to"])[0] if kind == "dm" else None
                 wire = None if kind != "dm" else {
@@ -1869,19 +1877,32 @@ class Relay:
         return agents
 
     def _inbound_room(self, name, sender):
-        """How many more messages one cloud agent may deliver in the current window."""
+        """Whether one cloud agent, and its mailbox as a whole, may deliver another message."""
         now = self.clock()
-        recent = self._inbound.setdefault((name, sender), collections.deque())
-        while recent and now - recent[0] > mailbox_mod.INBOUND_WINDOW_SECONDS:
-            recent.popleft()
-        return mailbox_mod.INBOUND_PER_WINDOW - len(recent)
+        room = True
+        for key, limit in (((name, sender), mailbox_mod.INBOUND_PER_WINDOW),
+                           ((name, None), mailbox_mod.INBOUND_MAILBOX_PER_WINDOW)):
+            recent = self._inbound.get(key)
+            while recent and now - recent[0] > mailbox_mod.INBOUND_WINDOW_SECONDS:
+                recent.popleft()
+            if recent is not None and not recent:
+                del self._inbound[key]
+            room = room and len(recent or ()) < limit
+        return room
+
+    def _inbound_count(self, name, sender):
+        for key in ((name, sender), (name, None)):
+            self._inbound.setdefault(key, collections.deque()).append(self.clock())
 
     def _apply_cloud(self, name, cfg, bots, messages):
         applied, failed = [], []
         ring = self._seen_ring(name)
         known = {b["name"] for b in bots}
         capped = set()
+        started = time.monotonic()
         for msg in (messages if isinstance(messages, list) else [])[:MAX_EVENTS]:
+            if time.monotonic() - started > mailbox_mod.APPLY_BUDGET_SECONDS:
+                break
             event_id = msg.get("id") if isinstance(msg, dict) else None
             if not isinstance(event_id, str) or not _ID_RE.fullmatch(event_id):
                 self.log(f"mailbox {name} sent a message with no usable id; ignored")
@@ -1893,21 +1914,21 @@ class Relay:
                     applied.append(event_id)
                 continue
             sender = msg.get("from") if isinstance(msg.get("from"), str) else ""
-            if self._inbound_room(name, sender) <= 0:
-                if sender not in capped:
-                    capped.add(sender)
-                    self.log(f"mailbox {name}: more than {mailbox_mod.INBOUND_PER_WINDOW} "
-                             f"messages from one agent in "
-                             f"{mailbox_mod.INBOUND_WINDOW_SECONDS}s; the rest wait")
-                continue
             error = ""
             try:
+                if sender in known and not self._inbound_room(name, sender):
+                    if sender not in capped:
+                        capped.add(sender)
+                        self.log(f"mailbox {name}: {sender} is over the inbound limit; its "
+                                 f"further messages are refused")
+                    raise RejectEvent(mailbox_mod.RATE_REFUSAL)
                 deliver_cloud_message(self.root, name, cfg["you_are"], known, msg, self.clock())
                 applied.append(event_id)
-                self._inbound[(name, sender)].append(self.clock())
+                self._inbound_count(name, sender)
             except RejectEvent as e:
                 error = str(e)[:300] or "rejected"
-                self.log(f"rejected message {event_id} from mailbox {name}: {e}")
+                if error != mailbox_mod.RATE_REFUSAL:
+                    self.log(f"rejected message {event_id} from mailbox {name}: {e}")
             except Exception as e:
                 tries = self._attempts.get(event_id, 0) + 1
                 self._attempts[event_id] = tries
@@ -1939,7 +1960,10 @@ class Relay:
         try:
             status, resp = self._mailbox_post(cfg["url"], cfg["key"], body)
         except Exception as e:
-            return self._contact_failed(st, "mailbox_unreachable", type(e).__name__)
+            timed_out = isinstance(e, (TimeoutError, socket.timeout))
+            return self._contact_failed(st, "mailbox_unreachable",
+                                        "it did not answer in time" if timed_out
+                                        else "the connection failed")
         if status != 200 or resp.get("v") != mailbox_mod.PROTOCOL:
             state, detail = (mailbox_mod.sync_failure(status, resp) if status != 200 else
                              ("mailbox_error", "it did not answer like a teammate-comms mailbox"))
@@ -1947,8 +1971,9 @@ class Relay:
         if resp.get("you_are") != cfg["you_are"]:
             return self._contact_failed(
                 st, "mailbox_error",
-                f"it now calls this machine {mailbox_mod.clean_note(resp.get('you_are'))!r}; "
-                f"link it again")
+                f"it now calls this machine "
+                f"{mailbox_mod.clean_note(resp.get('you_are'))[:64]!r}; unlink it and link "
+                f"it again")
         bots = mailbox_mod.clean_bots(resp.get("bots"))
         with self._lock:
             st["acks"] = [a for a in st["acks"] if a not in acks]
@@ -1970,12 +1995,16 @@ class Relay:
             self._settle(st, accepted, rejected, name)
             deferred = [d for d in items("deferred") if isinstance(d, dict) and known_id(d.get("id"))]
             for item in deferred:
-                st["inflight"].pop(item["id"], None)
-                st.setdefault("deferred", {})[item["id"]] = now + mailbox_mod.DEFER_SECONDS
-            for event_id in [e["id"] for e in batch if e["id"] in st["inflight"]]:
+                path = st["inflight"].pop(item["id"], None)
+                if path is not None:
+                    st.setdefault("deferred", {})[path.name] = now + mailbox_mod.DEFER_SECONDS
+            unanswered = [e["id"] for e in batch if e["id"] in st["inflight"]]
+            for event_id in unanswered:
                 st["inflight"].pop(event_id, None)
+            st["no_verdict"] = bool(unanswered)
             incoming = items("messages")
-            applied, failed = self._apply_cloud(name, cfg, bots, incoming)
+        applied, failed = self._apply_cloud(name, cfg, bots, incoming)
+        with self._lock:
             st["acks"] += applied
             st["nacks"] += failed
             try:
@@ -1988,24 +2017,32 @@ class Relay:
             st["last_contact"] = self.clock()
             st["fails"] = 0
             if deferred:
-                st["full_detail"] = mailbox_mod.clean_note(deferred[0].get("error"))
+                st["full_detail"] = mailbox_mod.said(deferred[0].get("error"))
             if st.get("deferred"):
                 self._set_state(st, "mailbox_full", st.get("full_detail", ""))
             else:
                 self._set_state(st, "ok")
             waiting = queued_count(self.root, name)
         progressed = bool(applied or failed)
-        if progressed or (waiting and accepted):
-            st["next_due"] = now
-        else:
-            st["next_due"] = now + (mailbox_mod.BUSY_SECONDS if batch and not deferred
-                                    else mailbox_mod.IDLE_SECONDS)
+        st["synced_at"] = now
+        st["next_due"] = now if progressed or (waiting and accepted) else (
+            now + mailbox_mod.IDLE_SECONDS)
+
+    def _mailbox_has_new(self, name, st):
+        """True when something queued could be sent now, so the idle wait should be cut short."""
+        if st["state"] != "ok" or st.get("no_verdict"):
+            return False
+        if self.clock() - st.get("synced_at", 0.0) < mailbox_mod.BUSY_SECONDS:
+            return False
+        d = outbox_dir(self.root, name)
+        held = st.get("deferred") or {}
+        return d.exists() and any(p.name not in held for p in d.glob("*.json"))
 
     def mailbox_tick(self):
         """One pass over the linked mailboxes: exchange with each one that is due."""
         for name, cfg in read_mailboxes(self.root).items():
             st = self._peer(name)
-            if self.clock() >= st["next_due"]:
+            if self.clock() >= st["next_due"] or self._mailbox_has_new(name, st):
                 self._mailbox_sync(name, cfg, st)
             self._notices(name, st)
 
