@@ -63,6 +63,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
+| `teammate_user_status` | `status?` (`away`\|`available`), `leave_at?`, `in_minutes?`, `heads_up_minutes?`, `away_behaviour?` | Whether your user is available for questions, shared by every agent. No arguments reads it. Set it only when your user asks: a leave time (agents get a heads-up before it and the status becomes away by itself), away now, available again, or what agents should do while the user is away. Every live agent is told by `comms-status`. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -408,6 +409,31 @@ How it behaves:
   cannot identify its own program safely, or cannot end it, it refuses and tells whoever
   asked rather than risk closing something else.
 
+## Your availability: away and back
+
+Your agents share one status for you: **available** or **away**. You change it by telling any
+agent, in your own words:
+
+- *"I'm leaving at 3."* The agent sets a leave time. Every live agent is told, gets a heads-up
+  shortly before (10 minutes unless you say otherwise), and is told again when the time passes.
+  From then on the status is away.
+- *"I'm away"* or *"I'm back."* The status changes at once and every live agent is told.
+- *"While I'm away, wait for me"* (or *work autonomously*, the default, or any one-line
+  instruction). This is what agents are shown when you leave. It is kept until you change it.
+
+An agent that is unsure whether you are there checks with `teammate_user_status`. The status
+stays away until you tell an agent you are back; the notice says since when, so a forgotten
+"away" is visible. The notices come from `comms-status`, a system sender that cannot be
+messaged.
+
+Machines you have linked share the status. A cloud agent can read it, and can set your leave
+time or status if you allow its connection: see "Letting a cloud agent set your status"
+below. A typical use is a cloud agent that watches your calendar and sets your leave time
+before a meeting.
+
+The away instruction never gives an agent more permission than it already had: an agent that
+must ask before a risky action still must.
+
 ## Cloud agents through a mailbox
 
 An agent that runs in someone else's cloud cannot reach your machines, and your machines have
@@ -429,8 +455,9 @@ xAI's Grok Bot, the only one tried so far, and the examples name the mailbox `cl
 
 **What a cloud agent can and cannot do.** It can exchange direct messages with agent sessions
 on your machines. It cannot join a group, cannot start or shut down sessions, cannot message
-the dashboard's human operator, and its messages always arrive at normal priority. These limits
-are enforced on your machine, not left to the cloud agent.
+the dashboard's human operator, and its messages always arrive at normal priority. It can read
+your availability status, and set it only if you allow its connection (below). These limits
+are enforced on your machine and in your mailbox, not left to the cloud agent.
 
 **Trusting a cloud agent.** A cloud agent's message arrives like any teammate's, with no warning
 line. Whether your agents act on it is your choice, and you state it in your standing
@@ -613,6 +640,16 @@ first, from a chat or a scheduled routine.
   up your Cloudflare plan's daily requests, add a rate limiting rule for it in Cloudflare.
 - One bot name can exist once per mailbox. Machines are not forwarded through each other: each
   machine that should reach the bot links to the mailbox itself.
+
+**Letting a cloud agent set your status.** Every cloud agent can read your availability with
+its `user_status` tool. To let the agents of one connection also set it (leave time, away,
+available), open `config.json` in your keys folder, add `"can_set_status": true` to that
+account, next to its `"key"`, then run `make_config.py --out <folder> --rebuild` and upload
+the secrets again. The setting is per account because agents sharing a connection can use each
+other's names. A cloud agent can never change what your agents do while you are away. The
+risk you accept: an allowed agent that is steered by something it reads could mark you away
+when you are not; the notice names it and any agent can set you back. This needs the mailbox
+Worker from 0.20.0 or later (`npx wrangler deploy` in `cloud-mailbox-worker`).
 
 **Turning it off.** `teammate_peers(action:"unlink_mailbox", machine:"cloudbot")` stops this
 machine using the mailbox. To cut a machine or a bot off for good, remove it from

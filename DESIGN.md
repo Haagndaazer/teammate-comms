@@ -401,9 +401,9 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **21 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
+long-lived server. **22 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
 project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37 + 1
-cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15, + 1 `teammate_shutdown`, §16):**
+cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15, + 1 `teammate_shutdown`, §16, + 1 `teammate_user_status`, §18):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -1256,3 +1256,62 @@ comms folder. It does not protect against a program running as the same user on 
 machine, and nothing that lets an unattended relay read the key could. A Worker secret is
 the mailbox's own copy and cannot serve as the machine's. Elsewhere the key stays plain
 with owner-only permissions.
+
+## 18. User availability status (0.20.0)
+
+Plan and rulings: `docs/availability-plan.md`.
+
+**State.** `TeammateComms/availability.json`, one per comms root, not team-namespaced:
+`status` (available | away), `status_epoch`, `leave_at_epoch`, `heads_up_seconds`, the away
+behaviour text, and two revision pairs, `(seq, rev)` for the status fields and
+`(behaviour_seq, behaviour_rev)` for the behaviour. `availability.py` owns it.
+
+**The effective status is computed.** Away means `status == "away"` or the leave time has
+passed. Nothing flips the file at the leave time, so no process needs to be running then.
+The relay cannot own a clock anyway: it only runs on a machine that has links.
+
+**Notices come from each session's own watcher.** On its heartbeat tick, once its inbox
+baseline is seeded, `channel.run_watcher` calls `availability.check`. That compares the
+state's `(rev, phase, behaviour_rev)` with the snapshot stored on the agent's own record
+(`availability_seen`), where phase is available, heads_up or away as of now. If they differ
+it writes one message from `comms-status` straight into its own agent's unread inbox, then
+stores the new snapshot. The ordinary wake does the rest on every harness. One notice
+describes the whole current situation, so missed stages collapse into one and a moved or
+cancelled leave time is always stated. The write uses a one-second lock and is retried next
+tick if the inbox is busy; a notice key on the record stops a retry after a failed snapshot
+write from duplicating it. Registration stores the current snapshot and prints the status
+line, so a new or compacted session is informed without being woken by old news.
+
+**Ordering is a counter, not a clock.** A writer sets `seq = held + 1` with a random `rev`;
+the larger `(seq, rev)` wins. A machine whose clock is ahead therefore cannot keep
+overriding later edits. Clock skew only shifts when each machine considers the leave time
+reached.
+
+**Linked machines.** The state rides in the roster each relay already sends
+(`roster.availability`), merged on receipt. An older peer ignores the key. Names are
+qualified with the machine on the wire (`Sylvie@desktop`) and made plain again at home.
+
+**Mailbox.** The state is in every `/pc/sync` body and answer. The Worker is one more
+replica with the same rule. The relay takes only the status fields from the mailbox, never
+the behaviour text, and keeps the setter's name only if it is a well-formed agent name or
+address (otherwise it shows "someone through the <name> mailbox"), so no free text from a
+cloud agent or a compromised mailbox reaches a notice. A copy whose counter is above
+10^9 is refused from any outside source, so a bad copy cannot exhaust the counter. A cloud change is stamped `cloud: true` with the bot's
+name, which the relay shows as `Name@<mailbox name>`.
+
+**Cloud tools.** `user_status` for every account; `user_set_status` only for an account
+with `can_set_status: true` in the user's config, default off. The gate is per account
+because agents on one connection can use each other's names (section 17). The tool takes no
+free text. Cloud agents are not sent notices: by the user's ruling they are always-on and do
+not stop when the user is away.
+
+**Reserved name.** `comms-status` cannot be registered (server, mailbox roster, Worker
+config, key tool) and cannot be sent to.
+
+**Kept risks.** A steered cloud agent on an allowed connection can mark the user away;
+notices name who set it and any agent can set it back. The away behaviour is text one local
+agent sets and all agents read as the user's wish: it is one line, stripped of control
+characters and of the guillemets that delimit it, shown quoted with its author, and every notice says it never
+widens what an agent may do. Away has no automatic end, by the user's ruling; notices show
+since when. A change made in the seconds before a copy hears of a change made elsewhere
+can lose to it; the next notice says what the status now is.

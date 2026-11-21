@@ -579,7 +579,7 @@ def main():
                       "teammate_delete",
                       "project_register", "list_projects", "project_profile", "project_delete",
                       "teammate_set_avatar", "teammate_request_compact", "teammate_peers",
-                      "teammate_readme"}
+                      "teammate_readme", "teammate_user_status"}
     if not isinstance(tl, list) or {t.get("name") for t in tl} != expected_names:
         failures.append(f"tools/list names mismatch: {tl}")  # WP-42 AC-4: teammate_ack must be absent
     else:

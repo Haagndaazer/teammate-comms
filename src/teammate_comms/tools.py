@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import harness as harness_mod
 from .guide import readme_guide
-from . import __version__, whats_new
+from . import __version__, availability, whats_new
 from . import mailbox as mailbox_mod
 from . import relay as relay_mod
 from .comms import (
@@ -757,6 +757,53 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "name": "teammate_user_status",
+        "description": (
+            "Whether your user is available for questions, shared by every agent on comms. "
+            "With no arguments it answers: available or away, any planned leave time, and "
+            "what your user wants agents to do while away. Check it before asking your user "
+            "something when you are unsure they are there. Every live agent is messaged by "
+            "comms-status when it changes: when a leave time is set, shortly before it, and "
+            "when the user is away or back. To change it, pass ONE of status, leave_at or "
+            "in_minutes, and only because your own user asked (for example 'I am leaving "
+            "at 3', 'I am back', 'while I am away, wait for me'). It stays away until an "
+            "agent sets it back to available."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": list(availability.STATUSES),
+                    "description": "Mark the user away now, or available again. Clears a "
+                                   "planned leave time.",
+                },
+                "leave_at": {
+                    "type": "string",
+                    "description": "When the user will leave: ISO 8601 with a UTC offset, e.g. "
+                                   "2026-11-21T15:30:00-06:00. The status becomes away at that "
+                                   "time by itself. An empty string cancels a planned time.",
+                },
+                "in_minutes": {
+                    "type": "integer",
+                    "description": "Instead of leave_at: the user leaves this many minutes "
+                                   "from now.",
+                },
+                "heads_up_minutes": {
+                    "type": "integer",
+                    "description": "How long before the leave time agents get the heads-up "
+                                   "(default 10, 0 to 120).",
+                },
+                "away_behaviour": {
+                    "type": "string",
+                    "description": "What the user wants agents to do while away: 'work "
+                                   "autonomously' (the default), 'wait', or their own one-line "
+                                   "instruction. Kept until changed. Max 500 chars.",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -969,6 +1016,10 @@ def send_dm(root, team, sender, to, message, priority="normal", post_type=None, 
     """
     name, machine = _resolve_address(root, team, to, "to", cloud=True)
     target = name if machine is None else f"{name}@{machine}"
+    if machine is None and name.lower() == availability.STATUS_SENDER:
+        raise CommsError(
+            f"{name} is the sender of user-availability notices, not a teammate, and "
+            f"cannot be messaged. teammate_user_status shows or changes the status.")
     if target == sender:
         raise CommsError(
             "Cannot send to yourself. teammate_send targets another teammate; "
@@ -2777,6 +2828,33 @@ def _handle_peers(args, ctx):
     return relay_mod.peers_report(root)
 
 
+def _handle_user_status(args, ctx):
+    agent, _team, root = _require_registered(ctx)
+    now = time.time()
+    status = args.get("status")
+    leave_at, in_minutes = args.get("leave_at"), args.get("in_minutes")
+    heads_up, behaviour = args.get("heads_up_minutes"), args.get("away_behaviour")
+    changes = {}
+    if status is not None:
+        changes["status"] = status
+    if leave_at is not None or in_minutes is not None:
+        changes["leave_at"] = availability.parse_leave(leave_at, in_minutes, now)
+    if heads_up is not None:
+        changes["heads_up_seconds"] = availability.clean_heads_up(heads_up)
+    if behaviour is not None:
+        changes["away_behaviour"] = availability.clean_behaviour(behaviour)
+    if not changes:
+        state = availability.read(root)
+        line = availability.status_line(state, now)
+        if not availability.is_away(state, now) and state["leave_at_epoch"] is None:
+            line += " " + availability.behaviour_text(state)
+        return line
+    state = availability.change(root, agent, now=now, **changes)
+    relay_mod.ensure_relay(root)
+    return ("Recorded. Every live agent on this machine is told within a few seconds, and "
+            "linked machines at their next contact. " + availability.status_line(state, now))
+
+
 def _handle_readme(args, ctx):
     if args.get("changes_seen") is True:
         return whats_new.confirm(__version__)
@@ -2805,6 +2883,7 @@ _HANDLERS = {
     "teammate_set_avatar": _handle_set_avatar,
     "teammate_request_compact": _handle_request_compact,
     "teammate_peers": _handle_peers,
+    "teammate_user_status": _handle_user_status,
 }
 
 

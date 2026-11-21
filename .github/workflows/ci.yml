@@ -60,6 +60,9 @@ jobs:
       - name: Run agent-surface and update-notice suite
         if: ${{ !cancelled() }}
         run: uv run --no-sync python tests/test_notices.py
+      - name: Run user availability suite
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync python tests/test_availability.py
       - name: Run cloud mailbox suite
         if: ${{ !cancelled() }}
         run: uv run --no-sync python tests/test_mailbox.py

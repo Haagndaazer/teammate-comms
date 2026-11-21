@@ -35,6 +35,7 @@ import threading
 import time
 from datetime import datetime
 
+from . import availability
 from . import harness as harness_mod
 from .comms import (
     HEARTBEAT_STALENESS_SECONDS,
@@ -565,6 +566,12 @@ def run_watcher(send_message, identity, initialized_evt, registered_evt, stop_ev
                 known_reaction_ids = next_known_rx
                 if new_rcursor is not None:
                     reaction_cursor = new_rcursor
+                if known_ids is not None and not demoted and hb_rec.get("type") != "human":
+                    try:
+                        availability.check(root, team, agent, hb_rec)
+                    except Exception as exc:
+                        print(f"[teammate-comms] user-status check failed: {exc}",
+                              file=sys.stderr, flush=True)
 
             # M2: merge any records a group fan-out couldn't deliver directly (lock-contended
             # unread) but recovered into our OWN pending file. Cheap Path.exists() gate — one

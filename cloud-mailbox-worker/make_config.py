@@ -67,6 +67,8 @@ def load(path):
         config = {"machines": dict(raw["machines"]), "accounts": {}}
         for label, account in dict(raw.get("accounts") or {}).items():
             config["accounts"][label] = {"key": account["key"], "bots": dict(account["bots"])}
+            if "can_set_status" in account:
+                config["accounts"][label]["can_set_status"] = account["can_set_status"]
         for name, bot in dict(raw.get("bots") or {}).items():
             label = slug(name)
             if label in config["accounts"]:
@@ -80,7 +82,7 @@ def load(path):
 
 
 def check_bot(name, bot):
-    if not BOT_RE.fullmatch(name) or name.lower() == "comms-relay":
+    if not BOT_RE.fullmatch(name) or name.lower() in ("comms-relay", "comms-status"):
         fail(f"bot name {name!r} is not usable")
     if not isinstance(bot, dict):
         fail(f"bot {name!r} must be an object")
@@ -126,6 +128,8 @@ def check(config):
         take(account.get("key"), ACCOUNT_KEY_RE, f"account {label!r}")
         if not account["bots"]:
             fail(f"account {label!r} has no bots")
+        if not isinstance(account.get("can_set_status", False), bool):
+            fail(f"account {label!r}: can_set_status must be true or false")
         for name, bot in account["bots"].items():
             check_bot(name, bot)
             if name.lower() in seen:
@@ -147,6 +151,8 @@ def upload_form(config):
                          "doorbell_key": bot["doorbell_key"].strip()}
             bots[name] = entry
         accounts[label] = {"key": account["key"], "bots": bots}
+        if account.get("can_set_status") is True:
+            accounts[label]["can_set_status"] = True
     return {"machines": config["machines"], "accounts": accounts}
 
 
@@ -260,7 +266,8 @@ def main(argv=None):
     print(f"Wrote the mailbox secrets to {out}")
     print(f"  machines: {', '.join(config['machines'])}")
     for label, account in config["accounts"].items():
-        print(f"  account {label}: {', '.join(account['bots'])}")
+        allowed = " (may set your availability status)" if account.get("can_set_status") is True else ""
+        print(f"  account {label}: {', '.join(account['bots'])}{allowed}")
     missing = [n for a in config["accounts"].values() for n, b in a["bots"].items()
                if not (b.get("doorbell_url") or "").strip()]
     if missing:

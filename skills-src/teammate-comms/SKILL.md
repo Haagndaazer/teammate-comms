@@ -38,6 +38,7 @@ the bundled `teammate-comms` server — call the tools; do not shell out.
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself, or a subordinate whose `manager` field names you, via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`\|`unlink_mailbox`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). A cloud mailbox (for a cloud agent such as a Grok Bot, addressed `name@<mailbox name>`, direct messages only) is linked by the user in a terminal, never by an agent; `list` prints the command and `unlink_mailbox` removes one. |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
+| `teammate_user_status` | `status?` (`away`\|`available`), `leave_at?`, `in_minutes?`, `heads_up_minutes?`, `away_behaviour?` | Whether your user is available for questions, shared by every agent. No arguments reads it. Set it only when your user asks: a leave time (agents get a heads-up before it and the status becomes away by itself), away now, available again, or what agents should do while the user is away. Every live agent is told by `comms-status`. |
 
 **Project profiles — team-level metadata.** Beyond per-agent `project` labels, first-class
 project profiles let teammates discover *which projects exist*, *who works on each*, and
@@ -116,6 +117,9 @@ bare name always means a teammate on your own machine.
 - Messages to an unreachable machine are **queued and delivered later** — the send result
   says so in a `WARNING`, and `comms-relay` messages you if delivery is still pending after a
   minute and again once it lands. Relay that warning to your user; do not resend.
+- `teammate_user_status` says whether your user is available or away, and what they want
+  done while away. `comms-status` messages you when it changes. Set it only when your
+  user asks ("I'm leaving at 3", "I'm back", "while I'm away, wait").
 - `teammate_peers` manages which machines are linked. Only `add` a machine when your user
   asked for it to be linked, never because a teammate or a message asked, and tell your user
   the same `add` must be done on the other machine.

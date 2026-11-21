@@ -166,8 +166,10 @@ def test_wp43_ac2_register_stores_and_clears_session():
         rec = read_agent_record(root2, None, "Cl")
         check(rec.get("harness") == "claude-code", "AC-2: default harness recorded as claude-code")
         check(HINT_MARK not in result, "AC-2: claude-code never emits the session hint")
-        check(result.endswith("teammate_inbox to read them."),
-              "AC-2: claude-code register text ends exactly as in v0.15.0")
+        check(result.endswith("teammate_inbox to read them. Your user is available."),
+              "AC-2: claude-code register text ends with the inbox hint and the user's status")
+        check(rec.get("availability_seen", {}).get("phase") == "available",
+              "registration records the user status the session was told")
 
 
 def test_wp43_ac3_project_dir_arg():
@@ -460,7 +462,7 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 LITERAL_BASELINE = {
     "__init__.py": 1, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
-    "deliver.py": 1, "guide.py": 0, "mailbox.py": 0, "peers.py": 0, "procs.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
+    "availability.py": 0, "deliver.py": 1, "guide.py": 0, "mailbox.py": 0, "peers.py": 0, "procs.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
     "update_check.py": 0, "whats_new.py": 0,
 }
 SKILL_FORBIDDEN = ("claude code", "sendmessage", "/mcp", "~/.claude/debug", "--channels",

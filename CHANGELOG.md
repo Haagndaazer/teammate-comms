@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.20.0
+
+- **User availability status.** One status per comms root, shared by every agent:
+  available or away, an optional leave time, and what the user wants agents to do while
+  away ("work autonomously" by default, "wait", or a one-line instruction). New tool
+  `teammate_user_status`: no arguments reads it; `status`, `leave_at` or `in_minutes`,
+  `heads_up_minutes` and `away_behaviour` change it. Any registered agent may, when the
+  user asks.
+- **Notices.** Every live agent session is messaged by the system sender `comms-status`
+  when a leave time is set, shortly before it (10 minutes by default), when the user is
+  away, and when they are back. The status becomes away at the leave time by itself, with
+  no process needing to run at that moment. It returns to available only when an agent
+  sets it. `teammate_register` prints the current status.
+- **Linked machines** share the status: it travels with the roster the relays already
+  exchange, and copies converge by a counter, not by clock time. A peer on an older
+  version ignores it.
+- **Cloud agents** (mailbox Worker 1.2.0) get `user_status`, and `user_set_status` when
+  the user marks their account `"can_set_status": true` in the mailbox `config.json`
+  (off by default; per account, because agents on one connection can use each other's
+  names). A cloud agent can never set the away behaviour and is not sent notices.
+  **Upgrading:** run `npx wrangler deploy` in `cloud-mailbox-worker`; an older Worker
+  keeps working without these tools.
+- `comms-status` is a reserved name: it cannot be registered or messaged.
+
 ## 0.19.4
 
 - **No warning line on cloud messages.** A message from a cloud agent used to start with a

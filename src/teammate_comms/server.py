@@ -21,12 +21,13 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, channel
+from . import __version__, availability, channel
 from . import harness as harness_mod
 from . import relay as relay_mod
 from . import tools as tools_mod
@@ -287,6 +288,11 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
             f"Cannot register as {agent!r}: that name is reserved for the cross-machine "
             f"relay's delivery notices — an agent may not claim it."
         )
+    if agent.lower() == availability.STATUS_SENDER:
+        raise CommsError(
+            f"Cannot register as {agent!r}: that name is reserved for the user-availability "
+            f"notices - an agent may not claim it."
+        )
     profile = dict(profile or {})
     # Auto-fill `project` from the current project dir (Claude Code injects
     # CLAUDE_PROJECT_DIR) unless the agent set it explicitly. With a global-by-
@@ -451,6 +457,7 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
                     f"{existing_project!r} — you inherit its inbox and transcript attribution.\n"
                 )
 
+    user_state, user_now = availability.read(root), time.time()
     effective = write_agent_record(
         root, team, agent, timeout=5, bump_epoch=True,
         type="full", channel=True, pid=os.getpid(), host=hostname,
@@ -463,6 +470,7 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
         startedAt=now_timestamp(), lastHeartbeat=now_timestamp(),
         pane_id=pane_id, wezterm_socket=wezterm_socket,
         harness=harness.name, harness_session=harness_session,
+        **{availability.SEEN_FIELD: availability.snapshot(user_state, user_now)},
         **profile_fields,
         **manager_fields,
         **({"spawned_by": spawned_by} if spawned_by else {}),
@@ -504,7 +512,7 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
     return warning + (
         f"Registered as {agent!r}{team_str}. Comms root: {root} (from {source}). "
         f"Channel armed. {profile_str}You have {len(unread)} unread message(s) — call "
-        f"teammate_inbox to read them."
+        f"teammate_inbox to read them. {availability.status_line(user_state, user_now)}"
     ) + session_hint + note
 
 

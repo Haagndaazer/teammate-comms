@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import __version__
+from . import availability
 from . import mailbox as mailbox_mod
 from .comms import (
     MACHINE_NAME_PATTERN,
@@ -1742,6 +1743,31 @@ class Relay:
                                  "accepts_remote_control": accepts
                                  if isinstance(accepts, bool) else None})
 
+    @staticmethod
+    def _mailbox_setter(raw, mailbox):
+        """Who a mailbox says set the status, kept only if it is a well-formed name."""
+        by = raw.get("updated_by")
+        try:
+            if raw.get("cloud") is True:
+                validate_agent_name(by)
+                return f"{by}@{mailbox}"
+            if isinstance(by, str) and "@" in by:
+                return validate_address(by)
+        except CommsError:
+            pass
+        return f"someone through the {mailbox} mailbox"
+
+    def _merge_availability(self, raw, me, mailbox=None):
+        try:
+            if mailbox and isinstance(raw, dict):
+                raw = {**raw, "updated_by": self._mailbox_setter(raw, mailbox)}
+            state = availability.from_wire(raw, me)
+            if state and availability.merge(self.root, state, behaviour=mailbox is None):
+                self.log(f"user availability updated from {mailbox or 'a linked machine'}: "
+                         f"seq {state['seq']}")
+        except Exception as e:
+            self.log(f"could not merge user availability: {type(e).__name__}: {e}")
+
     def authorize(self, source_ip):
         """The approved machine a connection came from, or None."""
         machine = self.net.identify(source_ip)
@@ -1771,6 +1797,8 @@ class Relay:
                 self._store_roster(machine, body["roster"])
             self._contact_ok(st)
             out = self._next_batch(machine, st)
+        if isinstance(body.get("roster"), dict):
+            self._merge_availability(body["roster"].get("availability"), self.machine)
         return 200, {"v": PROTOCOL, "from": self.machine, "applied": applied,
                      "failed": failed, "events": out}
 
@@ -1805,6 +1833,8 @@ class Relay:
         send_roster = now - st["roster_sent"] >= ROSTER_SECONDS
         if send_roster:
             body["roster"] = build_roster(self.root)
+            body["roster"]["availability"] = availability.wire(
+                availability.read(self.root), self.machine)
         try:
             status, resp = self._post(info["ip"], port, body)
         except Exception as e:
@@ -1966,7 +1996,9 @@ class Relay:
             batch = self._mailbox_batch(name, st)
             acks, nacks = list(st["acks"]), list(st["nacks"])
         body = {"v": mailbox_mod.PROTOCOL, "client": __version__, "events": batch,
-                "ack": acks, "failed": nacks}
+                "ack": acks, "failed": nacks,
+                "availability": availability.wire(availability.read(self.root),
+                                                  cfg["you_are"])}
         roster = self._mailbox_roster()
         since = now - st["roster_sent"]
         send_roster = since >= mailbox_mod.ROSTER_REFRESH_SECONDS or (
@@ -1996,6 +2028,7 @@ class Relay:
                 f"{mailbox_mod.clean_note(resp.get('you_are'))[:64]!r}; unlink it and link "
                 f"it again")
         bots = mailbox_mod.clean_bots(resp.get("bots"))
+        self._merge_availability(resp.get("availability"), cfg["you_are"], mailbox=name)
         with self._lock:
             st["acks"] = [a for a in st["acks"] if a not in acks]
             st["nacks"] = [f for f in st["nacks"] if f not in nacks]

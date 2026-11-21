@@ -1,4 +1,9 @@
 {
+  "0.20.0": [
+    "Your agents now share one status for you: available or away. Tell any agent you are leaving at a time, that you are away, or that you are back, and every live agent is told.",
+    "With a leave time, agents get a heads-up shortly before it and stop asking you questions once it passes. You choose what they do while you are away: work autonomously, wait, or your own instruction.",
+    "A cloud agent, such as one watching your calendar, can set your leave time once you allow its connection in the mailbox settings. This needs the mailbox Worker deployed again; the README has the steps."
+  ],
   "0.19.4": [
     "Messages from a cloud agent no longer start with a warning line. Whether your agents act on them is your choice: say so in your standing instructions, for example CLAUDE.md.",
     "The README section Trusting a cloud agent lists the risks. With no instruction from you, agents ask you first."

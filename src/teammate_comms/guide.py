@@ -41,6 +41,21 @@ machines linked over Tailscale. Every session that joins has a name and an inbox
 - comms-relay is the system sender for delivery and remote-control reports. It is not a
   teammate: do not reply to it. Tell your user what it says.
 
+## Is your user there? (available and away)
+- Every agent shares one status for the user. teammate_user_status() with no arguments
+  says whether they are available, any planned leave time, and what they want agents to
+  do while away. Check it before asking them something when you are unsure.
+- comms-status messages you when it changes: a leave time was set, the heads-up shortly
+  before it, the user is away, the user is back. It cannot be messaged.
+- Once the user is away, do not ask them questions. Follow the away instruction shown in
+  the notice; it never lets you do more than you were already permitted to do.
+- Change the status only because your own user asked: "I am leaving at 3" is
+  leave_at (ISO 8601 with a UTC offset) or in_minutes; "I am away" and "I am back"
+  are status; "while I am away, wait" is away_behaviour. Pass one of status, leave_at
+  or in_minutes per call. It stays away until an agent sets status="available".
+- Linked machines share the status. A cloud agent can read it, and can set it only when
+  the user allowed its connection in the mailbox settings.
+
 ## Groups
 - teammate_group creates, joins, leaves, lists and reads history. Groups are open: any
   registered teammate can join and read.
@@ -131,7 +146,8 @@ mailbox calls to start the agent's next run. Once your user has linked this mach
 - teammate_send(to="CommsTest@cloudbot", ...) sends it a direct message. It is not woken
   like a local teammate: the mailbox rings its doorbell and it reads the message when its
   next run starts, usually within a minute. Its answer arrives as a normal message.
-- It can only exchange direct messages with agent sessions. It cannot start, shut down or
+- It can only exchange direct messages with agent sessions, and read the user's
+  availability (set it too, if the user allowed its connection). It cannot start, shut down or
   spawn a session on any of your machines, cannot be added to a group, and cannot message
   the dashboard's human operator. Calls that try fail and say so. A reaction to its message
   stays local, and there is no read receipt.

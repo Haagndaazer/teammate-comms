@@ -283,7 +283,7 @@ def clean_bots(raw):
         except CommsError:
             continue
         if (name in seen or not _BOT_NAME_RE.fullmatch(name)
-                or name.lower() == "comms-relay"):
+                or name.lower() in ("comms-relay", "comms-status")):
             continue
         seen.add(name)
         last = entry.get("last_seen")

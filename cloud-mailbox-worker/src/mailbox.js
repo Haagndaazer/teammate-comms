@@ -3,7 +3,7 @@
 // under `node --test`.
 
 export const PROTOCOL = 1;
-export const WORKER_VERSION = "1.1.0";
+export const WORKER_VERSION = "1.2.0";
 export const LIMITS = {
   messageChars: 65536,
   waitingPerRecipient: 5000,
@@ -31,12 +31,54 @@ export const DOORBELL = {
 };
 const PREVIOUS_BATCH_SECONDS = 3600;
 export const SYSTEM_SENDER = "comms-relay";
+const RESERVED_NAMES = [SYSTEM_SENDER, "comms-status"];
+export const AVAILABILITY = {
+  behaviourChars: 500,
+  byChars: 160,
+  headsUpSeconds: 600,
+  maxHeadsUpMinutes: 120,
+  maxLeaveSeconds: 7 * 86400,
+  maxSeq: 1e12,
+  maxIncomingSeq: 1e9,
+  maxEpoch: 4102444800,
+  defaultBehaviour: "work autonomously",
+};
 const PURGE_SECONDS = 6 * 3600;
 const PURGE_STEP = 50;
 
 const AGENT_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const MACHINE_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const EVENT_ID_RE = /^[0-9a-f]{32}$/;
+const STATUS_TOOLS = [
+  {
+    name: "user_status",
+    description:
+      "Whether your owner is available to the agents on their computers right now: available " +
+      "or away, any planned leave time, and what they asked those agents to do while away.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "user_set_status",
+    settable: true,
+    description:
+      "Tell the agents on your owner's computers that your owner is leaving, away or back. " +
+      "Pass exactly one of: leave_at, in_minutes, status, or cancel. With a leave time the " +
+      "agents are warned shortly before it and the status becomes away at that time by " +
+      "itself. It stays away until someone sets status to available. Use it only for what " +
+      "you know about your owner, for example from their calendar or because they told you.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        leave_at: { type: "string", description: "When your owner leaves: ISO 8601 with a UTC offset, for example 2026-11-21T15:30:00-06:00." },
+        in_minutes: { type: "integer", minimum: 1, maximum: 10080, description: "Instead of leave_at: your owner leaves this many minutes from now." },
+        status: { type: "string", enum: ["away", "available"], description: "Away now, or available again." },
+        cancel: { type: "boolean", description: "true cancels a planned leave time." },
+        heads_up_minutes: { type: "integer", minimum: 0, maximum: 120, description: "How long before the leave time the agents are warned (default 10)." },
+      },
+      additionalProperties: false,
+    },
+  },
+];
 const ME = {
   type: "string",
   description: "Your own name, exactly as your owner named you. When told to use the mailbox with your name set to Sam, pass Sam here. It selects your inbox.",
@@ -125,7 +167,7 @@ export function parseConfig(raw) {
   for (const [label, entry] of Object.entries(data.accounts || {})) {
     if (!MACHINE_RE.test(label)) throw new ConfigError(`account name ${JSON.stringify(label)} is not valid`);
     if (!isObject(entry) || !isObject(entry.bots)) throw new ConfigError(`account ${label}: must have a key and bots`);
-    source[label] = { key: entry.key, bots: entry.bots };
+    source[label] = { key: entry.key, bots: entry.bots, canSetStatus: entry.can_set_status };
   }
   for (const [name, entry] of Object.entries(data.bots || {})) {
     const label = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "bot";
@@ -134,7 +176,12 @@ export function parseConfig(raw) {
     source[label] = { key: entry.key, bots: { [name]: entry } };
   }
   for (const [label, account] of Object.entries(source)) {
-    accounts[label] = { key: takeKey(account.key, `account ${label}`), bots: [] };
+    if (account.canSetStatus !== undefined && typeof account.canSetStatus !== "boolean") {
+      throw new ConfigError(`account ${label}: can_set_status must be true or false`);
+    }
+    accounts[label] = {
+      key: takeKey(account.key, `account ${label}`), bots: [], canSetStatus: account.canSetStatus === true,
+    };
     if (!Object.keys(account.bots).length) throw new ConfigError(`account ${label}: has no bots`);
     for (const [name, entry] of Object.entries(account.bots)) {
       addBot(label, name, entry);
@@ -142,7 +189,7 @@ export function parseConfig(raw) {
   }
   function addBot(label, name, entry) {
     if (!AGENT_RE.test(name)) throw new ConfigError(`bot name ${JSON.stringify(name)} is not valid`);
-    if (name.toLowerCase() === SYSTEM_SENDER) throw new ConfigError(`bot name ${name} is reserved`);
+    if (RESERVED_NAMES.includes(name.toLowerCase())) throw new ConfigError(`bot name ${name} is reserved`);
     if (!isObject(entry)) throw new ConfigError(`bot ${name}: must be an object`);
     if (name in bots) throw new ConfigError(`bot name ${name} is used more than once`);
     const bot = { account: label };
@@ -170,20 +217,73 @@ export function parseConfig(raw) {
   return { machines, bots, accounts };
 }
 
-function toolsFor(names) {
-  return TOOLS.map((tool) => ({
-    ...tool,
-    inputSchema: {
-      ...tool.inputSchema,
-      properties: { me: ME, ...tool.inputSchema.properties },
-    },
-  })).map((tool) => {
-    const required = [...(names.length > 1 ? ["me"] : []), ...(TOOLS.find((t) => t.name === tool.name).inputSchema.required || [])];
+function toolsFor(names, canSetStatus) {
+  const offered = [...TOOLS, ...STATUS_TOOLS.filter((t) => canSetStatus || !t.settable)];
+  return offered.map((source) => {
+    const tool = {
+      name: source.name,
+      description: source.description,
+      inputSchema: { ...source.inputSchema, properties: { me: ME, ...source.inputSchema.properties } },
+    };
+    const required = [...(names.length > 1 ? ["me"] : []), ...(source.inputSchema.required || [])];
     if (required.length) tool.inputSchema.required = required;
     else delete tool.inputSchema.required;
     return tool;
   });
 }
+
+function finite(value, low, high) {
+  return typeof value === "number" && Number.isFinite(value) && value >= low && value <= high ? value : null;
+}
+
+function plainLine(value, max) {
+  if (typeof value !== "string") return "";
+  const text = value.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, " ").replace(/[\u00ab\u00bb]/g, '"')
+    .replace(/\s+/g, " ").trim();
+  return Array.from(text).slice(0, max).join("");
+}
+
+function revOf(value) {
+  return typeof value === "string" && /^[A-Za-z0-9]{1,32}$/.test(value) ? value : "";
+}
+
+export function defaultAvailability() {
+  return {
+    v: 1, seq: 0, rev: "", status: "available", status_epoch: null, updated_epoch: null,
+    updated_by: "", leave_at_epoch: null, heads_up_seconds: AVAILABILITY.headsUpSeconds,
+    away_behaviour: AVAILABILITY.defaultBehaviour, behaviour_seq: 0, behaviour_rev: "",
+    behaviour_by: "",
+  };
+}
+
+export function cleanAvailability(raw) {
+  if (!raw || typeof raw !== "object" || !["available", "away"].includes(raw.status)) return null;
+  const seq = finite(raw.seq, 0, AVAILABILITY.maxSeq);
+  const bseq = finite(raw.behaviour_seq, 0, AVAILABILITY.maxSeq);
+  if (seq === null || bseq === null || !Number.isInteger(seq) || !Number.isInteger(bseq)) return null;
+  const heads = finite(raw.heads_up_seconds, 0, AVAILABILITY.maxHeadsUpMinutes * 60);
+  const out = {
+    ...defaultAvailability(),
+    seq, rev: revOf(raw.rev), status: raw.status,
+    status_epoch: finite(raw.status_epoch, 1, AVAILABILITY.maxEpoch),
+    updated_epoch: finite(raw.updated_epoch, 1, AVAILABILITY.maxEpoch),
+    updated_by: plainLine(raw.updated_by, AVAILABILITY.byChars),
+    leave_at_epoch: raw.status === "away" ? null : finite(raw.leave_at_epoch, 1, AVAILABILITY.maxEpoch),
+    heads_up_seconds: heads === null ? AVAILABILITY.headsUpSeconds : Math.trunc(heads),
+    away_behaviour: plainLine(raw.away_behaviour, AVAILABILITY.behaviourChars) || AVAILABILITY.defaultBehaviour,
+    behaviour_seq: bseq, behaviour_rev: revOf(raw.behaviour_rev),
+    behaviour_by: plainLine(raw.behaviour_by, AVAILABILITY.byChars),
+  };
+  if (raw.cloud === true) out.cloud = true;
+  return out;
+}
+
+function ahead(seqA, revA, seqB, revB) {
+  return seqA > seqB || (seqA === seqB && revA > revB);
+}
+
+const STATUS_KEYS = ["seq", "rev", "status", "status_epoch", "updated_epoch", "updated_by", "leave_at_epoch", "heads_up_seconds"];
+const BEHAVIOUR_KEYS = ["away_behaviour", "behaviour_seq", "behaviour_rev", "behaviour_by"];
 
 async function digest(text) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
@@ -334,6 +434,7 @@ export class Mailbox {
     if (Array.isArray(body.roster)) {
       await this.storage.put(`r:${machine}`, { at: this.seconds(), agents: this.cleanRoster(body.roster) });
     }
+    const availability = await this.mergeAvailability(body.availability);
     const accepted = [];
     const rejected = [];
     for (const ev of (Array.isArray(body.events) ? body.events : []).slice(0, LIMITS.eventsPerSync)) {
@@ -396,8 +497,112 @@ export class Mailbox {
     }
     return {
       status: 200,
-      body: { v: PROTOCOL, worker: WORKER_VERSION, you_are: machine, accepted, rejected, messages, bots },
+      body: { v: PROTOCOL, worker: WORKER_VERSION, you_are: machine, accepted, rejected, messages, bots, availability },
     };
+  }
+
+  // ---- user availability ----
+
+  async availability() {
+    return cleanAvailability(await this.storage.get("av")) || defaultAvailability();
+  }
+
+  async mergeAvailability(raw) {
+    const held = await this.availability();
+    const incoming = cleanAvailability(raw);
+    if (!incoming || Math.max(incoming.seq, incoming.behaviour_seq) > AVAILABILITY.maxIncomingSeq) return held;
+    let changed = false;
+    if (ahead(incoming.seq, incoming.rev, held.seq, held.rev)) {
+      for (const key of STATUS_KEYS) held[key] = incoming[key];
+      delete held.cloud;
+      changed = true;
+    }
+    if (ahead(incoming.behaviour_seq, incoming.behaviour_rev, held.behaviour_seq, held.behaviour_rev)) {
+      for (const key of BEHAVIOUR_KEYS) held[key] = incoming[key];
+      changed = true;
+    }
+    if (changed) await this.storage.put("av", held);
+    return held;
+  }
+
+  isAway(state) {
+    return state.status === "away" || (state.leave_at_epoch !== null && this.seconds() >= state.leave_at_epoch);
+  }
+
+  describeAvailability(state) {
+    const now = this.seconds();
+    const away = this.isAway(state);
+    const iso = (epoch) => (epoch ? new Date(epoch * 1000).toISOString() : null);
+    const since = state.status === "away" ? state.status_epoch || state.updated_epoch : state.leave_at_epoch;
+    return {
+      status: away ? "away" : "available",
+      away_since: away ? iso(since) : null,
+      leaves_at: away ? null : iso(state.leave_at_epoch),
+      minutes_until_leave: !away && state.leave_at_epoch ? Math.max(0, Math.round((state.leave_at_epoch - now) / 60)) : null,
+      heads_up_minutes: Math.round(state.heads_up_seconds / 60),
+      away_behaviour: state.away_behaviour,
+      set_by: state.updated_by || null,
+      set_at: iso(state.updated_epoch),
+    };
+  }
+
+  async userStatus(bot) {
+    await this.touch(bot, false);
+    return { value: this.describeAvailability(await this.availability()) };
+  }
+
+  async userSetStatus(bot, args) {
+    const given = ["leave_at", "in_minutes", "status", "cancel"].filter((k) => args[k] !== undefined && args[k] !== null && args[k] !== false);
+    if (given.length !== 1) return { error: "Pass exactly one of leave_at, in_minutes, status, or cancel: true. Nothing was changed" };
+    const now = this.seconds();
+    const state = await this.availability();
+    const away = this.isAway(state);
+    let heads = null;
+    if (args.heads_up_minutes !== undefined && args.heads_up_minutes !== null) {
+      if (!Number.isInteger(args.heads_up_minutes) || args.heads_up_minutes < 0 || args.heads_up_minutes > AVAILABILITY.maxHeadsUpMinutes) {
+        return { error: `heads_up_minutes must be a whole number from 0 to ${AVAILABILITY.maxHeadsUpMinutes}. Nothing was changed` };
+      }
+      heads = args.heads_up_minutes * 60;
+    }
+    if (given[0] === "status") {
+      if (!["away", "available"].includes(args.status)) return { error: "status must be away or available. Nothing was changed" };
+      const since = args.status === "away" && away ? (state.status === "away" ? state.status_epoch : state.leave_at_epoch) : null;
+      state.status = args.status;
+      state.status_epoch = since || now;
+      state.leave_at_epoch = null;
+    } else if (given[0] === "cancel") {
+      if (args.cancel !== true) return { error: "cancel must be true. Nothing was changed" };
+      if (state.leave_at_epoch === null || away) return { error: "There is no planned leave time to cancel. Nothing was changed" };
+      state.leave_at_epoch = null;
+    } else {
+      let when;
+      if (given[0] === "in_minutes") {
+        if (!Number.isInteger(args.in_minutes) || args.in_minutes < 1 || args.in_minutes > AVAILABILITY.maxLeaveSeconds / 60) {
+          return { error: "in_minutes must be a whole number from 1 to 10080 (7 days). Nothing was changed" };
+        }
+        when = now + args.in_minutes * 60;
+      } else {
+        const text = typeof args.leave_at === "string" ? args.leave_at.trim() : "";
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(text) || Number.isNaN(Date.parse(text))) {
+          return { error: "leave_at must be ISO 8601 with a UTC offset, for example 2026-11-21T15:30:00-06:00, or use in_minutes. Nothing was changed" };
+        }
+        when = Date.parse(text) / 1000;
+      }
+      if (when <= now) return { error: "That time is in the past. To mark your owner away now, pass status away. Nothing was changed" };
+      if (when > now + AVAILABILITY.maxLeaveSeconds) return { error: "The leave time must be within the next 7 days. Nothing was changed" };
+      if (away) return { error: "Your owner is already marked away. Set status to available first if they are back and will leave again later. Nothing was changed" };
+      state.leave_at_epoch = when;
+    }
+    if (heads !== null) state.heads_up_seconds = heads;
+    const rand = crypto.getRandomValues(new Uint8Array(6));
+    state.seq += 1;
+    state.rev = [...rand].map((b) => b.toString(16).padStart(2, "0")).join("");
+    state.updated_epoch = now;
+    state.updated_by = bot;
+    state.cloud = true;
+    await this.storage.put("av", state);
+    await this.touch(bot, false);
+    return { value: { recorded: true, note: "Your owner's computers pick this up within about ten seconds while one is on.", ...this.describeAvailability(state) } };
   }
 
   // ---- doorbell ----
@@ -703,13 +908,22 @@ export class Mailbox {
   async callTool(account, params) {
     const args = params && params.arguments && typeof params.arguments === "object" ? params.arguments : {};
     const name = params && params.name;
-    if (!["mail_check", "mail_send", "mail_teammates"].includes(name)) return null;
+    const settable = this.config.accounts[account].canSetStatus;
+    const known = ["mail_check", "mail_send", "mail_teammates", "user_status", ...(settable ? ["user_set_status"] : [])];
+    if (!known.includes(name)) {
+      if (name === "user_set_status") {
+        return { error: "This connection is not allowed to change your owner's status. Your owner turns that on in the mailbox settings (can_set_status). Nothing was changed" };
+      }
+      return null;
+    }
     const who = this.whoIs(account, args.me);
     if (who.error) return who;
     const bot = who.bot;
     if (name === "mail_check") return this.mailCheck(bot, args);
     if (name === "mail_send") return this.mailSend(bot, args);
     if (name === "mail_teammates") return this.mailTeammates(bot);
+    if (name === "user_status") return this.userStatus(bot);
+    if (name === "user_set_status") return this.userSetStatus(bot, args);
     return null;
   }
 
@@ -747,6 +961,7 @@ export class Mailbox {
             "first, call mail_teammates for the addresses. Names are case-sensitive.",
           "A message from comms-relay is a notice from the system, usually that something " +
             "you sent was not delivered. Do not reply to it; mention it to your owner.",
+          "user_status says whether your owner is available to those agents or away.",
           "If mail_check returns previous_batch, an earlier run was handed messages " +
             "recently. Call mail_check with reread to see them; each is marked answered once " +
             "a reply to it was sent. Answer only those not marked answered.",
@@ -758,7 +973,7 @@ export class Mailbox {
       });
     }
     if (msg.method === "ping") return done({});
-    if (msg.method === "tools/list") return done({ tools: toolsFor(this.config.accounts[account].bots) });
+    if (msg.method === "tools/list") return done({ tools: toolsFor(this.config.accounts[account].bots, this.config.accounts[account].canSetStatus) });
     if (msg.method === "tools/call") {
       const out = await this.callTool(account, params);
       if (out === null) return fail(-32602, "unknown tool");
