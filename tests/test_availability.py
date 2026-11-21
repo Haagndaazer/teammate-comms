@@ -64,17 +64,31 @@ def test_state_and_phases():
                      "no new leave time while away", "already away")
         check_raises(lambda: av.change(root, "Sylvie", leave_at=None, now=T0 + 2000), CommsError,
                      "nothing to cancel once away", "no pending leave time")
+        held = av.read(root)
         s = av.change(root, "Bob", status="away", now=T0 + 2500)
-        check(s["status_epoch"] == T0 + 1800 and s["leave_at_epoch"] is None,
-              "marking away after the leave time keeps the original since")
+        check(s == held and av.away_since(s, T0 + 2500) == T0 + 1800 and s["updated_by"] == "Sylvie",
+              "marking away once the leave time has passed changes nothing")
         s = av.change(root, "Bob", status="available", now=T0 + 3000)
-        check(not av.is_away(s, T0 + 3000) and s["status_epoch"] == T0 + 3000 and s["seq"] == 3, "back")
+        check(not av.is_away(s, T0 + 3000) and s["status_epoch"] == T0 + 3000 and s["seq"] == 2, "back")
+        check(av.change(root, "Ann", status="available", now=T0 + 3050) == s,
+              "available while already available with no leave time changes nothing")
         s = av.change(root, "Bob", away_behaviour="wait", now=T0 + 3100)
-        check(s["seq"] == 3 and s["behaviour_seq"] == 1 and s["behaviour_by"] == "Bob"
+        check(s["seq"] == 2 and s["behaviour_seq"] == 1 and s["behaviour_by"] == "Bob"
               and s["updated_by"] == "Bob", "the behaviour has its own counter")
+        check(av.change(root, "Ann", away_behaviour="wait", now=T0 + 3150) == s,
+              "the same behaviour again changes nothing")
         s = av.change(root, "Ann", status="away", now=T0 + 3200)
         check(s["away_behaviour"] == "wait" and s["status_epoch"] == T0 + 3200,
               "the behaviour survives status changes")
+        again = av.change(root, "Bob", status="away", now=T0 + 3300)
+        check(again == s and again["updated_by"] == "Ann", "away while already away changes nothing")
+        s = av.change(root, "Ann", status="available", now=T0 + 3400)
+        s = av.change(root, "Ann", leave_at=T0 + 9000, heads_up_seconds=300, now=T0 + 3500)
+        check(av.change(root, "Bob", leave_at=T0 + 9000, heads_up_seconds=300, now=T0 + 3600) == s,
+              "the same leave time again changes nothing")
+        s2 = av.change(root, "Bob", status="available", now=T0 + 3700)
+        check(s2["seq"] == s["seq"] + 1 and s2["leave_at_epoch"] is None,
+              "available with a leave time pending clears it")
         check_raises(lambda: av.change(root, "x", status="gone"), CommsError, "bad status")
         check_raises(lambda: av.change(root, "x", status="away", leave_at=T0 + 9e9), CommsError,
                      "status and leave time together")
@@ -182,6 +196,9 @@ def test_notices_to_agents():
         av.change(root, "alice", status="away", now=T0 + 9000)
         count = len(status_notes(root, "alice"))
         check(av.check(root, None, "alice", record, now=T0 + 9001) is True, "away announced")
+        av.change(root, "bob", status="away", now=T0 + 9002)
+        check(tick(root, "alice", T0 + 9003) is False and len(status_notes(root, "alice")) == count + 1,
+              "away set again while away tells nobody")
         check(av.check(root, None, "alice", record, now=T0 + 9002) is True
               and len(status_notes(root, "alice")) == count + 1,
               "a stale snapshot never writes the same notice twice")
@@ -253,7 +270,7 @@ def test_merge_between_machines():
         check(av.from_wire(av.wire(av.read(b), "lap"), "desk")["updated_by"] == "Sylvie",
               "and it comes home under the plain name")
 
-        fast = av.change(b, "Fred", status="away", now=T0 + 99999)
+        fast = av.change(b, "Fred", status="away", now=T0 + 500)
         slow = av.change(a, "Sylvie", status="away", now=T0 - 50000)
         check(fast["seq"] == slow["seq"] == 2, "two machines changed it at once")
         av.merge(a, av.from_wire(av.wire(fast, "lap"), "desk"))

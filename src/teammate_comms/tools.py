@@ -2849,7 +2849,11 @@ def _handle_user_status(args, ctx):
         if not availability.is_away(state, now) and state["leave_at_epoch"] is None:
             line += " " + availability.behaviour_text(state)
         return line
+    before = availability.read(root)
     state = availability.change(root, agent, now=now, **changes)
+    if (state["rev"], state["behaviour_rev"]) == (before["rev"], before["behaviour_rev"]):
+        return ("Nothing changed, so no agent was told again: that is already the case. "
+                + availability.status_line(state, now))
     relay_mod.ensure_relay(root)
     return ("Recorded. Every live agent on this machine is told within a few seconds, and "
             "linked machines at their next contact. " + availability.status_line(state, now))

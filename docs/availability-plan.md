@@ -84,6 +84,10 @@ or compacted session knows the state without an old notice waking it.
 - no arguments: effective status, away since, leave time (local time and minutes left),
   away behaviour, who set each and when. The "easy check".
 - `status`: `"away"` or `"available"`. Either clears a pending leave time.
+- A request that matches what is already the case (away while away, available while
+  available with no leave time, the same leave time, heads-up or behaviour) changes
+  nothing: no counter moves, so no agent is told again. The same holds for a cloud
+  agent, whose call answers `recorded: false`.
 - `leave_at`: ISO 8601 with offset (a time without offset is refused), or `in_minutes`
   (whole number, 1 to 10080). Must be in the future, at most 7 days out. Refused while
   already away. `leave_at: ""` cancels. `heads_up_minutes`: 0 to 120, default 10.

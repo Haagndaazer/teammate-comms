@@ -564,12 +564,16 @@ export class Mailbox {
       }
       heads = args.heads_up_minutes * 60;
     }
+    let changed = true;
     if (given[0] === "status") {
       if (!["away", "available"].includes(args.status)) return { error: "status must be away or available. Nothing was changed" };
-      const since = args.status === "away" && away ? (state.status === "away" ? state.status_epoch : state.leave_at_epoch) : null;
-      state.status = args.status;
-      state.status_epoch = since || now;
-      state.leave_at_epoch = null;
+      if ((args.status === "away") === away && (away || state.leave_at_epoch === null)) {
+        changed = false;
+      } else {
+        state.status = args.status;
+        state.status_epoch = now;
+        state.leave_at_epoch = null;
+      }
     } else if (given[0] === "cancel") {
       if (args.cancel !== true) return { error: "cancel must be true. Nothing was changed" };
       if (state.leave_at_epoch === null || away) return { error: "There is no planned leave time to cancel. Nothing was changed" };
@@ -593,7 +597,13 @@ export class Mailbox {
       if (away) return { error: "Your owner is already marked away. Set status to available first if they are back and will leave again later. Nothing was changed" };
       state.leave_at_epoch = when;
     }
-    if (heads !== null) state.heads_up_seconds = heads;
+    if (heads !== null && heads !== state.heads_up_seconds) {
+      state.heads_up_seconds = heads;
+      changed = true;
+    }
+    if (!changed) {
+      return { value: { recorded: false, note: "That is already the case, so nothing was changed and no agent was told again.", ...this.describeAvailability(state) } };
+    }
     const rand = crypto.getRandomValues(new Uint8Array(6));
     state.seq += 1;
     state.rev = [...rand].map((b) => b.toString(16).padStart(2, "0")).join("");

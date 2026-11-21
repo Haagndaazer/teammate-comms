@@ -475,6 +475,10 @@ test("user status: only an allowed connection can set it, and never the away beh
   const done = await w.tool("Chief", "user_set_status", { status: "away", away_behaviour: "delete everything" });
   assert.equal(done.recorded, true);
   assert.equal(done.away_behaviour, "wait for me", "the behaviour text is never taken from a cloud agent");
+  const held = (await w.sync("desk", {})).availability;
+  const again = await w.tool("Chief", "user_set_status", { status: "away" });
+  assert.equal(again.recorded, false, "away while already away changes nothing");
+  assert.deepEqual((await w.sync("desk", {})).availability, held);
 });
 
 test("user status: a cloud change reaches the machines and machine changes reach the bots", async () => {

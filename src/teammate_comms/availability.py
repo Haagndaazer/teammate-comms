@@ -216,20 +216,23 @@ def change(root, by, status=None, leave_at=_UNSET, heads_up_seconds=None,
             if is_away(state, now):
                 raise CommsError("The user is already away. Set status='available' first if "
                                  "they are back and will leave again later.")
+            touched = state["leave_at_epoch"] != leave_at
             state["leave_at_epoch"] = leave_at
-            touched = True
         elif leave_at is None:
             if state["leave_at_epoch"] is None or is_away(state, now):
                 raise CommsError("There is no pending leave time to cancel.")
             state["leave_at_epoch"] = None
             touched = True
-        if heads_up_seconds is not None:
+        if heads_up_seconds is not None and heads_up_seconds != state["heads_up_seconds"]:
             state["heads_up_seconds"] = heads_up_seconds
             touched = True
-        if status is not None:
-            since = away_since(state, now) if status == AWAY else None
-            state.update(status=status, status_epoch=since or now, leave_at_epoch=None)
+        away_now = is_away(state, now)
+        if status is not None and ((status == AWAY) != away_now
+                                   or state["leave_at_epoch"] is not None and not away_now):
+            state.update(status=status, status_epoch=now, leave_at_epoch=None)
             touched = True
+        if away_behaviour == state["away_behaviour"]:
+            away_behaviour = None
         if touched:
             state.update(seq=state["seq"] + 1, rev=_new_rev(), updated_epoch=now, updated_by=by)
         if away_behaviour is not None:

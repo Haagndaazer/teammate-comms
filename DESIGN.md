@@ -1312,6 +1312,8 @@ config, key tool) and cannot be sent to.
 notices name who set it and any agent can set it back. The away behaviour is text one local
 agent sets and all agents read as the user's wish: it is one line, stripped of control
 characters and of the guillemets that delimit it, shown quoted with its author, and every notice says it never
-widens what an agent may do. Away has no automatic end, by the user's ruling; notices show
+widens what an agent may do. A request that matches what is already the case, such as
+away while already away, leaves the state untouched, so nobody is told twice. Away has no
+automatic end, by the user's ruling; notices show
 since when. A change made in the seconds before a copy hears of a change made elsewhere
 can lose to it; the next notice says what the status now is.

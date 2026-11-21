@@ -22,6 +22,8 @@
   names). A cloud agent can never set the away behaviour and is not sent notices.
   **Upgrading:** run `npx wrangler deploy` in `cloud-mailbox-worker`; an older Worker
   keeps working without these tools.
+- Setting what is already the case, for example away while already away, changes nothing
+  and tells no agent again.
 - `comms-status` is a reserved name: it cannot be registered or messaged.
 
 ## 0.19.4
