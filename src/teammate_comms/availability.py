@@ -370,7 +370,9 @@ def notice(state, seen, now):
                 f"{minutes_text(leave - now)}{_by(state['updated_by'])}. You will get a "
                 f"heads-up {lead} before. {behaviour_text(state)}", False)
     if seen.get("phase") == AWAY:
-        return (f"Your user is available again{_by(state['updated_by'])}.", False)
+        return (f"Your user is available again{_by(state['updated_by'])}. If anything is "
+                f"waiting on them, a question, a decision or an approval, put it to them "
+                f"now in your own session. If you need nothing from them, say nothing.", False)
     if seen.get("leave") or seen.get("phase") == HEADS_UP:
         return (f"The leave time was cancelled{_by(state['updated_by'])}. Your user is "
                 f"available.", False)

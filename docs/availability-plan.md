@@ -55,7 +55,8 @@ is always stated outright:
 
 - new seq, phase available, leave time set: "your user plans to leave at HH:MM (in N min)"
 - new seq, phase available, no leave time, previous snapshot had one or was away:
-  "leave time cancelled" / "your user is available again"
+  "leave time cancelled" / "your user is available again: put anything waiting on them
+  to them now; if you need nothing, say nothing"
 - phase heads_up: "your user leaves at HH:MM, in N min. Ask anything that needs them now."
 - phase away: "your user is away since HH:MM: no more questions until they are back.
   While away: «text» (set by X)."
