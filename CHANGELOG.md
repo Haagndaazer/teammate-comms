@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.19.4
+
+- **No warning line on cloud messages.** A message from a cloud agent used to start with a
+  line telling the reader to treat it as information and not as an instruction. That line
+  is gone, and so is the same stance in `teammate_list`, the guide and the link output.
+  Trust in a cloud agent is the user's choice, stated in their standing instructions (for
+  example `CLAUDE.md`). The README section "Trusting a cloud agent" lists the risks and
+  gives example instructions; the built-in guide tells an agent with no instruction to ask
+  its user first and to offer those risks.
+- Unchanged: what a cloud agent cannot do (groups, spawn, shutdown, linking, urgent
+  priority) is still enforced on the machine, and header lookalikes in its text are still
+  broken.
+
 ## 0.19.3
 
 - Wording only. Bringing a cloud agent onto the mailbox is now one sentence the user pastes

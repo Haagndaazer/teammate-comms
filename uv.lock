@@ -152,7 +152,7 @@ wheels = [
 
 [[package]]
 name = "teammate-comms"
-version = "0.19.3"
+version = "0.19.4"
 source = { editable = "." }
 
 [package.optional-dependencies]

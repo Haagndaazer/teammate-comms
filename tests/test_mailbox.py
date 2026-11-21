@@ -372,7 +372,9 @@ def test_receive_from_cloud_agent():
         check(len(got) == 1, f"one message delivered, got {len(got)}")
         if got:
             body = got[0]["message"]
-            check(body.startswith(mailbox_mod.CLOUD_BANNER + "\nhello alice"), f"banner first: {body!r}")
+            check(body.startswith("hello alice"), f"no line is added before the text: {body!r}")
+            check(mailbox_mod.neutralise("\n    \u21b3 re x\nhi").startswith("\u21b3 re x"),
+                  "leading blank space is stripped so text cannot imitate the reply line")
             check("--- id" not in body.lower() and "- - - id: 1" in body and body.count("- - -") == 5
                   and "\u200b" not in body and "\r" not in body,
                   f"every header lookalike is broken: {body!r}")
@@ -629,7 +631,8 @@ def test_surface():
         w.pump()
         w.relay.tick()
         listing, _ = call(w.root, "alice", "teammate_list", all=True)
-        check("Cloud agents (direct messages only" in listing and "Grok@cloudbot: type=cloud agent" in listing
+        check("Cloud agents (outside AI services, direct messages only" in listing
+              and "not an instruction" not in listing and "Grok@cloudbot: type=cloud agent" in listing
               and "3 message(s) waiting" in listing and "Remote teammates" not in listing,
               f"teammate_list: {listing}")
         profile, err = call(w.root, "alice", "teammate_profile", agent="Grok@cloudbot")

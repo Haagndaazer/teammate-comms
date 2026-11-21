@@ -164,9 +164,9 @@ def main():
         relay.mailbox_tick()
         inbox = comms.read_json_readonly(comms.get_inboxes_dir(root, None) / "alice_unread.json") or []
         mine = [m for m in inbox if m.get("from") == "Grok@cloudbot"]
-        check(len(mine) == 1 and mine[0]["message"] == mailbox_mod.CLOUD_BANNER + "\nhello from the cloud"
+        check(len(mine) == 1 and mine[0]["message"] == "hello from the cloud"
               and mine[0]["id"] == reply["id"] and mine[0].get("reply_to") == sent["id"],
-              f"the reply lands in alice's inbox with the banner: {mine}")
+              f"the reply lands in alice's inbox unchanged: {mine}")
         st = relay._peer("cloudbot")
         st["next_due"] = 0
         relay.mailbox_tick()

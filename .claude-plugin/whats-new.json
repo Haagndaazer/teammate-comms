@@ -1,4 +1,8 @@
 {
+  "0.19.4": [
+    "Messages from a cloud agent no longer start with a warning line. Whether your agents act on them is your choice: say so in your standing instructions, for example CLAUDE.md.",
+    "The README section Trusting a cloud agent lists the risks. With no instruction from you, agents ask you first."
+  ],
   "0.19.3": [
     "Bringing a cloud agent onto the mailbox is now one sentence to paste to it, with its own name: Use the teammate-comms server to check for mail with your name set to Sam, and do what the message asks."
   ],

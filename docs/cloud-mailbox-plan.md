@@ -205,7 +205,9 @@ The reviewer's findings that changed the design:
 - **Human operators are left out**: not in the roster sent to the mailbox, not reachable
   from a cloud agent.
 - **A daily doorbell limit** (100) was added to the once-a-minute limit.
-- **Every cloud message carries a banner line**, and header lookalikes are broken.
+- **Header lookalikes in a cloud message are broken.** (The banner line added here was
+  removed in 0.19.4: trust in a cloud agent is the user's choice, stated in their
+  standing instructions.)
 - **Inbound volume is capped** per mailbox.
 - **An empty mail check reports the previous batch**, so a run that died after fetching can
   be recovered by the next one.

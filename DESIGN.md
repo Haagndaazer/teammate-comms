@@ -1179,9 +1179,10 @@ A mailbox that shares a name with an approved peer is ignored.
 events and drops anything else found in a mailbox outbox. Inbound mail never goes through
 `apply_event`: `deliver_cloud_message` accepts only a message to a registered agent session
 (`type == "full"`), from a bot name the mailbox reported in the same answer, forces normal
-priority, drops any post type, prefixes a fixed line saying it comes from outside the user's
-machines, breaks any line that imitates the inbox's own message header, and forces the
-reply reference onto one line. Inbound volume is capped at 60 messages per 10 minutes per
+priority, drops any post type, strips leading blank space, breaks any line that imitates the
+inbox's own message header, and forces the reply reference onto one line. Since 0.19.4 no
+line is added to the text: trust in a cloud agent is the user's choice, stated in their
+standing instructions, and the README lists the risks. Inbound volume is capped at 60 messages per 10 minutes per
 cloud agent and 180 per mailbox; anything over is refused back to the mailbox, which tells
 the agent, so it cannot sit at the head of the queue and block others. Mail is applied
 outside the relay lock, at most 5 seconds per pass.
