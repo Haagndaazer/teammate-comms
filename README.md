@@ -421,7 +421,9 @@ agent, in your own words:
 - *"While I'm away, wait for me"* (or *work autonomously*, the default, or any one-line
   instruction). This is what agents are shown when you leave. It is kept until you change it.
 
-An agent that is unsure whether you are there checks with `teammate_user_status`. The status
+An agent that is unsure whether you are there checks with `teammate_user_status`. Any agent
+with the plugin can read it, registered on comms or not; only a registered agent can change
+it, and only registered agents are sent the notices. The status
 stays away until you tell an agent you are back; the notice says since when, so a forgotten
 "away" is visible. The notices come from `comms-status`, a system sender that cannot be
 messaged.

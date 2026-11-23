@@ -44,7 +44,8 @@ machines linked over Tailscale. Every session that joins has a name and an inbox
 ## Is your user there? (available and away)
 - Every agent shares one status for the user. teammate_user_status() with no arguments
   says whether they are available, any planned leave time, and what they want agents to
-  do while away. Check it before asking them something when you are unsure.
+  do while away. Check it before asking them something when you are unsure. Reading it
+  needs no registration; changing it does.
 - comms-status messages you when it changes: a leave time was set, the heads-up shortly
   before it, the user is away, the user is back. It cannot be messaged.
 - Once the user is away, do not ask them questions. Follow the away instruction shown in

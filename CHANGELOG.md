@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.2
+
+- `teammate_user_status` with no arguments now works for an agent that is not registered
+  on comms, so any agent with the plugin can check whether the user is there and what
+  they want done while away. Changing the status still needs a registered agent, and
+  only registered agents are sent the notices.
+
 ## 0.20.1
 
 - **The server connects in the first session after an update.** Each update installs

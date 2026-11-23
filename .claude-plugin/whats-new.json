@@ -1,4 +1,7 @@
 {
+  "0.20.2": [
+    "Any agent with the plugin can now check whether you are available or away, and what you want done while away, without having joined comms first. Changing your status still needs an agent that has joined."
+  ],
   "0.20.1": [
     "The teammate tools now connect in the first session after an update. Before, the first start after each update failed and needed a second restart."
   ],

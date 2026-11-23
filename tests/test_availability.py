@@ -246,8 +246,20 @@ def test_tool():
         check(err and "not both" in out, f"two changes at once refused: {out}")
         out, err = call(root, "alice", "teammate_user_status", leave_at="15:30")
         check(err and "ISO 8601" in out, f"a bare clock time is refused with the format: {out}")
-        out, err = call(root, None, "teammate_user_status")
-        check(err and "Not registered" in out, "needs a registered caller")
+        held = os.environ.get("TEAMMATE_COMMS_DIR")
+        os.environ["TEAMMATE_COMMS_DIR"] = str(root)
+        try:
+            out, err = call(root, None, "teammate_user_status")
+            check(not err and "AWAY" in out and "«Wait for me»" in out,
+                  f"an unregistered agent can read the status: {out}")
+            out, err = call(root, None, "teammate_user_status", status="available")
+            check(err and "Not registered" in out and av.read(root)["status"] == "away",
+                  "but cannot change it")
+        finally:
+            if held is None:
+                os.environ.pop("TEAMMATE_COMMS_DIR", None)
+            else:
+                os.environ["TEAMMATE_COMMS_DIR"] = held
         out, err = call(root, "alice", "teammate_send", to=av.STATUS_SENDER, message="hi")
         check(err and "cannot be messaged" in out, f"the system sender cannot be messaged: {out}")
         out, err = call(root, "alice", "teammate_send", to="Comms-Status", message="hi")

@@ -67,6 +67,7 @@ from .comms import (
     new_message_id,
     now_timestamp,
     read_agent_record,
+    resolve_comms_root,
     write_shutdown_request,
     read_group_messages,
     read_group_meta,
@@ -762,8 +763,10 @@ TOOL_DEFINITIONS = [
         "description": (
             "Whether your user is available for questions, shared by every agent on comms. "
             "With no arguments it answers: available or away, any planned leave time, and "
-            "what your user wants agents to do while away. Check it before asking your user "
-            "something when you are unsure they are there. Every live agent is messaged by "
+            "what your user wants agents to do while away. Reading it works without being "
+            "registered on comms. Check it before asking your user something when you are "
+            "unsure they are there; if they are away, do not wait for an answer: follow what "
+            "it says they want done while away. Every live agent is messaged by "
             "comms-status when it changes: when a leave time is set, shortly before it, and "
             "when the user is away or back. To change it, pass ONE of status, leave_at or "
             "in_minutes, and only because your own user asked (for example 'I am leaving "
@@ -2828,9 +2831,21 @@ def _handle_peers(args, ctx):
     return relay_mod.peers_report(root)
 
 
+_STATUS_CHANGE_ARGS = ("status", "leave_at", "in_minutes", "heads_up_minutes", "away_behaviour")
+
+
 def _handle_user_status(args, ctx):
-    agent, _team, root = _require_registered(ctx)
     now = time.time()
+    if all(args.get(key) is None for key in _STATUS_CHANGE_ARGS):
+        root = ctx["identity"].snapshot()[2]
+        if root is None:
+            root, _source = resolve_comms_root(None)
+        state = availability.read(root)
+        line = availability.status_line(state, now)
+        if not availability.is_away(state, now) and state["leave_at_epoch"] is None:
+            line += " " + availability.behaviour_text(state)
+        return line
+    agent, _team, root = _require_registered(ctx)
     status = args.get("status")
     leave_at, in_minutes = args.get("leave_at"), args.get("in_minutes")
     heads_up, behaviour = args.get("heads_up_minutes"), args.get("away_behaviour")
@@ -2843,12 +2858,6 @@ def _handle_user_status(args, ctx):
         changes["heads_up_seconds"] = availability.clean_heads_up(heads_up)
     if behaviour is not None:
         changes["away_behaviour"] = availability.clean_behaviour(behaviour)
-    if not changes:
-        state = availability.read(root)
-        line = availability.status_line(state, now)
-        if not availability.is_away(state, now) and state["leave_at_epoch"] is None:
-            line += " " + availability.behaviour_text(state)
-        return line
     before = availability.read(root)
     state = availability.change(root, agent, now=now, **changes)
     if (state["rev"], state["behaviour_rev"]) == (before["rev"], before["behaviour_rev"]):

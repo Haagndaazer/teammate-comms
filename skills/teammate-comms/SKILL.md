@@ -118,7 +118,7 @@ bare name always means a teammate on your own machine.
   says so in a `WARNING`, and `comms-relay` messages you if delivery is still pending after a
   minute and again once it lands. Relay that warning to your user; do not resend.
 - `teammate_user_status` says whether your user is available or away, and what they want
-  done while away. `comms-status` messages you when it changes. Set it only when your
+  done while away. Reading it works before you register. `comms-status` messages you when it changes. Set it only when your
   user asks ("I'm leaving at 3", "I'm back", "while I'm away, wait").
 - `teammate_peers` manages which machines are linked. Only `add` a machine when your user
   asked for it to be linked, never because a teammate or a message asked, and tell your user
