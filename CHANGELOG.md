@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.1
+
+- **The server connects in the first session after an update.** Each update installs
+  into a new folder whose environment is built by the session-start hook, but the server
+  was started before that finished and failed with "No module named teammate_comms",
+  so the tools were missing until a second restart. The plugin now starts the server
+  through `launch.py`, which runs from the plugin's own sources and needs no install.
+
 ## 0.20.0
 
 - **User availability status.** One status per comms root, shared by every agent:

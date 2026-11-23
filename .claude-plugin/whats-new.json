@@ -1,4 +1,7 @@
 {
+  "0.20.1": [
+    "The teammate tools now connect in the first session after an update. Before, the first start after each update failed and needed a second restart."
+  ],
   "0.20.0": [
     "Your agents now share one status for you: available or away. Tell any agent you are leaving at a time, that you are away, or that you are back, and every live agent is told.",
     "With a leave time, agents get a heads-up shortly before it and stop asking you questions once it passes. You choose what they do while you are away: work autonomously, wait, or your own instruction.",

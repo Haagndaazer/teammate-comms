@@ -88,7 +88,13 @@ fast, predictable spawn:
 - A **SessionStart hook** (`hooks/session-start.sh`, registered in `hooks/hooks.json`
   via `${CLAUDE_PLUGIN_ROOT}`) runs `uv sync` against a stamp so the venv exists
   *before* the server is spawned. The hook runs under `bash` (git-bash on Windows).
-- The MCP server is launched with **`uv run --no-sync`** (venv already present).
+- The MCP server is launched with **`uv run --no-sync`** on `launch.py`, which puts the
+  plugin's own `src` on the import path. Every update installs into a new folder with no
+  venv, and the server is spawned before the hook has built one; `uv run --no-sync` then
+  makes a bare venv with nothing installed, where `python -m teammate_comms.server`
+  cannot be imported. Starting from the file needs no install, so the first session
+  after an install or update connects. An environment variable was not used for this
+  because sessions the server starts would inherit it.
 - **Hook hardening (0.7.x / WP-3):** both hooks **fail closed but VISIBLE** — an unset
   `CLAUDE_PLUGIN_ROOT` emits valid `{}` and exits 0 instead of dying silently under
   `set -u` before any JSON. session-start.sh writes the sync stamp **only on a successful
@@ -127,7 +133,7 @@ the plugin is self-contained and does not write into a project's `.mcp.json`.
   "mcpServers": {
     "teammate-comms": {
       "command": "uv",
-      "args": ["run", "--no-sync", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "teammate_comms.server"]
+      "args": ["run", "--no-sync", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "${CLAUDE_PLUGIN_ROOT}/launch.py"]
     }
   },
   "channels": [{ "server": "teammate-comms" }]

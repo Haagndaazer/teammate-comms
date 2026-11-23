@@ -726,9 +726,10 @@ automatically, so agents don't self-register under arbitrary names. Custom chann
 require `--dangerously-load-development-channels` — the flag only bypasses the plugin
 allowlist; your org's `channelsEnabled` policy still applies.
 
-**First install:** a SessionStart hook builds the (zero-dep) venv so the server
-launches with `uv run --no-sync`. If the server isn't connected on the very first
-session, **restart Claude Code once** — every session after is instant.
+**First install and updates:** the server starts straight from the plugin folder, so it
+connects in the first session after an install or update. A SessionStart hook builds the
+(zero-dep) venv alongside. If the server still isn't connected, run `/mcp` and reconnect
+it, or restart Claude Code once.
 
 ### Trusting the channel (skip the dangerous flag)
 

@@ -425,6 +425,30 @@ def test_readme_tool():
           "teammate_peers lists the linking steps in order and points at the guide")
 
 
+def test_launcher():
+    manifest = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    args = manifest["mcpServers"]["teammate-comms"]["args"]
+    check(args[-1] == "${CLAUDE_PLUGIN_ROOT}/launch.py" and "-m" not in args,
+          "the plugin starts the server from launch.py, not as an installed module")
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                     "clientInfo": {"name": "probe", "version": "0"}}}) + "\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PYTHONPATH", "TEAMMATE_AGENT", "TEAMMATE_TEAM")}
+        env.update(TEAMMATE_COMMS_DIR=tmp, TEAMMATE_RELAY_AUTOSTART="0", PYTHONIOENCODING="utf-8")
+        bare = subprocess.run([sys.executable, "-S", "-c", "import teammate_comms"], cwd=tmp, env=env,
+                              capture_output=True, text=True, timeout=60)
+        check(bare.returncode != 0, "without an install the package cannot be imported by name")
+        done = subprocess.run([sys.executable, "-S", str(REPO / "launch.py")], cwd=tmp, env=env,
+                              input=request, capture_output=True, text=True, encoding="utf-8",
+                              timeout=60)
+        lines = [ln for ln in done.stdout.splitlines() if ln.strip()]
+        reply = json.loads(lines[0]) if lines else {}
+        check(reply.get("result", {}).get("serverInfo", {}).get("version") == teammate_comms.__version__,
+              f"launch.py answers the handshake with nothing installed: {done.stderr[-300:]!r}")
+
+
 def test_release_consistency():
     version = teammate_comms.__version__
     changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -471,6 +495,7 @@ def main():
         ("update-available notice", test_update_check),
         ("session-start hook output", test_hook),
         ("teammate_readme and tool descriptions", test_readme_tool),
+        ("server start with nothing installed", test_launcher),
         ("release consistency", test_release_consistency),
     ]
     for label, fn in sections:

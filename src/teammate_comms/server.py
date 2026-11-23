@@ -664,8 +664,8 @@ def _write_plugin_runtime_pointer():
     bare PowerShell) cannot derive the plugin's versioned cache path, and bare
     ``python -m teammate_comms.deliver`` is a ``ModuleNotFoundError`` on any system Python.
     Drop a pointer file the broker reads FRESH per invocation, then runs
-    ``<python> -m teammate_comms.deliver ...`` — ``sys.executable`` is the venv interpreter
-    THIS live server imports the package from, so ``-m`` resolves; the file self-heals
+    ``<python> -m teammate_comms.deliver ...`` — ``sys.executable`` is the plugin's venv
+    interpreter, where ``-m`` resolves once the session-start hook has synced it; the file self-heals
     across plugin version bumps because every server start rewrites it. Uses the DEFAULT
     root resolution (no explicit comms_dir — identity isn't established yet at this point
     in startup), same as the auto-register path below. Best-effort: a failure here (an

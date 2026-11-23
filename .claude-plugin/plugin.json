@@ -1,6 +1,6 @@
 {
   "name": "teammate-comms",
-  "version": "0.20.0",
+  "version": "0.20.1",
   "description": "Agent-to-agent messaging between coding-agent sessions, on one machine or between machines linked over Tailscale.",
   "author": { "name": "ColtonDyck" },
   "license": "MIT",
@@ -9,7 +9,7 @@
   "mcpServers": {
     "teammate-comms": {
       "command": "uv",
-      "args": ["run", "--no-sync", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "teammate_comms.server"]
+      "args": ["run", "--no-sync", "--directory", "${CLAUDE_PLUGIN_ROOT}", "python", "${CLAUDE_PLUGIN_ROOT}/launch.py"]
     }
   },
   "channels": [{ "server": "teammate-comms" }]
