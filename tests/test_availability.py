@@ -175,7 +175,8 @@ def test_notices_to_agents():
         av.change(root, "bob", status="available", now=T0 + 2100)
         check(tick(root, "alice", T0 + 2101) is True
               and "available again (set by bob)" in status_notes(root, "alice")[-1]["message"]
-              and "If you need nothing from them, say nothing" in status_notes(root, "alice")[-1]["message"],
+              and "never on behalf of another agent" in status_notes(root, "alice")[-1]["message"]
+              and "say nothing." in status_notes(root, "alice")[-1]["message"],
               "back notice")
         av.change(root, "bob", away_behaviour="work autonomously", now=T0 + 2200)
         before = len(status_notes(root, "alice"))
