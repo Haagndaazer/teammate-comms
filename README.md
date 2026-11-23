@@ -63,7 +63,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
-| `teammate_user_status` | `status?` (`away`\|`available`), `leave_at?`, `in_minutes?`, `heads_up_minutes?`, `away_behaviour?` | Whether your user is available for questions, shared by every agent. No arguments reads it. Set it only when your user asks: a leave time (agents get a heads-up before it and the status becomes away by itself), away now, available again, or what agents should do while the user is away. Every live agent is told by `comms-status`. |
+| `teammate_user_status` | `status?` (`away`\|`available`), `leave_at?`, `in_minutes?`, `reason?`, `heads_up_minutes?`, `away_behaviour?` | Whether your user is available for questions, shared by every agent. No arguments reads it. Set it only when your user asks: a leave time (agents get a heads-up before it and the status becomes away by itself), away now, available again, or what agents should do while the user is away. Every live agent is told by `comms-status`. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
 **not** baked into the MCP launch config. The other messaging tools return an error
@@ -417,6 +417,8 @@ agent, in your own words:
 - *"I'm leaving at 3."* The agent sets a leave time. Every live agent is told, gets a heads-up
   shortly before (10 minutes unless you say otherwise), and is told again when the time passes.
   From then on the status is away.
+- *"I'm leaving at 3 for a massage."* The few words saying what you are leaving for (up to
+  60 characters) are shown to every agent with the time, and kept in the status file.
 - *"I'm away"* or *"I'm back."* The status changes at once and every live agent is told.
 - *"While I'm away, wait for me"* (or *work autonomously*, the default, or any one-line
   instruction). This is what agents are shown when you leave. It is kept until you change it.
@@ -648,10 +650,20 @@ its `user_status` tool. To let the agents of one connection also set it (leave t
 available), open `config.json` in your keys folder, add `"can_set_status": true` to that
 account, next to its `"key"`, then run `make_config.py --out <folder> --rebuild` and upload
 the secrets again. The setting is per account because agents sharing a connection can use each
-other's names. A cloud agent can never change what your agents do while you are away. The
-risk you accept: an allowed agent that is steered by something it reads could mark you away
-when you are not; the notice names it and any agent can set you back. This needs the mailbox
-Worker from 0.20.0 or later (`npx wrangler deploy` in `cloud-mailbox-worker`).
+other's names. A cloud agent can never change what your agents do while you are away. It
+can give the few words saying what you are leaving for, which your agents are shown, quoted
+and with its name. The risks you accept: an allowed agent that is steered by something it
+reads could mark you away when you are not, and could put up to 60 characters of its own
+wording in front of every agent as the reason; the notice names it and any agent can set you
+back. Setting it needs the mailbox Worker from 0.20.0 or later, and the reason needs the one
+from 0.21.0 (`npx wrangler deploy` in `cloud-mailbox-worker`).
+
+**A countdown in your own status line.** The status is a small file,
+`TeammateComms/availability.json` under the comms folder (`teammate_whoami` names it).
+`leave_at_epoch` is the leave time in Unix seconds (UTC), or `null`; `leave_reason` is what
+you are leaving for, or empty; `status` is `available` or `away`. You are away when `status`
+is `away`, or when `leave_at_epoch` is set and has passed: the file is not rewritten at that
+moment. A missing file means available.
 
 **Turning it off.** `teammate_peers(action:"unlink_mailbox", machine:"cloudbot")` stops this
 machine using the mailbox. To cut a machine or a bot off for good, remove it from

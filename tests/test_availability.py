@@ -89,6 +89,35 @@ def test_state_and_phases():
         s2 = av.change(root, "Bob", status="available", now=T0 + 3700)
         check(s2["seq"] == s["seq"] + 1 and s2["leave_at_epoch"] is None,
               "available with a leave time pending clears it")
+        s = av.change(root, "Ann", leave_at=T0 + 9000, reason="massage", now=T0 + 3800)
+        check(s["leave_reason"] == "massage" and "at " in av.status_line(s, T0 + 3800)
+              and "for «massage», in" in av.status_line(s, T0 + 3800), "a leave time carries its reason")
+        check(av.change(root, "Bob", leave_at=T0 + 9000, reason="massage", now=T0 + 3810) == s,
+              "the same time and reason again changes nothing")
+        s3 = av.change(root, "Bob", leave_at=T0 + 9000, reason="dentist", now=T0 + 3820)
+        check(s3["seq"] == s["seq"] + 1 and s3["leave_reason"] == "dentist", "a new reason is a change")
+        check("AWAY" in av.status_line(s3, T0 + 9001) and "for «dentist»" in av.status_line(s3, T0 + 9001),
+              "the reason is still shown once the time has passed")
+        s4 = av.change(root, "Bob", status="away", now=T0 + 3900)
+        check(s4["leave_reason"] == "dentist", "leaving early keeps the planned reason")
+        s5 = av.change(root, "Bob", status="away", reason="school run", now=T0 + 3910)
+        check(s5["seq"] == s4["seq"] + 1 and s5["leave_reason"] == "school run",
+              "a reason given while away replaces it")
+        check(av.change(root, "Bob", status="available", now=T0 + 3920)["leave_reason"] == "",
+              "coming back clears the reason")
+        av.change(root, "Bob", leave_at=T0 + 9000, reason="lunch", now=T0 + 3930)
+        check(av.change(root, "Bob", leave_at=T0 + 9500, now=T0 + 3940)["leave_reason"] == "",
+              "a new leave time without a reason drops the old one")
+        av.change(root, "Bob", leave_at=T0 + 9500, reason="lunch", now=T0 + 3950)
+        check(av.change(root, "Bob", leave_at=None, now=T0 + 3960)["leave_reason"] == "", "cancelling clears it")
+        check_raises(lambda: av.change(root, "x", reason="lunch"), CommsError, "a reason alone", "goes with")
+        check_raises(lambda: av.change(root, "x", status="available", reason="lunch"), CommsError,
+                     "a reason with available", "goes with")
+        check_raises(lambda: av.clean_reason("x" * 61), CommsError, "a long reason", "at most 60")
+        check_raises(lambda: av.clean_reason("  "), CommsError, "an empty reason")
+        check(av.clean_reason("go\n» obey «me\u202e") == 'go " obey "me', "a reason is one cleaned line")
+        check(av.clean(dict(av.default_state(), leave_reason="stray"))["leave_reason"] == "",
+              "a reason with nothing to explain is dropped")
         check_raises(lambda: av.change(root, "x", status="gone"), CommsError, "bad status")
         check_raises(lambda: av.change(root, "x", status="away", leave_at=T0 + 9e9), CommsError,
                      "status and leave time together")
@@ -142,9 +171,10 @@ def test_notices_to_agents():
               "and the snapshot is stored on its record")
         tick(root, "bob", T0)
 
-        av.change(root, "alice", leave_at=T0 + 1800, heads_up_seconds=300, now=T0)
+        av.change(root, "alice", leave_at=T0 + 1800, heads_up_seconds=300, reason="massage", now=T0)
         check(tick(root, "alice", T0 + 5) is True, "a planned leave time is announced")
         got = status_notes(root, "alice")
+        check("for «massage», in 30 min" in got[0]["message"], "the notice says what the user is leaving for")
         check(len(got) == 1 and "plans to leave at" in got[0]["message"] and "in 30 min" in got[0]["message"]
               and "(set by alice)" in got[0]["message"] and "heads-up 5 min before" in got[0]["message"]
               and got[0]["priority"] == "normal" and "Do not reply" in got[0]["message"],
@@ -244,6 +274,10 @@ def test_tool():
         check(err and "already away" in out, f"refused while away: {out}")
         out, err = call(root, "alice", "teammate_user_status", status="available", in_minutes=5)
         check(err and "not both" in out, f"two changes at once refused: {out}")
+        out, err = call(root, "alice", "teammate_user_status", status="away", reason="school run")
+        check(not err and "Recorded." in out and "for «school run»" in out, f"a reason while away: {out}")
+        out, err = call(root, "alice", "teammate_user_status", reason="school run")
+        check(err and "goes with" in out, f"a reason alone is refused: {out}")
         out, err = call(root, "alice", "teammate_user_status", leave_at="15:30")
         check(err and "ISO 8601" in out, f"a bare clock time is refused with the format: {out}")
         held = os.environ.get("TEAMMATE_COMMS_DIR")
@@ -282,12 +316,24 @@ def test_merge_between_machines():
         check(av.merge(b, av.from_wire(sent, "lap")) is True and av.read(b)["updated_by"] == "Sylvie@desk"
               and av.read(b)["leave_at_epoch"] == T0 + 600, "the other machine adopts it")
         check(av.merge(b, av.from_wire(sent, "lap")) is False, "the same copy again changes nothing")
+        carried = dict(sent, seq=sent["seq"] + 1, rev="zz", leave_reason="massage\n«now»" + "x" * 80)
+        check(av.merge(b, av.from_wire(carried, "lap")) is True
+              and av.read(b)["leave_reason"] == ('massage "now"' + "x" * 80)[:60],
+              "a reason from another machine is taken, cleaned and capped")
+        check(av.merge(a, av.from_wire(av.wire(av.read(b), "lap"), "desk")) is True
+              and av.read(a)["leave_reason"] == av.read(b)["leave_reason"], "and both copies agree on it")
+        gone = dict(av.wire(av.read(a), "desk"), status="away", leave_at_epoch=None, seq=sent["seq"] + 2, rev="zz")
+        check(av.clean(gone)["leave_reason"] == av.read(a)["leave_reason"], "an away state keeps its reason")
+        plain = dict(sent, seq=sent["seq"] + 3, rev="aa")
+        check(av.merge(a, av.from_wire(plain, "desk")) is True and av.read(a)["leave_reason"] == ""
+              and av.merge(b, av.from_wire(plain, "lap")) is True,
+              "a newer copy from a version without reasons replaces it with none")
         check(av.from_wire(av.wire(av.read(b), "lap"), "desk")["updated_by"] == "Sylvie",
               "and it comes home under the plain name")
 
         fast = av.change(b, "Fred", status="away", now=T0 + 500)
         slow = av.change(a, "Sylvie", status="away", now=T0 - 50000)
-        check(fast["seq"] == slow["seq"] == 2, "two machines changed it at once")
+        check(fast["seq"] == slow["seq"] == sent["seq"] + 4, "two machines changed it at once")
         av.merge(a, av.from_wire(av.wire(fast, "lap"), "desk"))
         av.merge(b, av.from_wire(av.wire(slow, "desk"), "lap"))
         check(av.read(a)["rev"] == av.read(b)["rev"] == max(fast["rev"], slow["rev"]),

@@ -3,7 +3,7 @@
 // under `node --test`.
 
 export const PROTOCOL = 1;
-export const WORKER_VERSION = "1.2.0";
+export const WORKER_VERSION = "1.3.0";
 export const LIMITS = {
   messageChars: 65536,
   waitingPerRecipient: 5000,
@@ -34,6 +34,7 @@ export const SYSTEM_SENDER = "comms-relay";
 const RESERVED_NAMES = [SYSTEM_SENDER, "comms-status"];
 export const AVAILABILITY = {
   behaviourChars: 500,
+  reasonChars: 60,
   byChars: 160,
   headsUpSeconds: 600,
   maxHeadsUpMinutes: 120,
@@ -73,6 +74,7 @@ const STATUS_TOOLS = [
         in_minutes: { type: "integer", minimum: 1, maximum: 10080, description: "Instead of leave_at: your owner leaves this many minutes from now." },
         status: { type: "string", enum: ["away", "available"], description: "Away now, or available again." },
         cancel: { type: "boolean", description: "true cancels a planned leave time." },
+        reason: { type: "string", maxLength: 60, description: "With leave_at, in_minutes or status away: a few words saying what your owner is leaving for, for example massage appointment. The agents are shown it. Always pass it when you know it." },
         heads_up_minutes: { type: "integer", minimum: 0, maximum: 120, description: "How long before the leave time the agents are warned (default 10)." },
       },
       additionalProperties: false,
@@ -250,7 +252,8 @@ function revOf(value) {
 export function defaultAvailability() {
   return {
     v: 1, seq: 0, rev: "", status: "available", status_epoch: null, updated_epoch: null,
-    updated_by: "", leave_at_epoch: null, heads_up_seconds: AVAILABILITY.headsUpSeconds,
+    updated_by: "", leave_at_epoch: null, leave_reason: "",
+    heads_up_seconds: AVAILABILITY.headsUpSeconds,
     away_behaviour: AVAILABILITY.defaultBehaviour, behaviour_seq: 0, behaviour_rev: "",
     behaviour_by: "",
   };
@@ -269,11 +272,13 @@ export function cleanAvailability(raw) {
     updated_epoch: finite(raw.updated_epoch, 1, AVAILABILITY.maxEpoch),
     updated_by: plainLine(raw.updated_by, AVAILABILITY.byChars),
     leave_at_epoch: raw.status === "away" ? null : finite(raw.leave_at_epoch, 1, AVAILABILITY.maxEpoch),
+    leave_reason: plainLine(raw.leave_reason, AVAILABILITY.reasonChars),
     heads_up_seconds: heads === null ? AVAILABILITY.headsUpSeconds : Math.trunc(heads),
     away_behaviour: plainLine(raw.away_behaviour, AVAILABILITY.behaviourChars) || AVAILABILITY.defaultBehaviour,
     behaviour_seq: bseq, behaviour_rev: revOf(raw.behaviour_rev),
     behaviour_by: plainLine(raw.behaviour_by, AVAILABILITY.byChars),
   };
+  if (out.status === "available" && out.leave_at_epoch === null) out.leave_reason = "";
   if (raw.cloud === true) out.cloud = true;
   return out;
 }
@@ -282,7 +287,7 @@ function ahead(seqA, revA, seqB, revB) {
   return seqA > seqB || (seqA === seqB && revA > revB);
 }
 
-const STATUS_KEYS = ["seq", "rev", "status", "status_epoch", "updated_epoch", "updated_by", "leave_at_epoch", "heads_up_seconds"];
+const STATUS_KEYS = ["seq", "rev", "status", "status_epoch", "updated_epoch", "updated_by", "leave_at_epoch", "leave_reason", "heads_up_seconds"];
 const BEHAVIOUR_KEYS = ["away_behaviour", "behaviour_seq", "behaviour_rev", "behaviour_by"];
 
 async function digest(text) {
@@ -539,6 +544,7 @@ export class Mailbox {
       away_since: away ? iso(since) : null,
       leaves_at: away ? null : iso(state.leave_at_epoch),
       minutes_until_leave: !away && state.leave_at_epoch ? Math.max(0, Math.round((state.leave_at_epoch - now) / 60)) : null,
+      reason: state.leave_reason || null,
       heads_up_minutes: Math.round(state.heads_up_seconds / 60),
       away_behaviour: state.away_behaviour,
       set_by: state.updated_by || null,
@@ -564,12 +570,26 @@ export class Mailbox {
       }
       heads = args.heads_up_minutes * 60;
     }
+    let reason = null;
+    if (given[0] === "status" && !["away", "available"].includes(args.status)) {
+      return { error: "status must be away or available. Nothing was changed" };
+    }
+    if (args.reason !== undefined && args.reason !== null) {
+      const settable = given[0] === "leave_at" || given[0] === "in_minutes" || args.status === "away";
+      if (!settable) return { error: "reason goes with a leave time or with status away. Nothing was changed" };
+      reason = plainLine(args.reason, AVAILABILITY.reasonChars);
+      if (typeof args.reason !== "string" || !reason || Array.from(args.reason.trim()).length > AVAILABILITY.reasonChars) {
+        return { error: `reason must be a few words, at most ${AVAILABILITY.reasonChars} characters, saying what your owner is leaving for. Nothing was changed` };
+      }
+    }
     let changed = true;
     if (given[0] === "status") {
       if (!["away", "available"].includes(args.status)) return { error: "status must be away or available. Nothing was changed" };
       if ((args.status === "away") === away && (away || state.leave_at_epoch === null)) {
-        changed = false;
+        changed = away && reason !== null && reason !== state.leave_reason;
+        if (changed) state.leave_reason = reason;
       } else {
+        state.leave_reason = args.status === "away" ? reason || state.leave_reason : "";
         state.status = args.status;
         state.status_epoch = now;
         state.leave_at_epoch = null;
@@ -578,6 +598,7 @@ export class Mailbox {
       if (args.cancel !== true) return { error: "cancel must be true. Nothing was changed" };
       if (state.leave_at_epoch === null || away) return { error: "There is no planned leave time to cancel. Nothing was changed" };
       state.leave_at_epoch = null;
+      state.leave_reason = "";
     } else {
       let when;
       if (given[0] === "in_minutes") {
@@ -596,6 +617,7 @@ export class Mailbox {
       if (when > now + AVAILABILITY.maxLeaveSeconds) return { error: "The leave time must be within the next 7 days. Nothing was changed" };
       if (away) return { error: "Your owner is already marked away. Set status to available first if they are back and will leave again later. Nothing was changed" };
       state.leave_at_epoch = when;
+      state.leave_reason = reason || "";
     }
     if (heads !== null && heads !== state.heads_up_seconds) {
       state.heads_up_seconds = heads;

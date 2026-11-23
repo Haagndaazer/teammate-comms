@@ -1,4 +1,9 @@
 {
+  "0.21.0": [
+    "A leave time can now say what you are leaving for, for example: I am leaving at 3 for a massage. Every agent is shown those few words with the time.",
+    "A cloud agent that sets your leave time can give the reason too, once the mailbox Worker is deployed again. Your agents see it quoted, with the cloud agent's name.",
+    "The leave time and reason are kept in a small status file that your own tools can read, for example to show a countdown. The README describes it."
+  ],
   "0.20.2": [
     "Any agent with the plugin can now check whether you are available or away, and what you want done while away, without having joined comms first. Changing your status still needs an agent that has joined."
   ],

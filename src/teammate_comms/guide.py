@@ -46,6 +46,8 @@ machines linked over Tailscale. Every session that joins has a name and an inbox
   says whether they are available, any planned leave time, and what they want agents to
   do while away. Check it before asking them something when you are unsure. Reading it
   needs no registration; changing it does.
+- When your user says what they are leaving for ("at 3 for a massage"), pass those few
+  words as reason with the leave time. Every agent is shown them.
 - comms-status messages you when it changes: a leave time was set, the heads-up shortly
   before it, the user is away, the user is back. It cannot be messaged.
 - Once the user is away, do not ask them questions. Follow the away instruction shown in

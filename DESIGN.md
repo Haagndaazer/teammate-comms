@@ -1268,8 +1268,8 @@ with owner-only permissions.
 Plan and rulings: `docs/availability-plan.md`.
 
 **State.** `TeammateComms/availability.json`, one per comms root, not team-namespaced:
-`status` (available | away), `status_epoch`, `leave_at_epoch`, `heads_up_seconds`, the away
-behaviour text, and two revision pairs, `(seq, rev)` for the status fields and
+`status` (available | away), `status_epoch`, `leave_at_epoch`, `leave_reason`,
+`heads_up_seconds`, the away behaviour text, and two revision pairs, `(seq, rev)` for the status fields and
 `(behaviour_seq, behaviour_rev)` for the behaviour. `availability.py` owns it.
 
 **The effective status is computed.** Away means `status == "away"` or the leave time has
@@ -1300,16 +1300,25 @@ qualified with the machine on the wire (`Sylvie@desktop`) and made plain again a
 **Mailbox.** The state is in every `/pc/sync` body and answer. The Worker is one more
 replica with the same rule. The relay takes only the status fields from the mailbox, never
 the behaviour text, and keeps the setter's name only if it is a well-formed agent name or
-address (otherwise it shows "someone through the <name> mailbox"), so no free text from a
-cloud agent or a compromised mailbox reaches a notice. A copy whose counter is above
+address (otherwise it shows "someone through the <name> mailbox"). The one free text a
+cloud agent or a compromised mailbox can get into a notice is the leave reason (0.21.0, by
+the user's ruling of 2026-11-23): one line of at most 60 characters, control characters and
+guillemets removed, shown inside guillemets beside the setter's name. A copy whose counter is above
 10^9 is refused from any outside source, so a bad copy cannot exhaust the counter. A cloud change is stamped `cloud: true` with the bot's
 name, which the relay shows as `Name@<mailbox name>`.
 
 **Cloud tools.** `user_status` for every account; `user_set_status` only for an account
 with `can_set_status: true` in the user's config, default off. The gate is per account
-because agents on one connection can use each other's names (section 17). The tool takes no
-free text. Cloud agents are not sent notices: by the user's ruling they are always-on and do
+because agents on one connection can use each other's names (section 17). Its only free
+text is `reason` (Worker 1.3.0). Cloud agents are not sent notices: by the user's ruling they are always-on and do
 not stop when the user is away.
+
+**Leave reason (0.21.0).** `leave_reason` says what the user is leaving for. It is set with
+a leave time or with status away, is one of the status fields (so it syncs and orders with
+them), and is cleared when the leave time is cancelled, replaced without a reason, or the
+user is back. Going away early keeps the planned reason. A reason that explains nothing
+(available, no leave time) is dropped on read. It is in the file for the user's own tools,
+such as a status line countdown.
 
 **Reserved name.** `comms-status` cannot be registered (server, mailbox roster, Worker
 config, key tool) and cannot be sent to.

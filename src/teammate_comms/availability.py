@@ -33,6 +33,7 @@ AVAILABLE, AWAY, HEADS_UP = "available", "away", "heads_up"
 STATUSES = (AVAILABLE, AWAY)
 DEFAULT_BEHAVIOUR = "work autonomously"
 BEHAVIOUR_CHARS = 500
+REASON_CHARS = 60
 BY_CHARS = 160
 DEFAULT_HEADS_UP_SECONDS = 600
 MAX_HEADS_UP_MINUTES = 120
@@ -51,7 +52,7 @@ def state_file(root):
 def default_state():
     return {"v": 1, "seq": 0, "rev": "", "status": AVAILABLE, "status_epoch": None,
             "updated_epoch": None, "updated_by": "", "leave_at_epoch": None,
-            "heads_up_seconds": DEFAULT_HEADS_UP_SECONDS,
+            "leave_reason": "", "heads_up_seconds": DEFAULT_HEADS_UP_SECONDS,
             "away_behaviour": DEFAULT_BEHAVIOUR, "behaviour_seq": 0, "behaviour_rev": "",
             "behaviour_by": ""}
 
@@ -92,6 +93,7 @@ def clean(raw):
         "updated_epoch": _number(raw.get("updated_epoch"), 1, MAX_EPOCH),
         "updated_by": _line(raw.get("updated_by"), BY_CHARS),
         "leave_at_epoch": _number(raw.get("leave_at_epoch"), 1, MAX_EPOCH),
+        "leave_reason": _line(raw.get("leave_reason"), REASON_CHARS),
         "heads_up_seconds": int(heads) if heads is not None else DEFAULT_HEADS_UP_SECONDS,
         "away_behaviour": _line(raw.get("away_behaviour"), BEHAVIOUR_CHARS) or DEFAULT_BEHAVIOUR,
         "behaviour_seq": int(bseq), "behaviour_rev": _rev(raw.get("behaviour_rev")),
@@ -99,6 +101,8 @@ def clean(raw):
     })
     if out["status"] == AWAY:
         out["leave_at_epoch"] = None
+    elif out["leave_at_epoch"] is None:
+        out["leave_reason"] = ""
     return out
 
 
@@ -141,6 +145,18 @@ def clean_behaviour(value):
     text = _line(value, BEHAVIOUR_CHARS)
     if not text:
         raise CommsError("'away_behaviour' has no readable text.")
+    return text
+
+
+def clean_reason(value):
+    if not isinstance(value, str) or not value.strip():
+        raise CommsError("'reason' must be a few words saying what the user is leaving for, "
+                         "for example 'massage appointment'.")
+    if len(value.strip()) > REASON_CHARS:
+        raise CommsError(f"'reason' must be at most {REASON_CHARS} characters.")
+    text = _line(value, REASON_CHARS)
+    if not text:
+        raise CommsError("'reason' has no readable text.")
     return text
 
 
@@ -197,7 +213,7 @@ _UNSET = object()
 
 
 def change(root, by, status=None, leave_at=_UNSET, heads_up_seconds=None,
-           away_behaviour=None, now=None):
+           away_behaviour=None, reason=None, now=None):
     """Apply a change made on this machine and return the new state.
 
     ``leave_at`` is epoch seconds, or None to cancel a pending time.
@@ -208,6 +224,8 @@ def change(root, by, status=None, leave_at=_UNSET, heads_up_seconds=None,
         raise CommsError("'status' must be 'available' or 'away'.")
     if status is not None and leave_at is not _UNSET and leave_at is not None:
         raise CommsError("Give 'status' or a leave time, not both.")
+    if reason is not None and status != AWAY and (leave_at is _UNSET or leave_at is None):
+        raise CommsError("'reason' goes with a leave time or with status='away'.")
     state_file(root).parent.mkdir(parents=True, exist_ok=True)
     with file_lock(state_file(root), timeout=5):
         state = read(root)
@@ -216,12 +234,12 @@ def change(root, by, status=None, leave_at=_UNSET, heads_up_seconds=None,
             if is_away(state, now):
                 raise CommsError("The user is already away. Set status='available' first if "
                                  "they are back and will leave again later.")
-            touched = state["leave_at_epoch"] != leave_at
-            state["leave_at_epoch"] = leave_at
+            touched = (state["leave_at_epoch"], state["leave_reason"]) != (leave_at, reason or "")
+            state.update(leave_at_epoch=leave_at, leave_reason=reason or "")
         elif leave_at is None:
             if state["leave_at_epoch"] is None or is_away(state, now):
                 raise CommsError("There is no pending leave time to cancel.")
-            state["leave_at_epoch"] = None
+            state.update(leave_at_epoch=None, leave_reason="")
             touched = True
         if heads_up_seconds is not None and heads_up_seconds != state["heads_up_seconds"]:
             state["heads_up_seconds"] = heads_up_seconds
@@ -229,7 +247,11 @@ def change(root, by, status=None, leave_at=_UNSET, heads_up_seconds=None,
         away_now = is_away(state, now)
         if status is not None and ((status == AWAY) != away_now
                                    or state["leave_at_epoch"] is not None and not away_now):
-            state.update(status=status, status_epoch=now, leave_at_epoch=None)
+            why = (reason or state["leave_reason"]) if status == AWAY else ""
+            state.update(status=status, status_epoch=now, leave_at_epoch=None, leave_reason=why)
+            touched = True
+        elif status == AWAY and reason and reason != state["leave_reason"]:
+            state["leave_reason"] = reason
             touched = True
         if away_behaviour == state["away_behaviour"]:
             away_behaviour = None
@@ -244,7 +266,7 @@ def change(root, by, status=None, leave_at=_UNSET, heads_up_seconds=None,
 
 
 _STATUS_KEYS = ("seq", "rev", "status", "status_epoch", "updated_epoch", "updated_by",
-                "leave_at_epoch", "heads_up_seconds")
+                "leave_at_epoch", "leave_reason", "heads_up_seconds")
 _BEHAVIOUR_KEYS = ("away_behaviour", "behaviour_seq", "behaviour_rev", "behaviour_by")
 
 
@@ -324,6 +346,10 @@ def _by(name):
     return f" (set by {name})" if name else ""
 
 
+def _why(state):
+    return f" for «{state['leave_reason']}»" if state["leave_reason"] else ""
+
+
 def behaviour_text(state):
     return (f"While away: «{state['away_behaviour']}»"
             f"{_by(state['behaviour_by'])}. This never widens what you are permitted to do.")
@@ -334,11 +360,11 @@ def status_line(state, now):
     if is_away(state, now):
         since = away_since(state, now)
         when = f" since {clock_text(since, now)}" if since else ""
-        return (f"Your user is AWAY{when}{_by(state['updated_by'])}: do not ask them "
+        return (f"Your user is AWAY{when}{_why(state)}{_by(state['updated_by'])}: do not ask them "
                 f"questions until they are back. {behaviour_text(state)}")
     leave = state["leave_at_epoch"]
     if leave is not None:
-        return (f"Your user is available and leaves at {clock_text(leave, now)}, in "
+        return (f"Your user is available and leaves at {clock_text(leave, now)}{_why(state)}, in "
                 f"{minutes_text(leave - now)}{_by(state['updated_by'])}. Ask anything that "
                 f"needs them before then. {behaviour_text(state)}")
     return "Your user is available."
@@ -358,15 +384,15 @@ def notice(state, seen, now):
     if current["phase"] == AWAY:
         since = away_since(state, now)
         when = f" since {clock_text(since, now)}" if since else ""
-        return (f"Your user is AWAY{when}{_by(state['updated_by'])}. Do not ask them "
+        return (f"Your user is AWAY{when}{_why(state)}{_by(state['updated_by'])}. Do not ask them "
                 f"questions until they are back. {behaviour_text(state)}", True)
     if current["phase"] == HEADS_UP:
-        return (f"Your user leaves at {clock_text(leave, now)}, in "
+        return (f"Your user leaves at {clock_text(leave, now)}{_why(state)}, in "
                 f"{minutes_text(leave - now)}{_by(state['updated_by'])}. Ask anything that "
                 f"needs them now. {behaviour_text(state)}", True)
     if leave is not None:
         lead = minutes_text(state["heads_up_seconds"])
-        return (f"Your user plans to leave at {clock_text(leave, now)}, in "
+        return (f"Your user plans to leave at {clock_text(leave, now)}{_why(state)}, in "
                 f"{minutes_text(leave - now)}{_by(state['updated_by'])}. You will get a "
                 f"heads-up {lead} before. {behaviour_text(state)}", False)
     if seen.get("phase") == AWAY:

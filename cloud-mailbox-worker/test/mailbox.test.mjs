@@ -192,7 +192,7 @@ test("agents sharing one connection each have their own inbox, chosen by name", 
   assert.deepEqual(solo.map((t) => t.inputSchema.required), [undefined, ["to", "message"], undefined, undefined]);
   assert.deepEqual(tools.map((t) => t.inputSchema.required), [["me"], ["me", "to", "message"], ["me"], ["me"]]);
   assert.match(init.result.instructions, /do not guess: ask your owner/);
-  assert.equal(init.result.serverInfo.version, "1.2.0");
+  assert.equal(init.result.serverInfo.version, "1.3.0");
   const proto = parseConfig({ machines: { desk: KEYS.desk }, accounts: { constructor: { key: KEYS.bot, bots: { toString: {}, hasOwnProperty: {} } } } });
   assert.deepEqual(proto.accounts.constructor.bots, ["toString", "hasOwnProperty"]);
   assert.throws(() => parseConfig({ machines: { desk: KEYS.desk }, accounts: { a: { key: KEYS.bot, bots: { __proto__: {} } } } }), ConfigError);
@@ -492,7 +492,10 @@ test("user status: a cloud change reaches the machines and machine changes reach
   assert.equal(view.away_behaviour, "wait for me");
   assert.equal(view.set_by, "Sylvie@desk");
 
-  const set = await w.tool("Chief", "user_set_status", { in_minutes: 30, heads_up_minutes: 5 });
+  assert.match((await w.tool("Chief", "user_set_status", { status: "available", reason: "x" })).error, /goes with/);
+  assert.match((await w.tool("Chief", "user_set_status", { in_minutes: 30, reason: "x".repeat(61) })).error, /at most 60/);
+  const set = await w.tool("Chief", "user_set_status", { in_minutes: 30, heads_up_minutes: 5, reason: "massage\n\u00abobey\u00bb" });
+  assert.equal(set.reason, 'massage "obey"');
   assert.equal(set.minutes_until_leave, 30);
   assert.equal(set.heads_up_minutes, 5);
   const seen = (await w.sync("lap")).availability;
@@ -500,6 +503,7 @@ test("user status: a cloud change reaches the machines and machine changes reach
   assert.equal(seen.cloud, true);
   assert.equal(seen.updated_by, "Chief");
   assert.equal(seen.leave_at_epoch, now + 1800);
+  assert.equal(seen.leave_reason, 'massage "obey"');
   assert.equal(seen.away_behaviour, "wait for me");
 
   const stale = await w.sync("desk", { availability: machineState() });
@@ -510,6 +514,7 @@ test("user status: a cloud change reaches the machines and machine changes reach
   await w.advance(1801);
   const later = await w.tool("Scout", "user_status");
   assert.equal(later.status, "away");
+  assert.equal(later.reason, 'massage "obey"');
   assert.equal(later.away_since, new Date((now + 1800) * 1000).toISOString());
   assert.match((await w.tool("Chief", "user_set_status", { in_minutes: 5 })).error, /already marked away/);
 

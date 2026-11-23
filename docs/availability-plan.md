@@ -125,8 +125,9 @@ Worker 1.2.0; `MIN_WORKER` stays 1.1.0, an older Worker just lacks the tools.
     the Worker resolves `in_minutes` on its own clock, bumps `seq`, stamps
     `updated_by = Name@<account label>`; machines pick it up at their next sync (10 s idle).
 - Accounts without the flag get `user_status` only.
-- A cloud agent can never set the away behaviour, and there is no free-text field it can
-  write into a notice.
+- A cloud agent can never set the away behaviour. Since 0.21.0 it can give the leave
+  reason (60 characters, cleaned, quoted, attributed), which notices show: the user's
+  ruling of 2026-11-23, replacing "no free-text field" from the first design.
 - Cloud agents are not sent notices; they read the status when they run.
 
 ## 7. User rulings (2026-11-20)

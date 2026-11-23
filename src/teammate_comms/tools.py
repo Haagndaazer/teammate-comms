@@ -793,6 +793,12 @@ TOOL_DEFINITIONS = [
                     "description": "Instead of leave_at: the user leaves this many minutes "
                                    "from now.",
                 },
+                "reason": {
+                    "type": "string",
+                    "description": "With a leave time or status 'away': a few words saying "
+                                   "what the user is leaving for, e.g. 'massage appointment'. "
+                                   "Shown to every agent. Max 60 chars.",
+                },
                 "heads_up_minutes": {
                     "type": "integer",
                     "description": "How long before the leave time agents get the heads-up "
@@ -2831,7 +2837,8 @@ def _handle_peers(args, ctx):
     return relay_mod.peers_report(root)
 
 
-_STATUS_CHANGE_ARGS = ("status", "leave_at", "in_minutes", "heads_up_minutes", "away_behaviour")
+_STATUS_CHANGE_ARGS = ("status", "leave_at", "in_minutes", "heads_up_minutes", "away_behaviour",
+                       "reason")
 
 
 def _handle_user_status(args, ctx):
@@ -2858,6 +2865,8 @@ def _handle_user_status(args, ctx):
         changes["heads_up_seconds"] = availability.clean_heads_up(heads_up)
     if behaviour is not None:
         changes["away_behaviour"] = availability.clean_behaviour(behaviour)
+    if args.get("reason") is not None:
+        changes["reason"] = availability.clean_reason(args.get("reason"))
     before = availability.read(root)
     state = availability.change(root, agent, now=now, **changes)
     if (state["rev"], state["behaviour_rev"]) == (before["rev"], before["behaviour_rev"]):

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.21.0
+
+- **What the user is leaving for.** `teammate_user_status` takes `reason` with a leave time
+  or with status away: a few words, at most 60 characters, shown to every agent in the
+  notices and the status line ("leaves at 12:17 for «massage», in 20 min"). It is cleared
+  when the leave time is cancelled or replaced without one, or the user is back.
+- The reason is stored as `leave_reason` in `TeammateComms/availability.json`, beside
+  `leave_at_epoch` (Unix seconds), so the user's own tools can show a countdown. The README
+  describes the file.
+- **Mailbox Worker 1.3.0:** `user_set_status` takes `reason` and `user_status` returns it.
+  By the user's ruling a reason set by a cloud agent is shown to local agents, quoted and
+  attributed. This is the one free text from a cloud agent that reaches a notice. Deploy the
+  Worker again to use it. A machine or Worker on an older version does not keep the reason,
+  and a change made there replaces it with none.
+
 ## 0.20.2
 
 - `teammate_user_status` with no arguments now works for an agent that is not registered
