@@ -407,9 +407,9 @@ prefix of its own suffixed extension and therefore sorts before it.
 Agents call tools instead of shelling out. `from` is implicit (the server's own
 resolved identity). `to` is validated with `validate_agent_name`. The dispatcher
 converts `CommsError` → an `isError` result so a single bad call never tears down the
-long-lived server. **22 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
+long-lived server. **23 tools (13 original − 1 `teammate_ack` removed WP-42 + 4
 project-profile tools v0.9.0 + 1 avatar tool v0.10.0 + 1 compact-request tool WP-37 + 1
-cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15, + 1 `teammate_shutdown`, §16, + 1 `teammate_user_status`, §18):**
+cross-machine `teammate_peers` tool, §14, + 1 guide tool `teammate_readme`, §15, + 1 `teammate_shutdown`, §16, + 1 `teammate_user_status`, §18, + 1 `teammate_email`, §19):**
 
 | Tool | Args | Behavior |
 |------|------|----------|
@@ -1332,3 +1332,55 @@ away while already away, leaves the state untouched, so nobody is told twice. Aw
 automatic end, by the user's ruling; notices show
 since when. A change made in the seconds before a copy hears of a change made elsewhere
 can lose to it; the next notice says what the status now is.
+
+## 19. Email addresses for agents (0.22.0)
+
+Plan, both reviews, the user's rulings and the live test: `docs/email-inbox-plan.md`. An
+agent gets an address on a domain the user owns; Cloudflare Email Routing hands the mail to
+the mailbox Worker's `email()` handler, and it reaches the agent through the existing sync,
+inbox and wake. Receive only.
+
+**Why the config and not a tool.** Addresses, their owners, the sender list and the
+attachment-trusted list are declared in the mailbox config, uploaded as their own secrets
+(`MAILBOX_EMAIL_PARTS`, `MAILBOX_EMAIL_1..8`; one Worker secret holds about 5 KB). An
+approval command using the machine key would not be an approval: every agent on the machine
+can read that key. The Cloudflare login is the one credential no agent session holds.
+
+**Sender identity** (`email.js senderIdentity`). The first `Authentication-Results` header
+must be Cloudflare's (first token exactly `mx.cloudflare.net`); it must report `dmarc=pass`,
+or a `dkim=pass` whose `header.d` is exactly the From domain (the user's ruling, because a
+domain without a DMARC record reports `dmarc=none`); the message has exactly one `From`
+with one plain-ASCII address that the MIME parser agrees with. Comments are read as a
+space. No identity means `setReject`. Inboxes are open by the user's ruling: the sender
+list only labels an email.
+
+**The handler never fails.** It always accepts or calls `setReject` (which the sender sees
+at once as `555 5.7.1 <text>`); an unexpected error becomes a rejection asking to retry.
+
+**Storage.** Email has its own keys so it cannot crowd cloud agent messages and an older
+relay never sees it: `m:`/`mi:` waiting email per machine, `mk:`/`ma:`/`mq:` held
+attachments in 512 KiB pieces with a purge index, `mr:` hourly rate windows, `mc:` counts,
+`mh:` duplicate hashes (sender, Message-ID and address, so one sender cannot pre-empt
+another's id), `c:mw*`/`c:mab*` counters. Listed and unlisted senders have separate rate
+limits, queue room and attachment budgets. A cloud owner's email goes into its `b:` queue as
+finished text; attachments are not kept for it.
+
+**On the machine** (`agentmail.py`). The relay builds the whole inbox text from validated
+fields: the label and note are fixed text chosen by one boolean from the Worker, every
+field is one cleaned line, every body line is prefixed `> `, and characters a person cannot
+see are removed. The sender is the reserved name `comms-email`. Acking an email does not
+free its attachments; the machine reports `attachments_done` once the files are saved.
+
+**Attachments.** Only the relay downloads, on its own thread (`_email_loop`), never inside
+the sync that carries messages; `teammate_email fetch_attachments` only marks a held email
+as wanted. Files go to `TeammateComms/email/attachments/<agent>/<email id>/` through a
+`.partial` file checked for size and SHA-256. Names are rebuilt (`safe_file_name`): NFKC,
+a small character set, one extension, Windows device names prefixed, and an extension
+allow-list with everything else given `.blocked` (a deny-list kept missing runnable types).
+Each file gets the Windows `Zone.Identifier` mark and is made read-only. A folder is
+removed 14 days after download, judged by the relay's own `.teammate-meta.json`.
+
+**Kept risks.** Text from any proven sender reaches an agent that can run commands; agents
+on one machine are not separated (the Worker authenticates machines, the comms folder is
+shared), so tool ownership checks are bookkeeping; a listed sender is trusted when their
+account is misused; mail without DMARC pass or an aligned DKIM signature cannot arrive.

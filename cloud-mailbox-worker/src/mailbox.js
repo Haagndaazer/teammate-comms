@@ -2,8 +2,11 @@
 // fetch and the alarm setter are passed in so the same code runs in a Durable Object and
 // under `node --test`.
 
+import { EmailConfigError, parseEmailConfig } from "./email.js";
+import { EmailBox } from "./emailbox.js";
+
 export const PROTOCOL = 1;
-export const WORKER_VERSION = "1.3.0";
+export const WORKER_VERSION = "1.4.0";
 export const LIMITS = {
   messageChars: 65536,
   waitingPerRecipient: 5000,
@@ -31,7 +34,7 @@ export const DOORBELL = {
 };
 const PREVIOUS_BATCH_SECONDS = 3600;
 export const SYSTEM_SENDER = "comms-relay";
-const RESERVED_NAMES = [SYSTEM_SENDER, "comms-status"];
+const RESERVED_NAMES = [SYSTEM_SENDER, "comms-status", "comms-email"];
 export const AVAILABILITY = {
   behaviourChars: 500,
   reasonChars: 60,
@@ -216,7 +219,15 @@ export function parseConfig(raw) {
   if (!Object.keys(bots).length) throw new ConfigError("no bots are configured");
   const lower = Object.keys(bots).map((n) => n.toLowerCase());
   if (new Set(lower).size !== lower.length) throw new ConfigError("bot names differ only by case");
-  return { machines, bots, accounts };
+  let email;
+  try {
+    email = parseEmailConfig(data.email, machines, bots);
+  } catch (e) {
+    if (!(e instanceof EmailConfigError)) throw e;
+    console.error(`mailbox email config rejected, email is off: ${e.message}`);
+    email = { addresses: Object.create(null), warnings: [], error: e.message };
+  }
+  return { machines, bots, accounts, email };
 }
 
 function toolsFor(names, canSetStatus) {
@@ -342,6 +353,7 @@ export class Mailbox {
       ? doorbellMinSeconds : DOORBELL.minSeconds;
     this.maxPerDay = Number.isInteger(doorbellMaxPerDay) && doorbellMaxPerDay >= 1
       ? doorbellMaxPerDay : DOORBELL.maxPerDay;
+    this.email = new EmailBox(this);
   }
 
   seconds() {
@@ -425,10 +437,12 @@ export class Mailbox {
     }
     const rung = new Set();
     for (const id of (Array.isArray(body.ack) ? body.ack : []).slice(0, 1000)) {
-      if (typeof id === "string" && EVENT_ID_RE.test(id)) await this.removeForMachine(machine, id);
+      if (typeof id !== "string" || !EVENT_ID_RE.test(id)) continue;
+      if (!(await this.email.remove(machine, id, false))) await this.removeForMachine(machine, id);
     }
     for (const item of (Array.isArray(body.failed) ? body.failed : []).slice(0, 1000)) {
       if (!item || typeof item.id !== "string" || !EVENT_ID_RE.test(item.id)) continue;
+      if (await this.email.remove(machine, item.id, true)) continue;
       const record = await this.removeForMachine(machine, item.id);
       if (record) {
         await this.notice(record.from, `Your message to ${record.to}@${machine} was not ` +
@@ -440,6 +454,7 @@ export class Mailbox {
       await this.storage.put(`r:${machine}`, { at: this.seconds(), agents: this.cleanRoster(body.roster) });
     }
     const availability = await this.mergeAvailability(body.availability);
+    await this.email.done(machine, body.attachments_done);
     const accepted = [];
     const rejected = [];
     for (const ev of (Array.isArray(body.events) ? body.events : []).slice(0, LIMITS.eventsPerSync)) {
@@ -502,7 +517,10 @@ export class Mailbox {
     }
     return {
       status: 200,
-      body: { v: PROTOCOL, worker: WORKER_VERSION, you_are: machine, accepted, rejected, messages, bots, availability },
+      body: {
+        v: PROTOCOL, worker: WORKER_VERSION, you_are: machine, accepted, rejected, messages, bots, availability,
+        ...(this.email.enabled() ? await this.email.forMachine(machine) : {}),
+      },
     };
   }
 
@@ -752,6 +770,7 @@ export class Mailbox {
       await this.storage.delete(record.key);
       removed++;
     }
+    more = (await this.email.purge()) || more;
     return more || removed === PURGE_STEP;
   }
 

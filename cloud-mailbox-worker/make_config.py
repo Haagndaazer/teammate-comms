@@ -36,6 +36,22 @@ BOT_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}")
 MACHINE_KEY_RE = re.compile(r"tcm_[A-Za-z0-9_-]{32,124}")
 ACCOUNT_KEY_RE = re.compile(r"tcb_[A-Za-z0-9_-]{32,124}")
 MAX_UPLOAD_BYTES = 4500
+MAX_EMAIL_PARTS = 8
+MAX_ADDRESSES = 50
+ADDRESS_RE = re.compile(r"([a-z0-9]([a-z0-9.-]{0,38}[a-z0-9])?)@([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+                        r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)")
+SENDER_RE = re.compile(r"([a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64})?@([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+                       r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)")
+
+
+def bad_shape(local, domain):
+    """What the Worker also refuses: odd dots in the name, a too short or too long domain."""
+    return (local.startswith(".") or local.endswith(".") or ".." in local
+            or not 4 <= len(domain) <= 253 or len(local) + len(domain) > 253)
+RESERVED_LOCALS = {"postmaster", "abuse", "admin", "root", "hostmaster", "webmaster", "noreply",
+                   "no-reply", "mailer-daemon", "security"}
+PUBLIC_MAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com",
+               "icloud.com", "me.com", "proton.me", "protonmail.com", "aol.com", "gmx.com"}
 DEFAULT_ACCOUNT = "main"
 
 
@@ -76,13 +92,15 @@ def load(path):
             config["accounts"][label] = {"key": bot["key"], "bots": {name: {
                 "doorbell_url": bot.get("doorbell_url") or "",
                 "doorbell_key": bot.get("doorbell_key") or ""}}}
+        if raw.get("email") is not None:
+            config["email"] = raw["email"]
         return config, [slug(n) for n in dict(raw.get("bots") or {})]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         fail(f"{path} is missing or not readable; create the mailbox first with --machine and --bot")
 
 
 def check_bot(name, bot):
-    if not BOT_RE.fullmatch(name) or name.lower() in ("comms-relay", "comms-status"):
+    if not BOT_RE.fullmatch(name) or name.lower() in ("comms-relay", "comms-status", "comms-email"):
         fail(f"bot name {name!r} is not usable")
     if not isinstance(bot, dict):
         fail(f"bot {name!r} must be an object")
@@ -140,6 +158,73 @@ def check(config):
         fail("at least one machine and one bot are needed")
 
 
+def check_email(config):
+    """Validate the optional 'email' block. Returns warnings for the user."""
+    email = config.get("email")
+    if email is None:
+        return []
+    if not isinstance(email, dict) or not isinstance(email.get("addresses", {}), dict):
+        fail("'email' must be an object with an 'addresses' object")
+    addresses = email.get("addresses", {})
+    if len(addresses) > MAX_ADDRESSES:
+        fail(f"'email' has more than {MAX_ADDRESSES} addresses")
+    bots = {name for account in config["accounts"].values() for name in account["bots"]}
+    own = set()
+    for address in addresses:
+        found = ADDRESS_RE.fullmatch(address) if isinstance(address, str) else None
+        if not found or bad_shape(found.group(1), found.group(3)):
+            fail(f"email address {address!r} is not valid: lower case letters, digits, '.' and '-' "
+                 f"before the @, then a domain")
+        if found.group(1) in RESERVED_LOCALS:
+            fail(f"email address {address!r}: {found.group(1)} is reserved")
+        own.add(found.group(3))
+    warnings = []
+    for address, entry in addresses.items():
+        if not isinstance(entry, dict):
+            fail(f"email address {address!r} must be an object with an owner")
+        owner = entry.get("owner")
+        name, at, machine = owner.partition("@") if isinstance(owner, str) else ("", "", "")
+        if not ((at and BOT_RE.fullmatch(name) and machine in config["machines"])
+                or (not at and name in bots)):
+            fail(f"email address {address!r}: owner must be Name@machine for one of your "
+                 f"machines ({', '.join(config['machines'])}) or the name of a cloud agent")
+        for key in ("senders", "attachments_from"):
+            values = entry.get(key, [])
+            if not isinstance(values, list) or len(values) > 100:
+                fail(f"email address {address!r}: {key} must be a list of at most 100 entries")
+            for value in values:
+                found = SENDER_RE.fullmatch(value) if isinstance(value, str) else None
+                if not found or bad_shape(found.group(1) or "", found.group(2)):
+                    fail(f"email address {address!r}: {key} entry {value!r} must be a lower case "
+                         f"address or @domain")
+                if found.group(2) in own:
+                    fail(f"email address {address!r}: {key} cannot list {found.group(2)}, which "
+                         f"carries agent addresses")
+                if not found.group(1) and found.group(2) in PUBLIC_MAIL:
+                    warnings.append(f"{address} {key}: @{found.group(2)} lists everyone with an "
+                                    f"address at a public mail service")
+        extra = set(entry) - {"owner", "senders", "attachments_from"}
+        if extra:
+            fail(f"email address {address!r}: unknown setting {sorted(extra)[0]!r}")
+    return warnings
+
+
+def email_secrets(config):
+    """The email block as numbered Worker secrets; a Worker secret holds about 5 KB."""
+    addresses = (config.get("email") or {}).get("addresses") or {}
+    if not addresses:
+        return {"MAILBOX_EMAIL_PARTS": "0"}
+    raw = json.dumps({"addresses": addresses}, separators=(",", ":")).encode("utf-8")
+    parts = [raw[i:i + MAX_UPLOAD_BYTES] for i in range(0, len(raw), MAX_UPLOAD_BYTES)]
+    if len(parts) > MAX_EMAIL_PARTS:
+        fail(f"the email addresses and their lists are {len(raw)} bytes, more than "
+             f"{MAX_EMAIL_PARTS * MAX_UPLOAD_BYTES}. Shorten the sender lists.")
+    out = {"MAILBOX_EMAIL_PARTS": str(len(parts))}
+    for n, part in enumerate(parts, 1):
+        out[f"MAILBOX_EMAIL_{n}"] = part.decode("utf-8")
+    return out
+
+
 def upload_form(config):
     accounts = {}
     for label, account in config["accounts"].items():
@@ -157,13 +242,15 @@ def upload_form(config):
 
 
 def write_all(out, config, converted=()):
+    mail = email_secrets(config)
     upload = json.dumps(upload_form(config))
     if len(upload.encode("utf-8")) > MAX_UPLOAD_BYTES:
         fail(f"the configuration is {len(upload.encode('utf-8'))} bytes, more than a Worker "
              f"secret can hold ({MAX_UPLOAD_BYTES}). Use a second mailbox for more bots.")
     out.mkdir(parents=True, exist_ok=True)
     private_write(out / "config.json", json.dumps(config, indent=2) + "\n")
-    private_write(out / "wrangler-secrets.json", json.dumps({"MAILBOX_CONFIG": upload}) + "\n")
+    private_write(out / "wrangler-secrets.json",
+                  json.dumps({"MAILBOX_CONFIG": upload, **mail}) + "\n")
     for name, key in config["machines"].items():
         private_write(out / f"machine-{name}.key", key + "\n")
     for label, account in config["accounts"].items():
@@ -262,6 +349,8 @@ def main(argv=None):
             fail(f"machine {name!r} is already in the mailbox")
         config["machines"][name] = "tcm_" + secrets.token_urlsafe(32)
     check(config)
+    for warning in check_email(config):
+        print(f"warning: {warning}", file=sys.stderr)
     write_all(out, config, converted)
     print(f"Wrote the mailbox secrets to {out}")
     print(f"  machines: {', '.join(config['machines'])}")

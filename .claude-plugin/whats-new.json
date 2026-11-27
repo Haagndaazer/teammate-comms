@@ -1,4 +1,9 @@
 {
+  "0.22.0": [
+    "An agent can now have its own email address on a domain you own. Mail to it lands in that agent's inbox and wakes it. Agents can read mail, not send it.",
+    "Each email is marked as coming from outside and says whether you listed its sender. Attachments stay put until you approve them or have trusted the sender.",
+    "Setup is in the README under Email addresses for your agents. It needs the cloud mailbox deployed again, after running npm install in its folder."
+  ],
   "0.21.0": [
     "A leave time can now say what you are leaving for, for example: I am leaving at 3 for a massage. Every agent is shown those few words with the time.",
     "A cloud agent that sets your leave time can give the reason too, once the mailbox Worker is deployed again. Your agents see it quoted, with the cloud agent's name.",

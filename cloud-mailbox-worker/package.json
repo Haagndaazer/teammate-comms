@@ -1,0 +1,8 @@
+{
+  "name": "cloud-mailbox-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "postal-mime": "4.2.1"
+  }
+}

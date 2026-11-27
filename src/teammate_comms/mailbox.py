@@ -33,6 +33,7 @@ HTTP_TIMEOUT_SECONDS = 10
 BATCH_EVENTS = 20
 BATCH_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+PIECE_LIMIT_BYTES = 512 * 1024
 INBOUND_PER_WINDOW = 60
 INBOUND_MAILBOX_PER_WINDOW = 180
 INBOUND_WINDOW_SECONDS = 600
@@ -260,6 +261,26 @@ def post_sync(url, key, body, timeout=HTTP_TIMEOUT_SECONDS):
     return resp.status, obj if isinstance(obj, dict) else {}
 
 
+def fetch_piece(url, key, email_id, n, piece, timeout=HTTP_TIMEOUT_SECONDS):
+    """One piece of one held attachment, as bytes. Raises ValueError when there is none."""
+    parts = urllib.parse.urlsplit(url)
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = cls(parts.hostname, parts.port, timeout=timeout)
+    try:
+        conn.request("POST", (parts.path.rstrip("/") or "") + "/pc/attachment",
+                     body=json.dumps({"v": PROTOCOL, "id": email_id, "n": n, "piece": piece}).encode("utf-8"),
+                     headers={"Content-Type": "application/json",
+                              "Authorization": "Bearer " + key,
+                              "User-Agent": "teammate-comms-relay"})
+        resp = conn.getresponse()
+        raw = resp.read(PIECE_LIMIT_BYTES + 1)
+    finally:
+        conn.close()
+    if resp.status != 200 or not raw or len(raw) > PIECE_LIMIT_BYTES:
+        raise ValueError(f"the mailbox did not return the piece (status {resp.status})")
+    return raw
+
+
 def clean_note(value):
     """Text a mailbox returned, made safe to show an agent on one line."""
     return " ".join(str(value or "").split())[:NOTE_CHARS]
@@ -283,7 +304,7 @@ def clean_bots(raw):
         except CommsError:
             continue
         if (name in seen or not _BOT_NAME_RE.fullmatch(name)
-                or name.lower() in ("comms-relay", "comms-status")):
+                or name.lower() in ("comms-relay", "comms-status", "comms-email")):
             continue
         seen.add(name)
         last = entry.get("last_seen")

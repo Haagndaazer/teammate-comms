@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import __version__
+from . import agentmail
 from . import availability
 from . import mailbox as mailbox_mod
 from .comms import (
@@ -1347,6 +1348,28 @@ def deliver_cloud_message(root, mailbox, me, bots, msg, now=None):
     tools.deliver_dm_record(root, None, out, to, report_live=False)
 
 
+def deliver_email(root, mailbox, addresses, record, now=None):
+    """Put one email a mailbox received into its owner's inbox, from the reserved email sender."""
+    from . import tools
+    msg_id = _clean_id(record.get("msg_id")) if isinstance(record, dict) else ""
+    now = time.time() if now is None else now
+    try:
+        stamped = calendar.timegm(time.strptime(msg_id[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        raise RejectEvent("bad message id")
+    if (msg_id != msg_id.strip() or not _MSG_ID_RE.fullmatch(msg_id)
+            or not now - mailbox_mod.ID_PAST_SECONDS <= stamped <= now + mailbox_mod.ID_FUTURE_SECONDS):
+        raise RejectEvent("bad message id")
+
+    def put(out, owner):
+        if not _already_here(root, out):
+            tools.deliver_dm_record(root, None, out, owner, report_live=False)
+    try:
+        agentmail.deliver(root, mailbox, addresses, record, put)
+    except agentmail.BadEmail as e:
+        raise RejectEvent(str(e))
+
+
 _APPLIERS = {
     "spawn": _apply_spawn,
     "shutdown": _apply_shutdown,
@@ -1472,6 +1495,8 @@ class Relay:
         self._attempts = {}
         self._stop = threading.Event()
         self._mailbox_post = mailbox_mod.post_sync
+        self._fetch_piece = mailbox_mod.fetch_piece
+        self._email_swept = 0.0
         self._inbound = {}
         self._status_at = 0.0
         self._status_last = None
@@ -1990,6 +2015,73 @@ class Relay:
             self._seen_add(name, event_id, error)
         return applied, failed
 
+    def _apply_emails(self, name, resp):
+        addresses = agentmail.clean_addresses(resp.get("addresses"))
+        try:
+            agentmail.save_addresses(self.root, name, addresses,
+                                     agentmail.clean_counts(resp.get("email_counts"), addresses))
+        except (OSError, CommsError) as e:
+            self.log(f"could not store the email addresses of mailbox {name}: {e}")
+        applied, failed = [], []
+        ring = self._seen_ring(name)
+        emails = resp.get("emails")
+        for record in (emails if isinstance(emails, list) else [])[:MAX_EVENTS]:
+            email_id = record.get("id") if isinstance(record, dict) else None
+            if not isinstance(email_id, str) or not _ID_RE.fullmatch(email_id):
+                continue
+            if email_id in ring["ids"]:
+                if email_id in ring["failed"]:
+                    failed.append({"id": email_id, "error": ring["failed"][email_id]})
+                else:
+                    applied.append(email_id)
+                continue
+            if not self._inbound_room(name, agentmail.EMAIL_SENDER):
+                break
+            error = ""
+            try:
+                deliver_email(self.root, name, addresses, record, self.clock())
+                applied.append(email_id)
+                self._inbound_count(name, agentmail.EMAIL_SENDER)
+            except RejectEvent as e:
+                error = str(e)[:300] or "rejected"
+                self.log(f"rejected email {email_id} from mailbox {name}: {e}")
+                failed.append({"id": email_id, "error": error})
+            except Exception as e:
+                tries = self._attempts.get(email_id, 0) + 1
+                self._attempts[email_id] = tries
+                self.log(f"email {email_id} from mailbox {name} failed (attempt {tries}): "
+                         f"{type(e).__name__}: {e}")
+                if tries < MAX_APPLY_ATTEMPTS:
+                    break
+                error = "it could not be stored on this machine"
+                failed.append({"id": email_id, "error": error})
+            self._attempts.pop(email_id, None)
+            self._seen_add(name, email_id, error)
+        return applied, failed
+
+    def email_tick(self):
+        """Download attachments that are wanted and clear old download folders."""
+        from . import tools
+        boxes = read_mailboxes(self.root)
+        fetchers = {name: (lambda i, n, p, cfg=cfg: self._fetch_piece(cfg["url"], cfg["key"], i, n, p))
+                    for name, cfg in boxes.items()}
+
+        def put(out, owner):
+            tools.deliver_dm_record(self.root, None, out, owner, report_live=False)
+        if (agentmail.email_dir(self.root) / "held").is_dir():
+            agentmail.download_tick(self.root, fetchers, put, self.log)
+        if self.clock() - self._email_swept > 3600:
+            self._email_swept = self.clock()
+            agentmail.sweep(self.root)
+
+    def _email_loop(self):
+        while not self._stop.is_set():
+            try:
+                self.email_tick()
+            except Exception as e:
+                self.log(f"email pass failed: {type(e).__name__}: {e}")
+            self._stop.wait(LOOP_SECONDS * 2)
+
     def _mailbox_sync(self, name, cfg, st):
         now = self.clock()
         with self._lock:
@@ -1999,6 +2091,9 @@ class Relay:
                 "ack": acks, "failed": nacks,
                 "availability": availability.wire(availability.read(self.root),
                                                   cfg["you_are"])}
+        fetched = agentmail.done_ids(self.root, name)
+        if fetched:
+            body["attachments_done"] = fetched
         roster = self._mailbox_roster()
         since = now - st["roster_sent"]
         send_roster = since >= mailbox_mod.ROSTER_REFRESH_SECONDS or (
@@ -2053,6 +2148,9 @@ class Relay:
             st["no_verdict"] = bool(unanswered)
             incoming = items("messages")
         applied, failed = self._apply_cloud(name, cfg, bots, incoming)
+        mail_applied, mail_failed = self._apply_emails(name, resp)
+        applied, failed = applied + mail_applied, failed + mail_failed
+        agentmail.forget_done(self.root, name, fetched)
         with self._lock:
             st["acks"] += applied
             st["nacks"] += failed
@@ -2326,6 +2424,7 @@ class Relay:
         except Exception as e:
             self.log(f"could not protect stored mailbox keys: {type(e).__name__}")
         threading.Thread(target=self._mailbox_loop, daemon=True).start()
+        threading.Thread(target=self._email_loop, daemon=True).start()
         empty_since = None
         while not self._stop.is_set():
             if self._stop_requested():

@@ -461,7 +461,7 @@ def test_wp44_ac7_reaction_drop_not_retired():
 
 
 LITERAL_BASELINE = {
-    "__init__.py": 1, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
+    "__init__.py": 1, "agentmail.py": 0, "avatars.py": 1, "channel.py": 18, "comms.py": 5, "dashboard.py": 0,
     "availability.py": 0, "deliver.py": 1, "guide.py": 0, "mailbox.py": 0, "peers.py": 0, "procs.py": 0, "relay.py": 0, "server.py": 9, "spawn.py": 30, "tools.py": 6,
     "update_check.py": 0, "whats_new.py": 0,
 }

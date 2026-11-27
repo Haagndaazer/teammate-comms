@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, availability, channel
+from . import __version__, agentmail, availability, channel
 from . import harness as harness_mod
 from . import relay as relay_mod
 from . import tools as tools_mod
@@ -287,6 +287,11 @@ def register_identity(agent, team, comms_dir, profile=None, manager=None,
         raise CommsError(
             f"Cannot register as {agent!r}: that name is reserved for the cross-machine "
             f"relay's delivery notices — an agent may not claim it."
+        )
+    if agent.lower() == agentmail.EMAIL_SENDER:
+        raise CommsError(
+            f"Cannot register as {agent!r}: that name is reserved for received email - an "
+            f"agent may not claim it."
         )
     if agent.lower() == availability.STATUS_SENDER:
         raise CommsError(

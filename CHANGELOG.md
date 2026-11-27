@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.22.0
+
+- **Email addresses for agents.** An agent can have its own address on a domain you own;
+  mail to it lands in the agent's inbox, from the reserved sender `comms-email`, and wakes
+  it. Receive only. It runs on the cloud mailbox and Cloudflare Email Routing. The README
+  section "Email addresses for your agents" has the setup and the risks.
+- Addresses, their sender lists and attachment-trusted senders are declared in the mailbox
+  `config.json` (`email` block) and take effect when uploaded. No agent can change them.
+- Every email is marked as coming from outside, says whether its sender is on the list, and
+  is quoted line by line. Mail whose sender cannot be proven (no DMARC pass and no DKIM
+  signature from the From domain) is refused.
+- **`teammate_email`** (new tool): `list`, `fetch_attachments`, `delete_attachments`.
+  Attachments are held at the mailbox and downloaded only for a trusted sender or when the
+  user approves, into one folder, with safe names; unusual file types get `.blocked`.
+- **Mailbox Worker 1.4.0.** It now has one dependency, `postal-mime`: run `npm install` in
+  `cloud-mailbox-worker` before `npx wrangler deploy`. `make_config.py` uploads the email
+  block as separate secrets. An older Worker has no email; nothing else changes.
+
 ## 0.21.0
 
 - **What the user is leaving for.** `teammate_user_status` takes `reason` with a leave time

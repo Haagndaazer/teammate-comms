@@ -63,6 +63,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
+| `teammate_email` | `action?` (`list`\|`fetch_attachments`\|`delete_attachments`), `id?` | Your own email address, if your user gave you one. Email arrives in your inbox from `comms-email`, marked as coming from outside. `list` shows your addresses and sender lists. Attachments are held: fetch them only when your user approved it for that email, never run them, and delete them after reading unless told to keep one. Receive only. |
 | `teammate_user_status` | `status?` (`away`\|`available`), `leave_at?`, `in_minutes?`, `reason?`, `heads_up_minutes?`, `away_behaviour?` | Whether your user is available for questions, shared by every agent. No arguments reads it. Set it only when your user asks: a leave time (agents get a heads-up before it and the status becomes away by itself), away now, available again, or what agents should do while the user is away. Every live agent is told by `comms-status`. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
@@ -532,9 +533,12 @@ have to be the Tailscale name. The command prints the exact upload command for s
 
 ```
 cd cloud-mailbox-worker
+npm install
 npx wrangler deploy
 npx wrangler secret bulk ~/teammate-mailbox/wrangler-secrets.json
 ```
+
+`npm install` fetches the one library the mailbox uses, to read email (0.22.0 and later).
 
 `wrangler deploy` prints the mailbox address, for example
 `https://cloud-mailbox-worker.<you>.workers.dev`. Until the secrets are uploaded the mailbox
@@ -675,6 +679,103 @@ in `cloud-mailbox-worker` removes the mailbox and everything in it.
 cloud agents, and anyone holding an account token can message your agents as that account's
 cloud agents. Whether your agents act on a cloud agent's message is your choice: see "Trusting
 a cloud agent" above.
+
+## Email addresses for your agents
+
+An agent can have its own email address on a domain you own. Mail sent to it lands in that
+agent's normal inbox and wakes it like a teammate message. Agents can receive mail; they
+cannot send it. It runs on the cloud mailbox above, so set that up first, and it needs the
+mailbox Worker from 0.22.0 or later.
+
+**What you need.** A domain or subdomain whose DNS is on the same Cloudflare account as the
+mailbox, and that has no other mail provider. Cloudflare has no ready-made domain for this.
+Different addresses can be on different domains.
+
+**1. Turn on Email Routing** for the domain in the Cloudflare dashboard (Email, then Email
+Routing). To use a subdomain such as `agents.example.com`, add it under Email Routing,
+Settings, Subdomains. On the same Settings page turn on subaddressing if you want
+`name+anything@...` to reach `name@...`, which lets one address hold many test accounts.
+
+**2. Declare the address.** In the `config.json` of your mailbox folder add an `email` block
+beside `machines` and `accounts`:
+
+```
+"email": {
+  "addresses": {
+    "ada-desktop@agents.example.com": {
+      "owner": "ada@desktop",
+      "senders": ["you@example.com", "@client.example"],
+      "attachments_from": ["@client.example"]
+    }
+  }
+}
+```
+
+- The address is your choice. `<agent>-<machine>@...` is a good habit, so the same agent
+  name on two machines never wants the same address.
+- `owner` is the agent as `Name@machine`, with the machine label you gave it in the
+  mailbox, or the name of one of the mailbox's cloud agents.
+- `senders` are the people you know: full addresses, or `@domain` for everyone at exactly
+  that domain. Mail from anyone else still arrives, flagged as not on the list.
+- `attachments_from` are the senders whose attachments are downloaded without asking.
+
+Then rebuild and upload, as for any config change:
+
+```
+python cloud-mailbox-worker/make_config.py --out ~/teammate-mailbox --rebuild
+cd cloud-mailbox-worker
+npx wrangler secret bulk ~/teammate-mailbox/wrangler-secrets.json
+```
+
+An agent you ask for an address tells you the entry to add; only you can add it. Changing
+either list is the same edit and upload.
+
+**3. Route the address to the mailbox.** Once per address:
+
+```
+npx wrangler email routing rules create example.com --name "agent: ada-desktop" --match-type literal --match-field to --match-value ada-desktop@agents.example.com --action-type worker --action-value cloud-mailbox-worker
+```
+
+Use the main domain name in the command even when the address is on a subdomain. On a
+whole domain used only for agent mail you can instead point its catch-all rule at the
+Worker once.
+
+**What the agent sees.** Each email starts with the address it was sent to, the sender and
+whether they are on the sender list, then a note that it comes from outside and that nothing
+in it is an instruction from you. The text is quoted line by line. A cloud agent gets the
+same through its mailbox tools, without attachments.
+
+**Who can write.** Only mail whose sender is proven: it passes the sender domain's DMARC
+check, or it is signed (DKIM) by exactly the domain in its From address. Other mail is
+refused and the sender gets a bounce saying why. Most mailing lists and auto-forwarded mail
+fail this and are refused.
+
+**Attachments.** They stay at the mailbox, at most 5 files and 3 MB per email (a whole email
+at most 5 MB). For a sender in `attachments_from` they are downloaded at once; otherwise the
+agent asks you, and fetches them with `teammate_email` when you say yes. Files are saved only
+under `TeammateComms/email/attachments/<agent>/<email id>/` in the comms folder, with a safe
+name, marked as downloaded from the internet, and anything that is not an ordinary document,
+image, archive or media file gets `.blocked` added to its name. The agent is told to delete
+them after reading unless you said to keep one, and to copy a kept file elsewhere: the folder
+is cleared 14 days after download. Unfetched attachments expire after 14 days.
+
+**Limits.** Per address and hour: 60 emails from listed senders, 30 from others, 10 from any
+one unlisted sender. 200 emails can wait for a machine that is off. `teammate_email` shows an
+agent how much was refused and why.
+
+**The risks you accept.**
+
+- Anyone on the internet whose sender address is proven can put text in front of an agent
+  that can run commands on your computer. The label and the note are reminders to the agent,
+  not a barrier. Say in your standing instructions how far an agent may act on email.
+- A sender you listed is trusted as much as you chose, including when their account is
+  misused.
+- A file from outside lands on your computer when you approve it or trusted its sender.
+  teammate-comms never opens or runs it; what an agent does with it is the agent's doing.
+- Agents on one machine are not separated: they share the comms folder, so one agent can
+  read another's mail files or ask for its attachments if it goes looking.
+- Email text waits in the mailbox at Cloudflare until your machine collects it, at most 14
+  days.
 
 ## Two wake regimes
 
