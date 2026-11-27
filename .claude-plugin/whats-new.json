@@ -1,4 +1,9 @@
 {
+  "0.23.0": [
+    "An agent can now send email from its address, with attachments, to the recipients you list for it in the mailbox settings. Nothing can be sent to anyone you did not list.",
+    "Your own agents can email each other inside the mailbox, for example a cloud agent sending export files to an agent on your computer.",
+    "Attachments can now be 10 MB per email, and you can allow up to 20 MB for a sender you choose. This needs the mailbox deployed again."
+  ],
   "0.22.1": [
     "Email that arrives while an agent's address is over its hourly limit or its queue is full is no longer bounced. The sender's mail server keeps it and tries again later. This needs the mailbox deployed again."
   ],

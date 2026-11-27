@@ -312,8 +312,141 @@ def test_review_fixes():
         w.close()
 
 
+SENDING = {ADDRESS: dict(ADDRESSES[ADDRESS], agents_from=["canary@agents.example.com"],
+                         send_to=["canary@agents.example.com", "boss@example.com"])}
+
+
+def test_agent_mail_text():
+    rec = email(internal=True, sent_by="Canary (rakazo)", **{"from": "canary@agents.example.com"})
+    lines = am.email_text(rec).split("\n")
+    check(lines[2] == am.AGENT_NOTE and lines[3] == "Sent through the mailbox by: Canary (rakazo)",
+          f"mail from another agent says so and who sent it: {lines[2:4]}")
+    lines = am.email_text(dict(rec, listed=False, sent_by="x\nFrom: fake")).split("\n")
+    check(lines[3] == am.UNLISTED_NOTE and lines[4] == "Sent through the mailbox by: x From: fake",
+          "an unlisted agent is still flagged, and the sender line cannot be broken")
+    check(am.NOTE in am.email_text(email()).split("\n"), "outside mail keeps its own note")
+
+
+def test_local_sending():
+    w = world(addresses=SENDING)
+    asked, uploaded, refuse = [], {}, {}
+
+    def ask(url, key, body):
+        asked.append(body)
+        if body["action"] in refuse:
+            return 200, {"refused": refuse[body["action"]]}
+        if body["action"] == "attach":
+            return 200, {"ok": {"attachment": f"{len(asked):032x}", "ticket": f"{len(asked):064x}"}}
+        return 200, {"ok": {"sent": True, "attachments_kept": len(body["args"]["attachments"])}}
+
+    def upload(url, ticket, path):
+        uploaded[ticket] = Path(path).read_bytes()
+        return 200
+    w.relay._email_post, w.relay._email_upload = ask, upload
+    add_agent(w.root, "bob")
+    files = w.root / "exports"
+    files.mkdir()
+    (files / "a.zip").write_bytes(b"A" * 5000)
+    (files / "b.txt").write_bytes(b"B" * 10)
+    try:
+        w.pump()
+        ok = dict(action="send", to="canary+run7@agents.example.com", subject="Results", body="see files",
+                  files=[str(files / "a.zip"), str(files / "b.txt")])
+        ok["from"] = ADDRESS
+        out, err = call(w.root, "alice", "teammate_email", **ok)
+        check(not err and "Queued" in out, f"the owner queues an email: {out}")
+        (files / "a.zip").write_bytes(b"changed after queueing")
+        w.relay.email_tick()
+        check(sorted(uploaded.values()) == [b"A" * 5000, b"B" * 10], "the files as they were when queued are uploaded")
+        attach = [b for b in asked if b["action"] == "attach"]
+        check([a["args"]["name"] for a in attach] == ["a.zip", "b.txt"] and attach[0]["args"]["size"] == 5000
+              and attach[0]["agent"] == "alice", f"each file is announced with its size and hash: {attach}")
+        sent = [b for b in asked if b["action"] == "send"][0]["args"]
+        check(sent["to"] == "canary+run7@agents.example.com" and sent["subject"] == "Results"
+              and len(sent["attachments"]) == 2 and len(sent["request_id"]) == 32, f"then the email is sent: {sent}")
+        last = mails(w.root)[-1]["message"]
+        check("was sent, with 2 of 2 attachment(s)" in last, f"the owner is told: {last}")
+        check(not list(am.outbox_dir(w.root).iterdir()), "nothing is left staged")
+
+        for bad, why in ((dict(ok, to="stranger@elsewhere.example"), "may only write to"),
+                         (dict(ok, **{"from": "other@agents.example.com"}), "your own addresses"),
+                         (dict(ok, subject=" "), "subject"), (dict(ok, body=""), "body"),
+                         (dict(ok, files=[str(files / "missing.zip")]), "not a regular file"),
+                         (dict(ok, files=[str(files)]), "not a regular file"),
+                         (dict(ok, files="a.zip"), "list of at most")):
+            out, err = call(w.root, "alice", "teammate_email", **bad)
+            check(err and why in out, f"refused ({why}): {out}")
+        out, err = call(w.root, "bob", "teammate_email", **ok)
+        check(err and "your own addresses" in out, f"another agent cannot send as alice: {out}")
+        check(not list(am.outbox_dir(w.root).iterdir()), "a refused request stages nothing")
+
+        before = len(asked)
+        forged = am.queue_send(w.root, "alice", ADDRESS, "boss@example.com", "s", "b", [])
+        request = am._read(am.outbox_dir(w.root) / f"{forged}.json", {})
+        am.write_json_atomic(am.outbox_dir(w.root) / f"{forged}.json", dict(request, agent="bob"))
+        w.relay.email_tick()
+        check(len(asked) == before and not list(am.outbox_dir(w.root).iterdir()),
+              "a request whose agent does not own the address is dropped unsent")
+
+        refuse["send"] = "the daily sending limit is reached"
+        call(w.root, "alice", "teammate_email", **dict(ok, files=[]))
+        w.relay.email_tick()
+        check("was not sent: the daily sending limit is reached" in mails(w.root)[-1]["message"],
+              f"a refusal from the mailbox is passed on: {mails(w.root)[-1]['message']}")
+        refuse.clear()
+
+        def down(url, key, body):
+            raise OSError("no network")
+        w.relay._email_post = down
+        call(w.root, "alice", "teammate_email", **dict(ok, files=[]))
+        told = len(mails(w.root))
+        w.relay.email_tick()
+        check(len(mails(w.root)) == told and len(list(am.outbox_dir(w.root).glob("*.json"))) == 1,
+              "while the mailbox is unreachable the request waits")
+        am.send_tick(w.root, {"cloudbot": (lambda body: down(0, 0, body), None)}, lambda out, owner: None,
+                     lambda m: None, now=time.time() + am.SEND_TRY_SECONDS + 5)
+        check(not list(am.outbox_dir(w.root).iterdir()), "and is given up after an hour")
+        out, err = call(w.root, "alice", "teammate_email")
+        check("may send to: canary@agents.example.com, boss@example.com" in out, f"list shows who it may write to: {out}")
+
+        w.relay._email_post = ask
+        asked.clear()
+        uploaded.clear()
+        crashed = am.queue_send(w.root, "alice", ADDRESS, "boss@example.com", "s", "b", [str(files / "b.txt")])
+        fail_send = {"on": True}
+
+        def flaky(url, key, body):
+            if body["action"] == "send" and fail_send["on"]:
+                raise OSError("connection lost after the mailbox accepted it")
+            return ask(url, key, body)
+        w.relay._email_post = flaky
+        w.relay.email_tick()
+        fail_send["on"] = False
+        w.relay.email_tick()
+        attaches = [b for b in asked if b["action"] == "attach"]
+        sends = [b for b in asked if b["action"] == "send"]
+        check(len(attaches) == 1 and len(uploaded) == 1, f"a retry does not upload the file again: {len(attaches)}")
+        check(len(sends) == 1 and sends[0]["args"]["request_id"] == crashed, "and repeats the send under the same request id")
+
+        w.relay._email_post = ask
+        for forged in ({"at": "soon"}, {"at": time.time() + 10 ** 6}, {"files": [{"staged": "../../secret", "size": 1, "sha256": "0" * 64, "name": "x"}]},
+                       {"files": "nope"}, {"mailbox": "gone"}):
+            rid = am.queue_send(w.root, "alice", ADDRESS, "boss@example.com", "s", "b", [])
+            request = am._read(am.outbox_dir(w.root) / f"{rid}.json", {})
+            am.write_json_atomic(am.outbox_dir(w.root) / f"{rid}.json", dict(request, **forged))
+        before = len([b for b in asked if b["action"] == "attach"])
+        w.relay.email_tick()
+        check(len([b for b in asked if b["action"] == "attach"]) == before, "a forged file entry uploads nothing")
+        am.send_tick(w.root, {"cloudbot": (lambda body: ask(0, 0, body), upload)}, lambda out, owner: None,
+                     lambda m: None, now=time.time() + am.SEND_TRY_SECONDS + 5)
+        check(not list(am.outbox_dir(w.root).iterdir()), f"damaged or forged requests never block the queue: {list(am.outbox_dir(w.root).iterdir())}")
+    finally:
+        w.close()
+
+
 def main():
-    tests = [("review fixes", test_review_fixes), ("delivery", test_delivery), ("refused records", test_refused),
+    tests = [("agent mail text", test_agent_mail_text), ("local sending", test_local_sending),
+             ("review fixes", test_review_fixes), ("delivery", test_delivery), ("refused records", test_refused),
              ("trusted attachments", test_trusted_attachments),
              ("held then fetched", test_held_then_fetched), ("bad downloads", test_bad_downloads),
              ("sweep", test_sweep)]

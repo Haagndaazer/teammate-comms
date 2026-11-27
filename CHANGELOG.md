@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.23.0
+
+- **Agents can send email.** An address sends to the exact recipients its `send_to` list
+  names in the mailbox config, one plain-text email at a time, with attachments.
+  `teammate_email` gains `send` (files as paths); cloud agents get `email_addresses`,
+  `email_attach` and `email_send`.
+- A cloud agent attaches a file by uploading it from its own computer to a one-time
+  address, since a file cannot travel through a tool call.
+- Mail between addresses of one mailbox is delivered inside it. The recipient's new
+  `agents_from` list says which of your agent addresses it trusts.
+- Attachments: 10 MB and 10 files per email by default (was 3 MB and 5), and
+  `attachment_mb` raises it per listed sender, to 20 MB for an agent address and 15 MB for
+  an outside sender.
+- **Mailbox Worker 1.5.0**, with a sending binding: outside recipients need Cloudflare
+  Email Sending turned on for the domain. Deploy the Worker again.
+
 ## 0.22.1
 
 - **Mailbox Worker 1.4.1:** an email that cannot be taken right now (the address is over its

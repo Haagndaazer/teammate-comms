@@ -203,9 +203,43 @@ def check_email(config):
                 if not found.group(1) and found.group(2) in PUBLIC_MAIL:
                     warnings.append(f"{address} {key}: @{found.group(2)} lists everyone with an "
                                     f"address at a public mail service")
-        extra = set(entry) - {"owner", "senders", "attachments_from"}
+        extra = set(entry) - {"owner", "senders", "attachments_from", "agents_from", "send_to",
+                              "send_per_day", "attachment_mb"}
         if extra:
             fail(f"email address {address!r}: unknown setting {sorted(extra)[0]!r}")
+
+        def exact(key, most):
+            values = entry.get(key, [])
+            if not isinstance(values, list) or len(values) > most:
+                fail(f"email address {address!r}: {key} must be a list of at most {most} addresses")
+            for value in values:
+                found = SENDER_RE.fullmatch(value) if isinstance(value, str) else None
+                if (not found or not found.group(1) or "+" in found.group(1)
+                        or bad_shape(found.group(1), found.group(2))):
+                    fail(f"email address {address!r}: {key} entry {value!r} must be one full lower "
+                         f"case address, without a plus tag")
+            return values
+        for other in exact("agents_from", 100):
+            if other not in addresses or other == address:
+                fail(f"email address {address!r}: agents_from entry {other!r} is not another "
+                     f"address of this mailbox")
+        if address in exact("send_to", 20):
+            fail(f"email address {address!r}: send_to cannot name the address itself")
+        per_day = entry.get("send_per_day", 20)
+        if not isinstance(per_day, int) or isinstance(per_day, bool) or not 1 <= per_day <= 200:
+            fail(f"email address {address!r}: send_per_day must be a whole number from 1 to 200")
+        sizes = entry.get("attachment_mb", {})
+        if not isinstance(sizes, dict):
+            fail(f"email address {address!r}: attachment_mb must be an object")
+        for who, mb in sizes.items():
+            agent = who in entry.get("agents_from", [])
+            if not agent and who not in entry.get("senders", []) + entry.get("attachments_from", []):
+                fail(f"email address {address!r}: attachment_mb names {who!r}, which is not on one "
+                     f"of this address's lists")
+            top = 20 if agent else 15
+            if not isinstance(mb, int) or isinstance(mb, bool) or not 1 <= mb <= top:
+                fail(f"email address {address!r}: attachment_mb for {who!r} must be a whole "
+                     f"number from 1 to {top}")
     return warnings
 
 

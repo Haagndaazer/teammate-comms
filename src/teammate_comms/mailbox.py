@@ -227,13 +227,38 @@ def read_key_file(value):
     return text
 
 
-def post_sync(url, key, body, timeout=HTTP_TIMEOUT_SECONDS):
+def post_email(url, key, body, timeout=HTTP_TIMEOUT_SECONDS):
+    """One email request for a local agent. Returns ``(status, object)``."""
+    return post_sync(url, key, dict(body, v=PROTOCOL), timeout, "/pc/email")
+
+
+def put_upload(url, ticket, path, timeout=60):
+    """Upload one staged file to its one-time ticket. Returns the status."""
+    if not isinstance(ticket, str) or not re.fullmatch(r"[0-9a-f]{64}", ticket):
+        raise ValueError("the mailbox gave no usable upload ticket")
+    parts = urllib.parse.urlsplit(url)
+    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = cls(parts.hostname, parts.port, timeout=timeout)
+    try:
+        with open(path, "rb") as f:
+            conn.request("PUT", (parts.path.rstrip("/") or "") + "/up/" + ticket, body=f,
+                         headers={"Content-Type": "application/octet-stream",
+                                  "Content-Length": str(os.fstat(f.fileno()).st_size),
+                                  "User-Agent": "teammate-comms-relay"})
+            resp = conn.getresponse()
+            resp.read(65536)
+    finally:
+        conn.close()
+    return resp.status
+
+
+def post_sync(url, key, body, timeout=HTTP_TIMEOUT_SECONDS, route="/pc/sync"):
     """One sync call. Returns ``(status, object)``; never follows a redirect."""
     parts = urllib.parse.urlsplit(url)
     cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
     conn = cls(parts.hostname, parts.port, timeout=timeout)
     try:
-        conn.request("POST", (parts.path.rstrip("/") or "") + "/pc/sync",
+        conn.request("POST", (parts.path.rstrip("/") or "") + route,
                      body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                      headers={"Content-Type": "application/json", "Accept": "application/json",
                               "Authorization": "Bearer " + key,

@@ -39,7 +39,7 @@ test("an email waits for its owner's machine until acked, and only that machine 
   assert.deepEqual(lap.emails, []);
   assert.deepEqual(lap.addresses, {});
   const desk = await w.sync("desk");
-  assert.deepEqual(desk.addresses[ADA], { owner: "Ada", senders: ["boss@example.com"], attachments_from: ["@client.example"] });
+  assert.deepEqual(desk.addresses[ADA], { owner: "Ada", senders: ["boss@example.com"], attachments_from: ["@client.example"], agents_from: [], send_to: [] });
   assert.equal(desk.emails.length, 1);
   const e = desk.emails[0];
   assert.equal(e.id, got.id);
@@ -158,7 +158,7 @@ test("attachments are held in pieces, served only to the owner's machine, and fr
 
 test("attachments over a cap are dropped and the email still arrives", async () => {
   const w = world(emailConfig());
-  await w.box.email.receive(mail({ attachments: [file(MAIL.fileBytes + 1)] }));
+  await w.box.email.receive(mail({ attachments: [file(10 * 1024 * 1024 + 1)] }));
   await w.box.email.receive(mail({ attachments: Array.from({ length: MAIL.files + 1 }, () => file(10)) }));
   await w.storage.put(`c:mab:${ADA}:l`, MAIL.listedBudget - 5);
   await w.box.email.receive(mail({ attachments: [file(10)] }));

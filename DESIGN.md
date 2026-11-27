@@ -1386,3 +1386,32 @@ removed 14 days after download, judged by the relay's own `.teammate-meta.json`.
 on one machine are not separated (the Worker authenticates machines, the comms folder is
 shared), so tool ownership checks are bookkeeping; a listed sender is trusted when their
 account is misused; mail without DMARC pass or an aligned DKIM signature cannot arrive.
+
+### 0.23.0: sending
+
+Plan, review and rulings: `docs/email-sending-plan.md`. An address sends only to the exact
+addresses in its `send_to` (config). `SendBox` (`emailsend.js`) holds it.
+
+**A file never travels in a tool call.** A model cannot emit megabytes of base64. The
+agent declares name, size and SHA-256 and gets a ticket (32 random bytes, stored only as
+its hash, 15 minutes, one use). It uploads the bytes to `/up/<ticket>`; the Worker forwards
+the request stream to the Durable Object's `fetch`, which stores 512 KiB pieces as they
+arrive and keeps the upload only if size and hash match. Tickets reserve budget (10 and
+50 MiB per address) that an expiry index releases.
+
+**Internal and outside.** A recipient that is an address of the same mailbox is delivered
+by `EmailBox.receiveInternal`, which shares `admit` with received mail (limits, counts,
+held attachments) but takes the sender from the mailbox, not from headers; the recipient's
+`agents_from` decides the label, because the config refuses agent domains on `senders`.
+An outside recipient goes through the `send_email` binding.
+
+**Who sent.** A cloud caller is `me` within an account, a local caller is `agent` as stated
+by the machine's relay (`/pc/email`, machine key). Neither is proof of the agent, so
+`send_to` is a limit on damage; each internal email carries `sent_by`.
+
+**Local agents.** `teammate_email send` copies each file to a private staging folder and
+hashes the copy; the relay re-checks that the agent owns the address, uploads and sends,
+with the request id as the mailbox's idempotency key, and reports the outcome.
+
+**Sizes.** 10 MiB of attachments per email by default, `attachment_mb` up to 20 for an
+agent address and 15 for an outside sender; received mail up to 22 MiB raw.

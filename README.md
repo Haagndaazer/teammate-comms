@@ -63,7 +63,7 @@ there. A's wake is automatic — B's message *is* the nudge, and reading it in
 | `teammate_request_compact` | `target` (agent name) | Request a `/compact` for yourself or a subordinate you manage (a teammate whose `manager` field, set at `teammate_register`/`teammate_update`, names you) via the compaction-broker daemon: authorizes, then atomically drops a request file the broker picks up and injects at a safe point. A denial best-effort DMs an audit line from `compact-broker` to you. A self-compact also best-effort DMs your registered manager, if you have one. |
 | `teammate_peers` | `action?` (`list`\|`add`\|`remove`\|`restart`\|`accept_remote_control`\|`refuse_remote_control`), `machine?` | Manage the other machines this one exchanges messages with over Tailscale. Both machines must `add` each other; teammates there are then addressed `name@machine`. `list` shows each peer's state and why it is unreachable, if it is. `accept_remote_control` lets every approved peer start and shut down agent sessions on this machine (off by default). |
 | `teammate_readme` | `changes_seen?` | The full guide to using teammate-comms: joining, addressing (`name`, `#group`, `name@machine`), messages, groups, linking another machine step by step, what each cross-machine warning means, updating and limits. Works before registering. `changes_seen: true` instead confirms the user has been told the what-changed note, which stops it. |
-| `teammate_email` | `action?` (`list`\|`fetch_attachments`\|`delete_attachments`), `id?` | Your own email address, if your user gave you one. Email arrives in your inbox from `comms-email`, marked as coming from outside. `list` shows your addresses and sender lists. Attachments are held: fetch them only when your user approved it for that email, never run them, and delete them after reading unless told to keep one. Receive only. |
+| `teammate_email` | `action?` (`list`\|`fetch_attachments`\|`delete_attachments`\|`send`), `id?`, `from?`, `to?`, `subject?`, `body?`, `files?` | Your own email address, if your user gave you one. Email arrives in your inbox from `comms-email`, marked as coming from outside or from another agent. `list` shows your addresses, sender lists and who you may write to. Attachments are held: fetch them only when your user approved it for that email, never run them, and delete them after reading unless told to keep one. `send` sends one plain-text email, with files given as paths, to a recipient your user listed; `comms-email` tells you the outcome. |
 | `teammate_user_status` | `status?` (`away`\|`available`), `leave_at?`, `in_minutes?`, `reason?`, `heads_up_minutes?`, `away_behaviour?` | Whether your user is available for questions, shared by every agent. No arguments reads it. Set it only when your user asks: a leave time (agents get a heads-up before it and the status becomes away by itself), away now, available again, or what agents should do while the user is away. Every live agent is told by `comms-status`. |
 
 Identity is established at runtime by `teammate_register` (the setup step) — it is
@@ -683,8 +683,8 @@ a cloud agent" above.
 ## Email addresses for your agents
 
 An agent can have its own email address on a domain you own. Mail sent to it lands in that
-agent's normal inbox and wakes it like a teammate message. Agents can receive mail; they
-cannot send it. It runs on the cloud mailbox above, so set that up first, and it needs the
+agent's normal inbox and wakes it like a teammate message. An agent can also send from its
+address, to the recipients you list for it. It runs on the cloud mailbox above, so set that up first, and it needs the
 mailbox Worker from 0.22.0 or later.
 
 **What you need.** A domain or subdomain whose DNS is on the same Cloudflare account as the
@@ -750,14 +750,50 @@ check, or it is signed (DKIM) by exactly the domain in its From address. Other m
 refused and the sender gets a bounce saying why. Most mailing lists and auto-forwarded mail
 fail this and are refused.
 
-**Attachments.** They stay at the mailbox, at most 5 files and 3 MB per email (a whole email
-at most 5 MB). For a sender in `attachments_from` they are downloaded at once; otherwise the
+**Attachments.** They stay at the mailbox, at most 10 files and 10 MB per email (more for a
+sender you raise with `attachment_mb`). For a sender in `attachments_from` they are downloaded at once; otherwise the
 agent asks you, and fetches them with `teammate_email` when you say yes. Files are saved only
 under `TeammateComms/email/attachments/<agent>/<email id>/` in the comms folder, with a safe
 name, marked as downloaded from the internet, and anything that is not an ordinary document,
 image, archive or media file gets `.blocked` added to its name. The agent is told to delete
 them after reading unless you said to keep one, and to copy a kept file elsewhere: the folder
 is cleared 14 days after download. Unfetched attachments expire after 14 days.
+
+**Sending (0.23.0).** An address can send only if you give it a `send_to` list: the exact
+addresses it may write to. There is no "anyone". Add to an address in `config.json`:
+
+```
+"canary@agents.example.com": {
+  "owner": "Canary",
+  "send_to": ["ada-desktop@agents.example.com", "you@example.com"],
+  "send_per_day": 20
+},
+"ada-desktop@agents.example.com": {
+  "owner": "ada@desktop",
+  "agents_from": ["canary@agents.example.com"],
+  "attachment_mb": {"canary@agents.example.com": 20}
+}
+```
+
+- `send_to`: at most 20 full addresses. `send_per_day` defaults to 20 (200 at most); the
+  whole mailbox sends 200 a day at most. One recipient per email, plain text.
+- `agents_from`: which of your own agent addresses this address trusts. Mail from one is
+  shown as on the list and its files download by themselves; mail from any other agent
+  address is flagged and its files held, like a stranger's.
+- `attachment_mb`: more than the default 10 MB of attachments for a listed sender, up to
+  20 MB for one of your agent addresses and 15 MB for an outside sender.
+- Mail to an address of the same mailbox is delivered inside it and never leaves. Mail to
+  an outside address goes through Cloudflare Email Sending, which you turn on once for the
+  domain (Email, then Email Sending, in the dashboard, or `npx wrangler email sending
+  enable <domain>`). "Sent" then means handed to that service, not that it arrived.
+- A cloud agent attaches a file by uploading it from its own computer to a one-time
+  address the mailbox gives it; an agent on your machine names the file's path.
+
+Sending adds risks: an agent steered by an incoming email can send any file it can read
+to any address on its `send_to` list, under your domain, so keep those lists short. The
+lists limit the damage; they do not prove which agent sent, because agents sharing a
+connection or a machine can use each other's addresses. A one-time upload address appears
+in a cloud agent's logs; for 15 minutes it lets its holder add that one file and nothing else.
 
 **Limits.** Per address and hour: 60 emails from listed senders, 30 from others, 10 from any
 one unlisted sender. 200 emails can wait for a machine that is off. `teammate_email` shows an

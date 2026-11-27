@@ -3,6 +3,7 @@ import { ConfigError, Mailbox, identify, parseConfig } from "./mailbox.js";
 import PostalMime from "postal-mime";
 import { splitRecipient } from "./email.js";
 import { MAIL } from "./emailbox.js";
+import { TICKET_RE } from "./emailsend.js";
 
 const MAX_MCP_BYTES = 1024 * 1024;
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
@@ -10,6 +11,7 @@ const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 let cached = { raw: null, config: null, error: "" };
 
 const MAX_EMAIL_PARTS = 8;
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
 function loadConfig(env) {
   let emailRaw = "";
@@ -65,10 +67,19 @@ export default {
     const path = new URL(request.url).pathname;
     const isSync = path === "/pc/sync";
     const isPiece = path === "/pc/attachment";
-    if (!isSync && !isPiece && path !== "/mcp") return json({ error: "not_found" }, 404);
+    const isEmail = path === "/pc/email";
+    if (path.startsWith("/up/")) {
+      const ticket = path.slice(4);
+      if (!TICKET_RE.test(ticket) || (request.method !== "PUT" && request.method !== "POST") || !request.body) {
+        return json({ error: "not_found" }, 404);
+      }
+      if (Number(request.headers.get("content-length") || 0) > MAX_UPLOAD_BYTES) return json({ error: "not_found" }, 404);
+      return env.MAILBOX.get(env.MAILBOX.idFromName("mailbox")).fetch(request);
+    }
+    if (!isSync && !isPiece && !isEmail && path !== "/mcp") return json({ error: "not_found" }, 404);
     const config = loadConfig(env);
     if (!config) return json({ error: "not_configured" }, 503);
-    const who = await identify(config, isSync || isPiece ? "machines" : "accounts", bearer(request));
+    const who = await identify(config, isSync || isPiece || isEmail ? "machines" : "accounts", bearer(request));
     if (!who) return json({ error: "unauthorized" }, 401, { "www-authenticate": "Bearer" });
     if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST" } });
     const body = await readJson(request, isSync ? MAX_SYNC_BYTES : MAX_MCP_BYTES);
@@ -84,7 +95,11 @@ export default {
       const out = await box.sync(who, body.value);
       return json(out.body, out.status);
     }
-    const reply = await box.rpc(who, body.value);
+    if (isEmail) {
+      const out = await box.machineEmail(who, body.value);
+      return json(out.body, out.status);
+    }
+    const reply = await box.rpc(who, body.value, new URL(request.url).origin);
     return reply === null ? new Response(null, { status: 202 }) : json(reply);
   },
 
@@ -134,6 +149,10 @@ export class MailboxObject extends DurableObject {
       config,
       fetch: (url, init) => fetch(url, init),
       setAlarm: (ms) => this.ctx.storage.setAlarm(ms),
+      sendMail: this.env.EMAIL ? (mail) => this.env.EMAIL.send({
+        from: mail.from, to: mail.to, subject: mail.subject, text: mail.text,
+        attachments: mail.attachments.map((a) => ({ content: a.bytes, filename: a.name, type: a.type, disposition: "attachment" })),
+      }) : null,
       doorbellMinSeconds: Number(this.env.DOORBELL_MIN_SECONDS),
       doorbellMaxPerDay: Number(this.env.DOORBELL_MAX_PER_DAY),
     });
@@ -144,9 +163,58 @@ export class MailboxObject extends DurableObject {
     return box ? box.sync(machine, body) : { status: 503, body: { error: "not_configured" } };
   }
 
-  async rpc(bot, body) {
+  async rpc(bot, body, origin) {
     const box = this.box();
-    return box ? box.rpc(bot, body) : null;
+    return box ? box.rpc(bot, body, origin) : null;
+  }
+
+  async machineEmail(machine, body) {
+    const box = this.box();
+    return box ? box.machineEmail(machine, body) : { status: 503, body: { error: "not_configured" } };
+  }
+
+  // One attachment upload: the body is read as it arrives and stored in pieces.
+  async fetch(request) {
+    const gone = () => json({ error: "not_found" }, 404);
+    const box = this.box();
+    const upload = box ? await box.send.uploadOpen(new URL(request.url).pathname.slice(4)) : null;
+    if (!upload) return gone();
+    let total = 0;
+    let pieces = 0;
+    let chunks = [];
+    let waiting = 0;
+    const flush = async (all) => {
+      if (waiting < MAIL.pieceBytes && !(all && waiting)) return;
+      let joined = new Uint8Array(waiting);
+      let at = 0;
+      for (const chunk of chunks) {
+        joined.set(chunk, at);
+        at += chunk.byteLength;
+      }
+      while (joined.byteLength >= MAIL.pieceBytes || (all && joined.byteLength)) {
+        await box.send.uploadPiece(upload, pieces++, joined.slice(0, MAIL.pieceBytes));
+        joined = joined.subarray(MAIL.pieceBytes);
+      }
+      chunks = joined.byteLength ? [joined] : [];
+      waiting = joined.byteLength;
+    };
+    try {
+      const reader = request.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > upload.size) break;
+        chunks.push(value);
+        waiting += value.byteLength;
+        await flush(false);
+      }
+      await flush(true);
+    } catch {
+      total = -1;
+    }
+    const out = await box.send.uploadClose(upload, total, pieces);
+    return out.error ? json({ error: "upload_refused", detail: out.error }, 400) : json(out.value);
   }
 
   async alarm() {

@@ -181,8 +181,31 @@ def test_hidden_characters():
     check(seen <= {">", "["}, f"every body line is quoted, for every character: {seen}")
 
 
+def test_config_cases():
+    import contextlib
+    import io
+    import json
+    sys.path.insert(0, str(REPO / "cloud-mailbox-worker"))
+    import make_config
+    cases = json.loads((REPO / "cloud-mailbox-worker" / "test" / "config-cases.json").read_text(encoding="utf-8"))
+    base = {"machines": {"desk": "k", "lap": "k"},
+            "accounts": {"g": {"key": "k", "bots": {"Grok": {}, "Quiet": {}}}}}
+
+    def accepted(addresses):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                make_config.check_email(dict(base, email={"addresses": addresses}))
+            return True
+        except SystemExit:
+            return False
+    for addresses in cases["accept"]:
+        check(accepted(addresses), f"make_config accepts {addresses}")
+    for addresses in cases["reject"]:
+        check(not accepted(addresses), f"make_config refuses {addresses}")
+
+
 def main():
-    tests = [("inbox text", test_text), ("a body cannot imitate the header", test_body_cannot_imitate),
+    tests = [("config cases shared with the Worker", test_config_cases), ("inbox text", test_text), ("a body cannot imitate the header", test_body_cannot_imitate),
              ("extras", test_extras), ("refused records", test_refused), ("file names", test_file_names),
              ("hidden characters", test_hidden_characters)]
     for label, fn in tests:

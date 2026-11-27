@@ -74,4 +74,4 @@ jobs:
       # The tested Worker logic imports no npm package; the runner's own Node runs it.
       - name: Run mailbox Worker suite
         if: ${{ !cancelled() }}
-        run: node --test cloud-mailbox-worker/test/mailbox.test.mjs cloud-mailbox-worker/test/email.test.mjs cloud-mailbox-worker/test/emailbox.test.mjs
+        run: node --test cloud-mailbox-worker/test/mailbox.test.mjs cloud-mailbox-worker/test/email.test.mjs cloud-mailbox-worker/test/emailbox.test.mjs cloud-mailbox-worker/test/emailsend.test.mjs

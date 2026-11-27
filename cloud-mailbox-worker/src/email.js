@@ -3,6 +3,11 @@
 export const EMAIL = {
   maxAddresses: 50,
   maxListEntries: 100,
+  maxSendTo: 20,
+  sendPerDay: 20,
+  maxSendPerDay: 200,
+  outsideMb: 15,
+  agentMb: 20,
   tagChars: 40,
   subjectChars: 200,
   htmlChars: 200000,
@@ -71,6 +76,30 @@ function parseList(raw, label, agentDomains, warnings) {
   return out;
 }
 
+const ENTRY_KEYS = ["owner", "senders", "attachments_from", "agents_from", "send_to", "send_per_day", "attachment_mb"];
+
+function exactList(raw, label, max) {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new EmailConfigError(`${label} must be a list`);
+  if (raw.length > max) throw new EmailConfigError(`${label} has more than ${max} entries`);
+  const out = [];
+  for (const item of raw) {
+    const parsed = typeof item === "string" ? parseAddress(item.trim()) : null;
+    if (!parsed || parsed.local.includes("+")) {
+      throw new EmailConfigError(`${label}: ${JSON.stringify(item)} must be one full address, without a plus tag`);
+    }
+    if (!out.includes(parsed.address)) out.push(parsed.address);
+  }
+  return out;
+}
+
+// The megabytes of attachments one email from `sender` may carry to an address.
+export function attachmentLimit(entry, sender) {
+  const parsed = parseAddress(sender);
+  if (!parsed) return 10;
+  return entry.attachmentMb[parsed.address] ?? entry.attachmentMb[`@${parsed.domain}`] ?? 10;
+}
+
 export function parseEmailConfig(raw, machines, bots) {
   const none = { addresses: Object.create(null), warnings: [] };
   if (raw === undefined || raw === null) return none;
@@ -97,12 +126,47 @@ export function parseEmailConfig(raw, machines, bots) {
   }
   const addresses = Object.create(null);
   const warnings = [];
+  const declared = new Set(parsed.map(([key]) => key));
   for (const [key, entry] of parsed) {
+    const label = `email address ${key}`;
+    const unknown = Object.keys(entry).find((name) => !ENTRY_KEYS.includes(name));
+    if (unknown) throw new EmailConfigError(`${label}: unknown setting ${JSON.stringify(unknown)}`);
+    const senders = parseList(entry.senders, `${label} senders`, agentDomains, warnings);
+    const attachmentsFrom = parseList(entry.attachments_from, `${label} attachments_from`, agentDomains, warnings);
+    const agentsFrom = exactList(entry.agents_from, `${label} agents_from`, EMAIL.maxListEntries);
+    for (const other of agentsFrom) {
+      if (!declared.has(other) || other === key) {
+        throw new EmailConfigError(`${label} agents_from: ${other} is not another address of this mailbox`);
+      }
+    }
+    const sendTo = exactList(entry.send_to, `${label} send_to`, EMAIL.maxSendTo);
+    if (sendTo.includes(key)) throw new EmailConfigError(`${label} send_to: an address cannot send to itself`);
+    let sendPerDay = EMAIL.sendPerDay;
+    if (entry.send_per_day !== undefined) {
+      sendPerDay = entry.send_per_day;
+      if (!Number.isInteger(sendPerDay) || sendPerDay < 1 || sendPerDay > EMAIL.maxSendPerDay) {
+        throw new EmailConfigError(`${label}: send_per_day must be a whole number from 1 to ${EMAIL.maxSendPerDay}`);
+      }
+    }
+    const attachmentMb = Object.create(null);
+    if (entry.attachment_mb !== undefined) {
+      if (!isObject(entry.attachment_mb)) throw new EmailConfigError(`${label}: attachment_mb must be an object`);
+      for (const [who, mb] of Object.entries(entry.attachment_mb)) {
+        const name = typeof who === "string" ? who.trim().toLowerCase() : "";
+        const agent = agentsFrom.includes(name);
+        if (!agent && !senders.includes(name) && !attachmentsFrom.includes(name)) {
+          throw new EmailConfigError(`${label} attachment_mb: ${JSON.stringify(who)} is not on one of this address's lists`);
+        }
+        const top = agent ? EMAIL.agentMb : EMAIL.outsideMb;
+        if (!Number.isInteger(mb) || mb < 1 || mb > top) {
+          throw new EmailConfigError(`${label} attachment_mb: ${name} must be a whole number from 1 to ${top}`);
+        }
+        attachmentMb[name] = mb;
+      }
+    }
     addresses[key] = {
       owner: parseOwner(entry.owner, key, machines, bots),
-      senders: parseList(entry.senders, `email address ${key} senders`, agentDomains, warnings),
-      attachmentsFrom: parseList(entry.attachments_from, `email address ${key} attachments_from`,
-        agentDomains, warnings),
+      senders, attachmentsFrom, agentsFrom, sendTo, sendPerDay, attachmentMb,
     };
   }
   return { addresses, warnings };

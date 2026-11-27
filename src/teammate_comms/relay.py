@@ -1496,6 +1496,8 @@ class Relay:
         self._stop = threading.Event()
         self._mailbox_post = mailbox_mod.post_sync
         self._fetch_piece = mailbox_mod.fetch_piece
+        self._email_post = mailbox_mod.post_email
+        self._email_upload = mailbox_mod.put_upload
         self._email_swept = 0.0
         self._inbound = {}
         self._status_at = 0.0
@@ -2070,6 +2072,11 @@ class Relay:
             tools.deliver_dm_record(self.root, None, out, owner, report_live=False)
         if (agentmail.email_dir(self.root) / "held").is_dir():
             agentmail.download_tick(self.root, fetchers, put, self.log)
+        if agentmail.outbox_dir(self.root).is_dir():
+            senders = {name: ((lambda body, cfg=cfg: self._email_post(cfg["url"], cfg["key"], body)),
+                              (lambda ticket, path, cfg=cfg: self._email_upload(cfg["url"], ticket, path)))
+                       for name, cfg in boxes.items()}
+            agentmail.send_tick(self.root, senders, put, self.log)
         if self.clock() - self._email_swept > 3600:
             self._email_swept = self.clock()
             agentmail.sweep(self.root)

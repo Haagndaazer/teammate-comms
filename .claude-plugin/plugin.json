@@ -1,6 +1,6 @@
 {
   "name": "teammate-comms",
-  "version": "0.22.1",
+  "version": "0.23.0",
   "description": "Agent-to-agent messaging between coding-agent sessions, on one machine or between machines linked over Tailscale.",
   "author": { "name": "ColtonDyck" },
   "license": "MIT",

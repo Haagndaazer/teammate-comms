@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
-  EMAIL, EmailConfigError, cleanLine, declaresAutomatic, htmlToText, onList, parseAddress,
+  EMAIL, EmailConfigError, attachmentLimit, cleanLine, declaresAutomatic, htmlToText, onList, parseAddress,
   parseEmailConfig, senderIdentity, splitRecipient,
 } from "../src/email.js";
 
@@ -281,4 +282,51 @@ test("live format: a signature from the From domain verifies a sender with no DM
     "an aligned signature stands even when the policy result is not pass");
   assert.equal(id("mx.cloudflare.net; spf=pass smtp.mailfrom=me@sender-domain.example; dmarc=none"), "", "SPF alone is not enough");
   assert.equal(id("mx.cloudflare.net; dkim=pass header.d=evil.example; dkim=pass header.d=sender-domain.example; dmarc=none"), "me@sender-domain.example");
+});
+
+test("sending config: lists, limits and their refusals", () => {
+  const two = (a, b = {}) => config({
+    "ada@agents.example.com": { owner: "Ada@desk", ...a },
+    "bot@agents.example.com": { owner: "Chief", ...b },
+  });
+  const out = two(
+    { senders: ["@client.example"], agents_from: ["Bot@agents.example.com"], attachment_mb: { "bot@agents.example.com": 20, "@client.example": 15 } },
+    { send_to: ["ada@agents.example.com", "boss@example.com"], send_per_day: 5 });
+  const ada = out.addresses["ada@agents.example.com"];
+  const bot = out.addresses["bot@agents.example.com"];
+  assert.deepEqual([ada.agentsFrom, ada.sendTo, ada.sendPerDay], [["bot@agents.example.com"], [], 20]);
+  assert.deepEqual([bot.sendTo, bot.sendPerDay], [["ada@agents.example.com", "boss@example.com"], 5]);
+  assert.equal(attachmentLimit(ada, "bot@agents.example.com"), 20);
+  assert.equal(attachmentLimit(ada, "jo@client.example"), 15);
+  assert.equal(attachmentLimit(ada, "x@elsewhere.example"), 10);
+  assert.equal(attachmentLimit(bot, "ada@agents.example.com"), 10);
+  const bad = (a, b, why) => assert.throws(() => two(a, b), EmailConfigError, why);
+  bad({ agents_from: ["stranger@elsewhere.example"] }, {}, "agents_from must be a mailbox address");
+  bad({ agents_from: ["ada@agents.example.com"] }, {}, "not itself");
+  bad({ agents_from: ["@agents.example.com"] }, {}, "no whole domain");
+  bad({ send_to: ["@example.com"] }, {}, "send_to takes no domain");
+  bad({ send_to: ["*"] }, {}, "no anyone");
+  bad({ send_to: ["boss+tag@example.com"] }, {}, "no plus tag");
+  bad({ send_to: "boss@example.com" }, {}, "list as text");
+  bad({ send_to: ["ada@agents.example.com"] }, {}, "not to itself");
+  bad({ send_to: Array.from({ length: 21 }, (_, i) => `p${i}@example.com`) }, {}, "too many");
+  bad({ send_per_day: 0 }, {}, "zero a day");
+  bad({ send_per_day: 201 }, {}, "too many a day");
+  bad({ send_per_day: "5" }, {}, "text");
+  bad({ attachment_mb: { "x@elsewhere.example": 12 } }, {}, "not on a list");
+  bad({ senders: ["@client.example"], attachment_mb: { "@client.example": 16 } }, {}, "outside ceiling");
+  bad({ agents_from: ["bot@agents.example.com"], attachment_mb: { "bot@agents.example.com": 21 } }, {}, "agent ceiling");
+  bad({ attachment_mb: [] }, {}, "not an object");
+  bad({ sendto: [] }, {}, "unknown setting");
+});
+
+test("the shared config cases: what make_config.py accepts the Worker accepts, and the listed refusals are refused", () => {
+  const cases = JSON.parse(readFileSync(new URL("./config-cases.json", import.meta.url), "utf8"));
+  const bots = { Grok: {}, Quiet: {} };
+  for (const addresses of cases.accept) {
+    assert.doesNotThrow(() => parseEmailConfig({ addresses }, MACHINES, bots), JSON.stringify(addresses));
+  }
+  for (const addresses of cases.reject) {
+    assert.throws(() => parseEmailConfig({ addresses }, MACHINES, bots), EmailConfigError, JSON.stringify(addresses));
+  }
 });

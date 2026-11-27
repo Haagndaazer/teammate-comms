@@ -1,0 +1,301 @@
+{
+ "comment": "Email config blocks that the Worker (parseEmailConfig) and make_config.py (check_email) must judge the same way. Machines: desk, lap. Cloud agents: Grok, Quiet. The Worker may be more lenient than make_config.py (it lower-cases), never stricter.",
+ "accept": [
+  {
+   "a@agents.example.com": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Ada@desk",
+    "senders": [
+     "boss@example.com",
+     "@client.example"
+    ],
+    "attachments_from": [
+     "@client.example"
+    ]
+   }
+  },
+  {
+   "a-desk@agents.example.com": {
+    "owner": "Ada@desk",
+    "agents_from": [
+     "b@bots.example.org"
+    ],
+    "attachment_mb": {
+     "b@bots.example.org": 20
+    }
+   },
+   "b@bots.example.org": {
+    "owner": "Grok",
+    "send_to": [
+     "a-desk@agents.example.com",
+     "boss@example.com"
+    ],
+    "send_per_day": 200
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "@client.example"
+    ],
+    "attachment_mb": {
+     "@client.example": 15
+    }
+   }
+  },
+  {
+   "a.b-c@a.bc": {
+    "owner": "Quiet",
+    "send_to": [],
+    "agents_from": [],
+    "attachment_mb": {}
+   }
+  }
+ ],
+ "reject": [
+  {
+   "A@agents.example.com": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "a+b@agents.example.com": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "a..b@agents.example.com": {
+    "owner": "Grok"
+   }
+  },
+  {
+   ".a@agents.example.com": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "a@a.b": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "a@localhost": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "postmaster@agents.example.com": {
+    "owner": "Grok"
+   }
+  },
+  {
+   "a@agents.example.com": "Grok"
+  },
+  {
+   "a@agents.example.com": {}
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Nobody"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Ada@elsewhere"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": "boss@example.com"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "not an address"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "a.@x.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "a..b@x.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     ".a@x.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "@a.b"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "@agents.example.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "attachments_from": [
+     "x@agents.example.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "agents_from": [
+     "stranger@elsewhere.example"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "agents_from": [
+     "a@agents.example.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "agents_from": "b@agents.example.com"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_to": [
+     "@example.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_to": [
+     "*"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_to": [
+     "boss+tag@example.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_to": [
+     "a@agents.example.com"
+    ]
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_to": "boss@example.com"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_per_day": 0
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_per_day": 201
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_per_day": "5"
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "send_per_day": true
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "attachment_mb": []
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "attachment_mb": {
+     "x@elsewhere.example": 12
+    }
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "@client.example"
+    ],
+    "attachment_mb": {
+     "@client.example": 16
+    }
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "senders": [
+     "@client.example"
+    ],
+    "attachment_mb": {
+     "@client.example": 1.5
+    }
+   }
+  },
+  {
+   "a@agents.example.com": {
+    "owner": "Grok",
+    "sendto": []
+   }
+  }
+ ]
+}
