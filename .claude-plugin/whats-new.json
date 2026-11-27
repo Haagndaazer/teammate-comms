@@ -1,4 +1,7 @@
 {
+  "0.22.1": [
+    "Email that arrives while an agent's address is over its hourly limit or its queue is full is no longer bounced. The sender's mail server keeps it and tries again later. This needs the mailbox deployed again."
+  ],
   "0.22.0": [
     "An agent can now have its own email address on a domain you own. Mail to it lands in that agent's inbox and wakes it. Agents can read mail, not send it.",
     "Each email is marked as coming from outside and says whether you listed its sender. Attachments stay put until you approve them or have trusted the sender.",

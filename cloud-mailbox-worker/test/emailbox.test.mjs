@@ -95,13 +95,13 @@ test("limits: strangers cannot shut out a listed sender", async () => {
   for (let i = 0; i < MAIL.unlistedPerSenderPerHour; i++) {
     assert.equal((await w.box.email.receive(mail({ from: "one@elsewhere.example" }))).accept, true);
   }
-  assert.match((await w.box.email.receive(mail({ from: "one@elsewhere.example" }))).reject, /last hour/);
+  assert.match((await w.box.email.receive(mail({ from: "one@elsewhere.example" }))).retry, /rate/);
   for (let i = 0; i < MAIL.unlistedPerHour - MAIL.unlistedPerSenderPerHour; i++) {
     assert.equal((await w.box.email.receive(mail({ from: `s${i}@elsewhere.example` }))).accept, true);
   }
-  assert.match((await w.box.email.receive(mail({ from: "fresh@elsewhere.example" }))).reject, /last hour/);
+  assert.match((await w.box.email.receive(mail({ from: "fresh@elsewhere.example" }))).retry, /rate/);
   assert.equal((await w.box.email.receive(mail())).accept, true, "a listed sender still gets through");
-  assert.equal((await w.box.email.receive(mail({ to: "ada-desk+other@agents.example.com", from: "fresh@elsewhere.example" }))).reject !== undefined,
+  assert.equal((await w.box.email.receive(mail({ to: "ada-desk+other@agents.example.com", from: "fresh@elsewhere.example" }))).retry !== undefined,
     true, "a plus tag does not get its own limit");
   await w.advance(3601);
   assert.equal((await w.box.email.receive(mail({ from: "one@elsewhere.example" }))).accept, true, "the hour passes");
@@ -111,10 +111,10 @@ test("limits: a full address refuses, with room kept for listed senders", async 
   const w = world(emailConfig());
   await w.storage.put(`c:mw:${ADA}`, MAIL.waitingUnlisted);
   await w.storage.put(`c:mwu:${ADA}`, MAIL.waitingUnlisted);
-  assert.match((await w.box.email.receive(mail({ from: "one@elsewhere.example" }))).reject, /full/);
+  assert.match((await w.box.email.receive(mail({ from: "one@elsewhere.example" }))).retry, /full/);
   assert.equal((await w.box.email.receive(mail())).accept, true);
   await w.storage.put(`c:mw:${ADA}`, MAIL.waiting);
-  assert.match((await w.box.email.receive(mail())).reject, /full/);
+  assert.match((await w.box.email.receive(mail())).retry, /full/);
   assert.equal((await w.sync("desk")).email_counts[ADA].full, true);
 });
 
@@ -233,7 +233,7 @@ test("a bot cannot be named comms-email", async () => {
 test("review: a cloud agent's inbox being full refuses email", async () => {
   const w = world(emailConfig());
   await w.storage.put("c:b:Grok", MAIL.botWaiting);
-  assert.match((await w.box.email.receive(mail({ to: BOT }))).reject, /full/);
+  assert.match((await w.box.email.receive(mail({ to: BOT }))).retry, /full/);
 });
 
 test("review: mail waiting for a machine that lost the address is dropped, and expires even if the machine is gone", async () => {

@@ -92,6 +92,12 @@ export class EmailBox {
     return { reject: text };
   }
 
+  // A refusal that passes with time: the sending server keeps the message and tries again.
+  async later(address, reason) {
+    await this.tally(address, reason);
+    return { retry: reason };
+  }
+
   // input: { to, rawSize, headers, parsedFrom, subject, text, html, attachments: [{name, type, bytes}] }
   async receive(input) {
     if (!this.enabled()) return { reject: "this address does not accept mail" };
@@ -119,13 +125,13 @@ export class EmailBox {
     const mine = rate.senders[identity] || [];
     if (listed ? rate.listed.length >= MAIL.listedPerHour
       : rate.unlisted.length >= MAIL.unlistedPerHour || mine.length >= MAIL.unlistedPerSenderPerHour) {
-      return this.refuse(address, "rate", "too many messages for this address in the last hour; try again later");
+      return this.later(address, "rate");
     }
     const waiting = await this.box.count(`mw:${address}`);
     const waitingUnlisted = await this.box.count(`mwu:${address}`);
     const botFull = entry.owner.kind === "bot" && (await this.box.count(`b:${entry.owner.bot}`)) >= MAIL.botWaiting;
     if (botFull || waiting >= MAIL.waiting || (!listed && waitingUnlisted >= MAIL.waitingUnlisted)) {
-      return this.refuse(address, "full", "this mailbox is full; try again later");
+      return this.later(address, "full");
     }
     const messageId = (input.headers.find((h) => h.key === "message-id") || {}).value;
     let seenKey = "";

@@ -6,7 +6,7 @@ import { EmailConfigError, parseEmailConfig } from "./email.js";
 import { EmailBox } from "./emailbox.js";
 
 export const PROTOCOL = 1;
-export const WORKER_VERSION = "1.4.0";
+export const WORKER_VERSION = "1.4.1";
 export const LIMITS = {
   messageChars: 65536,
   waitingPerRecipient: 5000,

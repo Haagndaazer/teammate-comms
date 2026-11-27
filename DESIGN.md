@@ -1354,8 +1354,10 @@ with one plain-ASCII address that the MIME parser agrees with. Comments are read
 space. No identity means `setReject`. Inboxes are open by the user's ruling: the sender
 list only labels an email.
 
-**The handler never fails.** It always accepts or calls `setReject` (which the sender sees
-at once as `555 5.7.1 <text>`); an unexpected error becomes a rejection asking to retry.
+**Refuse or fail.** A real refusal calls `setReject`, which the sender sees at once as
+`555 5.7.1 <text>`. What passes with time (hourly limit, full queue, an unexpected error)
+throws instead: the live test showed a sending server then keeps the message and retries
+(Gmail delivered one about 70 minutes later). The duplicate check makes a retry safe.
 
 **Storage.** Email has its own keys so it cannot crowd cloud agent messages and an older
 relay never sees it: `m:`/`mi:` waiting email per machine, `mk:`/`ma:`/`mq:` held

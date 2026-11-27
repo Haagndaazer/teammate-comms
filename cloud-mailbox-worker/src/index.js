@@ -117,9 +117,10 @@ export default {
         })),
       });
       if (result.reject) message.setReject(result.reject);
+      if (result.retry) throw new Error(`not taken now (${result.retry}); the sender's server will try again`);
     } catch (e) {
-      console.error(`email handler failed: ${String(e && e.message).slice(0, 200)}`);
-      message.setReject("this mailbox could not take the message; try again later");
+      console.error(`email not taken: ${String(e && e.message).slice(0, 200)}`);
+      throw e;
     }
   },
 };

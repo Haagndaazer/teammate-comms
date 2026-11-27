@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.22.1
+
+- **Mailbox Worker 1.4.1:** an email that cannot be taken right now (the address is over its
+  hourly limit, its queue is full, or the mailbox hit an error) is no longer bounced. The
+  Worker fails the delivery, which a sending server treats as temporary: it keeps the message
+  and tries again later, as seen in the live test. Real refusals still bounce at once.
+- The downloaded-from-the-internet mark on a saved attachment is written in its exact
+  standard form.
+
 ## 0.22.0
 
 - **Email addresses for agents.** An agent can have its own address on a domain you own;
