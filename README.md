@@ -736,7 +736,9 @@ either list is the same edit and upload.
 npx wrangler email routing rules create example.com --name "agent: ada-desktop" --match-type literal --match-field to --match-value ada-desktop@agents.example.com --action-type worker --action-value cloud-mailbox-worker
 ```
 
-Use the main domain name in the command even when the address is on a subdomain. On a
+Use the main domain name in the command even when the address is on a subdomain. An address
+without a rule bounces mail as "550 Address does not exist", including an address that only
+sends: do this for every address you declare. `make_config.py` lists them after each rebuild. On a
 whole domain used only for agent mail you can instead point its catch-all rule at the
 Worker once.
 

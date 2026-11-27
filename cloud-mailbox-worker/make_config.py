@@ -401,6 +401,16 @@ def main(argv=None):
         print(f'  to bring {name} on, paste to it: "Use the teammate-comms server to check for '
               f'mail with your name set to {name}, and do what the message asks."')
     print(f"Upload with: npx wrangler secret bulk \"{out / 'wrangler-secrets.json'}\"")
+    addresses = sorted((config.get("email") or {}).get("addresses") or {})
+    if addresses:
+        print("  email addresses (each needs Email Routing on its domain and, unless the domain's "
+              "catch-all points at the mailbox, its own routing rule; without one, mail to it "
+              "bounces as 'address does not exist'):")
+        for address in addresses:
+            print(f"    {address}")
+        print("  rule, with <zone> the main domain: npx wrangler email routing rules create <zone> "
+              "--match-type literal --match-field to --match-value <address> --action-type worker "
+              "--action-value cloud-mailbox-worker")
     return 0
 
 
